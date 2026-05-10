@@ -1,11 +1,12 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Bot, CalendarCheck, FileText, Gauge, MapPin, MessageSquareText, Search, Settings, Sparkles, Star } from "lucide-react";
+import { Bot, CalendarCheck, FileText, Gauge, HelpCircle, MapPin, MessageSquareText, Search, Settings, Sparkles, Star } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui";
 
 const nav = [
+  { href: "/overview", label: "How to use", icon: HelpCircle },
   { href: "/dashboard", label: "Dashboard", icon: Gauge },
   { href: "/competitors", label: "Competitors", icon: Search },
   { href: "/gbp", label: "Google Profile", icon: MapPin },
