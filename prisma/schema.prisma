@@ -1,0 +1,115 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum TaskStatus {
+  pending
+  in_progress
+  completed
+  blocked
+}
+
+enum AgentStatus {
+  idle
+  running
+  completed
+  failed
+}
+
+model Business {
+  id        String   @id @default(cuid())
+  name      String
+  website   String
+  location  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Competitor {
+  id          String   @id @default(cuid())
+  name        String
+  website     String?
+  rating      Float?
+  reviewCount Int?
+  strengths   String?
+  weaknesses  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Review {
+  id               String   @id @default(cuid())
+  author           String
+  rating           Int
+  text             String
+  serviceMentioned String?
+  reply            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model GBPPost {
+  id        String   @id @default(cuid())
+  title     String
+  content   String
+  status    String   @default("draft")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SeoAudit {
+  id          String   @id @default(cuid())
+  url         String
+  score       Int
+  findings    String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model AgentRun {
+  id        String      @id @default(cuid())
+  agentName String
+  status    AgentStatus @default(idle)
+  input     String?
+  output    String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+}
+
+model Task {
+  id          String     @id @default(cuid())
+  title       String
+  description String?
+  category    String
+  priority    String
+  status      TaskStatus @default(pending)
+  impact      String?
+  difficulty  String?
+  week        Int?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+model Report {
+  id        String   @id @default(cuid())
+  title     String
+  type      String
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model GeneratedContent {
+  id        String   @id @default(cuid())
+  type      String
+  title     String?
+  content   String
+  language  String   @default("sv")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
