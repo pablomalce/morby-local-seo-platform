@@ -1,3 +1,7 @@
+// Universal Local Growth Platform — Prisma schema
+// Phase 1: SQLite for local dev. Phase 2 will switch provider to PostgreSQL (Supabase) without
+// breaking the model shapes below. All cross-tenant data is rooted at Organization.
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -16,100 +20,310 @@ enum TaskStatus {
 
 enum AgentStatus {
   idle
+  queued
   running
   completed
   failed
 }
 
+enum WorkflowStatus {
+  draft
+  pending_review
+  approved
+  rejected
+  scheduled
+  published
+  archived
+}
+
+enum UserRole {
+  owner
+  admin
+  manager
+  editor
+  viewer
+}
+
+model Organization {
+  id              String               @id @default(cuid())
+  name            String
+  slug            String               @unique
+  defaultLocale   String               @default("en")
+  defaultCurrency String               @default("USD")
+  users           OrgUser[]
+  businesses      Business[]
+  integrations    IntegrationAccount[]
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+}
+
+model OrgUser {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  email          String
+  role           UserRole     @default(viewer)
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, email])
+}
+
 model Business {
-  id        String   @id @default(cuid())
-  name      String
-  website   String
-  location  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String             @id @default(cuid())
+  organizationId   String
+  organization     Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name             String
+  website          String
+  industry         String
+  brandTone        String
+  primaryLocale    String             @default("en")
+  valueProposition String
+  logoColor        String             @default("#8FAF9A")
+  locations        BusinessLocation[]
+  services         BusinessService[]
+  competitors      Competitor[]
+  reviews          Review[]
+  content          ContentAsset[]
+  imageAssets      SocialImageAsset[]
+  socialPosts      SocialPost[]
+  tasks            PlatformTask[]
+  reports          Report[]
+  keywords         Keyword[]
+  campaigns        Campaign[]
+  agentRuns        AgentRun[]
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+}
+
+model BusinessLocation {
+  id              String   @id @default(cuid())
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  label           String
+  addressLine     String
+  city            String
+  region          String
+  country         String
+  primaryGeoQuery String
+  latitude        Float?
+  longitude       Float?
+  isPrimary       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+}
+
+model BusinessService {
+  id                 String             @id @default(cuid())
+  businessId         String
+  business           Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  slug               String
+  name               String
+  description        String
+  primaryKeyword     String
+  supportingKeywords String // JSON array
+  isFeatured         Boolean            @default(false)
+  content            ContentAsset[]
+  imageAssets        SocialImageAsset[]
+
+  @@unique([businessId, slug])
+}
+
+model Keyword {
+  id              String   @id @default(cuid())
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  serviceId       String?
+  locationId      String?
+  query           String
+  intent          String
+  estimatedVolume Int?
+  difficulty      Int?
+  currentRank     Int?
+  targetRank      Int?
 }
 
 model Competitor {
-  id          String   @id @default(cuid())
-  name        String
-  website     String?
-  rating      Float?
-  reviewCount Int?
-  strengths   String?
-  weaknesses  String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id             String   @id @default(cuid())
+  businessId     String
+  business       Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  locationId     String?
+  name           String
+  website        String?
+  rating         Float?
+  reviewCount    Int?
+  strengthScore  Int      @default(0)
+  relevanceScore Int      @default(0)
+  strengths      String // JSON array
+  weaknesses     String // JSON array
+  opportunities  String // JSON array
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 }
 
 model Review {
-  id               String   @id @default(cuid())
+  id               String         @id @default(cuid())
+  businessId       String
+  business         Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  locationId       String?
   author           String
   rating           Int
   text             String
   serviceMentioned String?
-  reply            String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  suggestedReply   String?
+  status           WorkflowStatus @default(draft)
+  receivedAt       DateTime       @default(now())
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
 }
 
-model GBPPost {
-  id        String   @id @default(cuid())
-  title     String
-  content   String
-  status    String   @default("draft")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model ContentAsset {
+  id            String           @id @default(cuid())
+  businessId    String
+  business      Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  serviceId     String?
+  service       BusinessService? @relation(fields: [serviceId], references: [id])
+  locale        String           @default("en")
+  kind          String
+  title         String?
+  body          String
+  targetKeyword String?
+  status        WorkflowStatus   @default(draft)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 }
 
-model SeoAudit {
-  id          String   @id @default(cuid())
-  url         String
-  score       Int
-  findings    String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+model SocialImageAsset {
+  id           String           @id @default(cuid())
+  businessId   String
+  business     Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  serviceId    String?
+  service      BusinessService? @relation(fields: [serviceId], references: [id])
+  locationId   String?
+  platform     String
+  aspectRatio  String
+  visualStyle  String
+  campaignGoal String
+  audience     String
+  language     String           @default("en")
+  brandTone    String
+  prompt       String
+  caption      String
+  hashtags     String // JSON array
+  altText      String
+  cta          String
+  imageUrl     String
+  provider     String           @default("demo")
+  status       WorkflowStatus   @default(draft)
+  socialPosts  SocialPost[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
 }
 
-model AgentRun {
-  id        String      @id @default(cuid())
-  agentName String
-  status    AgentStatus @default(idle)
-  input     String?
-  output    String?
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+model SocialPost {
+  id           String            @id @default(cuid())
+  businessId   String
+  business     Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  imageAssetId String?
+  imageAsset   SocialImageAsset? @relation(fields: [imageAssetId], references: [id])
+  platform     String
+  locale       String            @default("en")
+  caption      String
+  hashtags     String // JSON array
+  scheduledFor DateTime?
+  status       WorkflowStatus    @default(draft)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
 }
 
-model Task {
+model Campaign {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  goal       String
+  startDate  DateTime
+  endDate    DateTime
+  status     String   @default("draft")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model PlatformTask {
   id          String     @id @default(cuid())
+  businessId  String
+  business    Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
   title       String
   description String?
   category    String
   priority    String
-  status      TaskStatus @default(pending)
   impact      String?
   difficulty  String?
   week        Int?
+  status      TaskStatus @default(pending)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 }
 
 model Report {
-  id        String   @id @default(cuid())
-  title     String
-  type      String
-  content   String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  title      String
+  kind       String
+  locale     String   @default("en")
+  summary    String
+  content    String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 }
 
-model GeneratedContent {
+model AgentRun {
+  id         String      @id @default(cuid())
+  businessId String?
+  business   Business?   @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  agentId    String
+  scope      String
+  scopeId    String
+  status     AgentStatus @default(idle)
+  input      String?
+  output     String?
+  error      String?
+  tokensUsed Int?
+  costUsd    Float?
+  startedAt  DateTime    @default(now())
+  finishedAt DateTime?
+}
+
+model IntegrationAccount {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider       String
+  status         String       @default("not_connected")
+  connectedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([organizationId, provider])
+}
+
+model ActivityLog {
   id        String   @id @default(cuid())
-  type      String
-  title     String?
-  content   String
-  language  String   @default("sv")
+  actorId   String?
+  scope     String
+  scopeId   String
+  action    String
+  payload   String?
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  resource   String
+  resourceId String
+  before     String?
+  after      String?
+  createdAt  DateTime @default(now())
 }

@@ -1,9 +1,91 @@
-import { Card, PageHeader, Badge } from "@/components/ui";
-import { business } from "@/lib/mock/data";
+"use client";
+
+import { Badge, Card, HudLabel, PageHeader } from "@/components/ui";
+import { useT } from "@/lib/i18n/I18nProvider";
+import { useSelection } from "@/lib/context/SelectionContext";
+
+const INTEGRATIONS = [
+  "OpenAI API",
+  "OpenAI Image Generation",
+  "Google Places API",
+  "Google Business Profile API",
+  "Google Search Console",
+  "Google Analytics GA4",
+  "LinkedIn",
+  "Meta (Facebook & Instagram)",
+  "X / Twitter",
+  "Buffer / Metricool",
+  "Resend",
+  "Stripe",
+  "Sentry",
+  "PostHog",
+];
 
 export default function SettingsPage() {
-  const integrations = ["OpenAI API", "Google Places API", "Google Business Profile API", "Google Search Console", "Google Analytics GA4"];
-  return <><PageHeader title="Settings & Integration Readiness" description="Project configuration, demo mode and future API connection checklist." action={<Badge variant="gold">Demo mode</Badge>} />
-  <div className="grid gap-6 lg:grid-cols-2"><Card><h2 className="text-xl font-bold text-ink">Business information</h2><div className="mt-5 space-y-3 text-sm"><Row label="Business" value={business.name} /><Row label="Website" value={business.website} /><Row label="Location" value={business.location} /><Row label="Target keyword" value={business.targetKeyword} /></div></Card><Card><h2 className="text-xl font-bold text-ink">Integration checklist</h2><div className="mt-5 space-y-3">{integrations.map((i) => <div key={i} className="flex items-center justify-between rounded-2xl border bg-white p-4"><span className="font-medium text-ink">{i}</span><Badge variant="muted">Not connected</Badge></div>)}</div><p className="mt-5 text-sm text-muted-foreground">Do not paste real API keys into frontend fields. Add credentials to .env.local in Phase 2.</p></Card></div></>;
+  const t = useT();
+  const { business, location, servicesForBusiness, locationsForBusiness } = useSelection();
+
+  return (
+    <>
+      <PageHeader
+        eyebrow={`10 / SETTINGS — ${business.name.toUpperCase()}`}
+        frame="INTEGRATIONS · 14"
+        title={t("settings.title")}
+        description={t("settings.description")}
+        action={<Badge variant="hud">{t("app.demoBadge")}</Badge>}
+      />
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card>
+          <HudLabel>{t("settings.businessInfo")}</HudLabel>
+          <div className="mt-5 space-y-2">
+            <Row label={t("selector.business")} value={business.name} />
+            <Row label="Website" value={business.website} />
+            <Row label={t("settings.industry")} value={business.industry.replace(/_/g, " ")} />
+            <Row label={t("settings.brandTone")} value={business.brandTone} />
+            <Row label={t("settings.primaryLocale")} value={business.primaryLocale.toUpperCase()} />
+            {location && (
+              <Row
+                label={t("selector.location")}
+                value={`${location.label} · ${location.city}, ${location.region}`}
+              />
+            )}
+            <Row label={t("settings.locations")} value={`${locationsForBusiness.length}`} />
+            <Row label={t("settings.services")} value={`${servicesForBusiness.length}`} />
+          </div>
+        </Card>
+        <Card>
+          <HudLabel>{t("settings.integrationChecklist")}</HudLabel>
+          <div className="mt-5 space-y-2">
+            {INTEGRATIONS.map((i, idx) => (
+              <div
+                key={i}
+                className="flex items-center justify-between rounded-vulkan border border-metal-800 bg-metal-950 px-4 py-3"
+              >
+                <span className="flex items-center gap-3">
+                  <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+                    {String(idx + 1).padStart(2, "0")}
+                  </span>
+                  <span className="text-[13px] text-vulkan-white">{i}</span>
+                </span>
+                <Badge variant="muted">{t("settings.notConnected")}</Badge>
+              </div>
+            ))}
+          </div>
+          <p className="mt-5 font-mono text-[10px] uppercase tracking-hud text-metal-500">
+            {t("settings.envWarning")}
+          </p>
+        </Card>
+      </div>
+    </>
+  );
 }
-function Row({ label, value }: { label: string; value: string }) { return <div className="flex justify-between gap-4 rounded-xl bg-cream px-4 py-3"><span className="text-muted-foreground">{label}</span><span className="font-medium text-ink">{value}</span></div>; }
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between rounded-vulkan border border-metal-800 bg-metal-950 px-4 py-3">
+      <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">{label}</span>
+      <span className="text-[13px] text-vulkan-white">{value}</span>
+    </div>
+  );
+}

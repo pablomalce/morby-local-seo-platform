@@ -1,16 +1,24 @@
-import { agents } from "@/lib/mock/data";
+/**
+ * Backward-compat orchestrator.
+ *
+ * The original agent runner has been replaced by the scope-aware registry. This shim preserves
+ * the public surface used by older API routes (`runAgent(id)` / `runAllAgents()`) while routing
+ * everything through the new registry so the platform always speaks one language.
+ */
+
+import { businesses } from "@/lib/mock/universal";
+import { getAgent, runAgent as runAgentScoped, runAllAgents as runAllScoped } from "./registry";
 
 export async function runAgent(agentId: string) {
-  const agent = agents.find((a) => a.id === agentId);
-  if (!agent) throw new Error("Agent not found");
-  return {
-    ...agent,
-    status: "Completed",
-    lastRun: new Date().toISOString(),
-    output: `${agent.name} produced a demo recommendation for Mörby Fotvård och Skönhet.`
-  };
+  const definition = getAgent(agentId);
+  if (!definition) throw new Error("Agent not found");
+  // Default scope: the first business in the demo dataset.
+  const scopeId = businesses[0].id;
+  return runAgentScoped({ agentId, scope: "business", scopeId });
 }
 
 export async function runAllAgents() {
-  return Promise.all(agents.map((a) => runAgent(a.id)));
+  return runAllScoped({ scope: "business", scopeId: businesses[0].id });
 }
+
+export { listAgents } from "./registry";

@@ -1,10 +1,10 @@
 {
-  "name": "Mörby Local SEO Intelligence Platform",
-  "short_name": "Mörby SEO",
-  "description": "AI-powered local SEO command center for Mörby Fotvård och Skönhet.",
+  "name": "VULKAN // GROWTH OS",
+  "short_name": "Vulkan",
+  "description": "Engineered local growth platform — high-end digital production by Vulkan Studios.",
   "start_url": "/dashboard",
   "display": "standalone",
-  "background_color": "#F7F1E8",
-  "theme_color": "#8FAF9A",
+  "background_color": "#000000",
+  "theme_color": "#000000",
   "icons": []
 }

@@ -2,25 +2,140 @@
 @tailwind components;
 @tailwind utilities;
 
+/* =============================================================================
+   VULKAN STUDIOS — Global base
+   Rule: Vulkan Black is the canvas. Every surface anchors here.
+   ============================================================================= */
+
 :root {
-  --background: 37 45% 96%;
-  --foreground: 142 18% 17%;
-  --card: 0 0% 100%;
-  --card-foreground: 142 18% 17%;
-  --primary: 139 18% 62%;
-  --primary-foreground: 0 0% 100%;
-  --secondary: 39 55% 94%;
-  --secondary-foreground: 142 18% 17%;
-  --muted: 40 20% 92%;
-  --muted-foreground: 142 10% 43%;
-  --accent: 42 44% 60%;
-  --accent-foreground: 142 18% 17%;
-  --border: 40 18% 86%;
-  --input: 40 18% 86%;
-  --ring: 139 18% 62%;
+  color-scheme: dark;
+  --font-rajdhani: "Rajdhani", system-ui, sans-serif;
+  --font-inter: "Inter", system-ui, sans-serif;
+  --font-jetbrains: "JetBrains Mono", ui-monospace, monospace;
+  --font-michroma: "Michroma", "Rajdhani", system-ui, sans-serif;
 }
 
-* { border-color: hsl(var(--border)); }
-body { background: linear-gradient(135deg, #fbf8f2 0%, #f4efe6 45%, #eef3ee 100%); color: hsl(var(--foreground)); }
-.gradient-card { background: linear-gradient(135deg, rgba(255,255,255,.96), rgba(247,241,232,.88)); }
-.glass { background: rgba(255,255,255,.72); backdrop-filter: blur(18px); }
+html,
+body {
+  background: #000000;
+  color: #F5F5F5;
+}
+
+/* Hairline + selection */
+::selection {
+  background: rgba(239, 76, 36, 0.35);
+  color: #F5F5F5;
+}
+
+/* Industrial scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #050505;
+}
+::-webkit-scrollbar-thumb {
+  background: #1A1A1A;
+  border: 2px solid #050505;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2A2A2A;
+}
+
+/* Default link */
+a {
+  color: inherit;
+}
+
+/* Default focus — controlled orange ring, no soft outline */
+:where(input, textarea, select, button, [role="button"], a):focus-visible {
+  outline: 1px solid #EF4C24;
+  outline-offset: 1px;
+}
+
+/* =============================================================================
+   Layered surface utilities
+   ============================================================================= */
+
+@layer components {
+  /* Vulkan radial accent — apply over the body once, never compete with text */
+  .vulkan-radial-bg {
+    background-image: radial-gradient(
+      circle at 80% -10%,
+      rgba(239, 76, 36, 0.10),
+      transparent 40%
+    );
+  }
+
+  /* Vulkan pattern overlay — texture, max 10% opacity */
+  .vulkan-pattern-overlay {
+    position: relative;
+    isolation: isolate;
+  }
+  .vulkan-pattern-overlay::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: url("/patterns/vulkan-pattern.svg");
+    background-size: 48px 48px;
+    opacity: 0.08;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .vulkan-pattern-overlay > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* Pattern with orange tint for CTA backdrops (slide 11) */
+  .vulkan-pattern-orange::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: url("/patterns/vulkan-pattern.svg");
+    background-size: 48px 48px;
+    opacity: 0.06;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+  }
+
+  /* HUD label — always uppercase mono with `// ` prefix */
+  .hud-label {
+    @apply font-mono uppercase tracking-hud text-[10px] text-metal-400;
+  }
+
+  /* Display headline — Rajdhani tight, uppercase, line-height 0.95 */
+  .display-h {
+    @apply font-display uppercase tracking-display leading-[0.95] text-vulkan-white;
+  }
+
+  /* Wordmark — Michroma (logo, section markers) */
+  .wordmark {
+    @apply font-michroma uppercase tracking-hud text-vulkan-white;
+  }
+
+  /* Card surface — metal-900 with metal-700 hairline */
+  .vulkan-card {
+    @apply rounded-vulkan-card border border-metal-700 bg-metal-900 transition-[transform,box-shadow,border-color] duration-vulkan-card ease-vulkan;
+  }
+  .vulkan-card-hover:hover {
+    @apply -translate-y-1 border-vulkan-orange shadow-orange-glow-soft;
+  }
+
+  /* Frame counter chip — mono, sits in headers */
+  .frame-counter {
+    @apply font-mono text-[10px] uppercase tracking-hud text-metal-400;
+  }
+}
+
+/* =============================================================================
+   Legacy class compatibility (transitional — old code still references these)
+   ============================================================================= */
+.gradient-card {
+  background: linear-gradient(135deg, #0a0a0a, #050505);
+}
+.glass {
+  background: rgba(10, 10, 10, 0.72);
+  backdrop-filter: blur(18px);
+}
