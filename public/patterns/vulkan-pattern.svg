@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <defs>
+    <pattern id="vulkan" x="0" y="0" width="48" height="48" patternUnits="userSpaceOnUse">
+      <rect width="48" height="48" fill="transparent"/>
+      <path d="M24 0v48M0 24h48" stroke="#F5F5F5" stroke-width="0.3" stroke-opacity="0.4"/>
+      <circle cx="24" cy="24" r="1" fill="#F5F5F5" fill-opacity="0.55"/>
+      <circle cx="0" cy="0" r="0.6" fill="#F5F5F5" fill-opacity="0.35"/>
+      <circle cx="48" cy="0" r="0.6" fill="#F5F5F5" fill-opacity="0.35"/>
+      <circle cx="0" cy="48" r="0.6" fill="#F5F5F5" fill-opacity="0.35"/>
+      <circle cx="48" cy="48" r="0.6" fill="#F5F5F5" fill-opacity="0.35"/>
+    </pattern>
+  </defs>
+  <rect width="48" height="48" fill="url(#vulkan)"/>
+</svg>

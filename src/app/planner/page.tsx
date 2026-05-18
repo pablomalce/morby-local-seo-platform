@@ -1,16 +1,96 @@
 "use client";
-import { useState } from "react";
-import { Card, PageHeader, Badge, Button, Progress } from "@/components/ui";
-import { plan as initialPlan } from "@/lib/mock/data";
+
+import { useEffect, useMemo, useState } from "react";
+import { Badge, Button, Card, HudLabel, PageHeader, Progress, StatusPill } from "@/components/ui";
+import { useT } from "@/lib/i18n/I18nProvider";
+import { useSelection } from "@/lib/context/SelectionContext";
+import { useTenantSnapshot } from "@/lib/hooks/useTenantSnapshot";
+import type { PlatformTask } from "@/lib/types/core";
 
 export default function PlannerPage() {
-  const [plan, setPlan] = useState(initialPlan);
-  const total = plan.flatMap((w) => w.tasks).length;
-  const done = plan.flatMap((w) => w.tasks).filter((t) => t.status === "completed").length;
-  function completeFirstPending() {
-    setPlan((current) => current.map((week) => ({ ...week, tasks: week.tasks.map((task) => task.status === "pending" ? { ...task, status: "completed" } : task) })).slice());
+  const t = useT();
+  const { business } = useSelection();
+  const snap = useTenantSnapshot();
+  const snapshotPlan = useMemo(() => snap.plan, [snap.plan]);
+  const [plan, setPlan] = useState<PlatformTask[]>(snapshotPlan);
+
+  useEffect(() => {
+    setPlan(snapshotPlan);
+  }, [snapshotPlan]);
+
+  const total = plan.length;
+  const done = plan.filter((task) => task.status === "completed").length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  function completePending() {
+    setPlan((current) =>
+      current.map((task) => (task.status === "pending" ? { ...task, status: "completed" } : task)),
+    );
   }
-  return <><PageHeader title="90-Day Strategy Planner" description="A guided execution plan to shift Google’s perception from foot-care authority to facial-treatment authority in Danderyd." action={<Button onClick={completeFirstPending}>Mark pending tasks completed</Button>} />
-  <Card className="mb-6"><div className="mb-2 flex justify-between text-sm"><span>Overall completion</span><span>{Math.round((done / total) * 100)}%</span></div><Progress value={(done / total) * 100} /></Card>
-  <div className="grid gap-5 lg:grid-cols-2">{plan.map((week) => <Card key={week.week}><div className="mb-4 flex items-center justify-between"><div><h2 className="text-xl font-bold text-ink">Week {week.week}</h2><p className="text-sm text-muted-foreground">Focus: {week.focus}</p></div><Badge variant="gold">Sprint</Badge></div><div className="space-y-3">{week.tasks.map((task) => <div key={task.title} className="rounded-2xl border bg-white p-4"><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-ink">{task.title}</p><p className="mt-1 text-sm text-muted-foreground">Priority: {task.priority} · Impact: {task.impact} · Difficulty: {task.difficulty}</p></div><Badge variant={task.status === "completed" ? "default" : task.status === "in_progress" ? "gold" : "muted"}>{task.status}</Badge></div></div>)}</div></Card>)}</div></>;
+
+  const weeks = Array.from(new Set(plan.map((p) => p.week))).sort((a, b) => a - b);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow={`07 / PLANNER — ${business.name.toUpperCase()}`}
+        frame={`${pct}% COMPLETE`}
+        title={t("planner.title")}
+        description={t("planner.description")}
+        action={
+          <Button variant="secondary" onClick={completePending}>
+            {t("planner.markCompleted")}
+          </Button>
+        }
+      />
+
+      <Card className="mb-6">
+        <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-hud text-metal-400">
+          <span>{t("planner.overall")}</span>
+          <span className="text-vulkan-white">{pct}%</span>
+        </div>
+        <div className="mt-3">
+          <Progress value={pct} />
+        </div>
+      </Card>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        {weeks.map((week) => {
+          const weekTasks = plan.filter((p) => p.week === week);
+          const focus = weekTasks[0]?.category ?? "Growth";
+          return (
+            <Card key={week} hoverable>
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <span className="font-mono text-[10px] uppercase tracking-hud text-vulkan-orange">
+                    WEEK {String(week).padStart(2, "0")}
+                  </span>
+                  <h2 className="mt-1 display-h text-lg">{focus}</h2>
+                </div>
+                <Badge variant="orange">{t("planner.sprint")}</Badge>
+              </div>
+              <div className="space-y-2">
+                {weekTasks.map((task) => (
+                  <div
+                    key={task.id}
+                    className="rounded-vulkan border border-metal-800 bg-metal-950 p-3"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[13px] text-vulkan-white">{task.title}</p>
+                        <p className="mt-1 font-mono text-[10px] uppercase tracking-hud text-metal-500">
+                          {task.priority} · IMPACT {task.impact} · DIFF {task.difficulty}
+                        </p>
+                      </div>
+                      <StatusPill status={task.status} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    </>
+  );
 }
