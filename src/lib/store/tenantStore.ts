@@ -1,10 +1,9 @@
 /**
- * Tenant store — runtime merge of seed demo data + user-created tenants.
+ * Tenant store — runtime merge of seed demo data + user-created tenants + agent outputs.
  *
- * Phase 1 stores user-created businesses/locations/services in `localStorage` so users can
- * onboard their own clients from the UI without a real database. Phase 2 will swap this for
- * tenant-scoped DB queries, but the public API (`addBusiness`, `addLocation`, `addService`,
- * `listBusinesses`, etc.) is intentionally stable so consumers don't change.
+ * Phase 1 stores user-created businesses/locations/services in `localStorage`, plus any data
+ * that agents produce when run (content drafts, competitor entries, reviews, reports). Phase 2
+ * will swap this for tenant-scoped DB queries.
  */
 
 import {
@@ -12,30 +11,62 @@ import {
   locations as seedLocations,
   services as seedServices,
 } from "@/lib/mock/universal";
-import type { Business, BusinessLocation, BusinessService } from "@/lib/types/core";
+import type {
+  Business,
+  BusinessLocation,
+  BusinessService,
+  Competitor,
+  ContentAsset,
+  Report,
+  Review,
+} from "@/lib/types/core";
 
-const STORAGE_KEY = "lg.tenants.v1";
+const STORAGE_KEY = "lg.tenants.v2";
 
 interface StoredState {
   businesses: Business[];
   locations: BusinessLocation[];
   services: BusinessService[];
+  content: ContentAsset[];
+  competitors: Competitor[];
+  reviews: Review[];
+  reports: Report[];
 }
 
 function emptyState(): StoredState {
-  return { businesses: [], locations: [], services: [] };
+  return {
+    businesses: [],
+    locations: [],
+    services: [],
+    content: [],
+    competitors: [],
+    reviews: [],
+    reports: [],
+  };
 }
 
 export function readStore(): StoredState {
   if (typeof window === "undefined") return emptyState();
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return emptyState();
+    if (!raw) {
+      // Best-effort migrate from v1.
+      const legacy = window.localStorage.getItem("lg.tenants.v1");
+      if (legacy) {
+        const parsed = JSON.parse(legacy) as Partial<StoredState>;
+        return { ...emptyState(), ...parsed };
+      }
+      return emptyState();
+    }
     const parsed = JSON.parse(raw) as Partial<StoredState>;
     return {
       businesses: Array.isArray(parsed.businesses) ? parsed.businesses : [],
       locations: Array.isArray(parsed.locations) ? parsed.locations : [],
       services: Array.isArray(parsed.services) ? parsed.services : [],
+      content: Array.isArray(parsed.content) ? parsed.content : [],
+      competitors: Array.isArray(parsed.competitors) ? parsed.competitors : [],
+      reviews: Array.isArray(parsed.reviews) ? parsed.reviews : [],
+      reports: Array.isArray(parsed.reports) ? parsed.reports : [],
     };
   } catch {
     return emptyState();
@@ -47,8 +78,8 @@ export function writeStore(state: StoredState) {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
-function cuid(): string {
-  return `usr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function cuid(prefix = "usr"): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export interface NewBusinessInput {
@@ -84,18 +115,20 @@ export interface NewServiceInput {
 }
 
 function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "")
-    .slice(0, 48) || `svc-${Date.now().toString(36)}`;
+  return (
+    value
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/(^-|-$)/g, "")
+      .slice(0, 48) || `svc-${Date.now().toString(36)}`
+  );
 }
 
 export function createBusiness(input: NewBusinessInput): Business {
   const business: Business = {
-    id: cuid(),
+    id: cuid("biz-usr"),
     organizationId: input.organizationId,
     name: input.name.trim(),
     website: input.website.trim(),
@@ -103,7 +136,7 @@ export function createBusiness(input: NewBusinessInput): Business {
     brandTone: input.brandTone.trim(),
     primaryLocale: input.primaryLocale,
     valueProposition: input.valueProposition.trim(),
-    logoColor: input.logoColor || "#8FAF9A",
+    logoColor: input.logoColor || "#EF4C24",
     createdAt: new Date().toISOString(),
   };
   const state = readStore();
@@ -114,7 +147,7 @@ export function createBusiness(input: NewBusinessInput): Business {
 
 export function createLocation(input: NewLocationInput): BusinessLocation {
   const location: BusinessLocation = {
-    id: cuid(),
+    id: cuid("loc-usr"),
     businessId: input.businessId,
     label: input.label.trim() || "Primary",
     addressLine: input.addressLine.trim(),
@@ -132,7 +165,7 @@ export function createLocation(input: NewLocationInput): BusinessLocation {
 
 export function createService(input: NewServiceInput): BusinessService {
   const service: BusinessService = {
-    id: cuid(),
+    id: cuid("svc-usr"),
     businessId: input.businessId,
     slug: input.slug?.trim() || slugify(input.name),
     name: input.name.trim(),
@@ -153,10 +186,44 @@ export function deleteBusiness(businessId: string) {
     businesses: state.businesses.filter((b) => b.id !== businessId),
     locations: state.locations.filter((l) => l.businessId !== businessId),
     services: state.services.filter((s) => s.businessId !== businessId),
+    content: state.content.filter((c) => c.businessId !== businessId),
+    competitors: state.competitors.filter((c) => c.businessId !== businessId),
+    reviews: state.reviews.filter((r) => r.businessId !== businessId),
+    reports: state.reports.filter((r) => r.businessId !== businessId),
   });
 }
 
-/** Merge seed + user-created data — single source of truth for the UI. */
+// ---------- Agent-output writers ----------
+
+export function appendContent(items: ContentAsset[]) {
+  if (items.length === 0) return;
+  const state = readStore();
+  state.content = [...items, ...state.content];
+  writeStore(state);
+}
+
+export function appendCompetitors(items: Competitor[]) {
+  if (items.length === 0) return;
+  const state = readStore();
+  state.competitors = [...items, ...state.competitors];
+  writeStore(state);
+}
+
+export function appendReviews(items: Review[]) {
+  if (items.length === 0) return;
+  const state = readStore();
+  state.reviews = [...items, ...state.reviews];
+  writeStore(state);
+}
+
+export function appendReport(report: Report) {
+  const state = readStore();
+  state.reports = [report, ...state.reports];
+  writeStore(state);
+}
+
+// ---------- Reads ----------
+
 export function listAllBusinesses(): Business[] {
   return [...seedBusinesses, ...readStore().businesses];
 }
@@ -167,6 +234,22 @@ export function listAllLocations(): BusinessLocation[] {
 
 export function listAllServices(): BusinessService[] {
   return [...seedServices, ...readStore().services];
+}
+
+export function listStoredContent(businessId: string): ContentAsset[] {
+  return readStore().content.filter((c) => c.businessId === businessId);
+}
+
+export function listStoredCompetitors(businessId: string): Competitor[] {
+  return readStore().competitors.filter((c) => c.businessId === businessId);
+}
+
+export function listStoredReviews(businessId: string): Review[] {
+  return readStore().reviews.filter((r) => r.businessId === businessId);
+}
+
+export function listStoredReports(businessId: string): Report[] {
+  return readStore().reports.filter((r) => r.businessId === businessId);
 }
 
 export function isUserCreated(businessId: string): boolean {

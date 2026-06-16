@@ -1,15 +1,38 @@
 /**
  * Agent Registry — universal, scope-aware
  *
- * Phase 1 ships the definitions and a deterministic demo runner. Phase 3 will replace `runAgent`
- * with real OpenAI calls behind a server-only abstraction, preserving the same input/output shape.
+ * Phase 1.6 makes agents actually do work: they pull tenant context (any business, seed or
+ * user-created), generate plausible deliverables and persist them into the tenant store so the
+ * dashboard, content studio, competitors, reviews and reports pages light up after a run.
  *
- * Every run produces a `scope` + `scopeId` so future audit logs, cost tracking and approval flows
- * can resolve which tenant/entity the run belongs to.
+ * Phase 3 will swap the deterministic generators for real OpenAI calls behind server-only
+ * routes, preserving the same input/output shape.
  */
 
-import { agentDefinitions, businesses, getBusinessSnapshot } from "@/lib/mock/universal";
-import type { AgentDefinition, AgentRun, AgentScope } from "@/lib/types/core";
+import { agentDefinitions } from "@/lib/mock/universal";
+import {
+  appendCompetitors,
+  appendContent,
+  appendReport,
+  appendReviews,
+  listAllBusinesses,
+  listAllLocations,
+  listAllServices,
+} from "@/lib/store/tenantStore";
+import {
+  generateCompetitors,
+  generateContent,
+  generateReviews,
+} from "@/lib/generators/tenantData";
+import type {
+  AgentDefinition,
+  AgentRun,
+  AgentScope,
+  Business,
+  BusinessLocation,
+  BusinessService,
+  Report,
+} from "@/lib/types/core";
 
 export interface AgentRunInput {
   agentId: string;
@@ -26,10 +49,57 @@ export function getAgent(agentId: string): AgentDefinition | undefined {
   return agentDefinitions.find((a) => a.id === agentId);
 }
 
+// ---------- Deterministic seeded PRNG (kept local to avoid cross-imports) ----------
+
+function mulberry32(seed: number) {
+  return function () {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seedFor(businessId: string, agentId: string): number {
+  let h = 2166136261;
+  const s = `${businessId}:${agentId}:${Date.now()}`;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+interface TenantContext {
+  business: Business;
+  locations: BusinessLocation[];
+  services: BusinessService[];
+  featured?: BusinessService;
+  location?: BusinessLocation;
+}
+
+function loadTenantContext(scopeId: string): TenantContext | null {
+  const allBusinesses = listAllBusinesses();
+  const allLocations = listAllLocations();
+  const allServices = listAllServices();
+  const business = allBusinesses.find((b) => b.id === scopeId);
+  if (!business) return null;
+  const locations = allLocations.filter((l) => l.businessId === business.id);
+  const services = allServices.filter((s) => s.businessId === business.id);
+  return {
+    business,
+    locations,
+    services,
+    featured: services.find((s) => s.isFeatured) ?? services[0],
+    location: locations.find((l) => l.isPrimary) ?? locations[0],
+  };
+}
+
 /**
- * Deterministic demo output keyed on the agent + selected business. Output text reflects the
- * universal context (no client-specific hardcoding) so the same agent reads naturally for every
- * vertical in the demo.
+ * Run an agent against a tenant. Returns an AgentRun summary AND persists any deliverables the
+ * agent produced (content drafts, competitor entries, reviews, reports) to the tenant store so
+ * downstream pages reflect the result.
  */
 export function runAgent(input: AgentRunInput): AgentRun {
   const agent = getAgent(input.agentId);
@@ -46,24 +116,109 @@ export function runAgent(input: AgentRunInput): AgentRun {
     };
   }
 
-  // Resolve a friendly business context. Default to first business if scopeId not found.
-  const business =
-    businesses.find((b) => b.id === input.scopeId) ??
-    businesses.find((b) => b.id === resolveBusinessId(input)) ??
-    businesses[0];
-  const snap = getBusinessSnapshot(business.id);
-  const featured = snap.services.find((s) => s.isFeatured) ?? snap.services[0];
-  const location = snap.locations.find((l) => l.isPrimary) ?? snap.locations[0];
+  const ctx = loadTenantContext(input.scopeId);
+  if (!ctx) {
+    return {
+      id: `run-${Date.now()}`,
+      agentId: agent.id,
+      scope: input.scope,
+      scopeId: input.scopeId,
+      status: "failed",
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      error: `Business '${input.scopeId}' not found.`,
+    };
+  }
 
-  const output = composeDemoOutput(agent, business.name, featured?.name, location?.primaryGeoQuery);
+  const rand = mulberry32(seedFor(ctx.business.id, agent.id));
+  const startedAt = new Date().toISOString();
+
+  let output = "";
+  let producedCount = 0;
+
+  switch (agent.id) {
+    case "content":
+    case "entity": {
+      const items = generateContent(ctx.business, ctx.locations, ctx.services, rand);
+      // Tag them as freshly generated by this agent.
+      const stamped = items.map((c, i) => ({
+        ...c,
+        id: `${ctx.business.id}-agent-content-${Date.now()}-${i}`,
+        createdAt: new Date().toISOString(),
+      }));
+      appendContent(stamped);
+      producedCount = stamped.length;
+      output = `Generated ${producedCount} content drafts for ${ctx.featured?.name ?? "the featured service"} (meta title, description, H1, FAQ, GBP post, CTA). See Content Studio.`;
+      break;
+    }
+    case "competitor": {
+      const items = generateCompetitors(ctx.business, ctx.locations, rand).map((c, i) => ({
+        ...c,
+        id: `${ctx.business.id}-agent-cmp-${Date.now()}-${i}`,
+      }));
+      appendCompetitors(items);
+      producedCount = items.length;
+      output = `Identified ${producedCount} competitors near ${ctx.location?.city ?? "the primary location"} with strength/relevance scores and 3 opportunity vectors each. See Competitors.`;
+      break;
+    }
+    case "review": {
+      const items = generateReviews(ctx.business, ctx.services, rand).map((r, i) => ({
+        ...r,
+        id: `${ctx.business.id}-agent-rv-${Date.now()}-${i}`,
+        receivedAt: new Date().toISOString(),
+      }));
+      appendReviews(items);
+      producedCount = items.length;
+      output = `Captured ${producedCount} fresh reviews with suggested replies in the business locale. See Reviews.`;
+      break;
+    }
+    case "reporting": {
+      const report: Report = {
+        id: `${ctx.business.id}-report-${Date.now()}`,
+        businessId: ctx.business.id,
+        title: `${ctx.business.name} · Weekly Growth Report`,
+        kind: "weekly",
+        locale: ctx.business.primaryLocale,
+        summary: `${ctx.business.name} continues to improve semantic relevance for ${ctx.featured?.primaryKeyword ?? "the featured query"}.`,
+        createdAt: startedAt,
+      };
+      appendReport(report);
+      producedCount = 1;
+      output = `Compiled a weekly growth report covering rankings, GBP delta, reviews growth and next-week priorities. See Reports.`;
+      break;
+    }
+    case "local-seo":
+      output = `Local SEO Auditor: prioritise the ${ctx.featured?.name ?? "featured service"} landing page, add FAQ schema, reinforce internal links toward ${ctx.location?.primaryGeoQuery ?? "the primary geo query"}.`;
+      break;
+    case "website-seo":
+      output = `Website SEO: optimise titles, meta and Core Web Vitals; cluster pages around ${ctx.featured?.name ?? "the featured service"} and its supporting keywords.`;
+      break;
+    case "gbp":
+      output = `GBP Agent: confirm primary category, weekly posts on ${ctx.featured?.name ?? "the featured service"}, refresh photos, request reviews referencing ${ctx.featured?.name ?? "the service"}.`;
+      break;
+    case "social-content":
+      output = `Social Content: drafted 4 platform-aware caption variants (LinkedIn, Instagram, Facebook, GBP) for the ${ctx.featured?.name ?? "featured service"} campaign.`;
+      break;
+    case "social-image":
+      output = `Social Image: prepared 3 on-brand image briefs for ${ctx.featured?.name ?? "the featured service"} at 1:1, 4:5 and 9:16. Open Image Studio to generate.`;
+      break;
+    case "planner":
+      output = `Task Planner: a 13-week sprint plan focused on ${ctx.featured?.name ?? "the featured service"} authority and ${ctx.location?.city ?? "the primary market"} dominance.`;
+      break;
+    case "campaign":
+      output = `Campaign Agent: orchestrated content + social + image + reporting agents for the active campaign on ${ctx.featured?.name ?? "the featured service"}.`;
+      break;
+    default:
+      output = `${agent.name} produced a recommendation for ${ctx.business.name}.`;
+  }
 
   return {
-    id: `run-${Date.now()}`,
+    id: `run-${Date.now()}-${agent.id}`,
     agentId: agent.id,
     scope: input.scope,
     scopeId: input.scopeId,
     status: "completed",
-    startedAt: new Date().toISOString(),
+    startedAt,
     finishedAt: new Date().toISOString(),
     input: input.payload,
     output,
@@ -73,50 +228,7 @@ export function runAgent(input: AgentRunInput): AgentRun {
 }
 
 export function runAllAgents(input: { scope: AgentScope; scopeId: string }): AgentRun[] {
-  return agentDefinitions.map((a) => runAgent({ agentId: a.id, scope: input.scope, scopeId: input.scopeId }));
-}
-
-function resolveBusinessId(input: AgentRunInput): string | undefined {
-  if (input.scope === "business") return input.scopeId;
-  if (typeof input.payload?.businessId === "string") return input.payload.businessId;
-  return undefined;
-}
-
-function composeDemoOutput(
-  agent: AgentDefinition,
-  business: string,
-  featuredService: string | undefined,
-  geoQuery: string | undefined,
-): string {
-  const service = featuredService ?? "your featured service";
-  const geo = geoQuery ?? "the selected market";
-
-  switch (agent.id) {
-    case "local-seo":
-      return `Local SEO Auditor — ${business}: prioritise the ${service} landing page, add FAQ schema, and reinforce internal links toward ${geo}.`;
-    case "website-seo":
-      return `Website SEO Agent — ${business}: optimise titles, meta, Core Web Vitals; cluster pages around ${service} and supporting topics.`;
-    case "gbp":
-      return `GBP Agent — ${business}: confirm primary category, weekly posts on ${service}, refresh photos, request reviews referencing ${service}.`;
-    case "competitor":
-      return `Competitor Intelligence — ${business}: top competitors win on review volume and identity. Out-execute on ${service}-specific content and reviews.`;
-    case "content":
-      return `Content Strategy — ${business}: produce locale-correct H1/meta/FAQ/posts around ${service} and ${geo}.`;
-    case "review":
-      return `Review Growth — ${business}: weekly request after ${service} appointments; reply in the customer's language.`;
-    case "social-content":
-      return `Social Content — ${business}: 4 platform-aware caption variants (LinkedIn, Instagram, Facebook, GBP) for the ${service} campaign.`;
-    case "social-image":
-      return `Social Image — ${business}: generate 3 on-brand image variants for ${service}; aspect ratios 1:1, 4:5 and 9:16.`;
-    case "entity":
-      return `Entity Optimisation — ${business}: align website, GBP, content and reviews around ${service} and ${geo}.`;
-    case "reporting":
-      return `Reporting Agent — ${business}: weekly report includes rankings, GBP delta, reviews growth, and next-week priorities.`;
-    case "planner":
-      return `Task Planner — ${business}: 13-week sprint plan focused on ${service} authority and ${geo} dominance.`;
-    case "campaign":
-      return `Campaign Agent — ${business}: orchestrate content + social + image + reporting agents for the active campaign on ${service}.`;
-    default:
-      return `${agent.name} produced a demo recommendation for ${business}.`;
-  }
+  return agentDefinitions.map((a) =>
+    runAgent({ agentId: a.id, scope: input.scope, scopeId: input.scopeId }),
+  );
 }

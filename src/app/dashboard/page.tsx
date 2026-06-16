@@ -1,8 +1,10 @@
 "use client";
 
+import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, CheckCircle2, Sparkles } from "lucide-react";
 import {
   Badge,
+  Button,
   Card,
   EmptyState,
   HudLabel,
@@ -54,6 +56,11 @@ export default function DashboardPage() {
         <EmptyState
           title={t("empty.metrics.title")}
           description={t("empty.metrics.body")}
+          action={
+            <Link href="/agents">
+              <Button>Run agents to populate</Button>
+            </Link>
+          }
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

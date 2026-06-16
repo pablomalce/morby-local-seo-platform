@@ -198,38 +198,45 @@ export default function NewBusinessPage() {
     if (/^https?:\/\//i.test(value)) return value;
     return `https://${value}`;
   }
-  function submit() {
+  const [submitting, setSubmitting] = useState(false);
+  async function submit() {
     if (!validateStep()) return;
+    setSubmitting(true);
     const supporting = svcSupport
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean);
-    createTenant({
-      business: {
-        name,
-        website: normaliseWebsite(website),
-        industry,
-        brandTone,
-        primaryLocale,
-        valueProposition,
-        logoColor,
-      },
-      firstLocation: {
-        label: locLabel,
-        addressLine,
-        city,
-        region,
-        country,
-        primaryGeoQuery: geoQuery,
-      },
-      firstService: {
-        name: svcName,
-        description: svcDesc,
-        primaryKeyword: svcKeyword,
-        supportingKeywords: supporting,
-      },
-    });
-    router.push("/dashboard");
+    try {
+      await createTenant({
+        business: {
+          name,
+          website: normaliseWebsite(website),
+          industry,
+          brandTone,
+          primaryLocale,
+          valueProposition,
+          logoColor,
+        },
+        firstLocation: {
+          label: locLabel,
+          addressLine,
+          city,
+          region,
+          country,
+          primaryGeoQuery: geoQuery,
+        },
+        firstService: {
+          name: svcName,
+          description: svcDesc,
+          primaryKeyword: svcKeyword,
+          supportingKeywords: supporting,
+        },
+      });
+      router.push("/dashboard");
+    } catch (err) {
+      setErrors({ submit: err instanceof Error ? err.message : "Failed to create business" });
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -452,9 +459,9 @@ export default function NewBusinessPage() {
                     <ArrowRight className="h-3.5 w-3.5" />
                   </Button>
                 ) : (
-                  <Button onClick={submit}>
+                  <Button onClick={submit} disabled={submitting}>
                     <Check className="h-3.5 w-3.5" />
-                    {t("onboarding.cta.create")}
+                    {submitting ? "Saving..." : t("onboarding.cta.create")}
                   </Button>
                 )}
               </div>

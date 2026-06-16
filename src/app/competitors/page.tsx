@@ -1,6 +1,7 @@
 "use client";
 
-import { Badge, Card, HudLabel, PageHeader, Progress } from "@/components/ui";
+import Link from "next/link";
+import { Badge, Button, Card, HudLabel, PageHeader, Progress } from "@/components/ui";
 import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
 import { useTenantSnapshot } from "@/lib/hooks/useTenantSnapshot";
@@ -20,10 +21,12 @@ export default function CompetitorsPage() {
       />
 
       {competitors.length === 0 ? (
-        <Card>
-          <p className="font-mono text-[11px] uppercase tracking-hud text-metal-500">
-            {t("empty.competitors")}
-          </p>
+        <Card className="flex flex-col items-start gap-3">
+          <HudLabel>NO COMPETITORS YET</HudLabel>
+          <p className="text-[13px] text-metal-300">{t("empty.competitors")}</p>
+          <Link href="/agents">
+            <Button>Run Competitor Intelligence Agent</Button>
+          </Link>
         </Card>
       ) : (
         <div className="grid gap-5 lg:grid-cols-3">

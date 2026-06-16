@@ -9,6 +9,8 @@ import {
   Gauge,
   HelpCircle,
   ImageIcon,
+  LogIn,
+  LogOut,
   MapPin,
   MessageSquareText,
   Search,
@@ -22,6 +24,8 @@ import { ServiceSelector } from "@/components/selectors/ServiceSelector";
 import { LocaleSwitcher } from "@/components/selectors/LocaleSwitcher";
 import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
+import { useAuth } from "@/lib/auth/AuthProvider";
+import { signOut } from "@/lib/auth/actions";
 
 interface NavItem {
   href: string;
@@ -99,6 +103,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const t = useT();
   const { business, service } = useSelection();
+  const { user, loading: authLoading } = useAuth();
 
   const groups: { label: string; items: NavItem[] }[] = [
     { label: "ENGAGE", items: nav.filter((n) => n.section === "ENGAGE") },
@@ -164,9 +169,34 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <ServiceSelector />
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="hud">
-                <span className="text-vulkan-orange">//</span> &nbsp;DEMO MODE
-              </Badge>
+              {!authLoading &&
+                (user ? (
+                  <form action={signOut} className="contents">
+                    <Badge variant="hud">
+                      <StatusDot tone="online" />&nbsp;{user.email?.split("@")[0]}
+                    </Badge>
+                    <button
+                      type="submit"
+                      className="rounded-vulkan border border-metal-700 px-2 py-1 font-mono text-[10px] uppercase tracking-hud text-metal-400 transition-colors duration-vulkan ease-vulkan hover:border-vulkan-orange hover:text-vulkan-orange"
+                      title="Sign out"
+                    >
+                      <span className="flex items-center gap-1">
+                        <LogOut className="h-3 w-3" />
+                        OUT
+                      </span>
+                    </button>
+                  </form>
+                ) : (
+                  <Link
+                    href="/login"
+                    className="rounded-vulkan bg-vulkan-orange px-3 py-1.5 font-mono text-[10px] uppercase tracking-hud text-vulkan-black transition-[background-color,box-shadow] duration-vulkan ease-vulkan hover:bg-vulkan-orange-soft hover:shadow-orange-glow"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <LogIn className="h-3 w-3" />
+                      SIGN IN
+                    </span>
+                  </Link>
+                ))}
               <LocaleSwitcher />
             </div>
           </div>
