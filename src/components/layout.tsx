@@ -26,6 +26,8 @@ import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
 import { useAuth } from "@/lib/auth/AuthProvider";
 import { signOut } from "@/lib/auth/actions";
+import { Footer } from "@/components/Footer";
+import { CookieConsent } from "@/components/CookieConsent";
 
 interface NavItem {
   href: string;
@@ -203,7 +205,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </header>
 
         <div className="mx-auto max-w-7xl px-5 py-8 md:px-8">{children}</div>
+
+        <Footer />
       </main>
+
+      <CookieConsent />
     </div>
   );
 }

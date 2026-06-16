@@ -208,6 +208,39 @@ const en: Dictionary = {
   "onboarding.review.basics": "Basics",
   "onboarding.review.location": "Location",
   "onboarding.review.service": "Service",
+
+  // Cookie consent
+  "cookies.eyebrow": "PRIVACY · COOKIES",
+  "cookies.title": "Your data, your choice.",
+  "cookies.body":
+    "We use strictly necessary cookies to keep the app running. With your consent, we also use a few more for preferences and analytics. You can change your mind anytime from the footer.",
+  "cookies.readMore": "Read our cookie policy →",
+  "cookies.acceptAll": "ACCEPT ALL",
+  "cookies.rejectAll": "REJECT ALL",
+  "cookies.customize": "Customize",
+  "cookies.hideDetails": "Hide details",
+  "cookies.saveChoice": "SAVE CHOICE",
+  "cookies.alwaysOn": "ALWAYS ON",
+  "cookies.preferences": "Cookie preferences",
+  "cookies.cat.necessary.title": "Strictly necessary",
+  "cookies.cat.necessary.body":
+    "Required for the app to function — authentication session, security, language and selected tenant. No tracking.",
+  "cookies.cat.functional.title": "Functional",
+  "cookies.cat.functional.body":
+    "Remembers preferences like your selected business and locale across visits. Improves UX but is not required.",
+  "cookies.cat.analytics.title": "Analytics",
+  "cookies.cat.analytics.body":
+    "Helps us understand which features are used so we can improve the platform. Anonymous, aggregated.",
+  "cookies.cat.marketing.title": "Marketing",
+  "cookies.cat.marketing.body":
+    "Used to deliver relevant content. We currently don't run marketing trackers — this toggle is reserved.",
+
+  // Legal footer
+  "footer.privacy": "Privacy",
+  "footer.cookies": "Cookies",
+  "footer.terms": "Terms",
+  "footer.cookiePreferences": "Cookie preferences",
+  "footer.tagline": "Engineered by Vulkan Studios",
 };
 
 const es: Dictionary = {
@@ -411,6 +444,39 @@ const es: Dictionary = {
   "onboarding.review.basics": "Básicos",
   "onboarding.review.location": "Ubicación",
   "onboarding.review.service": "Servicio",
+
+  // Cookie consent
+  "cookies.eyebrow": "PRIVACIDAD · COOKIES",
+  "cookies.title": "Tus datos, tu decisión.",
+  "cookies.body":
+    "Usamos cookies estrictamente necesarias para que la app funcione. Con tu consentimiento, también usamos algunas más para preferencias y analítica. Puedes cambiar de opinión en cualquier momento desde el footer.",
+  "cookies.readMore": "Leer nuestra política de cookies →",
+  "cookies.acceptAll": "ACEPTAR TODO",
+  "cookies.rejectAll": "RECHAZAR TODO",
+  "cookies.customize": "Personalizar",
+  "cookies.hideDetails": "Ocultar detalles",
+  "cookies.saveChoice": "GUARDAR ELECCIÓN",
+  "cookies.alwaysOn": "SIEMPRE ACTIVA",
+  "cookies.preferences": "Preferencias de cookies",
+  "cookies.cat.necessary.title": "Estrictamente necesarias",
+  "cookies.cat.necessary.body":
+    "Requeridas para el funcionamiento de la app — sesión de autenticación, seguridad, idioma y cliente seleccionado. Sin rastreo.",
+  "cookies.cat.functional.title": "Funcionales",
+  "cookies.cat.functional.body":
+    "Recuerdan tus preferencias como el negocio seleccionado y el idioma entre visitas. Mejoran la UX pero no son requeridas.",
+  "cookies.cat.analytics.title": "Analíticas",
+  "cookies.cat.analytics.body":
+    "Nos ayudan a entender qué funciones se usan para mejorar la plataforma. Datos anónimos y agregados.",
+  "cookies.cat.marketing.title": "Marketing",
+  "cookies.cat.marketing.body":
+    "Para entregar contenido relevante. Actualmente no usamos rastreadores de marketing — este toggle está reservado.",
+
+  // Legal footer
+  "footer.privacy": "Privacidad",
+  "footer.cookies": "Cookies",
+  "footer.terms": "Términos",
+  "footer.cookiePreferences": "Preferencias de cookies",
+  "footer.tagline": "Ingeniado por Vulkan Studios",
 };
 
 const sv: Dictionary = {
@@ -614,6 +680,39 @@ const sv: Dictionary = {
   "onboarding.review.basics": "Grunddata",
   "onboarding.review.location": "Plats",
   "onboarding.review.service": "Tjänst",
+
+  // Cookie consent
+  "cookies.eyebrow": "INTEGRITET · COOKIES",
+  "cookies.title": "Dina data, ditt val.",
+  "cookies.body":
+    "Vi använder strikt nödvändiga cookies för att appen ska fungera. Med ditt samtycke använder vi också några till för preferenser och analys. Du kan ändra dig när som helst från sidfoten.",
+  "cookies.readMore": "Läs vår cookiepolicy →",
+  "cookies.acceptAll": "ACCEPTERA ALLA",
+  "cookies.rejectAll": "AVVISA ALLA",
+  "cookies.customize": "Anpassa",
+  "cookies.hideDetails": "Dölj detaljer",
+  "cookies.saveChoice": "SPARA VAL",
+  "cookies.alwaysOn": "ALLTID PÅ",
+  "cookies.preferences": "Cookie-inställningar",
+  "cookies.cat.necessary.title": "Strikt nödvändiga",
+  "cookies.cat.necessary.body":
+    "Krävs för att appen ska fungera — inloggningssession, säkerhet, språk och vald kund. Ingen spårning.",
+  "cookies.cat.functional.title": "Funktionella",
+  "cookies.cat.functional.body":
+    "Kommer ihåg preferenser som vald verksamhet och språk mellan besök. Förbättrar UX men är inte obligatoriska.",
+  "cookies.cat.analytics.title": "Analys",
+  "cookies.cat.analytics.body":
+    "Hjälper oss förstå vilka funktioner som används så att vi kan förbättra plattformen. Anonym, aggregerad data.",
+  "cookies.cat.marketing.title": "Marknadsföring",
+  "cookies.cat.marketing.body":
+    "Används för att leverera relevant innehåll. Vi kör för närvarande inga marknadsföringsspårare — växeln är reserverad.",
+
+  // Legal footer
+  "footer.privacy": "Integritet",
+  "footer.cookies": "Cookies",
+  "footer.terms": "Villkor",
+  "footer.cookiePreferences": "Cookie-inställningar",
+  "footer.tagline": "Ingenjörsbyggt av Vulkan Studios",
 };
 
 export const dictionaries: Record<Locale, Dictionary> = { en, es, sv };
