@@ -7,6 +7,14 @@ import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
 import { ReportView } from "./ReportView";
 import type { Report } from "@/lib/reports/types";
+import {
+  isUserCreated,
+  listAllLocations,
+  listAllServices,
+  listStoredCompetitors,
+  listStoredContent,
+  listStoredReviews,
+} from "@/lib/store/tenantStore";
 
 const STORAGE_KEY = "lg.reports.cache.v1";
 
@@ -48,10 +56,25 @@ export default function ReportsPage() {
     setError(null);
     startTransition(async () => {
       try {
+        // If this tenant was created via the onboarding wizard (lives only in localStorage),
+        // include the local data so the server can build a snapshot for it.
+        let clientSnapshot: Record<string, unknown> | undefined;
+        if (isUserCreated(business.id)) {
+          const allLocations = listAllLocations().filter((l) => l.businessId === business.id);
+          const allServices = listAllServices().filter((s) => s.businessId === business.id);
+          clientSnapshot = {
+            business,
+            locations: allLocations,
+            services: allServices,
+            content: listStoredContent(business.id),
+            competitors: listStoredCompetitors(business.id),
+            reviews: listStoredReviews(business.id),
+          };
+        }
         const res = await fetch("/api/reports/generate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ businessId: business.id }),
+          body: JSON.stringify({ businessId: business.id, clientSnapshot }),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({ error: "Failed" }));

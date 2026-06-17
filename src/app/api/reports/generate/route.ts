@@ -3,8 +3,56 @@ import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import { businesses } from "@/lib/mock/universal";
 
+const businessSchema = z.object({
+  id: z.string(),
+  organizationId: z.string(),
+  name: z.string(),
+  website: z.string().optional().default(""),
+  industry: z.string(),
+  brandTone: z.string().optional().default(""),
+  primaryLocale: z.enum(["en", "es", "sv"]),
+  valueProposition: z.string().optional().default(""),
+  logoColor: z.string().optional().default("#EF4C24"),
+  createdAt: z.string().optional().default(() => new Date().toISOString()),
+});
+
+const locationSchema = z.object({
+  id: z.string(),
+  businessId: z.string(),
+  label: z.string(),
+  addressLine: z.string().optional().default(""),
+  city: z.string().optional().default(""),
+  region: z.string().optional().default(""),
+  country: z.string().optional().default(""),
+  primaryGeoQuery: z.string().optional().default(""),
+  latitude: z.number().optional(),
+  longitude: z.number().optional(),
+  isPrimary: z.boolean().optional().default(true),
+});
+
+const serviceSchema = z.object({
+  id: z.string(),
+  businessId: z.string(),
+  slug: z.string(),
+  name: z.string(),
+  description: z.string().optional().default(""),
+  primaryKeyword: z.string().optional().default(""),
+  supportingKeywords: z.array(z.string()).optional().default([]),
+  isFeatured: z.boolean().optional().default(false),
+});
+
 const schema = z.object({
   businessId: z.string().optional(),
+  clientSnapshot: z
+    .object({
+      business: businessSchema,
+      locations: z.array(locationSchema).default([]),
+      services: z.array(serviceSchema).default([]),
+      content: z.array(z.any()).optional(),
+      competitors: z.array(z.any()).optional(),
+      reviews: z.array(z.any()).optional(),
+    })
+    .optional(),
 });
 
 /**
@@ -14,9 +62,9 @@ const schema = z.object({
  */
 export async function POST(req: Request) {
   try {
-    const body = req.body ? schema.parse(await req.json().catch(() => ({}))) : { businessId: undefined };
+    const body = req.body ? schema.parse(await req.json().catch(() => ({}))) : { businessId: undefined, clientSnapshot: undefined };
     const businessId = body.businessId ?? businesses[0].id;
-    const report = await generateReport({ businessId });
+    const report = await generateReport({ businessId, clientSnapshot: body.clientSnapshot as any });
     if (!report) {
       return NextResponse.json({ error: "Business not found" }, { status: 404 });
     }

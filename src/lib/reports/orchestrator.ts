@@ -19,11 +19,35 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
+import type {
+  Business,
+  BusinessLocation,
+  BusinessService,
+  Competitor,
+  ContentAsset,
+  Review,
+} from "@/lib/types/core";
 import type { DataSourceHealth, Report } from "./types";
+
+/**
+ * Client-side snapshot passed from the browser when the tenant lives only in localStorage
+ * (i.e. created via the onboarding wizard while not signed in). This lets demo users get
+ * real reports without persisting to the DB.
+ */
+export interface ClientSnapshotInput {
+  business: Business;
+  locations: BusinessLocation[];
+  services: BusinessService[];
+  content?: ContentAsset[];
+  competitors?: Competitor[];
+  reviews?: Review[];
+}
 
 interface GenerateReportInput {
   /** Business ID (uuid for authenticated tenants, or one of the seed IDs in demo mode). */
   businessId: string;
+  /** Optional snapshot from the client — used when the tenant isn't in DB nor seed. */
+  clientSnapshot?: ClientSnapshotInput;
 }
 
 interface SnapshotResult {
@@ -32,7 +56,7 @@ interface SnapshotResult {
   authenticated: boolean;
 }
 
-async function loadSnapshot({ businessId }: GenerateReportInput): Promise<SnapshotResult | null> {
+async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput): Promise<SnapshotResult | null> {
   // Try authenticated path first.
   const supabase = await createSupabaseServerClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -86,10 +110,27 @@ async function loadSnapshot({ businessId }: GenerateReportInput): Promise<Snapsh
 
   // Fall back to seed business (demo mode).
   const seed = businesses.find((b) => b.id === businessId);
-  if (!seed) return null;
-  const locs = locations.filter((l) => l.businessId === seed.id);
-  const svcs = services.filter((s) => s.businessId === seed.id);
-  return { snapshot: buildBusinessSnapshot(seed, locs, svcs), authenticated: false };
+  if (seed) {
+    const locs = locations.filter((l) => l.businessId === seed.id);
+    const svcs = services.filter((s) => s.businessId === seed.id);
+    return { snapshot: buildBusinessSnapshot(seed, locs, svcs), authenticated: false };
+  }
+
+  // Final fallback: tenant lives only in the client's localStorage (created via onboarding
+  // wizard while not signed in). Build the snapshot from the data the browser sent.
+  if (clientSnapshot && clientSnapshot.business?.id === businessId) {
+    const snap = buildBusinessSnapshot(
+      clientSnapshot.business,
+      clientSnapshot.locations ?? [],
+      clientSnapshot.services ?? [],
+    );
+    if (clientSnapshot.content?.length) snap.content = clientSnapshot.content;
+    if (clientSnapshot.competitors?.length) snap.competitors = clientSnapshot.competitors;
+    if (clientSnapshot.reviews?.length) snap.reviews = clientSnapshot.reviews;
+    return { snapshot: snap, authenticated: false };
+  }
+
+  return null;
 }
 
 /**
@@ -124,7 +165,13 @@ async function hydrateWithPlaces(snap: BusinessSnapshot): Promise<DataSourceHeal
 
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
   const result = await loadSnapshot(input);
-  if (!result) return null;
+  if (!result) {
+    if (process.env.NODE_ENV !== "production") {
+      // eslint-disable-next-line no-console
+      console.warn("[reports] No snapshot for", input.businessId, "clientSnapshot?", !!input.clientSnapshot);
+    }
+    return null;
+  }
 
   const placesStatus = await hydrateWithPlaces(result.snapshot);
 
