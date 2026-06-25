@@ -60,6 +60,9 @@ export async function lookupPageSpeed(opts: {
     });
 
     if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      // eslint-disable-next-line no-console
+      console.warn(`[pagespeed] HTTP ${response.status} for ${opts.url}: ${detail.slice(0, 300)}`);
       return { status: "error", url: opts.url };
     }
 
@@ -68,6 +71,12 @@ export async function lookupPageSpeed(opts: {
     const perfScore = payload.lighthouseResult?.categories?.performance?.score;
 
     if (!audits || typeof perfScore !== "number") {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[pagespeed] incomplete result for ${opts.url}: runtimeError=${JSON.stringify(
+          payload.lighthouseResult?.runtimeError,
+        )} hasAudits=${!!audits} score=${perfScore}`,
+      );
       return { status: "error", url: opts.url };
     }
 
@@ -81,8 +90,12 @@ export async function lookupPageSpeed(opts: {
       lighthouseScore: Math.round(perfScore * 100),
       fetchedAt: new Date().toISOString(),
     };
-  } catch {
-    // AbortError (timeout) or network failure — degrade gracefully.
+  } catch (err) {
+    // AbortError (timeout) or network failure — degrade gracefully, but log why.
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[pagespeed] fetch failed for ${opts.url}: ${err instanceof Error ? `${err.name} ${err.message}` : String(err)}`,
+    );
     return { status: "error", url: opts.url };
   } finally {
     clearTimeout(timeout);
@@ -91,6 +104,7 @@ export async function lookupPageSpeed(opts: {
 
 interface PageSpeedApiResponse {
   lighthouseResult?: {
+    runtimeError?: { code?: string; message?: string };
     audits?: Record<string, { numericValue?: number }>;
     categories?: {
       performance?: { score?: number | null };
