@@ -29,8 +29,11 @@ export interface PageSpeedResult {
   fetchedAt?: string;
 }
 
-/** PageSpeed routinely takes 15–30s. Abort beyond this so we never hang a report. */
-const TIMEOUT_MS = 25_000;
+/**
+ * PageSpeed routinely takes 15–30s, and slow sites can push past 40s. Abort beyond this so we
+ * never hang a report. Kept under the route's `maxDuration` (60s) so the function has headroom.
+ */
+const TIMEOUT_MS = 45_000;
 
 export async function lookupPageSpeed(opts: {
   url: string;
