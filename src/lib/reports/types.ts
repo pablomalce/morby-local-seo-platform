@@ -7,7 +7,11 @@
  */
 
 export type IssueSeverity = "P1" | "P2" | "P3";
-export type ActionOwner = "Operations" | "Marketing" | "Content" | "Dev" | "Customer Success" | "Owner";
+/**
+ * Owner of an action. Holds a localized label (e.g. "Operations" / "Operaciones" / "Drift")
+ * produced by the engine's STRINGS table, so it is a plain string rather than a fixed union.
+ */
+export type ActionOwner = string;
 export type DataSourceStatus = "live" | "demo" | "missing" | "error";
 
 export interface KpiSnapshot {
@@ -29,6 +33,14 @@ export interface KpiSnapshot {
   competitorsTracked: number;
   /** Plan completion percentage 0–100. */
   planCompletion: number;
+  /** Real Core Web Vitals from PageSpeed Insights — present only when hydrated. */
+  webVitals?: {
+    lcp: number;
+    inp: number;
+    cls: number;
+    lighthouseScore: number;
+    fetchedAt: string;
+  };
 }
 
 export interface ReportIssue {
@@ -59,11 +71,13 @@ export interface ReportKpi {
   label: string;
   currentValue: string;
   target: string;
-  cadence: "Weekly" | "Monthly";
+  /** Localized cadence label (e.g. "Weekly" / "Semanal" / "Veckovis"). */
+  cadence: string;
 }
 
 export interface DataSourceHealth {
   places: DataSourceStatus;
+  pagespeed: DataSourceStatus;
   searchConsole: DataSourceStatus;
   gbp: DataSourceStatus;
   ga4: DataSourceStatus;

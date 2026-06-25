@@ -49,6 +49,25 @@ export function ReportView({ report }: { report: Report }) {
             target="2+ shipped/week"
           />
           <StateCell label="Plan completion" value={`${report.state.planCompletion}%`} />
+          {report.state.webVitals && (
+            <>
+              <StateCell
+                label="LCP (mobile)"
+                value={`${(report.state.webVitals.lcp / 1000).toFixed(1)}s`}
+                target="≤ 2.5s"
+              />
+              <StateCell
+                label="CLS"
+                value={report.state.webVitals.cls.toFixed(2)}
+                target="≤ 0.1"
+              />
+              <StateCell
+                label="Lighthouse"
+                value={`${report.state.webVitals.lighthouseScore}/100`}
+                target="≥ 90"
+              />
+            </>
+          )}
         </div>
       </Card>
 
@@ -144,6 +163,7 @@ export function ReportView({ report }: { report: Report }) {
             <HudLabel>DATA SOURCE HEALTH</HudLabel>
             <div className="mt-3 grid gap-2 md:grid-cols-2">
               <DataSourceRow label="Google Places" status={report.dataSourceHealth.places} />
+              <DataSourceRow label="Google PageSpeed" status={report.dataSourceHealth.pagespeed} />
               <DataSourceRow label="Search Console" status={report.dataSourceHealth.searchConsole} />
               <DataSourceRow label="Google Business Profile" status={report.dataSourceHealth.gbp} />
               <DataSourceRow label="Google Analytics 4" status={report.dataSourceHealth.ga4} />
