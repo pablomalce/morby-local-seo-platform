@@ -17,6 +17,7 @@ import "server-only";
 import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mock/universal";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
+import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
 import type {
@@ -48,6 +49,8 @@ interface GenerateReportInput {
   businessId: string;
   /** Optional snapshot from the client — used when the tenant isn't in DB nor seed. */
   clientSnapshot?: ClientSnapshotInput;
+  /** Optional UI locale override — when set, the engine renders in this language regardless of business.primaryLocale. */
+  locale?: "en" | "es" | "sv";
 }
 
 interface SnapshotResult {
@@ -163,6 +166,30 @@ async function hydrateWithPlaces(snap: BusinessSnapshot): Promise<DataSourceHeal
   return lookup.status === "missing-key" ? "missing" : "error";
 }
 
+/**
+ * Hydrate the snapshot with real Core Web Vitals from Google PageSpeed Insights.
+ * Returns the resulting DataSourceHealth status so the report shows provenance.
+ */
+async function hydrateWithPageSpeed(snap: BusinessSnapshot): Promise<DataSourceHealth["pagespeed"]> {
+  if (!process.env.GOOGLE_PAGESPEED_API_KEY) return "missing";
+  if (!snap.business.website) return "missing";
+
+  const result = await lookupPageSpeed({ url: snap.business.website, strategy: "mobile" });
+
+  if (result.status === "live" && result.lighthouseScore !== undefined) {
+    snap.webVitals = {
+      lcp: result.lcp ?? 0,
+      inp: result.inp ?? 0,
+      cls: result.cls ?? 0,
+      lighthouseScore: result.lighthouseScore,
+      fetchedAt: result.fetchedAt ?? new Date().toISOString(),
+    };
+    return "live";
+  }
+  if (result.status === "missing-key") return "missing";
+  return "error";
+}
+
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
   const result = await loadSnapshot(input);
   if (!result) {
@@ -173,15 +200,21 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
     return null;
   }
 
-  const placesStatus = await hydrateWithPlaces(result.snapshot);
+  // Both hydrations mutate the same snapshot but write disjoint fields, so they're safe in parallel.
+  const [placesStatus, pagespeedStatus] = await Promise.all([
+    hydrateWithPlaces(result.snapshot),
+    hydrateWithPageSpeed(result.snapshot),
+  ]);
 
   const report = buildReport(result.snapshot, new Date().toISOString(), {
     dataSources: {
       places: placesStatus,
+      pagespeed: pagespeedStatus,
       searchConsole: "missing",
       gbp: "missing",
       ga4: "missing",
     },
+    localeOverride: input.locale,
   });
 
   // Persist to DB if authenticated.

@@ -531,6 +531,18 @@ export interface BusinessSnapshot {
   campaigns: Campaign[];
   plan: PlatformTask[];
   gbpChecklist: { item: string; status: "Pending" | "In progress" | "Done" }[];
+  /**
+   * Real Core Web Vitals from Google PageSpeed Insights. Optional — only present when the
+   * orchestrator hydrated it (key configured + business has a website). The engine and UI
+   * degrade gracefully when absent.
+   */
+  webVitals?: {
+    lcp: number;
+    inp: number;
+    cls: number;
+    lighthouseScore: number;
+    fetchedAt: string;
+  };
 }
 
 export function getBusinessSnapshot(businessId: string): BusinessSnapshot {
