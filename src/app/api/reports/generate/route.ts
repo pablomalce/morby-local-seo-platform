@@ -3,6 +3,10 @@ import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import { businesses } from "@/lib/mock/universal";
 
+// PageSpeed Insights can take 15–40s for slow sites; give the serverless function
+// enough budget so the lookup isn't killed before its own 45s timeout. Vercel Hobby caps this at 60s.
+export const maxDuration = 60;
+
 const businessSchema = z.object({
   id: z.string(),
   organizationId: z.string(),
