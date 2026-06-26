@@ -30,3 +30,8 @@ create policy "pagespeed_cache_insert" on public.pagespeed_cache
 drop policy if exists "pagespeed_cache_update" on public.pagespeed_cache;
 create policy "pagespeed_cache_update" on public.pagespeed_cache
   for update using (true) with check (true);
+
+-- Tell PostgREST to reload its schema cache so the REST API sees the new table immediately.
+-- Without this, the app's REST upsert can fail silently ("table not found in schema cache")
+-- until PostgREST next reloads on its own.
+notify pgrst, 'reload schema';
