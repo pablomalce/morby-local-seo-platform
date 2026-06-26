@@ -166,24 +166,54 @@ async function hydrateWithPlaces(snap: BusinessSnapshot): Promise<DataSourceHeal
   return lookup.status === "missing-key" ? "missing" : "error";
 }
 
+/** How long a cached PageSpeed result stays fresh. */
+const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Hydrate the snapshot with real Core Web Vitals from Google PageSpeed Insights.
  * Returns the resulting DataSourceHealth status so the report shows provenance.
+ *
+ * Caching strategy: PageSpeed is slow (15–40s) and flaky on slow sites, so we cache only
+ * SUCCESSFUL results in the `pagespeed_cache` table (keyed by url+strategy, 24h TTL). A fresh hit
+ * is served instantly and survives redeploys; failures are never cached. All cache access is
+ * best-effort — if the table/RLS isn't present yet, we transparently fall back to a live call.
  */
 async function hydrateWithPageSpeed(snap: BusinessSnapshot): Promise<DataSourceHealth["pagespeed"]> {
   if (!process.env.GOOGLE_PAGESPEED_API_KEY) return "missing";
-  if (!snap.business.website) return "missing";
+  const website = snap.business.website;
+  if (!website) return "missing";
+  const strategy = "mobile";
 
-  const result = await lookupPageSpeed({ url: snap.business.website, strategy: "mobile" });
+  const supabase = await createSupabaseServerClient();
+
+  // 1. Serve a fresh cached good result if we have one.
+  const { data: cached } = await supabase
+    .from("pagespeed_cache")
+    .select("result, fetched_at")
+    .eq("url", website)
+    .eq("strategy", strategy)
+    .maybeSingle();
+  if (cached && Date.now() - new Date(cached.fetched_at).getTime() < PAGESPEED_TTL_MS) {
+    snap.webVitals = cached.result as BusinessSnapshot["webVitals"];
+    return "live";
+  }
+
+  // 2. Cache miss / stale → fresh lookup.
+  const result = await lookupPageSpeed({ url: website, strategy });
 
   if (result.status === "live" && result.lighthouseScore !== undefined) {
-    snap.webVitals = {
+    const webVitals = {
       lcp: result.lcp ?? 0,
       inp: result.inp ?? 0,
       cls: result.cls ?? 0,
       lighthouseScore: result.lighthouseScore,
       fetchedAt: result.fetchedAt ?? new Date().toISOString(),
     };
+    snap.webVitals = webVitals;
+    // 3. Cache the good result (best-effort — never block the report on a cache write).
+    await supabase
+      .from("pagespeed_cache")
+      .upsert({ url: website, strategy, result: webVitals, fetched_at: webVitals.fetchedAt });
     return "live";
   }
   if (result.status === "missing-key") return "missing";
