@@ -7,6 +7,11 @@
  *
  * If the key is missing we return `{ status: "missing-key" }` and the calling code falls back to
  * not showing Web Vitals. Never throws — PageSpeed is a nice-to-have, not a hard dependency.
+ *
+ * Reliability: auditing slow sites is flaky — a Lighthouse run can transiently fail (HTTP 5xx, a
+ * 200 with a runtimeError, or a timeout). We therefore (a) use `cache: "no-store"` so a failed run
+ * is never cached and re-served, and (b) retry once on a non-timeout failure within a bounded time
+ * budget. A persistent good-result cache (Supabase) is the recommended next step for speed.
  */
 
 import "server-only";
@@ -29,11 +34,12 @@ export interface PageSpeedResult {
   fetchedAt?: string;
 }
 
-/**
- * PageSpeed routinely takes 15–30s, and slow sites can push past 40s. Abort beyond this so we
- * never hang a report. Kept under the route's `maxDuration` (60s) so the function has headroom.
- */
+/** Per-attempt timeout. PageSpeed routinely takes 15–30s and slow sites push past 40s. */
 const TIMEOUT_MS = 45_000;
+/** Total wall-clock budget across both attempts — kept under the route's maxDuration (60s). */
+const TOTAL_BUDGET_MS = 55_000;
+/** Skip the retry if less than this remains in the budget. */
+const MIN_RETRY_BUDGET_MS = 10_000;
 
 export async function lookupPageSpeed(opts: {
   url: string;
@@ -49,21 +55,46 @@ export async function lookupPageSpeed(opts: {
   endpoint.searchParams.set("category", "performance");
   endpoint.searchParams.set("key", apiKey);
 
+  const start = Date.now();
+
+  // Attempt 1.
+  const first = await runOnce(endpoint, opts.url, TIMEOUT_MS);
+  // A timeout means we have no budget left to retry; otherwise a live result is final.
+  if (first.result.status === "live" || first.timedOut) return first.result;
+
+  // Attempt 2 — Lighthouse runs on slow sites fail transiently; one retry usually clears it.
+  const remaining = TOTAL_BUDGET_MS - (Date.now() - start);
+  if (remaining < MIN_RETRY_BUDGET_MS) return first.result;
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const second = await runOnce(endpoint, opts.url, Math.min(TIMEOUT_MS, remaining - 1_000));
+  return second.result;
+}
+
+/** Single PageSpeed attempt. Returns the result plus whether it aborted on timeout. */
+async function runOnce(
+  endpoint: URL,
+  url: string,
+  timeoutMs: number,
+): Promise<{ result: PageSpeedResult; timedOut: boolean }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
 
   try {
     const response = await fetch(endpoint.toString(), {
       signal: controller.signal,
-      // PageSpeed scores drift slowly — a day-long cache is plenty and keeps reports fast.
-      next: { revalidate: 86400 },
+      // Never cache: a failed Lighthouse run must not be re-served, and we retry on failure.
+      cache: "no-store",
     });
 
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       // eslint-disable-next-line no-console
-      console.warn(`[pagespeed] HTTP ${response.status} for ${opts.url}: ${detail.slice(0, 300)}`);
-      return { status: "error", url: opts.url };
+      console.warn(`[pagespeed] HTTP ${response.status} for ${url}: ${detail.slice(0, 300)}`);
+      return { result: { status: "error", url }, timedOut: false };
     }
 
     const payload = (await response.json()) as PageSpeedApiResponse;
@@ -73,32 +104,35 @@ export async function lookupPageSpeed(opts: {
     if (!audits || typeof perfScore !== "number") {
       // eslint-disable-next-line no-console
       console.warn(
-        `[pagespeed] incomplete result for ${opts.url}: runtimeError=${JSON.stringify(
+        `[pagespeed] incomplete result for ${url}: runtimeError=${JSON.stringify(
           payload.lighthouseResult?.runtimeError,
         )} hasAudits=${!!audits} score=${perfScore}`,
       );
-      return { status: "error", url: opts.url };
+      return { result: { status: "error", url }, timedOut: false };
     }
 
     return {
-      status: "live",
-      url: opts.url,
-      lcp: audits["largest-contentful-paint"]?.numericValue,
-      cls: audits["cumulative-layout-shift"]?.numericValue,
-      // Proxy for INP — Lighthouse exposes Time to Interactive, not INP directly.
-      inp: audits["interactive"]?.numericValue,
-      lighthouseScore: Math.round(perfScore * 100),
-      fetchedAt: new Date().toISOString(),
+      result: {
+        status: "live",
+        url,
+        lcp: audits["largest-contentful-paint"]?.numericValue,
+        cls: audits["cumulative-layout-shift"]?.numericValue,
+        // Proxy for INP — Lighthouse exposes Time to Interactive, not INP directly.
+        inp: audits["interactive"]?.numericValue,
+        lighthouseScore: Math.round(perfScore * 100),
+        fetchedAt: new Date().toISOString(),
+      },
+      timedOut: false,
     };
   } catch (err) {
     // AbortError (timeout) or network failure — degrade gracefully, but log why.
     // eslint-disable-next-line no-console
     console.warn(
-      `[pagespeed] fetch failed for ${opts.url}: ${err instanceof Error ? `${err.name} ${err.message}` : String(err)}`,
+      `[pagespeed] fetch failed for ${url}: ${err instanceof Error ? `${err.name} ${err.message}` : String(err)}`,
     );
-    return { status: "error", url: opts.url };
+    return { result: { status: "error", url }, timedOut };
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
 }
 
