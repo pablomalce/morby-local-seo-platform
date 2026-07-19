@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError } from "@/lib/api/error";
 import { z } from "zod";
 import { businesses, locations as allLocations, services as allServices } from "@/lib/mock/universal";
 import { generateImage } from "@/lib/integrations/imageProvider";
@@ -59,9 +60,6 @@ export async function POST(req: Request) {
     const asset = await generateImage(brief);
     return NextResponse.json(asset);
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unknown error" },
-      { status: 400 },
-    );
+    return apiError(error);
   }
 }
