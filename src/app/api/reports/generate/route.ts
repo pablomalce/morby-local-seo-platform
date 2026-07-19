@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api/error";
+import { rateLimit } from "@/lib/api/rate-limit";
 import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import { businesses } from "@/lib/mock/universal";
@@ -66,6 +67,11 @@ const schema = z.object({
  * when GOOGLE_PLACES_API_KEY is configured.
  */
 export async function POST(req: Request) {
+  // Public route that triggers real (billable) PageSpeed calls — rate-limit per IP.
+  // A report takes 20–40s, so 10/min is generous for humans but stops hammering.
+  const limited = rateLimit(req, { limit: 10, windowMs: 60_000, key: "reports-generate" });
+  if (limited) return limited;
+
   try {
     const body = req.body ? schema.parse(await req.json().catch(() => ({}))) : { businessId: undefined, clientSnapshot: undefined };
     const businessId = body.businessId ?? businesses[0].id;

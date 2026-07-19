@@ -1,7 +1,11 @@
+import { requireInternalSecret } from "@/lib/api/internal-guard";
 import { NextResponse } from "next/server";
 import { businesses, getBusinessSnapshot } from "@/lib/mock/universal";
 
 export async function GET(req: Request) {
+  const gate = requireInternalSecret(req);
+  if (gate) return gate;
+
   const url = new URL(req.url);
   const businessId = url.searchParams.get("businessId") ?? businesses[0].id;
   const snap = getBusinessSnapshot(businessId);
