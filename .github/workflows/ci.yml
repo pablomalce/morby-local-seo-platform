@@ -1,0 +1,75 @@
+# Hasta este archivo, el único portón automático del repo era el build de
+# Vercel — y main despliega a producción. Todo lo que entraba salía sin que
+# nadie hubiera corrido typecheck, lint ni un test.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nada de esta corrida necesita escribir en el repo.
+permissions:
+  contents: read
+
+# Un push nuevo sobre la misma rama cancela la corrida anterior en vez de
+# encolarla: la única respuesta que importa es la del último commit.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Un job colgado no es un fallo: se queda "en curso" y nadie lo mira. El
+    # corte lo vuelve un rojo explícito. Medido: la corrida completa tarda
+    # bastante menos, el margen es para un runner lento.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Si las dependencias no se instalan no hay nada que verificar, así que
+      # este paso sí es un cortocircuito y los de abajo lo consultan.
+      - name: install
+        id: install
+        run: npm ci
+
+      # Los pasos de verificación son INDEPENDIENTES entre sí a propósito: que
+      # falle el lint no debe esconder que además falla un test. Una sola
+      # corrida tiene que mostrar todos los fallos, no el primero.
+      #
+      # Se usa `!cancelled()` y no `always()` porque `always()` también corre
+      # sobre un job ya cancelado, y eso pelea con el cancel-in-progress de
+      # arriba: gastaría minutos verificando un commit que ya nadie espera.
+      # `!cancelled()` cumple lo mismo —ningún fallo tapa a otro— sin ese costo.
+      - name: typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run typecheck
+
+      - name: lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run lint
+
+      - name: test
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm test
+
+      # Los guards de gasto se verifican solos en cada PR. Antes esto dependía
+      # de que alguien se acordara de correrlo a mano, que es la definición de
+      # una verificación que no existe.
+      - name: guards selfcheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bash .codex/hooks/selfcheck.sh
+
+      # Verificado sobre un worktree limpio de main: el build NO necesita
+      # variables de entorno. Si algún día las necesita, va a fallar acá y no
+      # en el deploy a producción.
+      - name: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run build

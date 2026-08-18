@@ -9,13 +9,14 @@
 # gets in the way until somebody removes it. So the ALLOW list is not padding,
 # it is the half that keeps the guard survivable.
 #
-# KNOWN LIMIT, stated rather than hidden: this only runs when somebody
-# remembers to run it. The sibling project hit exactly this — the same checks
-# started life as a standalone script, and "a verification nobody executes is
-# indistinguishable from one that passes". There the fix was to move them into
-# `npm test`, so CI runs them on every PR. This repo has no test runner and no
-# test job in CI, so that door is closed until one exists. Wiring it up is the
-# durable fix; until then, run this after every edit to the hook.
+# El KNOWN LIMIT que este comentario declaraba —"esto sólo corre cuando alguien
+# se acuerda de correrlo"— ya está cerrado: .github/workflows/ci.yml lo ejecuta
+# como un paso propio en cada PR y en cada push a main. La frase que lo motivaba
+# sigue siendo la razón por la que se hizo: "una verificación que nadie ejecuta
+# es indistinguible de una que pasa".
+#
+# Queda un límite más chico y vale decirlo: esto verifica el guard, no el gasto.
+# Si el guard deja de invocarse desde los hooks, estos 21 casos siguen pasando.
 
 HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/block-money-spend.sh"
 pass=0; fail=0
