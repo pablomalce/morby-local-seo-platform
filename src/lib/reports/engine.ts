@@ -168,6 +168,9 @@ const STRINGS = {
       `Largest Contentful Paint: ${(lcp / 1000).toFixed(1)}s (target ≤ 2.5s)`,
       `Cumulative Layout Shift: ${cls.toFixed(2)} (target ≤ 0.1)`,
     ],
+    /** Prefijo que se antepone SÓLO cuando una fuente devolvió "error". */
+    sourceNoteFailed: (sources: string) =>
+      `Live data could not be retrieved from: ${sources}. That is a FAILED request, not a missing integration — the figures below fall back to synthetic data, and retrying may fix it.`,
     sourceNote:
       "Reports analyse the data currently available for this tenant. Where a section is sourced from synthetic data (no Google API connected yet), that section is annotated below — connect the relevant integration to upgrade it to live data.",
   },
@@ -301,6 +304,8 @@ const STRINGS = {
       `Largest Contentful Paint: ${(lcp / 1000).toFixed(1)}s (objetivo ≤ 2.5s)`,
       `Cumulative Layout Shift: ${cls.toFixed(2)} (objetivo ≤ 0.1)`,
     ],
+    sourceNoteFailed: (sources: string) =>
+      `No se pudieron obtener datos en vivo de: ${sources}. Es una solicitud que FALLÓ, no una integración sin conectar — las cifras de abajo vuelven a datos sintéticos y reintentar puede resolverlo.`,
     sourceNote:
       "Los reportes analizan los datos disponibles para este cliente. Las secciones que usan datos sintéticos (sin la API de Google conectada todavía) están anotadas más abajo — conecta la integración correspondiente para usar datos reales.",
   },
@@ -434,6 +439,8 @@ const STRINGS = {
       `Largest Contentful Paint: ${(lcp / 1000).toFixed(1)}s (mål ≤ 2.5s)`,
       `Cumulative Layout Shift: ${cls.toFixed(2)} (mål ≤ 0.1)`,
     ],
+    sourceNoteFailed: (sources: string) =>
+      `Livedata kunde inte hämtas från: ${sources}. Det är en MISSLYCKAD begäran, inte en saknad integration — siffrorna nedan faller tillbaka på syntetisk data och ett nytt försök kan lösa det.`,
     sourceNote:
       "Rapporten analyserar tillgänglig data för denna kund. Avsnitt med syntetisk data (ingen Google API ansluten ännu) annoteras nedan — anslut integrationen för att uppgradera till live-data.",
   },
@@ -923,13 +930,29 @@ export function buildReport(
   const trackingKpis = buildTrackingKpis(snap, kpis, lang);
   const summary = buildSummary(snap, kpis, issues, lang);
 
-  const dataSourceHealth: DataSourceHealth = {
+  const sources = {
     places: options.dataSources?.places ?? "demo",
     pagespeed: options.dataSources?.pagespeed ?? "demo",
     searchConsole: options.dataSources?.searchConsole ?? "missing",
     gbp: options.dataSources?.gbp ?? "missing",
     ga4: options.dataSources?.ga4 ?? "missing",
-    note: lang.sourceNote,
+  } satisfies Omit<DataSourceHealth, "note">;
+
+  // `note` es el ÚNICO texto que el usuario lee sobre la procedencia de los
+  // datos. Antes era una constante, así que una fuente en "error" —la API falló—
+  // se le presentaba con la misma frase que una integración sin conectar:
+  // "conectá la integración". Un fallo se leía como una tarea pendiente de
+  // configuración, que es justo lo contrario de lo que pasó.
+  const failed = Object.entries(sources)
+    .filter(([, status]) => status === "error")
+    .map(([source]) => source);
+
+  const dataSourceHealth: DataSourceHealth = {
+    ...sources,
+    note:
+      failed.length > 0
+        ? `${lang.sourceNoteFailed(failed.join(", "))} ${lang.sourceNote}`
+        : lang.sourceNote,
   };
 
   return {
