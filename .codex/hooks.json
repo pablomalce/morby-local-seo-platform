@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/pablo/Documents/Claude/Projects/Vulkan SaaS/.codex/hooks/block-dangerous-git.sh'"
+          },
+          {
+            "type": "command",
+            "command": "'/Users/pablo/Documents/Claude/Projects/Vulkan SaaS/.codex/hooks/block-money-spend.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
