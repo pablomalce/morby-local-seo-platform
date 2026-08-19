@@ -1,4 +1,4 @@
--- Nine isolation checks against the Growth OS schema — executable.
+-- Ten isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -317,9 +317,66 @@ WHERE tg.tgrelid = 'public.businesses'::regclass
   AND tg.tgname <> 'trg_businesses_updated_at';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 10. Una policy de escritura que se aplica a TODOS y no comprueba nada
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: a table that anyone holding the anon key can write. The key
+-- is in the browser bundle by design, so a write policy that applies to PUBLIC
+-- with `WITH CHECK (true)` is a write policy with no author.
+--
+-- pagespeed_cache had exactly that, and it was not theoretical: through
+-- PostgREST, with no session, the upsert returned 201 and the row read back byte
+-- for byte. hydrateWithPageSpeed() then serves that row for 24 hours without
+-- revalidating, which puts invented web vitals into a customer's report.
+--
+-- Deliberately about the SHAPE and not about a role. The suite has to run
+-- against the local replica and against Supabase, and asking "can anon write?"
+-- needs a live anon role. Asking "does any write policy apply to PUBLIC and
+-- check nothing?" is the same question at the catalog level, and it also catches
+-- the next table that ships this way instead of only the one that did.
+--
+-- SELECT is out of scope on purpose: a policy that lets everyone READ may be a
+-- deliberate decision, and pagespeed_cache is one -- it holds PageSpeed scores
+-- of public websites keyed by URL, with nothing tenant-scoped to leak.
+
+RESET ROLE;
+
+DO $$
+DECLARE
+    examinadas int;
+BEGIN
+    SELECT count(*) INTO examinadas
+      FROM pg_policy p
+      JOIN pg_class c ON c.oid = p.polrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND p.polcmd IN ('a', 'w', '*');
+
+    IF examinadas = 0 THEN
+        RAISE EXCEPTION
+            'Vacuous check 10: no write policies found at all in public.';
+    END IF;
+END
+$$;
+
+INSERT INTO defect_report
+SELECT 10, 'a write policy applies to PUBLIC and checks nothing',
+       count(*) > 0,
+       CASE WHEN count(*) > 0
+            THEN 'unconditional write for everyone on: ' ||
+                 string_agg(c.relname || '.' || p.polname, ', ')
+            ELSE 'no write policy applies to PUBLIC with WITH CHECK (true)'
+            END
+FROM pg_policy p
+JOIN pg_class c ON c.oid = p.polrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND p.polcmd IN ('a', 'w', '*')
+  AND p.polroles = '{0}'::oid[]
+  AND pg_get_expr(p.polwithcheck, p.polrelid) = 'true';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: nine checks were written, so nine rows must be present. Fewer
+-- Anti-vacuity: ten checks were written, so ten rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -329,8 +386,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 9 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 9 checks recorded a result.', checks;
+    IF checks <> 10 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 10 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -341,11 +398,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 9 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 10 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 9 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 10 checks green: the schema prevents every one of them.';
 END
 $$;
 

@@ -30,3 +30,18 @@ STABLE
 AS $$
     SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid
 $$;
+
+-- Los roles que Supabase trae de fábrica y que las policies nombran desde
+-- 0005. Sin ellos, `create policy ... to authenticated` falla acá y el esquema
+-- que se prueba deja de ser el que corre en producción. NOLOGIN: en la réplica
+-- nadie se conecta con ellos, sólo se los nombra.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        CREATE ROLE anon NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        CREATE ROLE authenticated NOLOGIN;
+    END IF;
+END
+$$;

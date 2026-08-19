@@ -55,9 +55,9 @@ docker exec growthos-replica psql -U postgres -d growthos \
 
 `replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
 order, with the auth objects stubbed from the same file the CI job uses.
-`defects_test.sql` then runs nine isolation checks as a NOSUPERUSER NOBYPASSRLS
+`defects_test.sql` then runs ten isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
-every policy that is not FORCEd. Exit 0 means the schema refuses all nine.
+every policy that is not FORCEd. Exit 0 means the schema refuses all ten.
 
 The `schema isolation` job in CI runs exactly these two steps on every pull
 request, so a migration that reopens one of them cannot merge.
@@ -75,6 +75,12 @@ fills it from `business_id`, which is why the application code sends the same
 INSERTs it always has. That trigger is scaffolding: it is removed once the
 writers send the column explicitly, and the column is `NOT NULL` everywhere
 except `agent_runs`, whose `business_id` is nullable.
+
+**Writers need a session.** Supabase grants every privilege on public tables to
+`anon` by default, and the anon key ships in the browser bundle. Check 10 refuses
+any write policy that applies to PUBLIC without checking anything — the shape
+`pagespeed_cache` had, and which let an unauthenticated upsert through PostgREST
+return 201 against a real project.
 
 Adding a migration means adding its check here too. A defect that is only ever
 read about is a claim; the file is what makes it a measurement.
