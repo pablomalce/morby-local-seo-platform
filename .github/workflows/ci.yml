@@ -73,3 +73,59 @@ jobs:
       - name: build
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: npm run build
+
+  # El esquema es la otra mitad del repo y hasta ahora nada lo verificaba: los
+  # tests de arriba corren contra dobles, así que probaban la LÓGICA y nunca
+  # que una policy aislara a un tenant de otro.
+  #
+  # Este job levanta el esquema real desde supabase/migrations, con el mismo
+  # stub de auth que usa supabase/qa/replica.sh en local — un solo archivo, no
+  # dos copias que puedan discrepar — y corre las aserciones como un rol
+  # NOSUPERUSER NOBYPASSRLS. Como superusuario saltearía RLS y no probaría nada.
+  schema:
+    name: schema isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: growthos
+          POSTGRES_DB: growthos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGPASSWORD: growthos
+      PSQL: psql -h localhost -U postgres -d growthos -v ON_ERROR_STOP=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: auth stub
+        id: stub
+        run: $PSQL -f supabase/qa/auth_stub.sql
+
+      # En orden y abortando en el primer error: una migración que falla y deja
+      # correr a la siguiente produce un esquema que no existe en ninguna parte.
+      - name: migrations
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: |
+          for f in supabase/migrations/*.sql; do
+            echo "== $f"
+            $PSQL -f "$f"
+          done
+
+      - name: application role
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: $PSQL -f supabase/qa/app_role.sql
+
+      - name: tenant isolation assertions
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: $PSQL -f supabase/qa/defects_test.sql
