@@ -109,21 +109,32 @@ export default function ReportsPage() {
   }
 
   const scopedHistory = history.filter((h) => h.businessId === business.id);
+  const noBusinessPicked = !business.id;
 
   return (
     <>
       <PageHeader
-        eyebrow={`08 / REPORTS — ${business.name.toUpperCase()}`}
+        eyebrow={`08 / REPORTS — ${noBusinessPicked ? t("selector.businessPlaceholder", "Select a business").toUpperCase() : business.name.toUpperCase()}`}
         frame={`${scopedHistory.length} GENERATED`}
         title={t("reports.title")}
         description={t("reports.description")}
         action={
-          <Button onClick={generate} disabled={pending} size="lg">
+          <Button onClick={generate} disabled={pending || noBusinessPicked} size="lg">
             <Play className="h-3.5 w-3.5" />
             {pending ? "GENERATING..." : "GENERATE REPORT"}
           </Button>
         }
       />
+
+      {noBusinessPicked && (
+        <EmptyState
+          title={t("selector.pickBusinessTitle", "Pick a business to continue")}
+          description={t(
+            "selector.pickBusinessDescription",
+            "Use the selector at the top to choose a tenant. Reports, agents and KPIs need a business in context.",
+          )}
+        />
+      )}
 
       {error && (
         <Card className="mb-6 border-red-900/60 bg-red-950/30">
@@ -133,7 +144,7 @@ export default function ReportsPage() {
         </Card>
       )}
 
-      {active ? (
+      {noBusinessPicked ? null : active ? (
         <div className="space-y-6">
           <Card className="vulkan-pattern-overlay">
             <div className="flex flex-wrap items-center justify-between gap-3">
