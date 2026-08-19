@@ -41,6 +41,44 @@ npm run dev
 
 Open <http://localhost:3000>.
 
+## Schema and tenant isolation
+
+The schema is the other half of this repo, and the tests above run against
+doubles: they prove the LOGIC, never that one tenant is isolated from another.
+That is what `supabase/qa/` is for, and it needs no Supabase project.
+
+```bash
+./supabase/qa/replica.sh
+docker exec growthos-replica psql -U postgres -d growthos \
+    -v ON_ERROR_STOP=1 -f /tmp/defects_test.sql
+```
+
+`replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
+order, with the auth objects stubbed from the same file the CI job uses.
+`defects_test.sql` then runs nine isolation checks as a NOSUPERUSER NOBYPASSRLS
+role — as the owner they would prove nothing, since the owner is exempt from
+every policy that is not FORCEd. Exit 0 means the schema refuses all nine.
+
+The `schema isolation` job in CI runs exactly these two steps on every pull
+request, so a migration that reopens one of them cannot merge.
+
+**How a tenant is resolved.** Every table that belongs to an organization
+stores `organization_id` itself, and every child of `businesses` is tied to it
+by a composite foreign key `(organization_id, business_id)` referencing
+`businesses (organization_id, id)`. A row therefore cannot claim a tenant its
+parent does not have, and a business cannot change organization while it owns
+child rows. Policies read `organization_id` off the row; none of them resolves
+a tenant through a subquery against another table.
+
+Writers do not have to supply `organization_id`. A `BEFORE INSERT` trigger
+fills it from `business_id`, which is why the application code sends the same
+INSERTs it always has. That trigger is scaffolding: it is removed once the
+writers send the column explicitly, and the column is `NOT NULL` everywhere
+except `agent_runs`, whose `business_id` is nullable.
+
+Adding a migration means adding its check here too. A defect that is only ever
+read about is a claim; the file is what makes it a measurement.
+
 ## Project structure (post-Phase 1)
 
 ```text

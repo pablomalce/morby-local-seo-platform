@@ -1,4 +1,4 @@
--- Six isolation defects in the Growth OS schema — executable.
+-- Nine isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -8,6 +8,12 @@
 -- defect; running is how you prove it, and running again is how you know it
 -- stayed fixed. Before 0003_expand_tenant_isolation.sql all six were present;
 -- this file is what says so, and what would say so again.
+--
+-- Checks 7 to 9 arrived with 0004_composite_tenant_key.sql. The first six ask
+-- whether the schema permits a defect. These three ask something narrower and
+-- easier to get wrong: whether the refusal comes from the STRUCTURE. Check 5
+-- was green the day a trigger refused to reparent a business, and it would have
+-- stayed green forever while the children still stored no tenant of their own.
 --
 -- Each check asks whether the schema still PERMITS the thing. Permitting it is
 -- the defect, so every check is written to answer no once the schema refuses.
@@ -65,6 +71,13 @@ SELECT '44444444-4444-4444-8444-444444444444', org_bob, 'Bob Co' FROM t;
 INSERT INTO business_services (id, business_id, slug, name) VALUES
     ('55555555-5555-4555-8555-555555555555',
      '44444444-4444-4444-8444-444444444444', 'bob-service', 'Bob Service');
+
+-- Bob's own location, for check 8. organization_id is deliberately left out:
+-- filling it from the parent is what 0004's BEFORE INSERT trigger is for, and a
+-- fixture that supplied it by hand would never exercise that path.
+INSERT INTO business_locations (id, business_id, label, is_primary) VALUES
+    ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+     '44444444-4444-4444-8444-444444444444', 'Bob Main', true);
 
 -- Becoming a given user, as the application role.
 CREATE OR REPLACE FUNCTION pg_temp.be(p_user uuid) RETURNS void
@@ -232,9 +245,81 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 7. A child row can claim a tenant its parent does not have
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: organization_id on a child drifting away from the parent's.
+-- The column is only worth having if it cannot lie: a policy that trusts it
+-- while nothing keeps it in step with businesses is a policy reading a field
+-- any writer can set to anything.
+--
+-- Alice is a member of bob's organization by now — check 5 gave her that
+-- membership, and it is what makes this check test what it says. Without it the
+-- row would be refused by the policy's WITH CHECK, the check would go green,
+-- and the composite foreign key would never be consulted at all.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+
+INSERT INTO defect_report
+SELECT 7, 'a child row may carry an organization_id its parent does not have',
+       pg_temp.accepted(format($sql$
+           INSERT INTO business_locations (id, business_id, organization_id, label)
+           VALUES ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+                   '33333333-3333-4333-8333-333333333333', %L, 'Forged')
+       $sql$, (SELECT org_bob FROM t))),
+       'alice tagging a location of her own business with bob''s tenant';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. A grandchild can point across businesses
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: location_id and service_id reaching a row that belongs to a
+-- different business — the same hole 0003 closed for content_assets.service_id,
+-- one level down and on four other foreign keys.
+--
+-- The competitor row itself is entirely alice's, so the policy has nothing to
+-- object to. Only the composite foreign key can refuse this one, which is the
+-- point of writing it this way.
+
+INSERT INTO defect_report
+SELECT 8, 'a grandchild may reference a location belonging to another business',
+       pg_temp.accepted($sql$
+           INSERT INTO competitors (id, business_id, location_id, name)
+           VALUES ('cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+                   '33333333-3333-4333-8333-333333333333',
+                   'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Crossed')
+       $sql$),
+       'alice pointing her competitor at a location of bob''s business';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 9. The refusal in check 5 is a trigger, not the schema
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: check 5 passing for a reason that can be dropped in one
+-- statement. 0003 closed it with a BEFORE UPDATE trigger on businesses, which
+-- refuses the move while leaving the children storing no tenant at all.
+--
+-- This check and check 5 only mean something together: 5 says the move is
+-- refused, 9 says no trigger is doing the refusing. Either one alone is
+-- satisfied by a schema that has the hole.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 9, 'reparenting is blocked by a trigger rather than by the schema',
+       count(*) > 0,
+       CASE WHEN count(*) > 0
+            THEN 'businesses carries ' || count(*) ||
+                 ' trigger(s) on organization_id: ' || string_agg(tg.tgname, ', ')
+            ELSE 'no trigger on businesses.organization_id; the refusal is structural'
+            END
+FROM pg_trigger tg
+WHERE tg.tgrelid = 'public.businesses'::regclass
+  AND NOT tg.tgisinternal
+  AND tg.tgname <> 'trg_businesses_updated_at';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: six checks were written, so six rows must be present. Fewer
+-- Anti-vacuity: nine checks were written, so nine rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -244,8 +329,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 6 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 6 checks recorded a result.', checks;
+    IF checks <> 9 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 9 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -256,11 +341,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 6 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 9 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 6 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 9 checks green: the schema prevents every one of them.';
 END
 $$;
 
