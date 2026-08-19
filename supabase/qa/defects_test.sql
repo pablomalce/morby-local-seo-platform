@@ -1,4 +1,4 @@
--- Ten isolation checks against the Growth OS schema — executable.
+-- Eleven isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -20,6 +20,11 @@
 -- Refusal and invisibility both count as refusal: it does not matter whether a
 -- tenant-less row is rejected at write time or hidden at read time, as long as
 -- no other tenant can reach it.
+--
+-- Check 11 is the odd one out: it asks about the application ROLE rather than
+-- about the schema. It belongs here anyway, because it is the same question the
+-- other ten ask — can something reach this data that should not — and because
+-- the CI job that runs this file is the only place that would ever notice.
 --
 -- Runs as postgres and drops to growthos_app for every assertion. That matters
 -- more here than usual: defect 6 is precisely that the owner is exempt from
@@ -374,9 +379,85 @@ WHERE n.nspname = 'public'
   AND pg_get_expr(p.polwithcheck, p.polrelid) = 'true';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 11. El rol de aplicación puede abrir una conexión propia
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: a login account with a weak password sitting on a database
+-- that holds customer data. supabase/qa/app_role.sql used to create
+-- growthos_app with LOGIN and the password 'growthos'. In a throwaway container
+-- that costs nothing; applied to a real database it is an account anyone who
+-- has read the repository can connect as, and it holds SELECT, INSERT, UPDATE
+-- and DELETE on all fifteen tables.
+--
+-- Nothing needs the login: every assertion here and every step of the CI job
+-- reaches the role through SET ROLE from a connection that already exists. So
+-- the check is not a style preference — it asserts that the one capability
+-- nobody uses is also the one nobody has.
+--
+-- The vacuity guard below is defence in depth and nothing more: measured, a run
+-- against a database without the role aborts thirty lines earlier, at the GRANT
+-- on defect_report. It stays because the day that GRANT moves, this check would
+-- otherwise start passing by absence.
+--
+-- The password is checked as well as the LOGIN, and not for tidiness: measured
+-- on tpqiltnskfeycnybczgz, growthos_app was already NOLOGIN by hand and still
+-- stored the password from the old file. A stored password on a NOLOGIN role is
+-- one ALTER away from being an account again, and that ALTER leaves no trace of
+-- where the credential came from.
+--
+-- rolcanlogin comes from pg_roles, which is world-readable. The password lives
+-- in pg_authid, which is superuser-only in stock PostgreSQL: readable as the
+-- owner in the local replica, in CI, and — measured, not assumed — on Supabase
+-- too. Where it is not readable the check falls back to LOGIN alone and says so
+-- in its evidence, rather than reporting an absence it never looked for.
+
+RESET ROLE;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'growthos_app') THEN
+        RAISE EXCEPTION
+            'Vacuous check 11: growthos_app does not exist in this database.';
+    END IF;
+END
+$$;
+
+DO $$
+DECLARE
+    puede_login boolean;
+    ve_authid   boolean;
+    con_clave   boolean := false;
+BEGIN
+    SELECT rolcanlogin INTO puede_login FROM pg_roles WHERE rolname = 'growthos_app';
+
+    ve_authid := has_table_privilege(current_user, 'pg_authid', 'SELECT');
+    IF ve_authid THEN
+        EXECUTE $q$SELECT rolpassword IS NOT NULL FROM pg_authid
+                    WHERE rolname = 'growthos_app'$q$ INTO con_clave;
+    END IF;
+
+    INSERT INTO defect_report VALUES (
+        11,
+        'the application role can open a connection of its own',
+        puede_login OR con_clave,
+        CASE
+            WHEN puede_login AND con_clave THEN
+                'growthos_app has LOGIN and a stored password'
+            WHEN puede_login THEN
+                'growthos_app has LOGIN'
+            WHEN con_clave THEN
+                'growthos_app is NOLOGIN but still stores a password'
+            WHEN ve_authid THEN
+                'growthos_app is NOLOGIN with no password; SET ROLE is the only way in'
+            ELSE
+                'growthos_app is NOLOGIN; pg_authid unreadable, password not checked'
+        END);
+END
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: ten checks were written, so ten rows must be present. Fewer
+-- Anti-vacuity: eleven checks were written, so eleven rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -386,8 +467,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 10 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 10 checks recorded a result.', checks;
+    IF checks <> 11 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 11 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -398,11 +479,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 10 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 11 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 10 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 11 checks green: the schema prevents every one of them.';
 END
 $$;
 
