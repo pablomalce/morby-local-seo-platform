@@ -1,4 +1,4 @@
--- Eleven isolation checks against the Growth OS schema — executable.
+-- Thirteen isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -455,9 +455,82 @@ END
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 12. El tenant sigue pudiendo faltar en las tablas que 0003 y 0004 tocaron
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: a row with no tenant at all. Checks 1 to 4 are about a
+-- tenant-less row being VISIBLE to everybody; this one is about it existing in
+-- the first place.
+--
+-- 0003 and 0004 were the expand halves and left the columns nullable on
+-- purpose: the NOT NULL arrived as a NOT VALID check, which constrains new rows
+-- and says nothing about the ones already there. 0006 is the contract half that
+-- validates them and puts the constraint on the column, where the catalogue can
+-- state it instead of a check having to imply it.
+--
+-- Written against the CATALOGUE and not by attempting an INSERT, because the
+-- fill trigger would supply organization_id and the INSERT would succeed either
+-- way — proving the trigger works, which is check 13, and not that the column
+-- refuses NULL, which is this one.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 12, 'a tenant column can still hold NULL after the contract migration',
+       count(*) > 0,
+       CASE WHEN count(*) > 0
+            THEN 'still nullable: ' || string_agg(t || '.' || c, ', ' ORDER BY t, c)
+            ELSE 'organization_id and business_id are NOT NULL everywhere they exist'
+            END
+  FROM (
+    SELECT c.relname AS t, a.attname AS c
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind = 'r'
+       AND a.attnum > 0 AND NOT a.attisdropped AND NOT a.attnotnull
+       AND a.attname IN ('organization_id', 'business_id')
+  ) nulables;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 13. Los diez triggers que llenan el tenant siguen en pie
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA, y es lo contrario de lo habitual: acá el defecto sería que los
+-- triggers NO estén.
+--
+-- fill_organization_id_from_business() llena organization_id en diez tablas
+-- hijas, y la aplicación depende de eso: medido, supabaseTenantStore.ts:236
+-- inserta en business_locations con business_id y sin organization_id, y la
+-- misma forma se repite en business_services, competitors, content_assets,
+-- reports y reviews. Seis sitios de INSERT vivos.
+--
+-- Borrarlos antes de que la aplicación mande la columna no falla en el
+-- despliegue: empieza a escribir filas sin tenant, que es exactamente el
+-- defecto que 0003 vino a cerrar. Un fallo silencioso es peor que uno ruidoso,
+-- así que este bloque hace ruido.
+--
+-- El día que la aplicación mande organization_id explícitamente, este bloque
+-- hay que darlo vuelta a mano — y eso es deliberado: que borrar los triggers
+-- exija tocar la suite es la forma de que nadie los borre de paso.
+
+INSERT INTO defect_report
+SELECT 13, 'the ten triggers that fill the tenant are gone before the app sends it',
+       count(*) <> 10,
+       CASE WHEN count(*) = 10
+            THEN 'the ten fill triggers are in place'
+            ELSE 'expected 10 fill triggers, found ' || count(*) ||
+                 CASE WHEN count(*) = 0 THEN ' — child rows can now be written with no tenant'
+                      ELSE ': ' || COALESCE(string_agg(c.relname, ', ' ORDER BY c.relname), '')
+                 END
+            END
+  FROM pg_trigger t
+  JOIN pg_class c ON c.oid = t.tgrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgname LIKE '%fill_org%';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: eleven checks were written, so eleven rows must be present. Fewer
+-- Anti-vacuity: thirteen checks were written, so thirteen rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -467,8 +540,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 11 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 11 checks recorded a result.', checks;
+    IF checks <> 13 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 13 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -479,11 +552,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 11 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 13 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 11 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 13 checks green: the schema prevents every one of them.';
 END
 $$;
 
