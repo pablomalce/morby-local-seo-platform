@@ -37,9 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # 17, como el proyecto hosted. La primera corrida que llegó a comparar de
+    # verdad lo dejó claro: contra un 16 aparecían 45 diferencias de `MAINTAIN`,
+    # un privilegio que existe desde el 17. Ninguna era deriva — era el runner
+    # midiendo con otra regla. Comparar dos versiones distintas de PostgreSQL
+    # produce ruido que tapa la señal que este job existe para dar.
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_PASSWORD: growthos
           POSTGRES_DB: growthos
