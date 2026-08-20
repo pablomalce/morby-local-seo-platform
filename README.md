@@ -114,6 +114,37 @@ grants — is byte-identical.
 Which is the point of the file. `0006` was merged and green in CI, and nothing
 anywhere would have told you it was not on the database.
 
+### Asking a database what it has
+
+Since `0008` there is a table that answers directly, instead of the diff above
+being the only way to find out:
+
+```sql
+SELECT version, applied_at FROM public.schema_migrations ORDER BY version;
+```
+
+Every migration writes its own row as its last statement, with
+`ON CONFLICT DO NOTHING` so re-applying one is not an error. There is no runner
+doing it, because the runner is a person — and a person forgets.
+`src/lib/store/__tests__/migrationsRegistered.test.ts` is what makes sure they
+do not have to remember: it fails if a migration does not register itself, if
+the numbering has a gap, or if `0008` stops backfilling one of the seven that
+came before it.
+
+**Applying a migration to hosted, in full:**
+
+1. Read `schema_migrations` on the hosted project to see what is already there.
+2. Apply the pending files, in order, in the SQL editor.
+3. Re-read `schema_migrations` — the new rows should be there, written by the
+   migrations themselves.
+4. Run `schema_fingerprint.sql` on both sides and `diff` them. Zero differences
+   is the point; anything else means the file did something different there than
+   it did locally.
+
+Step 4 is not ceremony. It is how the `0007` grants were found in the first
+place: the schema in the repository and the schema in the database can differ
+in ways no migration in the repository accounts for.
+
 ## Project structure (post-Phase 1)
 
 ```text
