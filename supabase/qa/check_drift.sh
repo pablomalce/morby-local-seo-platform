@@ -53,6 +53,27 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
     exit 0
 fi
 
+# Que el valor sea una cadena de conexión, antes de intentar usarlo. psql acepta
+# cualquier cosa como nombre de base y cae al socket local, así que un secreto
+# mal copiado no se reporta como "el secreto está mal" sino como un error de
+# socket que manda a buscar el problema donde no está. Medido en la primera
+# corrida con secreto: los dos repos fallaron con
+# `connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed`,
+# que no dice nada sobre lo que había que arreglar.
+if [[ ! "$DATABASE_URL" =~ ^postgres(ql)?:// ]]; then
+    echo "==> DATABASE_URL no parece una cadena de conexión."
+    echo
+    echo "    Tiene que empezar con postgresql:// o postgres://, y el valor"
+    echo "    guardado empieza con: '${DATABASE_URL:0:12}...'"
+    echo
+    echo "    En el dashboard de Supabase, Project Settings → Database →"
+    echo "    Connection string, hay varias pestañas. La que sirve es URI."
+    echo "    Las otras dan un comando de psql o una cadena de JDBC, que no"
+    echo "    son esto. Y si la cadena todavía dice [YOUR-PASSWORD], hay que"
+    echo "    reemplazarlo por la contraseña real de la base."
+    exit 1
+fi
+
 REPLICA_URL="${REPLICA_URL:-postgresql://postgres:growthos@localhost:55433/growthos}"
 
 fallos=0
