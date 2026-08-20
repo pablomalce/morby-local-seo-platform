@@ -90,6 +90,16 @@ SELECT 'rls ' || c.relname || ' enable=' || c.relrowsecurity || ' force=' || c.r
  WHERE n.nspname='public' AND c.relkind='r'
 
 UNION ALL
+-- Un conteo por categoría, y no es redundante con las líneas por objeto: una
+-- categoría SIN filas desaparece del resultado en vez de decir cero, así que
+-- comparando sólo las que aparecen, una clase entera de objeto puede faltar de
+-- un lado sin que nada lo diga. Fue el caso: la réplica no tenía ningún grant a
+-- los roles de Supabase y hosted tenía 282, y la comparación no lo reportó
+-- porque del lado local no había categoría `grant` que comparar.
+SELECT 'conteo grants: ' || count(*) FROM information_schema.role_table_grants
+ WHERE table_schema='public' AND grantee IN ('anon','authenticated','service_role')
+
+UNION ALL
 SELECT 'grant ' || table_name || ' ' || grantee || ' ' || privilege_type
   FROM information_schema.role_table_grants
  WHERE table_schema='public' AND grantee IN ('anon','authenticated','service_role')
