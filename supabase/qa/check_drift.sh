@@ -107,9 +107,56 @@ if ! error_conexion="$(psql "$DATABASE_URL" -tAc "SELECT 1" 2>&1 >/dev/null)"; t
     echo "    no se pudo conectar a la base:"
     echo "$error_conexion" | sed 's/^/      /'
     echo
-    echo "    Revisá que DATABASE_URL sea la cadena de conexión completa del"
-    echo "    proyecto — Supabase la da en Project Settings, Database,"
-    echo "    Connection string, pestaña URI."
+    echo
+    # Desglose de la forma, nunca del contenido. Un fallo de autenticación no
+    # dice cuál de las cuatro cosas está mal, y sin esto la única salida es
+    # probar de nuevo a ciegas. Nada de lo que sigue revela la credencial:
+    # longitudes, presencia o ausencia, y el host, que no es secreto.
+    # Por el ÚLTIMO arroba, que es como separa libpq. Cortar por el primero
+    # trunca la contraseña cuando tiene un arroba adentro — justo el caso que
+    # este desglose tiene que detectar.
+    sin_esquema="${DATABASE_URL#*://}"
+    credenciales="${sin_esquema%@*}"
+    servidor="${sin_esquema##*@}"
+    usuario="${credenciales%%:*}"
+    clave="${credenciales#*:}"
+    arrobas="$(tr -cd '@' <<< "$sin_esquema" | wc -c | tr -d ' ')"
+
+    echo "    Cómo está formada la cadena guardada:"
+    echo "      usuario:     $usuario"
+    echo "      servidor:    $servidor"
+    echo "      contraseña:  ${#clave} caracteres"
+
+    if [[ "$usuario" != *.* ]]; then
+        echo
+        echo "    El usuario no tiene el punto con el ref del proyecto. El"
+        echo "    pooler lo necesita para saber a qué proyecto ir."
+    fi
+    if [[ "$arrobas" -gt 1 ]]; then
+        echo
+        echo "    La contraseña tiene un arroba sin percent-encodear (%40), que"
+        echo "    parte la URI en el lugar equivocado."
+    fi
+    if [[ "$clave" =~ [:/?\#\&%\[\]] ]]; then
+        echo
+        echo "    La contraseña tiene caracteres que hay que percent-encodear"
+        echo "    (@ : / ? # & % [ ]) o rompen la URI. Lo más simple es"
+        echo "    resetearla a una sólo alfanumérica."
+    fi
+    if [[ "$clave" == *"YOUR-PASSWORD"* ]]; then
+        echo
+        echo "    Quedó el marcador [YOUR-PASSWORD] sin reemplazar."
+    fi
+    if [[ "$clave" =~ [[:space:]] ]]; then
+        echo
+        echo "    La contraseña tiene un espacio o un salto de línea, que casi"
+        echo "    siempre se cuela al copiar."
+    fi
+
+    echo
+    echo "    Si la forma de arriba es correcta, entonces la contraseña no es"
+    echo "    la de esa base: reseteala en Project Settings → Database →"
+    echo "    Reset database password y volvé a guardar la cadena entera."
     exit 1
 fi
 
