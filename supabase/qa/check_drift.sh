@@ -67,8 +67,23 @@ fallos=0
 
 echo "==> migraciones pendientes"
 
+# Conectar primero, y como su propio paso. La versión anterior de esto mandaba
+# la consulta con `2>/dev/null || true` y trataba cualquier respuesta vacía como
+# "la base no tiene schema_migrations": medido en la primera corrida real, con
+# el secreto ya puesto, eso convirtió un error de conexión en un diagnóstico
+# equivocado sobre el esquema. Un mensaje de error tragado no es un mensaje.
+if ! error_conexion="$(psql "$DATABASE_URL" -tAc "SELECT 1" 2>&1 >/dev/null)"; then
+    echo "    no se pudo conectar a la base:"
+    echo "$error_conexion" | sed 's/^/      /'
+    echo
+    echo "    Revisá que DATABASE_URL sea la cadena de conexión completa del"
+    echo "    proyecto — Supabase la da en Project Settings, Database,"
+    echo "    Connection string, pestaña URI."
+    exit 1
+fi
+
 aplicadas="$(psql "$DATABASE_URL" -tAc \
-    "SELECT version FROM public.schema_migrations ORDER BY version" 2>/dev/null || true)"
+    "SELECT version FROM public.schema_migrations ORDER BY version")"
 
 if [[ -z "$aplicadas" ]]; then
     echo "    la base no tiene schema_migrations, o está vacía."
