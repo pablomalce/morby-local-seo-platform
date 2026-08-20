@@ -96,13 +96,24 @@ UNION ALL
 -- un lado sin que nada lo diga. Fue el caso: la réplica no tenía ningún grant a
 -- los roles de Supabase y hosted tenía 282, y la comparación no lo reportó
 -- porque del lado local no había categoría `grant` que comparar.
-SELECT 'conteo grants: ' || count(*) FROM information_schema.role_table_grants
- WHERE table_schema='public' AND grantee IN ('anon','authenticated','service_role')
+SELECT 'conteo grants: ' || count(*)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+       LATERAL aclexplode(c.relacl) a
+ WHERE n.nspname='public' AND c.relkind='r'
+   AND pg_get_userbyid(a.grantee) IN ('anon','authenticated','service_role')
 
 UNION ALL
-SELECT 'grant ' || table_name || ' ' || grantee || ' ' || privilege_type
-  FROM information_schema.role_table_grants
- WHERE table_schema='public' AND grantee IN ('anon','authenticated','service_role')
+-- Desde pg_class y no desde information_schema.role_table_grants, y no es
+-- cosmético: esa vista sólo muestra las filas donde quien consulta es el
+-- otorgante, el receptor, o miembro de alguno. Medido — `postgres` ve 240
+-- grants y un rol de sólo lectura ve 0, sobre la misma base. Con la huella
+-- leyendo esa vista, comparar desde una credencial acotada reportaría 240
+-- diferencias que no existen. pg_class es legible por cualquiera.
+SELECT 'grant ' || c.relname || ' ' || pg_get_userbyid(a.grantee) || ' ' || a.privilege_type
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+       LATERAL aclexplode(c.relacl) a
+ WHERE n.nspname='public' AND c.relkind='r'
+   AND pg_get_userbyid(a.grantee) IN ('anon','authenticated','service_role')
 
 UNION ALL
 -- El rol de QA no es parte del esquema: supabase/qa/app_role.sql le da EXECUTE
