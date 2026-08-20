@@ -53,6 +53,16 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
     exit 0
 fi
 
+# Nada de lo que se imprima acá puede venir del valor. La primera versión de
+# este bloque mostraba sus primeros doce caracteres para que un error fuera
+# reconocible, y funcionó demasiado bien: alguien guardó la contraseña sola en
+# vez de la cadena entera, y esos doce caracteres eran doce caracteres de la
+# contraseña, impresos en el log del workflow. GitHub tampoco los enmascara,
+# porque enmascara el secreto completo y no un prefijo suyo.
+#
+# La longitud y la ausencia del prefijo alcanzan para diagnosticar, y no revelan
+# nada.
+#
 # Que el valor sea una cadena de conexión, antes de intentar usarlo. psql acepta
 # cualquier cosa como nombre de base y cae al socket local, así que un secreto
 # mal copiado no se reporta como "el secreto está mal" sino como un error de
@@ -63,8 +73,8 @@ fi
 if [[ ! "$DATABASE_URL" =~ ^postgres(ql)?:// ]]; then
     echo "==> DATABASE_URL no parece una cadena de conexión."
     echo
-    echo "    Tiene que empezar con postgresql:// o postgres://, y el valor"
-    echo "    guardado empieza con: '${DATABASE_URL:0:12}...'"
+    echo "    Tiene que empezar con postgresql:// o postgres://."
+    echo "    Lo guardado mide ${#DATABASE_URL} caracteres y no tiene ese prefijo."
     echo
     echo "    En el dashboard de Supabase, Project Settings → Database →"
     echo "    Connection string, hay varias pestañas. La que sirve es URI."
