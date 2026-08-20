@@ -137,12 +137,22 @@ if ! error_conexion="$(psql "$DATABASE_URL" -tAc "SELECT 1" 2>&1 >/dev/null)"; t
         echo "    La contraseña tiene un arroba sin percent-encodear (%40), que"
         echo "    parte la URI en el lugar equivocado."
     fi
-    if [[ "$clave" =~ [:/?\#\&%\[\]] ]]; then
-        echo
-        echo "    La contraseña tiene caracteres que hay que percent-encodear"
-        echo "    (@ : / ? # & % [ ]) o rompen la URI. Lo más simple es"
-        echo "    resetearla a una sólo alfanumérica."
-    fi
+    # `case` y no `=~`: la versión anterior de esta comprobación usaba una clase
+    # de caracteres con barras invertidas adentro y NO DISPARABA NUNCA — probada
+    # con /, :, # y %, las cuatro pasaban de largo. Una rama que promete
+    # detectar algo y nunca lo detecta es peor que no tenerla, porque su
+    # silencio se lee como "esto está bien".
+    #
+    # `%` queda fuera a propósito: una contraseña correctamente percent-encodeada
+    # lo contiene, así que incluirlo convertiría el caso correcto en un aviso.
+    case "$clave" in
+        *[/:?\#\&\[\]]*)
+            echo
+            echo "    La contraseña tiene caracteres que hay que percent-encodear"
+            echo "    (@ : / ? # & [ ]) o rompen la URI. Lo más simple es"
+            echo "    resetearla a una sólo alfanumérica."
+            ;;
+    esac
     if [[ "$clave" == *"YOUR-PASSWORD"* ]]; then
         echo
         echo "    Quedó el marcador [YOUR-PASSWORD] sin reemplazar."
