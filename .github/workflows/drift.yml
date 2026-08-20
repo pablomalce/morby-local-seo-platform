@@ -77,7 +77,14 @@ jobs:
         id: comparar
         env:
           DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: ./supabase/qa/check_drift.sh | tee /tmp/deriva.txt
+        # `| tee` sin más deja que el código de salida del pipeline sea el de
+        # `tee`, así que el job pasaba en verde aunque el script fallara.
+        # Medido: la primera corrida real con el secreto puesto no pudo
+        # conectarse a la base y el job dio success igual. Un workflow que no
+        # puede fallar es peor que no tenerlo.
+        run: |
+          set -o pipefail
+          ./supabase/qa/check_drift.sh | tee /tmp/deriva.txt
 
       - name: dejarlo escrito
         if: ${{ !cancelled() }}
