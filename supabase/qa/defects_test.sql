@@ -1,4 +1,4 @@
--- Thirteen isolation checks against the Growth OS schema — executable.
+-- Fourteen isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -527,10 +527,49 @@ SELECT 13, 'the ten triggers that fill the tenant are gone before the app sends 
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgname LIKE '%fill_org%';
 
+-- ──────────────────────────────────────────────────────────────────────────────
+-- 14. La llave pública puede escribir en alguna tabla
+-- ──────────────────────────────────────────────────────────────────────────────
+-- WHAT IT PREVENTS: the key that ships in the browser bundle holding write
+-- privileges on a table of data. Today the policies already stop it — the 0010
+-- comment records that measurement, and it is why that migration is defence in
+-- depth rather than a fix. This block is about the second layer staying up.
+--
+-- The reason it exists is narrower and more concrete than "anon should not
+-- write". Supabase has default privileges that hand every NEW table in `public`
+-- the full seven privileges to all three roles. So this does not stay closed on
+-- its own: it reopens on the next CREATE TABLE, silently, for a table nobody
+-- has written yet. It already happened twice with `schema_migrations` — once
+-- here and once in Lead Engine.
+--
+-- A migration closes it once. This is what makes the next one visible.
+--
+-- Emptying a table is in the list on purpose even though `anon` no longer holds
+-- that privilege: it is the one that does not go through RLS at all, so if it
+-- ever comes back it is not a second layer failing, it is the only layer.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 14, 'the public key can write to a table',
+       count(*) > 0,
+       CASE WHEN count(*) > 0
+            THEN 'anon holds ' || string_agg(DISTINCT privilege_type, ', ') ||
+                 ' on ' || count(DISTINCT table_name) || ' table(s): ' ||
+                 (SELECT string_agg(DISTINCT t.table_name, ', ')
+                    FROM information_schema.role_table_grants t
+                   WHERE t.table_schema = 'public' AND t.grantee = 'anon'
+                     AND t.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE'))
+            ELSE 'anon holds no write privilege anywhere in public'
+            END
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'public' AND grantee = 'anon'
+   AND privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE');
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: thirteen checks were written, so thirteen rows must be present. Fewer
+-- Anti-vacuity: fourteen checks were written, so fourteen rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -540,8 +579,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 13 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 13 checks recorded a result.', checks;
+    IF checks <> 14 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 14 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -552,11 +591,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 13 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 14 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 13 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 14 checks green: the schema prevents every one of them.';
 END
 $$;
 
