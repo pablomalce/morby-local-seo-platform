@@ -18,6 +18,58 @@ import type {
 
 const client = () => createSupabaseBrowserClient();
 
+/**
+ * The tenant of each of these businesses, as one query.
+ *
+ * Why this exists. Every child table carries `organization_id` and a composite
+ * foreign key back to `(organization_id, business_id)` of the parent, which is
+ * what makes cross-tenant reparenting structurally impossible. Until now the
+ * application never sent that column: `fill_organization_id_from_business()`
+ * filled it in a BEFORE INSERT trigger on ten tables.
+ *
+ * A trigger that supplies a value the caller should have supplied is a trigger
+ * nobody can remove — and removing it matters, because the schema can state a
+ * NOT NULL column but cannot state "a trigger will get there first". Sending
+ * the column explicitly is what lets a later migration drop those ten triggers
+ * without silently starting to write tenant-less rows.
+ *
+ * One query for the whole batch, not one per row. The lookup goes through the
+ * same RLS the caller is subject to, so a business in another organization
+ * comes back missing rather than resolved — and the throw below is a better
+ * failure than the composite foreign key violation that would otherwise follow.
+ */
+async function tenantOf(
+  supabase: ReturnType<typeof client>,
+  businessIds: string[]
+): Promise<Map<string, string>> {
+  const unique = [...new Set(businessIds)];
+  if (unique.length === 0) return new Map();
+
+  const { data, error } = await supabase
+    .from("businesses")
+    .select("id, organization_id")
+    .in("id", unique);
+
+  if (error) throw new Error(error.message);
+
+  const byId = new Map<string, string>(
+    (data ?? []).map((row: { id: string; organization_id: string }) => [
+      row.id,
+      row.organization_id,
+    ])
+  );
+
+  const missing = unique.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    throw new Error(
+      `No organization for business ${missing.join(", ")} — it does not exist, ` +
+        `or it belongs to an organization this session cannot see.`
+    );
+  }
+
+  return byId;
+}
+
 // ---------- Row → app type mappers ----------
 
 function mapBusiness(row: any): Business {
@@ -234,6 +286,7 @@ export async function createTenantInDb(input: {
 
   if (input.firstLocation) {
     await supabase.from("business_locations").insert({
+      organization_id: input.organizationId,
       business_id: biz.id,
       label: input.firstLocation.label,
       address_line: input.firstLocation.addressLine,
@@ -247,6 +300,7 @@ export async function createTenantInDb(input: {
 
   if (input.firstService) {
     await supabase.from("business_services").insert({
+      organization_id: input.organizationId,
       business_id: biz.id,
       slug: input.firstService.slug ?? slugify(input.firstService.name),
       name: input.firstService.name,
@@ -269,7 +323,9 @@ export async function deleteBusinessFromDb(businessId: string): Promise<void> {
 export async function appendContentToDb(items: ContentAsset[]): Promise<void> {
   if (items.length === 0) return;
   const supabase = client();
+  const tenants = await tenantOf(supabase, items.map((c) => c.businessId));
   const rows = items.map((c) => ({
+    organization_id: tenants.get(c.businessId)!,
     business_id: c.businessId,
     service_id: c.serviceId ?? null,
     locale: c.locale,
@@ -286,7 +342,9 @@ export async function appendContentToDb(items: ContentAsset[]): Promise<void> {
 export async function appendCompetitorsToDb(items: Competitor[]): Promise<void> {
   if (items.length === 0) return;
   const supabase = client();
+  const tenants = await tenantOf(supabase, items.map((c) => c.businessId));
   const rows = items.map((c) => ({
+    organization_id: tenants.get(c.businessId)!,
     business_id: c.businessId,
     location_id: c.locationId ?? null,
     name: c.name,
@@ -306,7 +364,9 @@ export async function appendCompetitorsToDb(items: Competitor[]): Promise<void> 
 export async function appendReviewsToDb(items: Review[]): Promise<void> {
   if (items.length === 0) return;
   const supabase = client();
+  const tenants = await tenantOf(supabase, items.map((r) => r.businessId));
   const rows = items.map((r) => ({
+    organization_id: tenants.get(r.businessId)!,
     business_id: r.businessId,
     location_id: r.locationId ?? null,
     author: r.author,
