@@ -43,5 +43,14 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         CREATE ROLE authenticated NOLOGIN;
     END IF;
+    -- El tercero faltaba, y se notó recién cuando 0007 le otorgó EXECUTE: la
+    -- réplica abortó con `role "service_role" does not exist` mientras hosted
+    -- lo tiene desde siempre. Un rol que está en producción y no en la réplica
+    -- es una diferencia que aparece sólo el día que alguien lo nombra.
+    -- BYPASSRLS porque así es allá, y omitirlo haría que cualquier aserción
+    -- sobre él midiera un rol que no es el que corre.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        CREATE ROLE service_role NOLOGIN BYPASSRLS;
+    END IF;
 END
 $$;

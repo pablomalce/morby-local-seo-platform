@@ -85,6 +85,35 @@ return 201 against a real project.
 Adding a migration means adding its check here too. A defect that is only ever
 read about is a claim; the file is what makes it a measurement.
 
+### Nothing applies these migrations for you
+
+Measured, because it is easy to assume otherwise: no part of this repository
+applies `supabase/migrations/` to the hosted project. Not the CI workflow —
+that applies them to a throwaway PostgreSQL so the assertions have a schema to
+run against; not `vercel.json`; not a `package.json` script. They reach
+`tpqiltnskfeycnybczgz` because somebody applies them by hand.
+
+A process like that drifts, and drift does not announce itself. So there is a
+way to look:
+
+```bash
+./supabase/qa/replica.sh
+docker exec growthos-replica psql -U postgres -d growthos \
+    -tAf /tmp/schema_fingerprint.sql > local.txt
+# paste supabase/qa/schema_fingerprint.sql into the hosted SQL editor, save as hosted.txt
+diff local.txt hosted.txt
+```
+
+Each line is one object and a hash of what defines it, so a difference names the
+object rather than reporting that something, somewhere, differs. Run against
+both today, the diff is exactly migration `0006`: three columns whose `NOT NULL`
+is missing on hosted, and the two `NOT VALID` checks that `0006` removes. Every
+other category — indexes, policies, RLS flags, triggers, functions, function
+grants — is byte-identical.
+
+Which is the point of the file. `0006` was merged and green in CI, and nothing
+anywhere would have told you it was not on the database.
+
 ## Project structure (post-Phase 1)
 
 ```text
