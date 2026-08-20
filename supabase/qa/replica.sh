@@ -49,6 +49,8 @@ for f in "$REPO_ROOT"/supabase/migrations/*.sql; do
     apply "$f"
 done
 
+# NOLOGIN and passwordless, here as everywhere else: the assertions reach it
+# with SET ROLE, so the replica has no reason to be laxer than a real database.
 echo "==> non-superuser application role"
 apply "$REPO_ROOT/supabase/qa/app_role.sql"
 
@@ -61,4 +63,5 @@ TABLES=$(docker exec "$CONTAINER" psql -U postgres -d growthos -tAc \
 echo
 echo "replica up: $TABLES tables in public"
 echo "  assertions:  docker exec $CONTAINER psql -U postgres -d growthos -v ON_ERROR_STOP=1 -f /tmp/defects_test.sql"
-echo "  as the app:  PGPASSWORD=growthos psql -h localhost -p $PORT -U growthos_app -d growthos"
+echo "  as the app:  PGPASSWORD=growthos psql -h localhost -p $PORT -U postgres -d growthos"
+echo "               then: SET ROLE growthos_app;"
