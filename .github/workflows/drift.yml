@@ -1,0 +1,91 @@
+name: deriva
+
+# ¿La base hosted tiene lo que dice el repositorio?
+#
+# El job `schema isolation` de ci.yml aplica las migraciones a un PostgreSQL
+# descartable y corre las aserciones contra él. Eso comprueba que el esquema del
+# REPOSITORIO es correcto, y no dice absolutamente nada sobre la base que sirve
+# a producción.
+#
+# La diferencia costó dos veces: la 0006 estuvo mergeada y en verde mientras
+# `tpqiltnskfeycnybczgz` no la tenía, y en Lead Engine la migración que cierra
+# la superficie de `anon` estuvo así durante semanas con datos reales adentro.
+# Los dos casos aparecieron porque alguien fue a mirar, no porque algo avisara.
+#
+# Este workflow es el que avisa. NO APLICA NADA — leer y comparar es todo lo que
+# hace; aplicar sin que nadie mire es otra decisión.
+
+on:
+  push:
+    branches: [main]
+  # Una migración puede quedar sin aplicar el martes y nadie tocar main hasta el
+  # viernes. La corrida diaria es la que acorta esa ventana.
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deriva-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deriva:
+    name: repo vs base hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: growthos
+          POSTGRES_DB: growthos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGPASSWORD: growthos
+      PSQL: psql -h localhost -U postgres -d growthos -v ON_ERROR_STOP=1
+      REPLICA_URL: postgresql://postgres:growthos@localhost:5432/growthos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # La referencia contra la cual comparar: el esquema tal como lo construyen
+      # las migraciones de este commit, sin intervención de nadie.
+      - name: construir la referencia desde las migraciones
+        run: |
+          $PSQL -f supabase/qa/auth_stub.sql
+          for f in supabase/migrations/*.sql; do
+            echo "== $f"
+            $PSQL -f "$f"
+          done
+          $PSQL -f supabase/qa/app_role.sql
+
+      # Sin el secreto el script avisa y no falla. Romper main hasta que alguien
+      # configure un secreto es una forma segura de que el aviso deje de leerse,
+      # y el resumen de abajo lo deja escrito en cada corrida igual.
+      - name: comparar contra la base hosted
+        id: comparar
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: ./supabase/qa/check_drift.sh | tee /tmp/deriva.txt
+
+      - name: dejarlo escrito
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Deriva entre el repositorio y la base hosted"
+            echo
+            echo '```'
+            cat /tmp/deriva.txt 2>/dev/null || echo "(el paso anterior no llegó a producir salida)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

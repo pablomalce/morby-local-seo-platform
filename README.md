@@ -145,6 +145,31 @@ Step 4 is not ceremony. It is how the `0007` grants were found in the first
 place: the schema in the repository and the schema in the database can differ
 in ways no migration in the repository accounts for.
 
+### And something that checks without being asked
+
+Those four steps only run when somebody remembers. `.github/workflows/drift.yml`
+runs them on every push to `main`, once a day, and on demand: it reads
+`schema_migrations`, works out what is missing, compares the fingerprint against
+a schema built from that commit's migrations, and fails naming what differs. It
+**applies nothing** — reading and comparing is all it does.
+
+It needs one secret, and that is the one part of this that cannot come from the
+repository:
+
+```bash
+gh secret set SUPABASE_DB_URL --repo pablomalce/morby-local-seo-platform
+```
+
+Read-only credentials are enough. Without the secret the job does not fail; it
+prints what is missing and writes it into the run summary, because breaking
+every build until someone configures a secret is a reliable way to make the
+warning stop being read.
+
+Verified against a second database standing in for hosted: a missing migration,
+a version present in the database but not in the repository, and an index
+created outside the migrations are each caught and named. The last one is the
+case nothing else here would have seen.
+
 ## Project structure (post-Phase 1)
 
 ```text
