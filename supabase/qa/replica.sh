@@ -24,7 +24,10 @@
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-growthos-replica}"
-IMAGE="${IMAGE:-postgres:16}"
+# 17, como el proyecto hosted. Verificar sobre una mayor distinta prueba otro
+# motor: en el job de deriva un 16 producía 45 diferencias de `MAINTAIN`, un
+# privilegio que sólo existe desde el 17, y ninguna era deriva de verdad.
+IMAGE="${IMAGE:-postgres:17}"
 PORT="${PORT:-55433}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
