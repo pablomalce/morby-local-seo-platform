@@ -55,13 +55,18 @@ docker exec growthos-replica psql -U postgres -d growthos \
 
 `replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
 order, with the auth objects stubbed from the same file the CI job uses.
-`defects_test.sql` then runs fourteen isolation checks as a NOSUPERUSER NOBYPASSRLS
+`defects_test.sql` then runs nineteen isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
-every policy that is not FORCEd. Exit 0 means the schema refuses all fourteen.
+every policy that is not FORCEd. Exit 0 means the schema refuses all nineteen.
 
 Check 13 is the odd one and worth knowing about before it surprises someone: it
 is the only one where the DEFECT is an object being present rather than absent.
 It used to be the reverse — see below.
+
+Checks 15 to 19 arrived with `0013` and are about how a member is taken off an
+organisation: it archives, never deletes. They are the only ones that measure a
+BEHAVIOUR the canonical cannot — its tenant resolver reads a GUC and never
+touches `org_members`, so archiving somebody there cannot cut anything.
 
 The `schema isolation` job in CI runs exactly these two steps on every pull
 request, so a migration that reopens one of them cannot merge.

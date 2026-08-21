@@ -39,8 +39,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO growthos_
 -- Y lo que la aplicación NO tiene, este rol tampoco. Desde la 0013 ni `anon` ni
 -- `authenticated` pueden borrar una membresía: la baja archiva. El GRANT de
 -- arriba es sobre ALL TABLES y se la devolvería, y entonces la suite estaría
--- midiendo un rol que no existe en producción — el chequeo 15 pasaría en verde
+-- midiendo un rol que no existe en producción — el chequeo 17 pasaría en verde
 -- por tener un privilegio de más, que es la peor manera de pasar.
+--
+-- Este REVOKE hay que aplicarlo también a hosted a mano, y no lo dice la huella:
+-- `schema_fingerprint.sql` filtra los grants de tabla a
+-- ('anon','authenticated','service_role'), así que un privilegio de growthos_app
+-- que sobre en la base es invisible para el job de deriva. Medido el
+-- 2026-08-21: hosted tenía el DELETE y la comparación daba verde igual.
 REVOKE DELETE ON public.org_members FROM growthos_app;
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
