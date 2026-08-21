@@ -24,11 +24,14 @@ const en: Dictionary = {
   "nav.settings": "Settings",
 
   "selector.business": "Business",
+  "selector.businessPlaceholder": "Select a business",
   "selector.service": "Service",
   "selector.location": "Location",
   "selector.locale": "Language",
   "selector.allServices": "All services",
   "selector.allLocations": "All locations",
+  "selector.pickBusinessTitle": "Pick a business to continue",
+  "selector.pickBusinessDescription": "Use the selector at the top to choose a tenant. Reports, agents and KPIs need a business in context.",
 
   "metrics.rank": "Estimated local rank",
   "metrics.rank.note": "Target: knowledge panel & map pack visibility",
@@ -260,11 +263,14 @@ const es: Dictionary = {
   "nav.settings": "Configuración",
 
   "selector.business": "Negocio",
+  "selector.businessPlaceholder": "Selecciona un negocio",
   "selector.service": "Servicio",
   "selector.location": "Ubicación",
   "selector.locale": "Idioma",
   "selector.allServices": "Todos los servicios",
   "selector.allLocations": "Todas las ubicaciones",
+  "selector.pickBusinessTitle": "Selecciona un negocio para continuar",
+  "selector.pickBusinessDescription": "Usa el selector de la parte superior para elegir un tenant. Los reportes, agentes y KPIs necesitan un negocio en contexto.",
 
   "metrics.rank": "Posición local estimada",
   "metrics.rank.note": "Objetivo: panel de conocimiento y map pack",
@@ -496,11 +502,14 @@ const sv: Dictionary = {
   "nav.settings": "Inställningar",
 
   "selector.business": "Verksamhet",
+  "selector.businessPlaceholder": "Välj en verksamhet",
   "selector.service": "Tjänst",
   "selector.location": "Plats",
   "selector.locale": "Språk",
   "selector.allServices": "Alla tjänster",
   "selector.allLocations": "Alla platser",
+  "selector.pickBusinessTitle": "Välj en verksamhet för att fortsätta",
+  "selector.pickBusinessDescription": "Använd väljaren högst upp för att välja en hyresgäst. Rapporter, agenter och KPI:er behöver en verksamhet i sammanhanget.",
 
   "metrics.rank": "Uppskattad lokal placering",
   "metrics.rank.note": "Mål: kunskapspanel och map pack",

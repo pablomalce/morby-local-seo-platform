@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { organizations } from "@/lib/mock/universal";
 import {
   createBusiness as storeCreateBusiness,
@@ -58,12 +58,15 @@ interface SelectionContextValue extends SelectionState {
 
 const SelectionContext = createContext<SelectionContextValue | null>(null);
 
-function defaultState(allBusinesses: Business[]): SelectionState {
-  const org = organizations[0];
-  const biz = allBusinesses.find((b) => b.organizationId === org.id) ?? allBusinesses[0];
+/**
+ * Empty selection — no business picked. The header selector renders a "Select a business"
+ * placeholder; pages that need a business render a friendly empty state. The previous default
+ * of "first seed tenant" caused the Mörby flash on every navigation.
+ */
+function emptySelection(): SelectionState {
   return {
-    organizationId: org.id,
-    businessId: biz?.id ?? "",
+    organizationId: organizations[0]?.id ?? "",
+    businessId: "",
     serviceId: null,
     locationId: null,
   };
@@ -117,39 +120,52 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
   const allLocations = isAuthenticated && dbState ? dbState.locations : localLocations;
   const allServices = isAuthenticated && dbState ? dbState.services : localServices;
 
-  const [state, setState] = useState<SelectionState>(() => defaultState(localBusinesses));
+  const [state, setState] = useState<SelectionState>(emptySelection);
 
-  // Sync selection when datasets change (e.g. user signs in and DB tenants arrive).
-  useEffect(() => {
-    setState((prev) => {
-      const stillExists = allBusinesses.some((b) => b.id === prev.businessId);
-      if (stillExists) return prev;
-      const first = allBusinesses[0];
-      if (!first) return prev;
-      return { organizationId: first.organizationId, businessId: first.id, serviceId: null, locationId: null };
-    });
-  }, [allBusinesses]);
+  // Track whether we've read the localStorage selection yet. We must NOT persist the empty
+  // default state before this happens — otherwise the persist effect clobbers the saved
+  // selection on first render, defeating the whole point of localStorage.
+  const restoredRef = useRef(false);
 
-  // Persist selection to localStorage so reloads keep context.
+  // Restore previously selected business on mount (runs before persistence kicks in).
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [state]);
-
-  // Restore previously selected business on mount.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined") {
+      restoredRef.current = true;
+      return;
+    }
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as Partial<SelectionState>;
-      if (parsed.businessId) {
-        setState((prev) => ({ ...prev, ...parsed } as SelectionState));
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<SelectionState>;
+        if (parsed.businessId) {
+          setState((prev) => ({ ...prev, ...parsed } as SelectionState));
+        }
       }
     } catch {
       /* ignore */
     }
+    restoredRef.current = true;
   }, []);
+
+  // Sync selection when datasets change (e.g. user signs in and DB tenants arrive).
+  // If the previously selected business no longer exists, clear the selection (don't auto-pick
+  // another tenant) so the user explicitly picks a new one.
+  useEffect(() => {
+    setState((prev) => {
+      if (!prev.businessId) return prev; // No selection yet — leave it.
+      const stillExists = allBusinesses.some((b) => b.id === prev.businessId);
+      if (stillExists) return prev;
+      return { ...emptySelection(), organizationId: prev.organizationId };
+    });
+  }, [allBusinesses]);
+
+  // Persist selection to localStorage so reloads keep context. Guarded so it never writes
+  // the empty default state before restore has had a chance to run.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!restoredRef.current) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [state]);
 
   const setBusinessId = useCallback((id: string) => {
     setState((prev) => ({ ...prev, businessId: id, serviceId: null, locationId: null }));
@@ -258,22 +274,23 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<SelectionContextValue>(() => {
     const organization =
       organizations.find((o) => o.id === state.organizationId) ?? organizations[0];
-    const business =
-      allBusinesses.find((b) => b.id === state.businessId) ?? allBusinesses[0] ??
-      // Last-resort placeholder so destructuring downstream never crashes when there are zero
-      // tenants for a brand-new authenticated user.
-      ({
-        id: "",
-        organizationId: organization.id,
-        name: "No business yet",
-        website: "",
-        industry: "other",
-        brandTone: "",
-        primaryLocale: "en",
-        valueProposition: "",
-        logoColor: "#EF4C24",
-        createdAt: new Date().toISOString(),
-      } as Business);
+    // Placeholder business for the "no selection yet" state. Pages that need a business
+    // detect it via `business.id === ""` and render an empty state.
+    const placeholderBusiness: Business = {
+      id: "",
+      organizationId: organization.id,
+      name: "__SELECT_BUSINESS__", // sentinel — the selector renders a localised label.
+      website: "",
+      industry: "other",
+      brandTone: "",
+      primaryLocale: "en",
+      valueProposition: "",
+      logoColor: "#3a3a3a",
+      createdAt: new Date().toISOString(),
+    };
+    const business = state.businessId
+      ? allBusinesses.find((b) => b.id === state.businessId) ?? placeholderBusiness
+      : placeholderBusiness;
     const businessesForOrg = allBusinesses.filter((b) => b.organizationId === organization.id);
     const servicesForBusiness = allServices.filter((s) => s.businessId === business.id);
     const locationsForBusiness = allLocations.filter((l) => l.businessId === business.id);
