@@ -35,5 +35,12 @@ ALTER ROLE growthos_app NOLOGIN PASSWORD NULL;
 
 GRANT USAGE ON SCHEMA public, auth TO growthos_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO growthos_app;
+
+-- Y lo que la aplicación NO tiene, este rol tampoco. Desde la 0013 ni `anon` ni
+-- `authenticated` pueden borrar una membresía: la baja archiva. El GRANT de
+-- arriba es sobre ALL TABLES y se la devolvería, y entonces la suite estaría
+-- midiendo un rol que no existe en producción — el chequeo 15 pasaría en verde
+-- por tener un privilegio de más, que es la peor manera de pasar.
+REVOKE DELETE ON public.org_members FROM growthos_app;
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
