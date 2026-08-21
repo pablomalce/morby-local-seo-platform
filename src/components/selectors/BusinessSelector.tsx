@@ -12,6 +12,8 @@ export function BusinessSelector() {
   const { business, businessesForOrg, setBusinessId } = useSelection();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
+  const hasSelection = business.id !== "";
+  const displayName = hasSelection ? business.name : t("selector.businessPlaceholder", "Select a business");
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -31,8 +33,11 @@ export function BusinessSelector() {
         )}
       >
         <span
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-vulkan text-vulkan-black"
-          style={{ backgroundColor: business.logoColor }}
+          className={cn(
+            "flex h-9 w-9 shrink-0 items-center justify-center rounded-vulkan text-vulkan-black",
+            !hasSelection && "opacity-70",
+          )}
+          style={{ backgroundColor: hasSelection ? business.logoColor : "#3a3a3a" }}
         >
           <Building2 className="h-4 w-4" strokeWidth={1.8} />
         </span>
@@ -40,8 +45,13 @@ export function BusinessSelector() {
           <span className="block font-mono text-[9px] uppercase tracking-hud text-metal-500">
             <span className="text-vulkan-orange">//</span> {t("selector.business")}
           </span>
-          <span className="block truncate font-display text-[13px] uppercase tracking-hud text-vulkan-white">
-            {business.name}
+          <span
+            className={cn(
+              "block truncate font-display text-[13px] uppercase tracking-hud",
+              hasSelection ? "text-vulkan-white" : "text-metal-400",
+            )}
+          >
+            {displayName}
           </span>
         </span>
         <ChevronDown

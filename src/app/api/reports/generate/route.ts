@@ -3,6 +3,7 @@ import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
+import type { ClientSnapshotInput } from "@/lib/reports/orchestrator";
 import { businesses } from "@/lib/mock/universal";
 
 // PageSpeed Insights can take 15–40s for slow sites; give the serverless function
@@ -75,7 +76,10 @@ export async function POST(req: Request) {
   try {
     const body = req.body ? schema.parse(await req.json().catch(() => ({}))) : { businessId: undefined, clientSnapshot: undefined };
     const businessId = body.businessId ?? businesses[0].id;
-    const report = await generateReport({ businessId, clientSnapshot: body.clientSnapshot as any });
+    const report = await generateReport({
+      businessId,
+      clientSnapshot: body.clientSnapshot as ClientSnapshotInput | undefined,
+    });
     if (!report) {
       return NextResponse.json({ error: "Business not found" }, { status: 404 });
     }
