@@ -1,4 +1,4 @@
--- Fourteen isolation checks against the Growth OS schema — executable.
+-- Nineteen isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -581,9 +581,219 @@ SELECT 14, 'the public key can write to a table',
    AND privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE');
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 15. Archivar a un miembro no le corta el acceso
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que dar de baja a alguien sea una anotación sin efecto. Desde la
+-- 0013 la baja de un miembro archiva en vez de borrar, y lo que traduce una
+-- membresía en acceso es `current_user_org_ids()`. Si esa función no filtra por
+-- estado, la columna `state` existe, la UI puede mostrar "archivado", y la
+-- persona sigue leyendo todo.
+--
+-- Es el bloque que el canónico NO puede escribir. Su resolutor lee un GUC y
+-- nunca toca org_members, así que allá archivar no puede cortar nada y el
+-- bloque 16 lo dice en su propio encabezado. Acá el resolutor es SQL de verdad,
+-- así que acá se mide el efecto.
+--
+-- Se siembra un tenant propio en vez de reusar a alice y bob: para el bloque 15
+-- esos dos ya arrastran las membresías cruzadas del 5 y del 7, y medir sobre un
+-- estado acumulado es medir otra cosa de la que uno cree.
+
+RESET ROLE;
+
+-- La organización y la membresía las crea handle_new_user() al insertarse el
+-- usuario, igual que para alice y bob más arriba. Sembrarlas a mano sería
+-- sembrar una forma que la aplicación nunca produce.
+INSERT INTO auth.users (id, email) VALUES
+    ('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'carol@example.test'),
+    -- dave existe sólo para el bloque 16: hace falta alguien a quien carol
+    -- pueda INTENTAR dar de alta y que todavía no tenga fila en su
+    -- organización. Con carol misma, la unicidad de (organization_id, user_id)
+    -- rechaza el INSERT antes que la policy, y `accepted()` —que atrapa WHEN
+    -- OTHERS— lo anota como rechazado. Medido: el bloque quedaba verde con la
+    -- policy rota. handle_new_user() le da su propia organización, que no es la
+    -- de carol y no molesta.
+    ('dddddddd-dddd-4ddd-8ddd-ddddddddddde', 'dave@example.test'),
+    ('dddddddd-dddd-4ddd-8ddd-dddddddddddf', 'erin@example.test'),
+    ('dddddddd-dddd-4ddd-8ddd-ddddddddddda', 'frank@example.test');
+
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'ffffffff-ffff-4fff-8fff-ffffffffffff', organization_id, 'Carol Co'
+  FROM org_members
+ WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+
+-- Anti-vacuidad, y no es ceremonia: si carol no viera su negocio ESTANDO
+-- activa, el chequeo de abajo daría verde por un motivo que no tiene nada que
+-- ver con archivar — un fixture mal sembrado se lee igual que un acceso
+-- cortado.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM businesses
+     WHERE id = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    IF n <> 1 THEN
+        RAISE EXCEPTION
+            'Vacuous check 15: carol activa ve % negocios propios; debe ver 1. '
+            'Sin esto, el chequeo pasaría en verde con el fixture roto.', n;
+    END IF;
+END
+$$;
+
+-- Anti-vacuidad de la OTRA mitad, y no es de más: `members_owner_write` no
+-- funcionaba —recursaba— y nadie lo había notado porque nada la ejercitaba. Si
+-- carol ACTIVA tampoco pudiera dar de alta a nadie, los bloques 16 y 19 darían
+-- verde por una policy rota en vez de por una policy que discrimina.
+DO $$
+BEGIN
+    INSERT INTO org_members (organization_id, user_id, role)
+    SELECT organization_id, 'dddddddd-dddd-4ddd-8ddd-ddddddddddde'::uuid, 'editor'
+      FROM org_members
+     WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION
+        'Vacuous checks 16/19: carol ACTIVA, dueña de su organización, no pudo '
+        'dar de alta a nadie (%). Con la escritura rota, los dos bloques que '
+        'siguen pasan sin discriminar nada.', SQLERRM;
+END
+$$;
+
+RESET ROLE;
+UPDATE org_members SET state = 'archived'
+ WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+
+INSERT INTO defect_report
+SELECT 15, 'an archived member still reads the tenant they were removed from',
+       count(*) > 0,
+       CASE WHEN count(*) > 0
+            THEN 'carol was archived and still reads ' || count(*) ||
+                 ' business(es) of the organization she was removed from'
+            ELSE 'an archived membership resolves to no tenant: carol reads 0'
+            END
+  FROM businesses
+ WHERE id = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 16. Un owner archivado sigue administrando miembros
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que archivar a quien manda no le saque el poder de mandar. La
+-- policy `members_owner_write` decide quién puede tocar org_members, y hasta la
+-- 0013 su subconsulta preguntaba por el rol sin mirar el estado. Un owner
+-- archivado conservaba el alta y la baja de cualquiera — incluida la suya, así
+-- que podía desarchivarse.
+--
+-- Este hueco no lo encontró un test: apareció leyendo la policy al escribir la
+-- migración. El bloque existe para que la próxima vez lo encuentre un test.
+--
+-- Se prueba con un INSERT y no con un UPDATE a propósito. `members_owner_write`
+-- no declara WITH CHECK, así que PostgreSQL usa su USING también para el
+-- INSERT, y un INSERT rechazado por policy LANZA. Un UPDATE tapado por la misma
+-- policy no lanza: actualiza cero filas, y `accepted()` lo anotaría como
+-- aceptado. Es la trampa que el bloque 6 de Lead Engine ya pagó una vez.
+--
+-- Y se da de alta a ERIN y no a carol, por una segunda trampa que costó una
+-- mutación: con carol, la unicidad de (organization_id, user_id) rechaza el
+-- INSERT antes de que la policy opine, `accepted()` atrapa WHEN OTHERS y lo
+-- anota como rechazado. El bloque quedaba verde con la policy rota. Cada bloque
+-- da de alta a alguien distinto por ese motivo.
+
+INSERT INTO defect_report
+SELECT 16, 'an archived owner can still add members to the organization',
+       pg_temp.accepted(format($sql$
+           INSERT INTO org_members (organization_id, user_id, role)
+           VALUES (%L, 'dddddddd-dddd-4ddd-8ddd-dddddddddddf'::uuid, 'admin')
+       $sql$, (SELECT organization_id FROM org_members
+                WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'))),
+       'carol, archived, adding erin to the organization she was removed from';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 17. Una membresía se puede borrar en vez de archivar
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la baja destruya el registro de que esa persona tuvo acceso.
+-- La 0013 le saca DELETE sobre org_members a `anon` y a `authenticated`; lo
+-- conserva `service_role`, que es quien corre el borrado de cuenta propia.
+--
+-- Medido contra hosted antes de escribir la migración, y contradice lo que §5.4
+-- del prompt maestro suponía: `authenticated` SÍ tenía DELETE acá, porque la
+-- 0010 lo otorga sobre ALL TABLES. El borrado duro ya era posible.
+--
+-- `app_role.sql` repite el mismo REVOKE sobre growthos_app por un motivo
+-- concreto: su GRANT es sobre ALL TABLES y se lo devolvería, y entonces este
+-- bloque estaría midiendo un rol con un privilegio que producción no tiene.
+
+INSERT INTO defect_report
+SELECT 17, 'a membership can be deleted outright instead of archived',
+       pg_temp.accepted($sql$
+           DELETE FROM org_members
+            WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+       $sql$),
+       'the application role deleting a membership row';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 18. `state` acepta un valor fuera del vocabulario
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que `state` sea texto libre. El resolutor filtra por el literal
+-- 'active', así que 'activo', 'ACTIVE' o 'inactive' no son sinónimos: son
+-- valores que cortan el acceso sin que nadie lo haya pedido, o que lo dejan
+-- abierto creyendo lo contrario.
+--
+-- Corre como dueño y no como la aplicación, y es deliberado: sin FORCE el dueño
+-- está exento de RLS, así que lo único que puede rechazar la escritura es el
+-- CHECK. Es exactamente lo que se quiere medir.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 18, 'org_members.state accepts a value outside (active, archived)',
+       pg_temp.accepted($sql$
+           UPDATE org_members SET state = 'inactivo'
+            WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+       $sql$),
+       'a state the tenant resolver does not know how to read';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 19. Un miembro que no es owner ni admin administra miembros igual
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: el complemento del 16. Aquél mide que el ESTADO cuente; éste, que
+-- el ROL siga contando. La 0013 movió los dos chequeos dentro de
+-- `current_user_admin_org_ids()`, así que ahora los sostiene una función y no
+-- una policy — y nada medía el rol.
+--
+-- Lo dijo una mutación: sacarle `role IN ('owner','admin')` a esa función dejaba
+-- los dieciocho bloques en verde, porque carol es owner y su caso no cambia.
+-- Un editor que pueda darse a sí mismo el rol de owner es una escalada de
+-- privilegios, no un detalle de forma.
+--
+-- dave es editor ACTIVO de la organización de carol: la única razón para
+-- rechazarlo es el rol.
+--
+-- El `SET LOCAL ROLE` de abajo no es ceremonia. El bloque 18 termina con
+-- `RESET ROLE` para medir el CHECK sin RLS de por medio, y sin esta línea este
+-- bloque correría como el dueño — que sin FORCE está exento de toda policy. Se
+-- midió: así, el INSERT de dave se aceptaba y el bloque reportaba un defecto que
+-- no existe. Es la misma advertencia que el encabezado del archivo hace sobre
+-- correr las aserciones como dueño, cobrada de nuevo.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('dddddddd-dddd-4ddd-8ddd-ddddddddddde');
+
+INSERT INTO defect_report
+SELECT 19, 'a plain member can administer the memberships of their organization',
+       pg_temp.accepted(format($sql$
+           INSERT INTO org_members (organization_id, user_id, role)
+           VALUES (%L, 'dddddddd-dddd-4ddd-8ddd-ddddddddddda'::uuid, 'owner')
+       $sql$, (SELECT organization_id FROM org_members
+                WHERE user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'))),
+       'dave, an active editor, adding frank as owner of the organization';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: fourteen checks were written, so fourteen rows must be present. Fewer
+-- Anti-vacuity: nineteen checks were written, so nineteen rows must be present. Fewer
 -- means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -593,8 +803,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 14 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 14 checks recorded a result.', checks;
+    IF checks <> 19 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 19 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -605,11 +815,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 14 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 19 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 14 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 19 checks green: the schema prevents every one of them.';
 END
 $$;
 
