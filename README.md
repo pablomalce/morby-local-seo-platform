@@ -55,9 +55,13 @@ docker exec growthos-replica psql -U postgres -d growthos \
 
 `replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
 order, with the auth objects stubbed from the same file the CI job uses.
-`defects_test.sql` then runs ten isolation checks as a NOSUPERUSER NOBYPASSRLS
+`defects_test.sql` then runs fourteen isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
-every policy that is not FORCEd. Exit 0 means the schema refuses all ten.
+every policy that is not FORCEd. Exit 0 means the schema refuses all fourteen.
+
+Check 13 is the odd one and worth knowing about before it surprises someone: it
+is the only one where the DEFECT is an object being present rather than absent.
+It used to be the reverse — see below.
 
 The `schema isolation` job in CI runs exactly these two steps on every pull
 request, so a migration that reopens one of them cannot merge.
@@ -70,11 +74,28 @@ parent does not have, and a business cannot change organization while it owns
 child rows. Policies read `organization_id` off the row; none of them resolves
 a tenant through a subquery against another table.
 
-Writers do not have to supply `organization_id`. A `BEFORE INSERT` trigger
-fills it from `business_id`, which is why the application code sends the same
-INSERTs it always has. That trigger is scaffolding: it is removed once the
-writers send the column explicitly, and the column is `NOT NULL` everywhere
-except `agent_runs`, whose `business_id` is nullable.
+**Writers supply `organization_id` themselves.** They did not always: a
+`BEFORE INSERT` trigger filled it from `business_id` on ten tables, which is why
+the application could ignore the column. That was scaffolding, and `0012`
+removed it — the function and all ten triggers — once every writer sent the
+value. The column is `NOT NULL` everywhere except `agent_runs`, whose
+`business_id` is nullable, so an INSERT that omits it is now refused rather than
+quietly completed.
+
+Two things keep it that way, one on each side.
+`src/lib/store/__tests__/tenantOnInsert.test.ts` reads the exact argument of
+every `.insert(` into a tenant-scoped table — parentheses balanced, comments
+stripped — and fails if one leaves the column out. Check 13 of `defects_test.sql`
+fails if the function or any of its triggers comes back. Neither is optional:
+the reason the trigger had to go is that a `NOT NULL` column is a fact the
+catalogue enforces, while *"a trigger will get there first"* is not, and no
+migration can validate the second one.
+
+The order in which that happened was the whole risk, and it is recorded in
+`0012` itself: the INSERTs run in the browser, so the writers had to be live in
+production **before** the triggers came out. Dropping them first would not have
+failed a deploy — a tab holding the old bundle would simply have started writing
+tenant-less rows.
 
 **Writers need a session.** Supabase grants every privilege on public tables to
 `anon` by default, and the anon key ships in the browser bundle. Check 10 refuses
@@ -105,14 +126,16 @@ diff local.txt hosted.txt
 ```
 
 Each line is one object and a hash of what defines it, so a difference names the
-object rather than reporting that something, somewhere, differs. Run against
-both today, the diff is exactly migration `0006`: three columns whose `NOT NULL`
-is missing on hosted, and the two `NOT VALID` checks that `0006` removes. Every
-other category — indexes, policies, RLS flags, triggers, functions, function
-grants — is byte-identical.
+object rather than reporting that something, somewhere, differs.
 
-Which is the point of the file. `0006` was merged and green in CI, and nothing
+The example that earned the file: run this way, the diff once came back as
+exactly migration `0006` — three columns whose `NOT NULL` was missing on hosted,
+and the two `NOT VALID` checks the migration removes — while every other
+category was byte-identical. `0006` was merged and green in CI, and nothing else
 anywhere would have told you it was not on the database.
+
+The numbers move every time a migration is applied, so this paragraph does not
+quote a current one. The `deriva` job below reports the live figure.
 
 ### Asking a database what it has
 

@@ -25,7 +25,8 @@ const client = () => createSupabaseBrowserClient();
  * foreign key back to `(organization_id, business_id)` of the parent, which is
  * what makes cross-tenant reparenting structurally impossible. Until now the
  * application never sent that column: `fill_organization_id_from_business()`
- * filled it in a BEFORE INSERT trigger on ten tables.
+ * filled it in a BEFORE INSERT trigger on ten tables. Migration 0012 removed
+ * both, so this is now the only thing putting a tenant on a child row.
  *
  * A trigger that supplies a value the caller should have supplied is a trigger
  * nobody can remove — and removing it matters, because the schema can state a

@@ -188,10 +188,10 @@ describe("inserts into tenant-scoped tables", () => {
 
     expect(
       missing,
-      `These writes leave organization_id to fill_organization_id_from_business(). ` +
-        `While any of them do, those ten triggers cannot be removed, and the ` +
-        `tenant on those rows is guaranteed by a trigger rather than by the ` +
-        `schema. Pass the column — tenantOf() in ` +
+      `These writes leave organization_id out. Since 0012 nothing fills it: ` +
+        `fill_organization_id_from_business() and its ten triggers are gone, so ` +
+        `the write is refused outright by NOT NULL rather than quietly ` +
+        `completed. Pass the column — tenantOf() in ` +
         `lib/store/supabaseTenantStore.ts resolves it for a whole batch in one ` +
         `query.`
     ).toEqual([]);
