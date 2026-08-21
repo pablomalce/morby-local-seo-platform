@@ -251,11 +251,11 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
   if (result.authenticated) {
     const supabase = await createSupabaseServerClient();
     await supabase.from("reports").insert({
-      // Explicit, rather than left to fill_organization_id_from_business(). The
-      // snapshot already carries the tenant — it was read from the same
-      // `businesses` row this report is about — so the trigger was supplying a
-      // value that had been in scope all along. See tenantOf() in
-      // lib/store/supabaseTenantStore.ts for why that matters.
+      // Explicit. The snapshot already carries the tenant — it was read from
+      // the same `businesses` row this report is about — so the trigger that
+      // used to supply it was supplying a value that had been in scope all
+      // along. That trigger is gone as of 0012; without this line the insert is
+      // refused by NOT NULL. See tenantOf() in lib/store/supabaseTenantStore.ts.
       organization_id: result.snapshot.business.organizationId,
       business_id: report.businessId,
       title: `${report.businessName} · ${new Date(report.generatedAt).toLocaleDateString()}`,

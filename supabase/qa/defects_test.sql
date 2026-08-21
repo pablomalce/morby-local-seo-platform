@@ -73,16 +73,19 @@ SELECT '33333333-3333-4333-8333-333333333333', org_alice, 'Alice Co' FROM t;
 INSERT INTO businesses (id, organization_id, name)
 SELECT '44444444-4444-4444-8444-444444444444', org_bob, 'Bob Co' FROM t;
 
-INSERT INTO business_services (id, business_id, slug, name) VALUES
-    ('55555555-5555-4555-8555-555555555555',
-     '44444444-4444-4444-8444-444444444444', 'bob-service', 'Bob Service');
+INSERT INTO business_services (id, business_id, organization_id, slug, name)
+SELECT '55555555-5555-4555-8555-555555555555',
+       '44444444-4444-4444-8444-444444444444', org_bob, 'bob-service', 'Bob Service'
+  FROM t;
 
--- Bob's own location, for check 8. organization_id is deliberately left out:
--- filling it from the parent is what 0004's BEFORE INSERT trigger is for, and a
--- fixture that supplied it by hand would never exercise that path.
-INSERT INTO business_locations (id, business_id, label, is_primary) VALUES
-    ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-     '44444444-4444-4444-8444-444444444444', 'Bob Main', true);
+-- Bob's own location, for check 8. organization_id is passed explicitly since
+-- 0012: the BEFORE INSERT trigger that used to fill it from the parent is gone,
+-- and a fixture that omitted the column would now be refused by NOT NULL —
+-- which would make every check downstream pass for the wrong reason.
+INSERT INTO business_locations (id, business_id, organization_id, label, is_primary)
+SELECT 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+       '44444444-4444-4444-8444-444444444444', org_bob, 'Bob Main', true
+  FROM t;
 
 -- Becoming a given user, as the application role.
 CREATE OR REPLACE FUNCTION pg_temp.be(p_user uuid) RETURNS void
@@ -163,11 +166,12 @@ SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
 INSERT INTO defect_report
 SELECT 3, 'content_assets: service_id may point at another tenant''s service',
        pg_temp.accepted($sql$
-           INSERT INTO content_assets (id, business_id, service_id, kind, body)
-           VALUES ('88888888-8888-4888-8888-888888888888',
-                   '33333333-3333-4333-8333-333333333333',
-                   '55555555-5555-4555-8555-555555555555',
-                   'page', 'body')
+           INSERT INTO content_assets (id, business_id, organization_id, service_id, kind, body)
+           SELECT '88888888-8888-4888-8888-888888888888',
+                  '33333333-3333-4333-8333-333333333333', org_alice,
+                  '55555555-5555-4555-8555-555555555555',
+                  'page', 'body'
+             FROM t
        $sql$),
        'alice pointing her asset at bob''s service';
 
@@ -182,16 +186,18 @@ SELECT 3, 'content_assets: service_id may point at another tenant''s service',
 -- would make this check pass the moment the default flips to false, while the
 -- schema still happily accepted two explicit primaries.
 
-INSERT INTO business_locations (id, business_id, label, is_primary) VALUES
-    ('99999999-9999-4999-8999-999999999991',
-     '33333333-3333-4333-8333-333333333333', 'One', true);
+INSERT INTO business_locations (id, business_id, organization_id, label, is_primary)
+SELECT '99999999-9999-4999-8999-999999999991',
+       '33333333-3333-4333-8333-333333333333', org_alice, 'One', true
+  FROM t;
 
 INSERT INTO defect_report
 SELECT 4, 'business_locations: several locations can be primary at once',
        pg_temp.accepted($sql$
-           INSERT INTO business_locations (id, business_id, label, is_primary)
-           VALUES ('99999999-9999-4999-8999-999999999992',
-                   '33333333-3333-4333-8333-333333333333', 'Two', true)
+           INSERT INTO business_locations (id, business_id, organization_id, label, is_primary)
+           SELECT '99999999-9999-4999-8999-999999999992',
+                  '33333333-3333-4333-8333-333333333333', org_alice, 'Two', true
+             FROM t
        $sql$),
        'a second explicit primary for the same business';
 
@@ -288,10 +294,11 @@ SELECT 7, 'a child row may carry an organization_id its parent does not have',
 INSERT INTO defect_report
 SELECT 8, 'a grandchild may reference a location belonging to another business',
        pg_temp.accepted($sql$
-           INSERT INTO competitors (id, business_id, location_id, name)
-           VALUES ('cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-                   '33333333-3333-4333-8333-333333333333',
-                   'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Crossed')
+           INSERT INTO competitors (id, business_id, organization_id, location_id, name)
+           SELECT 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+                  '33333333-3333-4333-8333-333333333333', org_alice,
+                  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Crossed'
+             FROM t
        $sql$),
        'alice pointing her competitor at a location of bob''s business';
 
@@ -492,40 +499,47 @@ SELECT 12, 'a tenant column can still hold NULL after the contract migration',
   ) nulables;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 13. Los diez triggers que llenan el tenant siguen en pie
+-- 13. El tenant lo pone la aplicación, no un trigger
 -- ─────────────────────────────────────────────────────────────────────────────
--- QUÉ CUIDA, y es lo contrario de lo habitual: acá el defecto sería que los
--- triggers NO estén.
+-- QUÉ CUIDA. Este bloque estuvo dado vuelta hasta la 0012, y el motivo de que
+-- lo estuviera vale conservarlo: mientras la aplicación no mandaba
+-- `organization_id`, borrar los diez triggers no fallaba en el despliegue —
+-- empezaba a escribir filas sin tenant, en silencio. Un fallo silencioso es
+-- peor que uno ruidoso, así que el bloque hacía ruido por la AUSENCIA.
 --
--- fill_organization_id_from_business() llena organization_id en diez tablas
--- hijas, y la aplicación depende de eso: medido, supabaseTenantStore.ts:236
--- inserta en business_locations con business_id y sin organization_id, y la
--- misma forma se repite en business_services, competitors, content_assets,
--- reports y reviews. Seis sitios de INSERT vivos.
+-- Ese requisito se invirtió, y no por decreto: el PR #23 hizo que los seis
+-- sitios de INSERT manden la columna, `tenantOnInsert.test.ts` los obliga a
+-- seguir mandándola, y el commit estuvo sirviendo en producción antes de que
+-- la 0012 borrara nada.
 --
--- Borrarlos antes de que la aplicación mande la columna no falla en el
--- despliegue: empieza a escribir filas sin tenant, que es exactamente el
--- defecto que 0003 vino a cerrar. Un fallo silencioso es peor que uno ruidoso,
--- así que este bloque hace ruido.
+-- Ahora el defecto es que sigan ahí. Un trigger que llena el tenant vuelve a
+-- convertir la garantía en *"algo va a llegar primero"*, que es exactamente lo
+-- que ninguna migración puede validar.
 --
--- El día que la aplicación mande organization_id explícitamente, este bloque
--- hay que darlo vuelta a mano — y eso es deliberado: que borrar los triggers
--- exija tocar la suite es la forma de que nadie los borre de paso.
+-- Se mira la función además de los triggers. Un trigger huérfano no puede
+-- existir sin ella, pero la función sí puede sobrevivir sin triggers, y
+-- mientras exista alcanza un `CREATE TRIGGER` de una línea para deshacer todo
+-- esto sin que la suite lo note.
 
 INSERT INTO defect_report
-SELECT 13, 'the ten triggers that fill the tenant are gone before the app sends it',
-       count(*) <> 10,
-       CASE WHEN count(*) = 10
-            THEN 'the ten fill triggers are in place'
-            ELSE 'expected 10 fill triggers, found ' || count(*) ||
-                 CASE WHEN count(*) = 0 THEN ' — child rows can now be written with no tenant'
-                      ELSE ': ' || COALESCE(string_agg(c.relname, ', ' ORDER BY c.relname), '')
-                 END
+SELECT 13, 'the tenant is filled by a trigger instead of by the application',
+       count(*) <> 0,
+       CASE WHEN count(*) = 0
+            THEN 'no fill trigger and no fill function remain: the application sends the tenant'
+            ELSE 'still present: ' || string_agg(que, ', ' ORDER BY que)
             END
-  FROM pg_trigger t
-  JOIN pg_class c ON c.oid = t.tgrelid
-  JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgname LIKE '%fill_org%';
+  FROM (
+    SELECT 'trigger on ' || c.relname AS que
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgname LIKE '%fill_org%'
+    UNION ALL
+    SELECT 'function ' || p.proname
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public' AND p.proname = 'fill_organization_id_from_business'
+  ) sobrantes;
 
 -- ──────────────────────────────────────────────────────────────────────────────
 -- 14. La llave pública puede escribir en alguna tabla
