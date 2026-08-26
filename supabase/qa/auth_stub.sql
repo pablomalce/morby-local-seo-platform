@@ -54,3 +54,28 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Los default privileges que Supabase deja puestos sobre `public`, que es la
+-- diferencia que hacía a la réplica MÁS SEGURA que la base real.
+--
+-- En un proyecto de Supabase, todo objeto que se cree después en `public` nace
+-- con GRANT ALL para los tres roles, porque el proyecto los trae de fábrica. En
+-- una PostgreSQL pelada no, así que una migración que confiaba en que "nadie
+-- tiene permiso hasta que se lo doy" pasaba verde acá y dejaba el permiso
+-- abierto en hosted.
+--
+-- Medido contra `tpqiltnskfeycnybczgz` el 2026-08-26: los tiene puestos para
+-- tablas, funciones y secuencias, los tres roles. Esta réplica no los tenía.
+--
+-- Es el mismo cambio que Lead Engine hizo ese día, y allá encontró que `anon`
+-- tenía UPDATE sobre las doce secuencias de `public` sin que ninguna migración
+-- lo otorgara. Acá no hay secuencias todavía, así que lo que se corrige es la
+-- ceguera antes de que haya algo que esconder.
+--
+-- Una sentencia por tipo de objeto: PostgreSQL no acepta la lista junta.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;

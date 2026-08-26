@@ -116,12 +116,44 @@ SELECT 'grant ' || c.relname || ' ' || pg_get_userbyid(a.grantee) || ' ' || a.pr
    AND pg_get_userbyid(a.grantee) IN ('anon','authenticated','service_role')
 
 UNION ALL
--- El rol de QA no es parte del esquema: supabase/qa/app_role.sql le da EXECUTE
--- sobre todo `public` después de las migraciones, y si contara acá la huella
--- local nunca podría coincidir con la de una base donde ese rol no existe.
+-- Las secuencias, que hasta el 2026-08-26 estaban FUERA de la huella entera:
+-- sólo se miraba relkind='r'. Acá todavía no hay ninguna —este esquema usa uuid
+-- en todas sus claves— así que estas tres cláusulas no cambian ningún número
+-- hoy. Se agregan igual, y el conteo es la razón: una categoría SIN filas
+-- desaparece del resultado en vez de decir cero, así que la primera columna
+-- `bigserial` que alguien agregue nacería con los permisos que los default
+-- privileges de Supabase reparten y **nada lo diría**. En Lead Engine eso fue
+-- `anon` con UPDATE sobre doce secuencias, invisible mientras `deriva` reportaba
+-- "813 objetos idénticos".
+SELECT 'conteo secuencias: ' || count(*)
+  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE n.nspname='public' AND c.relkind='S'
+
+UNION ALL
+SELECT 'conteo grants secuencia: ' || count(*)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+       LATERAL aclexplode(c.relacl) a
+ WHERE n.nspname='public' AND c.relkind='S'
+   AND pg_get_userbyid(a.grantee) IN ('anon','authenticated','service_role')
+
+UNION ALL
+SELECT 'grant secuencia ' || c.relname || ' ' || pg_get_userbyid(a.grantee) || ' ' || a.privilege_type
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+       LATERAL aclexplode(c.relacl) a
+ WHERE n.nspname='public' AND c.relkind='S'
+   AND pg_get_userbyid(a.grantee) IN ('anon','authenticated','service_role')
+
+UNION ALL
+-- `growthos_app` SÍ es parte del esquema acá, y la línea que lo excluía estaba
+-- mal por partida doble. Filtraba `leadengine_qa`, que es el rol del OTRO repo y
+-- en esta base no existe —código muerto llegado por copia—, y su comentario
+-- decía que el rol de QA no cuenta. Medido el 2026-08-26 contra
+-- `tpqiltnskfeycnybczgz`: `growthos_app` existe EN HOSTED, NOLOGIN y
+-- NOBYPASSRLS. O sea que no es un artefacto de la réplica: es un rol de
+-- aplicación real, y esconderlo de la huella habría ocultado deriva de verdad
+-- el día que sus grants cambiaran de un lado y no del otro.
 SELECT 'execute ' || p.proname || ' ' ||
-       coalesce((SELECT string_agg(e, ' ') FROM unnest(p.proacl::text[]) e
-                  WHERE e NOT LIKE 'leadengine\_qa=%'), 'default')
+       coalesce(array_to_string(p.proacl::text[], ' '), 'default')
   FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='public' AND NOT pg_temp.es_de_extension(p.oid)
 
