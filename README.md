@@ -54,7 +54,21 @@ docker exec growthos-replica psql -U postgres -d growthos \
 ```
 
 `replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
-order, with the auth objects stubbed from the same file the CI job uses.
+order, with the auth objects stubbed from the same file the CI job uses — and
+since 2026-08-26 that stub also sets **Supabase's default privileges**, so the
+replica starts where the hosted project starts. Without them the replica was
+BUILT SAFER THAN PRODUCTION: in a Supabase project every new object in `public`
+is born with `GRANT ALL` for `anon`, `authenticated` and `service_role`, and on
+a bare PostgreSQL it is born with nothing, so a migration relying on *"nobody
+has permission until I grant it"* passed green here and left the permission open
+there.
+
+Measured when it was added: **zero lines of the fingerprint moved.** This repo's
+migrations declare their ACLs explicitly enough that the change of starting
+point reveals nothing — which is the answer to whether these checks were
+measuring the replica or the product. The same change in Lead Engine moved
+twelve lines and uncovered `anon` holding `UPDATE` on all twelve of its
+sequences.
 `defects_test.sql` then runs nineteen isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
 every policy that is not FORCEd. Exit 0 means the schema refuses all nineteen.
