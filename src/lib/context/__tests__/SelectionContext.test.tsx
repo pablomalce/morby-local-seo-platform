@@ -153,7 +153,7 @@ describe("SelectionProvider", () => {
     expect(
       selected(),
       "a fresh visitor must not arrive already inside somebody's tenant"
-    ).toBe("(none)");
+    ).toBe("ROTO A PROPOSITO — prueba de la barrera")");
   });
 
   it("restores a saved selection instead of losing it on mount", async () => {
