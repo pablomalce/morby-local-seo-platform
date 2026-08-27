@@ -36,7 +36,30 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" \
     -e POSTGRES_PASSWORD=growthos -e POSTGRES_DB=growthos \
     -p "$PORT:5432" "$IMAGE" >/dev/null
-until docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
+# Esperar a que la BASE responda, no a que el servidor acepte conexiones. No es
+# lo mismo: la imagen de postgres levanta un servidor temporal para correr su
+# init y después reinicia con la configuración final, así que hay una ventana en
+# la que `pg_isready` dice que sí y `growthos` todavía no existe o el servidor
+# está por reiniciarse.
+#
+# Medido el 2026-08-26, y no es teórico: con la máquina cargada este script
+# falló DOS VECES SEGUIDAS con `FATAL: database "growthos" does not exist`, y
+# tres de tres bien después con la máquina tranquila. Intermitente, y es el
+# PRIMER comando que `PROMPT_SIGUIENTE_SESION.md` le pide a la sesión siguiente
+# — un arranque que falla bajo carga se lee como un esquema roto.
+#
+# Con límite y no en un `until` pelado: si algo está mal de verdad, esperar para
+# siempre esconde el motivo.
+espera=0
+until docker exec "$CONTAINER" psql -U postgres -d growthos -c 'SELECT 1' >/dev/null 2>&1; do
+    sleep 2
+    espera=$((espera + 2))
+    if [[ "$espera" -ge 60 ]]; then
+        echo "la base growthos no respondió en 60 s. Últimas líneas del contenedor:" >&2
+        docker logs --tail 20 "$CONTAINER" >&2
+        exit 1
+    fi
+done
 
 apply() {
     docker cp "$1" "$CONTAINER:/tmp/apply.sql" >/dev/null
