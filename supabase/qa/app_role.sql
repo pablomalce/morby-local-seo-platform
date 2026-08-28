@@ -33,6 +33,33 @@ $$;
 -- the file on Supabase, where the owner is not a superuser.
 ALTER ROLE growthos_app NOLOGIN PASSWORD NULL;
 
+-- Que quien aplica esto pueda entrar en el rol. Un superusuario hace SET ROLE a
+-- cualquiera sin pedir permiso, y por eso esta línea no hacía falta mientras la
+-- réplica corría sobre `postgres:17`, donde el dueño ERA superusuario. Sobre la
+-- imagen de Supabase —y en hosted— `postgres` no lo es, y la primera corrida
+-- murió en la línea 110 de defects_test.sql con
+-- `permission denied to set role "growthos_app"`.
+--
+-- Desde PostgreSQL 16 la pertenencia a un rol y el derecho a ENTRAR en él son
+-- dos cosas distintas, así que `WITH SET TRUE` no es adorno: sin eso la
+-- pertenencia sola no habilita el SET ROLE.
+--
+-- Es una diferencia que el superusuario escondía, no una que aparezca ahora.
+--
+-- Y el rol se NOMBRA, no se escribe `CURRENT_USER`. La primera versión de esta
+-- línea decía `TO CURRENT_USER` y **voltea el servidor**:
+--
+--     GRANT probe_role TO CURRENT_USER WITH SET TRUE;
+--     server closed the connection unexpectedly
+--     FATAL:  the database system is in recovery mode
+--
+-- Reproducido el 2026-08-28 en dos líneas sobre un contenedor limpio de
+-- supabase/postgres:17.4.1.075, sin nada de este esquema puesto. Con el nombre
+-- escrito, `GRANT ... TO postgres WITH SET TRUE`, funciona y el SET ROLE
+-- después anda. `postgres` es el dueño acá y en hosted, así que nombrarlo no
+-- pierde generalidad.
+GRANT growthos_app TO postgres WITH SET TRUE;
+
 GRANT USAGE ON SCHEMA public, auth TO growthos_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO growthos_app;
 

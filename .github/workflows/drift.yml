@@ -44,10 +44,17 @@ jobs:
     # produce ruido que tapa la señal que este job existe para dar.
     services:
       postgres:
-        image: postgres:17
+        # La imagen de Supabase, no una PostgreSQL pelada. Trae `supabase_vault`
+        # —que hosted tiene y `postgres:17` no—, y con él los roles reales:
+        # `postgres` deja de ser superusuario, como en hosted, y `service_role`
+        # trae su BYPASSRLS de fábrica.
+        #
+        # Sin POSTGRES_DB a propósito: esta imagen crearía esa base con
+        # `supabase_admin` de dueño y entonces `postgres` no podría ni crear un
+        # esquema adentro. La crea el primer paso del job, y así la posee.
+        image: supabase/postgres:17.4.1.075
         env:
           POSTGRES_PASSWORD: growthos
-          POSTGRES_DB: growthos
         ports:
           - 5432:5432
         options: >-
@@ -66,6 +73,15 @@ jobs:
 
       # La referencia contra la cual comparar: el esquema tal como lo construyen
       # las migraciones de este commit, sin intervención de nadie.
+      # La base y el Vault, lo mismo que hace supabase/qa/replica.sh en local.
+      # Van juntos y antes que todo lo demás: el resto del job se conecta con
+      # `-d growthos`, que hasta acá no existe.
+      - name: base growthos, y el Vault
+        run: |
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE growthos"
+          $PSQL -c "CREATE EXTENSION IF NOT EXISTS supabase_vault CASCADE"
+
       - name: construir la referencia desde las migraciones
         run: |
           $PSQL -f supabase/qa/auth_stub.sql
