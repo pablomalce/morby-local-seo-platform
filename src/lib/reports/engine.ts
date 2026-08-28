@@ -12,6 +12,7 @@
  */
 
 import type { BusinessSnapshot } from "@/lib/mock/universal";
+import { type DataSourceKey, labelForSource } from "./dataSources";
 import type {
   ActionOwner,
   DataSourceHealth,
@@ -943,9 +944,12 @@ export function buildReport(
   // se le presentaba con la misma frase que una integración sin conectar:
   // "conectá la integración". Un fallo se leía como una tarea pendiente de
   // configuración, que es justo lo contrario de lo que pasó.
-  const failed = Object.entries(sources)
+  // `labelForSource`, y no la clave: la clave es un identificador de programador
+  // y esta nota es prosa que lee el cliente. `searchConsole` y `ga4` llegaban
+  // así a la pantalla, en los tres idiomas.
+  const failed = (Object.entries(sources) as [DataSourceKey, string][])
     .filter(([, status]) => status === "error")
-    .map(([source]) => source);
+    .map(([source]) => labelForSource(source));
 
   const dataSourceHealth: DataSourceHealth = {
     ...sources,

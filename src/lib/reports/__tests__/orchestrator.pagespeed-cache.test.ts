@@ -26,6 +26,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { DATA_SOURCE_LABELS } from "@/lib/reports/dataSources";
+
 // `server-only` explota fuera de un React Server Component. Es un centinela de
 // build, no lógica: se neutraliza para poder ejercitar el módulo.
 vi.mock("server-only", () => ({}));
@@ -184,7 +186,10 @@ describe("caché de PageSpeed — un fallo no se cachea ni se disfraza", () => {
 
     // El campo `pagespeed: "error"` no lo lee nadie: lo que se muestra es la
     // nota. Si el fallo no llega hasta ahí, para el usuario no ocurrió.
-    expect(rep?.dataSourceHealth.note).toContain("pagespeed");
+    // Con el nombre de producto, no con la clave del objeto: la nota es prosa
+    // que lee el cliente. Esta aserción decía `"pagespeed"` y pasaba porque la
+    // nota se armaba con las claves — clavaba el defecto, no el requisito.
+    expect(rep?.dataSourceHealth.note).toContain(DATA_SOURCE_LABELS.pagespeed);
   });
 
   it("distingue 'sin API key' de 'la API falló'", async () => {
