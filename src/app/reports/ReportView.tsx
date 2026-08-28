@@ -2,6 +2,7 @@
 
 import { AlertOctagon, AlertTriangle, CheckCircle2, Info, Target, TrendingUp } from "lucide-react";
 import { Badge, Card, HudLabel } from "@/components/ui";
+import { DATA_SOURCE_LABELS, displayForStatus } from "@/lib/reports/dataSources";
 import type { Report, ReportIssue } from "@/lib/reports/types";
 
 export function ReportView({ report }: { report: Report }) {
@@ -162,11 +163,11 @@ export function ReportView({ report }: { report: Report }) {
           <div className="flex-1">
             <HudLabel>DATA SOURCE HEALTH</HudLabel>
             <div className="mt-3 grid gap-2 md:grid-cols-2">
-              <DataSourceRow label="Google Places" status={report.dataSourceHealth.places} />
-              <DataSourceRow label="Google PageSpeed" status={report.dataSourceHealth.pagespeed} />
-              <DataSourceRow label="Search Console" status={report.dataSourceHealth.searchConsole} />
-              <DataSourceRow label="Google Business Profile" status={report.dataSourceHealth.gbp} />
-              <DataSourceRow label="Google Analytics 4" status={report.dataSourceHealth.ga4} />
+              <DataSourceRow label={DATA_SOURCE_LABELS.places} status={report.dataSourceHealth.places} />
+              <DataSourceRow label={DATA_SOURCE_LABELS.pagespeed} status={report.dataSourceHealth.pagespeed} />
+              <DataSourceRow label={DATA_SOURCE_LABELS.searchConsole} status={report.dataSourceHealth.searchConsole} />
+              <DataSourceRow label={DATA_SOURCE_LABELS.gbp} status={report.dataSourceHealth.gbp} />
+              <DataSourceRow label={DATA_SOURCE_LABELS.ga4} status={report.dataSourceHealth.ga4} />
             </div>
             <p className="mt-3 text-[12px] text-metal-400">{report.dataSourceHealth.note}</p>
           </div>
@@ -277,13 +278,7 @@ function StateCell({
 }
 
 function DataSourceRow({ label, status }: { label: string; status: string }) {
-  const config: Record<string, { color: string; text: string }> = {
-    live: { color: "text-emerald-400", text: "● LIVE" },
-    demo: { color: "text-vulkan-orange", text: "○ DEMO" },
-    missing: { color: "text-metal-500", text: "○ NOT CONNECTED" },
-    error: { color: "text-red-400", text: "● ERROR" },
-  };
-  const c = config[status] ?? config.missing;
+  const c = displayForStatus(status);
   return (
     <div className="flex items-center justify-between rounded-vulkan border border-metal-800 bg-metal-900 px-3 py-2">
       <span className="font-mono text-[11px] uppercase tracking-hud text-metal-400">{label}</span>
