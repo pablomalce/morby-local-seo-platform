@@ -1,4 +1,4 @@
--- Nineteen isolation checks against the Growth OS schema — executable.
+-- Twenty-five isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -791,10 +791,252 @@ SELECT 19, 'a plain member can administer the memberships of their organization'
        'dave, an active editor, adding frank as owner of the organization';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la 0014 — un token de bob, con su secreto en el Vault
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Como dueño: `service_role` es quien escribe tokens en producción y es el único
+-- con USAGE sobre `vault`. Que el fixture use la ruta real —crear el secreto en
+-- el Vault y guardar SÓLO su id— es lo que hace que el bloque 22 mida algo: si
+-- el fixture guardara el token en una columna, estaría midiendo su propio
+-- descuido y no el esquema.
+RESET ROLE;
+
+CREATE TEMP TABLE tok AS
+SELECT vault.create_secret(
+           'ya29.SECRETO-DE-PRUEBA-NO-REAL',
+           'integration_token/prueba',
+           'fixture de defects_test.sql'
+       ) AS secret_id;
+
+GRANT SELECT ON tok TO growthos_app;
+
+INSERT INTO integration_tokens (organization_id, provider, secret_id, expires_at)
+SELECT t.org_bob, 'google', tok.secret_id, now() + interval '30 days'
+  FROM t, tok;
+
+-- Y una usuaria nueva para el bloque 20, que no es de ninguna organización salvo
+-- la suya.
+--
+-- NO se usa alice, y la primera versión de este bloque sí la usaba: la corrida
+-- reportó el defecto 20 como vivo, y tenía razón — el bloque 5 le da a alice una
+-- membresía en la organización de bob, así que a esta altura del archivo alice
+-- VE las cosas de bob con todo derecho. El bloque no medía aislamiento: medía
+-- una membresía que el propio archivo le había dado quince bloques antes.
+--
+-- Tampoco se reusa erin, que ya existe. Su membresía depende del RESULTADO del
+-- bloque 16 —es a quien carol archivada intenta dar de alta—, así que un día que
+-- ese bloque regrese, este otro cambiaría de fixture sin que nadie lo toque.
+-- Grace no la nombra ningún otro bloque.
+--
+-- Entra por auth.users como todos los demás: handle_new_user() le da su
+-- organización y su membresía de owner, que es el camino real de alta.
+INSERT INTO auth.users (id, email) VALUES
+    ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'grace@example.test');
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20. Un tenant llega al token de otro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el eje de organización valga también para la tabla más cara del
+-- esquema. Un lead filtrado es un lead; un token filtrado es la cuenta de Google
+-- de otro cliente, con los permisos que haya otorgado.
+--
+-- alice no tiene nada que ver con bob. Que la fila sea invisible cuenta igual que
+-- que sea rechazada, como en todo este archivo — lo que no puede pasar es que la
+-- alcance.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 20, 'a tenant can reach another tenant''s integration token',
+       count(*) > 0,
+       'grace sees ' || count(*) || ' of bob''s tokens; must see 0'
+  FROM integration_tokens;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 21. Vencido y revocado se leen igual
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el esquema distinga dos situaciones que piden acciones
+-- opuestas. Un token vencido se refresca solo, sin molestar al cliente; uno
+-- revocado no se refresca nunca y necesita que el cliente vuelva a conectar.
+--
+-- Es el mismo defecto que #46 arregló una capa más arriba, donde una API caída
+-- se leía como una integración sin conectar. Acá el precio de confundirlos es un
+-- reintento infinito contra un token que ninguna cantidad de refrescos revive.
+--
+-- Y el cuarto caso es el que se escribe mal solo: revocado Y vencido a la vez.
+-- Tiene que decir 'revoked'. Un CASE con las ramas al revés lo llamaría
+-- 'expired' y mandaría a refrescar algo que ya no existe — y los otros tres
+-- casos seguirían dando bien, que es por qué está escrito aparte.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 21, 'expired and revoked are not told apart',
+       -- Dos condiciones, y hacen falta las dos. Que los tres estados sean
+       -- distintos no dice nada sobre cuál gana cuando se dan juntos, y que la
+       -- revocación domine no sirve si 'expired' y 'revoked' son la misma
+       -- palabra.
+       cardinality(ARRAY(SELECT DISTINCT unnest(estados))) <> 3
+       OR ambos <> 'revoked',
+       'active/expired/revoked dan ' || array_to_string(estados, '/') ||
+       '; revocado y vencido a la vez da ' || ambos
+  FROM (
+    SELECT ARRAY[
+             public.integration_token_state(now() + interval '1 day', NULL),
+             public.integration_token_state(now() - interval '1 day', NULL),
+             public.integration_token_state(now() + interval '1 day', now())
+           ] AS estados,
+           public.integration_token_state(now() - interval '1 day', now()) AS ambos
+  ) q;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 22. El secreto del cliente se puede leer fuera del Vault
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo único que hace que esta tabla sea segura de tener. El token no
+-- está en `public` en ninguna forma, y la ruta al Vault no está abierta para la
+-- llave que viaja en el navegador.
+--
+-- Las dos mitades, porque cada una sola miente:
+--
+--   * una columna en claro sería un desastre aunque el Vault estuviera cerrado;
+--   * y el Vault abierto a `authenticated` haría inútil que la columna no exista.
+--
+-- La primera no se pregunta por el NOMBRE de una columna —que se elude
+-- llamándola de otra manera— sino volcando la fila entera a texto y buscando el
+-- secreto adentro. Da igual cómo se llame la columna o de qué tipo sea.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 22, 'the client''s token is readable outside the vault',
+       en_claro > 0 OR alcance > 0,
+       CASE
+         WHEN en_claro > 0 THEN 'hay ' || en_claro || ' filas con el secreto en claro '
+                                'o columnas de texto de más en public.integration_tokens'
+         WHEN alcance > 0  THEN 'anon/authenticated alcanzan el esquema vault en ' ||
+                                alcance || ' lugar(es)'
+         ELSE 'el secreto sólo existe cifrado en vault, y anon/authenticated no llegan'
+       END
+  FROM (
+    SELECT
+      -- Dos cosas, y la segunda apareció por una mutación que sobrevivió a la
+      -- primera. Buscar el secreto en la fila sólo encuentra un secreto que YA
+      -- se filtró: agregar una columna `secret_plano text` y no escribir nada en
+      -- ella pasaba en verde, y esa columna es precisamente la invitación.
+      --
+      -- Así que además se cuentan las columnas capaces de guardar texto. `provider`
+      -- es la única que debe haber; cualquier otra obliga a mirar por qué está.
+      -- Es el mismo denominador a mano que los bloques 1 y 5 tienen con el total
+      -- de tablas.
+      (SELECT count(*) FROM public.integration_tokens x
+        WHERE x::text LIKE '%ya29.SECRETO-DE-PRUEBA-NO-REAL%')
+      + (SELECT count(*) FROM information_schema.columns c
+          WHERE c.table_schema = 'public' AND c.table_name = 'integration_tokens'
+            AND c.data_type IN ('text', 'character varying', 'bytea')
+            AND c.column_name <> 'provider') AS en_claro,
+      (SELECT count(*)
+         FROM information_schema.role_table_grants
+        WHERE table_schema = 'vault' AND grantee IN ('anon', 'authenticated'))
+      + (SELECT count(*) FROM pg_namespace n
+          WHERE n.nspname = 'vault'
+            AND (has_schema_privilege('anon', n.oid, 'USAGE')
+              OR has_schema_privilege('authenticated', n.oid, 'USAGE'))) AS alcance
+  ) q;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 23. El rol del navegador puede escribir un token
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que guardar un token siga siendo cosa del servidor. La 0014 le da a
+-- `authenticated` SÓLO SELECT — escribir uno es consecuencia de un intercambio
+-- OAuth, que ocurre con `service_role` y del lado de allá. Una sesión de
+-- navegador que pueda INSERTAR acá puede apuntar una organización a un secreto
+-- que ella eligió.
+--
+-- Existe porque una mutación sobrevivió: sacarle a `growthos_app` el REVOKE de
+-- escritura no rompía nada, ya que el bloque 20 sólo LEE. Un privilegio de más
+-- no se nota leyendo.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 23, 'the browser-side role can write an integration token',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_tokens (organization_id, provider, secret_id, expires_at)
+           VALUES (%L, 'google', %L, now() + interval '30 days')
+       $sql$, (SELECT organization_id FROM org_members
+                WHERE user_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'),
+              (SELECT secret_id FROM tok))),
+       'grace, from a browser session, storing a token for her OWN organization';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 24. Una policy permisiva nueva ensancha el acceso a los tokens
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo único que la policy RESTRICTIVE compra, y que ninguna otra cosa
+-- compra.
+--
+-- Las permisivas se combinan con OR: agregar una más laxa ENSANCHA el acceso, y
+-- así es como esto se rompe en la vida real — alguien agrega una policy para un
+-- caso nuevo y se lleva puesto el aislamiento sin darse cuenta. Las restrictivas
+-- se combinan con AND y no se pueden anular agregando policies.
+--
+-- El bloque lo mide en vez de afirmarlo: agrega la policy más laxa que existe
+-- —`USING (true)`— y vuelve a preguntar. Con la restrictiva puesta, grace sigue
+-- sin ver nada de bob. Sin ella, ve todo.
+--
+-- Existe porque una mutación sobrevivió: borrar la policy restrictiva dejaba los
+-- veintitrés bloques en verde, porque la permisiva sola también aísla. Aísla
+-- HOY, que es otra cosa.
+
+RESET ROLE;
+CREATE POLICY "tokens_mutacion_permisiva" ON public.integration_tokens
+    FOR SELECT USING (true);
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 24, 'a new permissive policy widens access to another tenant''s tokens',
+       count(*) > 0,
+       'con una policy USING (true) agregada, grace ve ' || count(*) ||
+       ' tokens de bob; debe seguir viendo 0'
+  FROM integration_tokens;
+
+RESET ROLE;
+DROP POLICY "tokens_mutacion_permisiva" ON public.integration_tokens;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 25. Una organización puede tener dos tokens vivos del mismo proveedor
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que revocar sirva de algo.
+--
+-- Parece una regla de prolijidad y no lo es. Si una organización puede tener dos
+-- tokens de Google vivos a la vez, revocar uno deja el otro andando y el código
+-- —que busca "el token de esta organización"— puede tomar cualquiera de los dos.
+-- La revocación pasa a ser una anotación en una fila que nadie garantiza que sea
+-- la que se usa.
+--
+-- Lo sostiene un índice único PARCIAL, `WHERE revoked_at IS NULL`: uno vivo, y
+-- los revocados se acumulan para poder auditar quién tuvo acceso y hasta cuándo.
+--
+-- Existe porque una mutación sobrevivió: cambiar ese índice por uno común dejaba
+-- los veinticuatro bloques en verde.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 25, 'one organization can hold two live tokens for the same provider',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_tokens (organization_id, provider, secret_id, expires_at)
+           VALUES (%L, 'google', %L, now() + interval '60 days')
+       $sql$, (SELECT org_bob FROM t), (SELECT secret_id FROM tok))),
+       'un segundo token de google, vivo, para la organización de bob';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: nineteen checks were written, so nineteen rows must be present. Fewer
--- means a check silently failed to record and the report is lying by omission.
+-- Anti-vacuity: twenty-five checks were written, so twenty-five rows must be present.
+-- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
 DECLARE
@@ -803,8 +1045,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 19 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 19 checks recorded a result.', checks;
+    IF checks <> 25 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 25 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -815,11 +1057,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 19 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 25 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 19 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 25 checks green: the schema prevents every one of them.';
 END
 $$;
 

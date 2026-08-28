@@ -75,5 +75,26 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO growthos_
 -- que sobre en la base es invisible para el job de deriva. Medido el
 -- 2026-08-21: hosted tenía el DELETE y la comparación daba verde igual.
 REVOKE DELETE ON public.org_members FROM growthos_app;
+
+-- Lo mismo para los tokens, por el mismo motivo. La 0014 le da a `authenticated`
+-- SÓLO SELECT sobre integration_tokens: escribir un token es consecuencia de un
+-- intercambio OAuth y ocurre en el servidor, con `service_role`. El GRANT de
+-- arriba es sobre ALL TABLES y le devolvería a este rol un INSERT/UPDATE/DELETE
+-- que la aplicación no tiene, así que el bloque 20 estaría midiendo un rol que
+-- no existe en producción.
+--
+-- Y guardado, a diferencia del REVOKE de arriba. `rollback.sh` aplica este
+-- archivo sobre el esquema tal como estaba ANTES de la migración que prueba, así
+-- que al probar la 0014 lo corre cuando integration_tokens todavía no existe.
+-- Sin la guarda, el script muere con `relation "public.integration_tokens" does
+-- not exist` y ninguna migración nueva se puede volver a probar. org_members no
+-- necesita esto porque existe desde la 0001.
+DO $$
+BEGIN
+    IF to_regclass('public.integration_tokens') IS NOT NULL THEN
+        REVOKE INSERT, UPDATE, DELETE ON public.integration_tokens FROM growthos_app;
+    END IF;
+END
+$$;
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;

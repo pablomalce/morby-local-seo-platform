@@ -63,6 +63,14 @@ echo "==> base limpia"
 docker exec "$CONTAINER" psql -U postgres -d postgres -q \
     -c "DROP DATABASE IF EXISTS $DB" -c "CREATE DATABASE $DB" >/dev/null
 
+# El Vault, igual que replica.sh. Las extensiones son POR BASE, así que una base
+# recién creada no lo tiene aunque el contenedor sí. Lo pidió la 0014, que
+# referencia vault.secrets: sin esta línea el script muere con
+# `schema "vault" does not exist` al aplicarla, y el .down de cualquier migración
+# posterior a ella deja de poder probarse.
+docker exec "$CONTAINER" psql -U postgres -d "$DB" -q \
+    -c "CREATE EXTENSION IF NOT EXISTS supabase_vault CASCADE" >/dev/null
+
 echo "==> migraciones anteriores a $MIG"
 aplicar "$REPO_ROOT/supabase/qa/auth_stub.sql"
 for f in "$REPO_ROOT"/supabase/migrations/*.sql; do
