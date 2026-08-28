@@ -1,4 +1,4 @@
--- Twenty-five isolation checks against the Growth OS schema — executable.
+-- Thirty-one isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -1033,9 +1033,220 @@ SELECT 25, 'one organization can hold two live tokens for the same provider',
        'un segundo token de google, vivo, para la organización de bob';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la 0015 — un borrador de bob
+-- ─────────────────────────────────────────────────────────────────────────────
+RESET ROLE;
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT '77777777-7777-4777-8777-777777777777', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Bob post', 'cuerpo original', 'draft'
+  FROM t;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 26. Un asset sin aprobar se puede publicar
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la puerta de F3, primera mitad — *un asset no aprobado NO PUEDE
+-- publicarse aunque se llame la ruta directamente*.
+--
+-- El vocabulario de `status` existía desde la 0001 y no obligaba a nada: el CHECK
+-- decía que 'published' se escribe así, no que se pueda llegar ahí. Un
+-- `UPDATE ... SET status = 'published'` sobre un borrador pasaba.
+--
+-- Y se prueba por SQL directo, no por la aplicación, porque "aunque se llame la
+-- ruta directamente" es literalmente el texto de la puerta: una regla que vive en
+-- el código se saltea llamando a PostgREST.
+
+INSERT INTO defect_report
+SELECT 26, 'an unapproved asset can be published',
+       pg_temp.accepted($sql$
+           UPDATE content_assets SET status = 'published'
+            WHERE id = '77777777-7777-4777-8777-777777777777'
+       $sql$),
+       'un borrador pasando directo a published, sin aprobación de nadie';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 27. Un cambio post-aprobación sigue publicable
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la segunda mitad de la puerta — *un cambio post-aprobación lo
+-- devuelve a borrador*.
+--
+-- Es el defecto más caro de los dos: aprobar y después reescribir el cuerpo
+-- publica algo que nadie leyó, con el sello de alguien que aprobó otra cosa. La
+-- aprobación queda apuntando a un texto que ya no existe.
+--
+-- El bloque no mide el rechazo sino el ESTADO en el que queda la fila: el trigger
+-- la devuelve a 'draft', y eso es lo que la espina pide. Que además sea imposible
+-- publicarla es el bloque 28.
+
+RESET ROLE;
+
+-- Se aprueba de verdad: el hash de lo aprobado tiene que ser el del payload de
+-- ese momento, o el CHECK rechaza la aprobación misma.
+UPDATE content_assets
+   SET status = 'approved',
+       approved_by = '22222222-2222-4222-8222-222222222222',
+       approved_at = now(),
+       approved_hash = payload_hash
+ WHERE id = '77777777-7777-4777-8777-777777777777';
+
+-- Anti-vacuidad: si la aprobación no quedó, lo de abajo mide otra cosa.
+DO $$
+DECLARE st text;
+BEGIN
+    SELECT status INTO st FROM content_assets
+     WHERE id = '77777777-7777-4777-8777-777777777777';
+    IF st <> 'approved' THEN
+        RAISE EXCEPTION
+            'Vacuous check 27: el asset quedó en %, no en approved. '
+            'Sin la aprobación puesta, el cambio de abajo no prueba nada.', st;
+    END IF;
+END
+$$;
+
+UPDATE content_assets SET body = 'cuerpo reescrito DESPUÉS de aprobar'
+ WHERE id = '77777777-7777-4777-8777-777777777777';
+
+INSERT INTO defect_report
+SELECT 27, 'a post-approval edit keeps the asset publishable',
+       status <> 'draft' OR approved_hash IS NOT NULL,
+       'tras reescribir el cuerpo el asset quedó en ' || status ||
+       ' con approved_hash ' || coalesce(approved_hash, 'NULL') ||
+       '; debe quedar en draft y sin sello'
+  FROM content_assets
+ WHERE id = '77777777-7777-4777-8777-777777777777';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 28. La negativa del 26 y el 27 la sostiene un trigger, no el esquema
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que los dos bloques de arriba sigan significando algo el día que
+-- alguien tire el trigger.
+--
+-- Es la misma pregunta que el bloque 9 le hace al bloque 5, y por el mismo
+-- motivo: una negativa que depende de un trigger se cae en un `DROP TRIGGER` de
+-- una línea, y la suite queda verde hasta que alguien lo note.
+--
+-- Acá el reparto es deliberado: el CHECK es la garantía y el trigger es la
+-- comodidad. Sin trigger, un cambio post-aprobación se RECHAZA en vez de
+-- degradarse — más estricto, no menos. Este bloque lo tira y comprueba que
+-- publicar sigue siendo imposible.
+
+RESET ROLE;
+DROP TRIGGER trg_content_assets_reset_approval ON public.content_assets;
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT '88888888-8888-4888-8888-888888888888', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Otro post', 'otro cuerpo', 'draft'
+  FROM t;
+
+INSERT INTO defect_report
+SELECT 28, 'without the trigger, an unapproved asset becomes publishable again',
+       pg_temp.accepted($sql$
+           UPDATE content_assets SET status = 'published'
+            WHERE id = '88888888-8888-4888-8888-888888888888'
+       $sql$),
+       'con el trigger tirado, un borrador pasando a published: lo tiene que '
+       'seguir impidiendo el CHECK, que es la garantía';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 29. Sin el trigger, un cambio post-aprobación queda publicable
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la mitad del CHECK que compara el hash aprobado con el actual, que
+-- es la que impide publicar contenido que cambió después de aprobarse.
+--
+-- Corre en la misma ventana sin trigger que el 28, y por eso está acá y no más
+-- arriba: con el trigger puesto, editar degrada la fila a borrador y el CHECK
+-- nunca llega a opinar. Sacado el trigger, la única defensa que queda es la
+-- comparación de hashes — y esta es la única forma de ejercitarla.
+--
+-- Existe porque una mutación sobrevivió: cambiar `approved_hash = payload_hash`
+-- por `true` dejaba los veintiocho bloques en verde.
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT '99999999-9999-4999-8999-999999999999', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Tercer post', 'cuerpo aprobado', 'draft'
+  FROM t;
+
+UPDATE content_assets
+   SET status = 'approved',
+       approved_by = '22222222-2222-4222-8222-222222222222',
+       approved_at = now(),
+       approved_hash = payload_hash
+ WHERE id = '99999999-9999-4999-8999-999999999999';
+
+INSERT INTO defect_report
+SELECT 29, 'without the trigger, an edited-after-approval asset stays publishable',
+       pg_temp.accepted($sql$
+           UPDATE content_assets SET body = 'cuerpo cambiado sin que nadie lo apruebe'
+            WHERE id = '99999999-9999-4999-8999-999999999999'
+       $sql$),
+       'sin trigger, reescribir el cuerpo de un asset aprobado: lo tiene que '
+       'rechazar el CHECK, comparando el hash aprobado con el actual';
+
+CREATE TRIGGER trg_content_assets_reset_approval
+    BEFORE UPDATE ON public.content_assets
+    FOR EACH ROW
+    EXECUTE FUNCTION public.content_assets_reset_approval();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 30. Un borrador puede arrastrar el sello de una aprobación vieja
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la otra mitad del CHECK, la rama ELSE. Un estado que no implica
+-- aprobación no puede conservar `approved_hash`, `approved_by` ni `approved_at`.
+--
+-- Si pudiera, el camino para saltear la revisión sería trivial: bajar a
+-- 'draft' con el sello puesto y volver a subir. La aprobación se convierte en
+-- algo que se consigue una vez y vale para siempre.
+--
+-- Existe porque una mutación sobrevivió: reemplazar esa rama por `true` dejaba
+-- los veintinueve bloques en verde.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 30, 'a draft can carry the seal of an old approval',
+       pg_temp.accepted($sql$
+           UPDATE content_assets
+              SET status = 'draft',
+                  approved_hash = payload_hash,
+                  approved_by = '22222222-2222-4222-8222-222222222222',
+                  approved_at = now()
+            WHERE id = '99999999-9999-4999-8999-999999999999'
+       $sql$),
+       'un borrador conservando approved_hash, approved_by y approved_at';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 31. Se puede aprobar sin que quede quién aprobó
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la aprobación tenga dueño. La puerta de F4 pide *registro de
+-- quién aprobó qué y cuándo*, y sin esto la 0015 dejaría aprobar con el hash
+-- puesto y la firma vacía — una aprobación que nadie hizo.
+--
+-- Existe porque una mutación sobrevivió: sacarle al CHECK las dos condiciones de
+-- `approved_by` y `approved_at` no rompía ningún bloque, porque todos los demás
+-- aprueban bien.
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Cuarto post', 'cuerpo cuatro', 'draft'
+  FROM t;
+
+INSERT INTO defect_report
+SELECT 31, 'an asset can be approved with nobody recorded as the approver',
+       pg_temp.accepted($sql$
+           UPDATE content_assets
+              SET status = 'approved', approved_hash = payload_hash
+            WHERE id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+       $sql$),
+       'aprobando con el hash puesto y approved_by/approved_at vacíos';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: twenty-five checks were written, so twenty-five rows must be present.
+-- Anti-vacuity: thirty-one checks were written, so thirty-one rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1045,8 +1256,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 25 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 25 checks recorded a result.', checks;
+    IF checks <> 31 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 31 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1057,11 +1268,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 25 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 31 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 25 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 31 checks green: the schema prevents every one of them.';
 END
 $$;
 
