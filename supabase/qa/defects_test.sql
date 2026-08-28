@@ -1,4 +1,4 @@
--- Thirty-one isolation checks against the Growth OS schema — executable.
+-- Thirty-six isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -1244,9 +1244,160 @@ SELECT 31, 'an asset can be approved with nobody recorded as the approver',
        'aprobando con el hash puesto y approved_by/approved_at vacíos';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la 0016 — un asset de bob aprobado de verdad
+-- ─────────────────────────────────────────────────────────────────────────────
+RESET ROLE;
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Post publicable', 'cuerpo aprobado y publicable', 'draft'
+  FROM t;
+
+UPDATE content_assets
+   SET status = 'approved',
+       approved_by = '22222222-2222-4222-8222-222222222222',
+       approved_at = now(),
+       approved_hash = payload_hash
+ WHERE id = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+
+INSERT INTO publications (organization_id, asset_id, approved_hash, destination,
+                          external_id, status, published_at, attempts)
+SELECT org_bob, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+       (SELECT approved_hash FROM content_assets
+         WHERE id = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+       'google_business_profile', 'gbp-post-0001', 'published', now(), 1
+  FROM t;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 32. Un reintento duplica el post en la cuenta del cliente
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la parte de la puerta de F4 que dice *un reintento que demuestre que
+-- no duplica*.
+--
+-- Es una promesa que el código no puede sostener solo. Dos procesos que consultan
+-- "¿ya lo publiqué?" y después insertan pasan LOS DOS por el `if`, y el cliente
+-- termina con el mismo post dos veces en su ficha. La única forma de que la
+-- promesa sea cierta es que la base rechace el segundo.
+
+INSERT INTO defect_report
+SELECT 32, 'a retry duplicates the post in the client''s account',
+       pg_temp.accepted($sql$
+           INSERT INTO publications (organization_id, asset_id, approved_hash,
+                                     destination, status, attempts)
+           SELECT organization_id, id, approved_hash, 'google_business_profile', 'pending', 2
+             FROM content_assets WHERE id = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+       $sql$),
+       'un segundo intento de publicar el mismo asset en el mismo destino';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 33. Dos publicaciones pueden reclamar el mismo post de la red
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el id que devolvió la red identifique UNA publicación.
+--
+-- El bloque 32 cuida el lado de acá —un asset, un destino—; éste cuida el lado de
+-- allá. Sin él, dos filas distintas pueden decir que son el post `gbp-post-0001`,
+-- y borrar una dejaría la otra apuntando a algo que ya no existe. Un reintento
+-- que crea una fila NUEVA con el id viejo es exactamente esa forma.
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'dddddddd-2222-4ddd-8ddd-dddddddddddd', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Otro publicable', 'otro cuerpo aprobado', 'draft'
+  FROM t;
+
+UPDATE content_assets
+   SET status = 'approved',
+       approved_by = '22222222-2222-4222-8222-222222222222',
+       approved_at = now(),
+       approved_hash = payload_hash
+ WHERE id = 'dddddddd-2222-4ddd-8ddd-dddddddddddd';
+
+INSERT INTO defect_report
+SELECT 33, 'two publications can claim the same post on the network',
+       pg_temp.accepted($sql$
+           INSERT INTO publications (organization_id, asset_id, approved_hash,
+                                     destination, external_id, status, published_at)
+           SELECT organization_id, id, approved_hash, 'google_business_profile',
+                  'gbp-post-0001', 'published', now()
+             FROM content_assets WHERE id = 'dddddddd-2222-4ddd-8ddd-dddddddddddd'
+       $sql$),
+       'otro asset reclamando el id gbp-post-0001, que ya es de una publicación';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 34. Se puede publicar un asset que nadie aprobó
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la garantía de la 0015 llegue hasta el ledger.
+--
+-- La 0015 impide que el ASSET llegue a 'published'. Esto es otra tabla: sin la FK
+-- compuesta contra `(id, approved_hash)`, se podría anotar la publicación de un
+-- borrador y el registro diría que salió algo que nunca se aprobó — que es
+-- justamente el registro que la puerta de F4 pide que exista.
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'eeeeeeee-3333-4eee-8eee-eeeeeeeeeeee', org_bob,
+       '44444444-4444-4444-8444-444444444444', 'en', 'post',
+       'Borrador', 'sin aprobar', 'draft'
+  FROM t;
+
+INSERT INTO defect_report
+SELECT 34, 'an asset nobody approved can be published',
+       pg_temp.accepted($sql$
+           INSERT INTO publications (organization_id, asset_id, approved_hash,
+                                     destination, status)
+           SELECT organization_id, id, 'un-hash-inventado', 'google_business_profile', 'pending'
+             FROM content_assets WHERE id = 'eeeeeeee-3333-4eee-8eee-eeeeeeeeeeee'
+       $sql$),
+       'publicando un borrador, con un hash que ninguna aprobación produjo';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 35. Una publicación puede decir 'published' sin haber salido
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que 'published' signifique algo. Sin el id que devolvió la red y sin
+-- fecha, la fila dice que el post salió y no hay forma de ir a buscarlo, ni de
+-- borrarlo, ni de saber cuándo fue.
+--
+-- Es el mismo defecto de clase que #46 arregló en el reporte: un estado que
+-- tranquiliza sin respaldarse en nada.
+
+INSERT INTO defect_report
+SELECT 35, 'a publication can claim ''published'' without having gone out',
+       pg_temp.accepted($sql$
+           INSERT INTO publications (organization_id, asset_id, approved_hash,
+                                     destination, status)
+           SELECT organization_id, id, approved_hash, 'google_business_profile', 'published'
+             FROM content_assets WHERE id = 'dddddddd-2222-4ddd-8ddd-dddddddddddd'
+       $sql$),
+       'una publicación en published, sin external_id ni published_at';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 36. Un tenant llega al registro de publicaciones de otro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el eje de organización valga también en el ledger. Dice qué
+-- publica cada cliente, cuándo y con qué id en la red — o sea su calendario de
+-- contenido y sus posts, que es de las cosas más sensibles que guarda el sistema.
+--
+-- Existe porque una mutación sobrevivió: sacarle el `ENABLE ROW LEVEL SECURITY` a
+-- `publications` dejaba los treinta y cinco bloques en verde. El bloque 6, que
+-- mide FORCE, sólo mira tablas que YA tienen RLS activo, así que una tabla sin
+-- RLS del todo se le escapa por definición — su ausencia se lee igual que la
+-- corrección, que es la trampa del bloque 12 en otra forma.
+--
+-- grace no es de ninguna organización salvo la suya, como en el bloque 20.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 36, 'a tenant can reach another tenant''s publication ledger',
+       count(*) > 0,
+       'grace ve ' || count(*) || ' publicaciones de bob; debe ver 0'
+  FROM publications;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: thirty-one checks were written, so thirty-one rows must be present.
+-- Anti-vacuity: thirty-six checks were written, so thirty-six rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1256,8 +1407,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 31 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 31 checks recorded a result.', checks;
+    IF checks <> 36 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 36 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1268,11 +1419,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 31 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 36 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 31 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 36 checks green: the schema prevents every one of them.';
 END
 $$;
 
