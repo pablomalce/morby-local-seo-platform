@@ -111,8 +111,21 @@ VUELTA="$(huella)"
 # revertido, el job de deriva informa "no falta ninguna" sobre una base que sí
 # volvió atrás — que es exactamente la clase de mentira silenciosa por la que
 # existe el job.
+#
+# Y se saltea cuando la tabla todavía no existe, que es el caso de toda migración
+# ANTERIOR a la 0008 — la que la crea. Sin esta guarda, el script no podía probar
+# el .down de ninguna de las siete primeras: moría acá con
+# `relation "public.schema_migrations" does not exist` DESPUÉS de haber
+# comprobado el esquema, o sea informando un error sobre una vuelta atrás que
+# había funcionado.
 echo "==> ¿el registro quedó limpio?"
-REGISTRADA="$(psql_db -tAc "SELECT count(*) FROM public.schema_migrations WHERE version = '$MIG'")"
+HAY_REGISTRO="$(psql_db -tAc "SELECT to_regclass('public.schema_migrations') IS NOT NULL")"
+if [ "$HAY_REGISTRO" != "t" ]; then
+    echo "    (no aplica: schema_migrations no existe antes de la 0008)"
+    REGISTRADA=0
+else
+    REGISTRADA="$(psql_db -tAc "SELECT count(*) FROM public.schema_migrations WHERE version = '$MIG'")"
+fi
 if [ "$REGISTRADA" != "0" ]; then
     echo
     echo "la vuelta atrás revirtió el esquema pero dejó $MIG en schema_migrations." >&2
