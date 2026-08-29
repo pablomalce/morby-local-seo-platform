@@ -18,6 +18,11 @@ import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mo
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
+import {
+  type GoogleSurface,
+  type PropertyMapping,
+  resolveGoogleSource,
+} from "@/lib/integrations/google/sources";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
 import type {
@@ -28,7 +33,7 @@ import type {
   ContentAsset,
   Review,
 } from "@/lib/types/core";
-import type { DataSourceHealth, Report } from "./types";
+import type { DataSourceHealth, DataSourceStatus, Report } from "./types";
 
 /**
  * Client-side snapshot passed from the browser when the tenant lives only in localStorage
@@ -220,6 +225,57 @@ async function hydrateWithPageSpeed(snap: BusinessSnapshot): Promise<DataSourceH
   return "error";
 }
 
+/**
+ * Los mapeos VIVOS de una organización, de `integration_properties`.
+ *
+ * Una consulta para las tres superficies: la 0017 garantiza un mapeo vivo por
+ * organización y proveedor, así que son tres filas como mucho y pedirlas de a
+ * una sería triplicar el costo de cada reporte por nada.
+ *
+ * `organization_id` va escrito aunque la RLS ya lo imponga, por lo mismo que el
+ * INSERT en `reports` lo escribe: la policy es la garantía y el filtro es lo que
+ * hace legible qué se está pidiendo. Y `unmapped_at IS NULL` también, aunque el
+ * índice único sólo alcance a los vivos — el índice impide que haya DOS vivos,
+ * no que se lea uno muerto.
+ *
+ * Un fallo de lectura devuelve la lista vacía y NO rompe el reporte. La
+ * consecuencia es que las tres fuentes salen `client-not-mapped`, que es lo
+ * mismo que dirían si no hubiera mapeo — y eso es una pérdida de precisión
+ * aceptada a cambio de que una integración no tumbe un reporte que las otras
+ * cuatro fuentes pueden llenar igual.
+ */
+async function readPropertyMappings(organizationId: string): Promise<PropertyMapping[]> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("integration_properties")
+    .select("provider, property_ref")
+    .eq("organization_id", organizationId)
+    .is("unmapped_at", null);
+
+  if (error || !data) return [];
+  return data.map((row) => ({
+    provider: row.provider as GoogleSurface,
+    propertyRef: row.property_ref as string,
+  }));
+}
+
+/**
+ * De la resolución al estado que el reporte muestra.
+ *
+ * ACÁ ENCHUFA EL CLIENTE HTTP DE F2, y hasta que exista `ready` es `error`. No
+ * es una elección cómoda y las otras dos son peores: `live` afirmaría datos que
+ * nadie trajo, y `missing` diría «conectá esto» sobre una integración que está
+ * conectada y mapeada — que es exactamente el defecto que arregló el #46, y
+ * volver a introducirlo desde el otro lado sería peor que no haber tocado nada.
+ *
+ * `error` dice lo que pasó: el reporte no consiguió el dato. Cuando el cliente
+ * exista, esta rama lo llama y `statusForOutcome()` traduce la respuesta —
+ * `status.ts` ya fija ese contrato y no hace falta cambiar nada de acá arriba.
+ */
+function statusForResolution(resolution: ReturnType<typeof resolveGoogleSource>): DataSourceStatus {
+  return resolution.ready ? "error" : resolution.status;
+}
+
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
   const result = await loadSnapshot(input);
   if (!result) {
@@ -236,13 +292,20 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
     hydrateWithPageSpeed(result.snapshot),
   ]);
 
+  // Sin sesión no hay mapeo que leer: la tabla es por organización y un reporte
+  // de demostración no tiene ninguna. Las tres salen `missing`, que es lo que
+  // corresponde — y por eso la lista vacía, no por una palabra escrita.
+  const mappings = result.authenticated
+    ? await readPropertyMappings(result.snapshot.business.organizationId)
+    : [];
+
   const report = buildReport(result.snapshot, new Date().toISOString(), {
     dataSources: {
       places: placesStatus,
       pagespeed: pagespeedStatus,
-      searchConsole: "missing",
-      gbp: "missing",
-      ga4: "missing",
+      searchConsole: statusForResolution(resolveGoogleSource("search_console", mappings)),
+      gbp: statusForResolution(resolveGoogleSource("google_business_profile", mappings)),
+      ga4: statusForResolution(resolveGoogleSource("ga4", mappings)),
     },
     localeOverride: input.locale,
   });
