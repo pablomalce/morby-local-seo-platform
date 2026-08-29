@@ -1689,9 +1689,72 @@ SELECT 44, 'a provider with no shape branch is accepted with no shape check at a
        'un proveedor sin rama en el CASE, con una referencia de forma arbitraria';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 45. El rol `authenticated` de Supabase puede escribir un mapeo
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo mismo que el bloque 38, sobre el rol que la MIGRACIÓN nombra.
+--
+-- El 38 mide `growthos_app`, y el privilegio que lo frena no está en la 0017:
+-- está en `supabase/qa/app_role.sql`, que es un archivo de QA. Medido el
+-- 2026-08-29: cambiar la 0017 a `GRANT SELECT, INSERT, UPDATE, DELETE ON
+-- public.integration_properties TO authenticated` deja la suite ENTERA EN VERDE,
+-- porque ningún bloque le pregunta nada a `authenticated`.
+--
+-- O sea que la línea de la 0017 que sostiene todo el argumento —una sesión de
+-- navegador no puede apuntar su organización a la property de otro cliente— se
+-- podía borrar en una migración y llegar a producción sin que nada lo dijera.
+-- Es la forma exacta de «la suite medía la réplica, no el producto».
+--
+-- CÓMO ESTÁ CONSTRUIDO, Y POR QUÉ NO ALCANZA CON COPIAR EL 38
+--
+-- La organización se resuelve ANTES de cambiar de rol, y se comprueba que no sea
+-- NULL. Si se resolviera adentro del INSERT como `authenticated`, una lectura
+-- vacía daría `VALUES (NULL, ...)`, el NOT NULL rechazaría la fila, y el bloque
+-- pasaría en verde midiendo el NOT NULL en vez del privilegio: verde por el
+-- motivo equivocado, que es peor que rojo.
+--
+-- Y grace mapea para su PROPIA organización, igual que en el 38: es el caso que
+-- parece legítimo. Tiene que ser rechazado igual, y por el privilegio, porque la
+-- fila es suya y ninguna policy tiene nada que objetarle.
+
+RESET ROLE;
+
+CREATE TEMP TABLE org45 AS
+SELECT organization_id FROM public.org_members
+ WHERE user_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM org45) <> 1 OR (SELECT organization_id FROM org45) IS NULL THEN
+        RAISE EXCEPTION 'el fixture de grace no resolvió una organización: el bloque 45 mediría el NOT NULL';
+    END IF;
+END
+$$;
+
+-- El INSERT se arma acá, todavía como `postgres`, y el resultado viaja por un
+-- GUC de transacción. Es para NO tocarle los privilegios a `authenticated`: el
+-- bloque 38 puede escribir en `defect_report` porque el encabezado le da
+-- `GRANT ALL` a `growthos_app`, y darle lo mismo a `authenticated` sería
+-- ensancharle los permisos al rol que este bloque mide, en el mismo archivo que
+-- lo mide. Un GUC local no le otorga nada.
+SELECT set_config('qa.sql45', format($sql$
+    INSERT INTO integration_properties (organization_id, provider, property_ref)
+    VALUES (%L, 'ga4', 'properties/777666555')
+$sql$, (SELECT organization_id FROM org45)), true);
+
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b45', pg_temp.accepted(current_setting('qa.sql45'))::text, true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 45, 'the authenticated role itself can write a property mapping',
+       current_setting('qa.b45')::boolean,
+       'grace, como `authenticated` y no como el rol de la réplica, mapeando para su PROPIA organización';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: forty-four checks were written, so forty-four rows must be present.
+-- Anti-vacuity: forty-five checks were written, so forty-five rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1701,8 +1764,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 44 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 44 checks recorded a result.', checks;
+    IF checks <> 45 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 45 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1713,11 +1776,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 44 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 45 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 44 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 45 checks green: the schema prevents every one of them.';
 END
 $$;
 

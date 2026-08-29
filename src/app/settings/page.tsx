@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { Badge, Card, HudLabel, PageHeader } from "@/components/ui";
 import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
@@ -75,6 +76,19 @@ export default function SettingsPage() {
           <p className="mt-5 font-mono text-[10px] uppercase tracking-hud text-metal-500">
             {t("settings.envWarning")}
           </p>
+          {/*
+            Esta lista es de demostración y dice «sin conectar» siempre, porque
+            está escrita así. El estado REAL de las tres superficies de Google es
+            por organización y sale del mapeo, no de un arreglo: vive en
+            /app/integrations. Sin este enlace esa pantalla no se alcanza desde
+            ninguna parte, que es lo mismo que no haberla escrito.
+          */}
+          <Link
+            href="/app/integrations"
+            className="mt-4 inline-block font-mono text-[10px] uppercase tracking-hud text-vulkan-orange underline"
+          >
+            Google integrations, per organization →
+          </Link>
         </Card>
       </div>
     </>

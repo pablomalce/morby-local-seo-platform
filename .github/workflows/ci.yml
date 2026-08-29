@@ -145,3 +145,15 @@ jobs:
       - name: tenant isolation assertions
         if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
         run: $PSQL -f supabase/qa/defects_test.sql
+
+      # La forma canónica del `property_ref` vive en dos lugares: el CHECK de la
+      # 0017 y `src/lib/integrations/google/mapping.ts`, que la repite en
+      # JavaScript para poder rechazar un identificador mal escrito ANTES de
+      # escribirlo. Dos copias de una regla se separan; esto es lo que lo dice.
+      #
+      # Va en un paso propio y no dentro del anterior: un fallo de acuerdo entre
+      # el front y el esquema no es un defecto de aislamiento, y mezclarlos haría
+      # que el conteo de defects_test.sql dejara de significar lo que dice.
+      - name: canonical shape agreement
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: $PSQL -f supabase/qa/forma_canonica.sql
