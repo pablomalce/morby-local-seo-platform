@@ -194,7 +194,23 @@ ALTER TABLE public.social_image_assets
   FOREIGN KEY (service_id) REFERENCES public.business_services(id)
   ON DELETE SET NULL;
 
-
+-- Y la quinta, que no reemplaza a ninguna compuesta de esta migración: la 0004
+-- borró `content_assets_service_id_fkey` sin poner nada en su lugar, por ser
+-- subconjunto estricto de la compuesta que la 0003 había agregado al lado. Al
+-- revertir, la compuesta de la 0003 SIGUE puesta —deshacerla es trabajo del
+-- .down de la 0003— así que reponer ésta devuelve el par redundante que había
+-- antes de esta migración, que es lo que "dejar el esquema como estaba"
+-- significa.
+--
+-- `ON DELETE SET NULL` es como la escribió la 0001, con la foránea en línea en
+-- el CREATE TABLE; el nombre es el que PostgreSQL le da a una foránea en línea,
+-- y la huella lo compara.
+ALTER TABLE public.content_assets
+  DROP CONSTRAINT IF EXISTS content_assets_service_id_fkey;
+ALTER TABLE public.content_assets
+  ADD CONSTRAINT content_assets_service_id_fkey
+  FOREIGN KEY (service_id) REFERENCES public.business_services(id)
+  ON DELETE SET NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. agent_runs
