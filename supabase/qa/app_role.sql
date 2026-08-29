@@ -96,5 +96,31 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Y lo mismo para el mapeo de propiedades, con más razón todavía. La 0017 le da a
+-- `authenticated` SÓLO SELECT porque una sesión de navegador que pueda INSERTAR
+-- un mapeo puede apuntar SU organización a la property de OTRO cliente: la fila
+-- resultante es suya, pasa la RLS sin objeciones, y el token de agencia —que
+-- llega a las dos propiedades— le sirve los datos ajenos. La escalada no ocurre
+-- en la base, así que ninguna policy la puede ver; el único lugar donde se cierra
+-- es el privilegio.
+--
+-- El GRANT sobre ALL TABLES de más arriba se lo devolvería, y entonces el bloque
+-- 42 estaría midiendo un rol que no existe en producción — pasaría en verde por
+-- tener un privilegio de más, que es la peor manera de pasar.
+--
+-- Guardado con `to_regclass` por el mismo motivo que el de arriba: `rollback.sh`
+-- aplica este archivo sobre el esquema tal como estaba ANTES de la migración que
+-- prueba, así que al probar la 0017 lo corre cuando integration_properties
+-- todavía no existe. Sin la guarda el script muere con `relation
+-- "public.integration_properties" does not exist` y ninguna migración nueva se
+-- puede volver a probar.
+DO $$
+BEGIN
+    IF to_regclass('public.integration_properties') IS NOT NULL THEN
+        REVOKE INSERT, UPDATE, DELETE ON public.integration_properties FROM growthos_app;
+    END IF;
+END
+$$;
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
