@@ -1,4 +1,4 @@
--- Thirty-six isolation checks against the Growth OS schema — executable.
+-- Forty-four isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -987,6 +987,14 @@ SELECT 23, 'the browser-side role can write an integration token',
 -- Existe porque una mutación sobrevivió: borrar la policy restrictiva dejaba los
 -- veintitrés bloques en verde, porque la permisiva sola también aísla. Aísla
 -- HOY, que es otra cosa.
+--
+-- Cuenta los tokens DE BOB y no todo lo que grace alcanza, y eso se corrigió el
+-- 2026-08-29 auditando la 0017, donde el bloque equivalente tenía el mismo
+-- acople. Con la escritura devuelta a `growthos_app`, el bloque 23 consigue
+-- guardar un token para la organización DE GRACE, y este bloque lo contaba como
+-- si fuera de bob: reportaba 'grace ve 1 tokens de bob' sobre un token suyo. No
+-- era un verde falso —sólo ocurre cuando el 23 ya está en rojo— pero su
+-- evidencia mentía exactamente cuando alguien la iba a leer.
 
 RESET ROLE;
 CREATE POLICY "tokens_mutacion_permisiva" ON public.integration_tokens
@@ -1000,7 +1008,8 @@ SELECT 24, 'a new permissive policy widens access to another tenant''s tokens',
        count(*) > 0,
        'con una policy USING (true) agregada, grace ve ' || count(*) ||
        ' tokens de bob; debe seguir viendo 0'
-  FROM integration_tokens;
+  FROM integration_tokens
+ WHERE organization_id = (SELECT org_bob FROM t);
 
 RESET ROLE;
 DROP POLICY "tokens_mutacion_permisiva" ON public.integration_tokens;
@@ -1395,9 +1404,294 @@ SELECT 36, 'a tenant can reach another tenant''s publication ledger',
   FROM publications;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la 0017 — el mapeo vivo de bob
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Dos superficies, porque los bloques de abajo necesitan las dos formas: la de
+-- GA4, que es un identificador opaco, y la de Search Console, que es una URL y
+-- es la que se escribe mal.
+RESET ROLE;
+
+INSERT INTO integration_properties (organization_id, provider, property_ref)
+SELECT org_bob, 'ga4', 'properties/123456789' FROM t;
+INSERT INTO integration_properties (organization_id, provider, property_ref)
+SELECT org_bob, 'search_console', 'https://bob.example/' FROM t;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 37. Un tenant llega al mapeo de propiedades de otro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: el eje de organización sobre la tabla que, con un token de agencia,
+-- ES la frontera entre clientes. La 0017 existe porque hay UN SOLO token OAuth
+-- —el de la cuenta de Vulkan, con permiso delegado sobre las propiedades de
+-- todos los clientes— así que lo único que decide de quién son los números de un
+-- reporte es qué property se consultó.
+--
+-- Leer el mapeo ajeno no es curiosidad: es saber qué property ID pedirle a la
+-- API que ya te contesta por todos.
+--
+-- grace no es de ninguna organización salvo la suya, igual que en los bloques 20
+-- y 36, y por el mismo motivo: alice tiene desde el bloque 5 una membresía en la
+-- organización de bob, así que un bloque escrito con alice mediría esa membresía
+-- y no el aislamiento.
+--
+-- Y cuenta las filas DE BOB, no todas las que grace alcanza. La diferencia la
+-- destapó una mutación: con la escritura devuelta a `growthos_app`, el bloque 38
+-- consigue insertar un mapeo para la organización DE GRACE, y un bloque que
+-- cuente todo lo visible se enciende contando esa fila mientras dice "grace ve N
+-- mapeos de bob". Sería el defecto del bloque 20 otra vez —medir un fixture que
+-- el propio archivo sembró— y con un agravante: se encendería sólo cuando OTRO
+-- bloque ya está en rojo, o sea justo cuando su evidencia se lee y miente.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 37, 'a tenant can reach another tenant''s property mapping',
+       count(*) > 0,
+       'grace ve ' || count(*) || ' mapeos de bob; debe ver 0'
+  FROM integration_properties
+ WHERE organization_id = (SELECT org_bob FROM t);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 38. El rol del navegador puede escribir un mapeo
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la escalada que ninguna policy puede ver, y es la razón por la que
+-- este bloque importa MÁS que su equivalente sobre tokens y no menos.
+--
+-- Una sesión de navegador capaz de INSERTAR acá apunta SU organización a la
+-- property de OTRO cliente. La fila resultante es suya: `organization_id` es el
+-- de ella, la policy la aprueba sin objeciones, la RESTRICTIVE también. Nada en
+-- la base está mal. Y a partir de ahí el token de agencia —que llega a las dos
+-- propiedades— le sirve los datos ajenos en su propio reporte.
+--
+-- El aislamiento se cumple sobre la FILA y la fuga ocurre en el CONTENIDO, así
+-- que el único lugar donde esto se cierra es el privilegio. La 0017 le da a
+-- `authenticated` sólo SELECT, y `supabase/qa/app_role.sql` le quita a
+-- `growthos_app` lo que su GRANT sobre ALL TABLES le devolvería.
+--
+-- grace intenta mapear para su PROPIA organización, que es el caso legítimo en
+-- apariencia. Tiene que ser rechazado igual.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 38, 'the browser-side role can write a property mapping',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_properties (organization_id, provider, property_ref)
+           VALUES (%L, 'ga4', 'properties/999888777')
+       $sql$, (SELECT organization_id FROM org_members
+                WHERE user_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'))),
+       'grace, desde una sesión de navegador, mapeando para su PROPIA organización';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 39. Una policy permisiva nueva ensancha el acceso al mapeo
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo único que compra la policy RESTRICTIVE, que es sobrevivir a la
+-- PRÓXIMA policy. Las permisivas se combinan con OR, así que agregar una más
+-- laxa ensancha el acceso — y así es como esto se rompe de verdad: alguien
+-- agrega una policy para un caso nuevo y se lleva puesto el aislamiento.
+--
+-- Igual que el bloque 24 sobre tokens, y está escrito aparte por el mismo
+-- motivo: la permisiva sola también aísla HOY, así que sin este bloque borrar la
+-- RESTRICTIVA deja todo en verde.
+
+RESET ROLE;
+CREATE POLICY "properties_mutacion_permisiva" ON public.integration_properties
+    FOR SELECT USING (true);
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 39, 'a new permissive policy widens access to another tenant''s property mapping',
+       count(*) > 0,
+       'con una policy USING (true) agregada, grace ve ' || count(*) ||
+       ' mapeos de bob; debe seguir viendo 0'
+  FROM integration_properties
+ WHERE organization_id = (SELECT org_bob FROM t);
+
+RESET ROLE;
+DROP POLICY "properties_mutacion_permisiva" ON public.integration_properties;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 40. Dos organizaciones pueden apuntar a la misma property
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la fuga entera, en su forma más directa. Es el bloque por el que
+-- existe la 0017.
+--
+-- Con un token por cliente, mapear mal no llega a ningún lado: el token no tiene
+-- permiso sobre lo ajeno. Con un token de agencia lo tiene sobre TODO, así que
+-- dos organizaciones apuntadas a la misma property es un cliente viendo los
+-- números de otro, entregados por la base sin una sola violación de RLS.
+--
+-- Y tiene que ser una RESTRICCIÓN, no un `if`. "Comprobar que nadie más tenga
+-- esta property" es un SELECT seguido de un INSERT, y dos onboardings
+-- concurrentes pasan los dos por el `if` — el mismo argumento que la 0016 hace
+-- sobre la idempotencia de publicar, con un precio peor: allá el cliente ve un
+-- post repetido, acá ve las métricas de otro.
+--
+-- Se intenta como `postgres`, o sea sin RLS de por medio y con todos los
+-- privilegios. Si esto lo frenara una policy en vez del índice, el bloque
+-- pasaría por el motivo equivocado: `service_role` mapea legítimamente durante
+-- el onboarding y no está sujeto a la policy de miembro.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 40, 'two organizations can hold the same live property',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_properties (organization_id, provider, property_ref)
+           VALUES (%L, 'ga4', 'properties/123456789')
+       $sql$, (SELECT org_alice FROM t))),
+       'la organización de alice reclamando la property de GA4 que ya es de bob';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 41. Una organización puede tener dos mapeos vivos del mismo proveedor
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que "el mapeo de esta organización" identifique algo.
+--
+-- Parece prolijidad y no lo es. Con dos properties de GA4 vivas para el mismo
+-- cliente, el código que busca su mapeo recibe dos filas y toma la que la base
+-- devuelva primero: la mitad de los reportes salen con los números del sitio
+-- equivocado DEL MISMO cliente. No es una fuga entre tenants, y por eso el
+-- bloque 40 no lo cubre — pero es un reporte que dice cosas falsas.
+--
+-- Mismo argumento que el bloque 25 hace sobre dos tokens vivos.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 41, 'one organization can hold two live mappings for the same provider',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_properties (organization_id, provider, property_ref)
+           VALUES (%L, 'ga4', 'properties/555444333')
+       $sql$, (SELECT org_bob FROM t))),
+       'un segundo mapeo de GA4, vivo, para la organización de bob';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 42. Una referencia con una forma que ninguna API produce entra igual
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la unicidad del bloque 40 signifique algo. Una unicidad sobre
+-- texto libre se saltea escribiendo lo mismo de otra manera: `123456` y
+-- `properties/123456` son la misma property para Google y dos filas distintas
+-- para PostgreSQL. La fuga entra por la ortografía, y ningún índice se entera.
+--
+-- Los dos casos son los dos que se escriben mal:
+--
+--   * GA4 sin el prefijo `properties/`, que es como lo muestra la interfaz de
+--     Google Analytics y como lo copia una persona;
+--   * Search Console sin la barra final. La API devuelve las propiedades de
+--     prefijo de URL SIEMPRE con la barra, así que `https://ejemplo.com` es un
+--     valor que ninguna respuesta produce y que un humano escribe todo el tiempo.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 42, 'a property reference in a form no API produces is accepted',
+       ga4_pelado OR sc_sin_barra,
+       CASE
+         WHEN ga4_pelado AND sc_sin_barra THEN 'entran las dos: GA4 sin prefijo y Search Console sin barra final'
+         WHEN ga4_pelado  THEN 'entra un GA4 sin el prefijo properties/'
+         WHEN sc_sin_barra THEN 'entra una URL de Search Console sin la barra final'
+         ELSE 'las dos formas no canónicas se rechazan'
+       END
+  FROM (
+    SELECT
+      pg_temp.accepted(format($sql$
+          INSERT INTO integration_properties (organization_id, provider, property_ref)
+          VALUES (%L, 'ga4', '123456789')
+      $sql$, (SELECT org_alice FROM t))) AS ga4_pelado,
+      pg_temp.accepted(format($sql$
+          INSERT INTO integration_properties (organization_id, provider, property_ref)
+          VALUES (%L, 'search_console', 'https://alice.example')
+      $sql$, (SELECT org_alice FROM t))) AS sc_sin_barra
+  ) q;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 43. La unicidad se saltea con la tecla de mayúsculas
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: el bloque 40, otra vez, contra la variante que sí pasa el CHECK de
+-- forma del bloque 42.
+--
+-- Los hosts no distinguen mayúsculas: `https://BOB.example/` y
+-- `https://bob.example/` son el mismo sitio para Google y dos textos distintos
+-- para PostgreSQL. Una unicidad sobre la columna pelada los deja convivir, y las
+-- dos organizaciones quedan apuntadas al mismo lugar sin que nada avise.
+--
+-- Por eso el índice es sobre `lower(property_ref)`. El esquema queda por eso más
+-- estricto de lo que Google exige —la RUTA de una URL sí distingue mayúsculas,
+-- así que dos rutas que sólo difieren en eso se rechazan aunque técnicamente
+-- podrían ser dos sitios— y es la dirección correcta del error: rechazar un
+-- mapeo es una molestia de onboarding, compartirlo es una fuga entre clientes.
+--
+-- El esquema de la URL va en minúsculas a propósito: `HTTPS://` lo rechazaría el
+-- CHECK de forma, y el bloque pasaría por el bloque de al lado en vez de por el
+-- índice.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 43, 'the uniqueness is bypassed by changing the case of the reference',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_properties (organization_id, provider, property_ref)
+           VALUES (%L, 'search_console', 'https://BOB.example/')
+       $sql$, (SELECT org_alice FROM t))),
+       'la organización de alice reclamando el sitio de bob con otras mayúsculas';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 44. Un proveedor nuevo entra sin ninguna comprobación de forma
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: el `ELSE false` del CHECK de forma, que es la única línea de la
+-- 0017 que protege contra una migración FUTURA.
+--
+-- El CASE del CHECK tiene una rama por proveedor. El día que alguien agregue un
+-- cuarto al vocabulario y se olvide de agregarle su rama, con `ELSE true` esa
+-- superficie entraría sin ninguna comprobación de forma y nada lo diría —
+-- volvería el bloque 42 a ser mentira para el proveedor nuevo. Con `ELSE false`
+-- no entra nada hasta que alguien escriba la rama.
+--
+-- Un CHECK que devuelve NULL PASA, además, así que el `ELSE` no es opcional:
+-- sacarlo entero es equivalente a ponerlo en true.
+--
+-- Se mide tirando el CHECK del vocabulario y volviendo a preguntar, como hace el
+-- bloque 28 con el trigger de aprobación: con el vocabulario puesto, un proveedor
+-- nuevo lo frena ÉL, y el `ELSE` no se llega a evaluar nunca. La pregunta que
+-- este bloque hace es qué queda cuando el vocabulario se ensancha, que es
+-- exactamente lo que pasa el día que alguien agregue el cuarto proveedor.
+
+RESET ROLE;
+ALTER TABLE public.integration_properties
+    DROP CONSTRAINT integration_properties_provider_check;
+
+CREATE TEMP TABLE step44 AS SELECT pg_temp.accepted(format($sql$
+    INSERT INTO integration_properties (organization_id, provider, property_ref)
+    VALUES (%L, 'bing_webmaster', 'cualquier cosa sin forma')
+$sql$, (SELECT org_alice FROM t))) AS entro;
+
+-- La fila de sonda se borra ANTES de reponer el vocabulario, y el orden no es
+-- prolijidad. Lo dijo una mutación: con `ELSE true` la fila entra, y entonces el
+-- `ADD CONSTRAINT` de abajo no puede validarse con ella adentro. El archivo moría
+-- acá con `check constraint ... is violated by some row`, o sea informando un
+-- error de psql en el lugar exacto donde acababa de medir el defecto — y sin
+-- llegar nunca al reporte, así que el número 44 no aparecía por ningún lado.
+--
+-- Es la forma que toma acá la regla que `pg_temp.accepted` existe para cumplir:
+-- un bloque que no sobrevive a que su defecto esté VIVO no mide nada, aborta.
+DELETE FROM public.integration_properties WHERE provider = 'bing_webmaster';
+
+ALTER TABLE public.integration_properties
+    ADD CONSTRAINT integration_properties_provider_check
+    CHECK (provider IN ('ga4', 'search_console', 'google_business_profile'));
+
+INSERT INTO defect_report
+SELECT 44, 'a provider with no shape branch is accepted with no shape check at all',
+       (SELECT entro FROM step44),
+       'un proveedor sin rama en el CASE, con una referencia de forma arbitraria';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: thirty-six checks were written, so thirty-six rows must be present.
+-- Anti-vacuity: forty-four checks were written, so forty-four rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1407,8 +1701,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 36 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 36 checks recorded a result.', checks;
+    IF checks <> 44 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 44 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1419,11 +1713,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 36 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 44 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 36 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 44 checks green: the schema prevents every one of them.';
 END
 $$;
 
