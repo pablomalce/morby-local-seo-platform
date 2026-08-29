@@ -51,6 +51,8 @@ That is what `supabase/qa/` is for, and it needs no Supabase project.
 ./supabase/qa/replica.sh
 docker exec growthos-replica psql -U postgres -d growthos \
     -v ON_ERROR_STOP=1 -f /tmp/defects_test.sql
+docker exec growthos-replica psql -U postgres -d growthos \
+    -v ON_ERROR_STOP=1 -f /tmp/forma_canonica.sql
 ```
 
 `replica.sh` builds a throwaway PostgreSQL from this repo's own migrations, in
@@ -69,9 +71,12 @@ point reveals nothing — which is the answer to whether these checks were
 measuring the replica or the product. The same change in Lead Engine moved
 twelve lines and uncovered `anon` holding `UPDATE` on all twelve of its
 sequences.
-`defects_test.sql` then runs nineteen isolation checks as a NOSUPERUSER NOBYPASSRLS
+`defects_test.sql` then runs forty-five isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
-every policy that is not FORCEd. Exit 0 means the schema refuses all nineteen.
+every policy that is not FORCEd. Exit 0 means the schema refuses all forty-five.
+The count is written by hand in five places inside that file and is a gate, not
+a nuisance: a check that silently stops recording a result would otherwise leave
+the report lying by omission.
 
 Check 13 is the odd one and worth knowing about before it surprises someone: it
 is the only one where the DEFECT is an object being present rather than absent.
@@ -82,7 +87,27 @@ organisation: it archives, never deletes. They are the only ones that measure a
 BEHAVIOUR the canonical cannot — its tenant resolver reads a GUC and never
 touches `org_members`, so archiving somebody there cannot cut anything.
 
-The `schema isolation` job in CI runs exactly these two steps on every pull
+Checks 37 to 45 arrived with `0017` and guard the property mapping, which with
+an agency-wide Google token IS the boundary between clients: one token reaches
+every client's data, so the only thing deciding whose numbers land in a report
+is which property was queried. Two of them look like duplicates and are not.
+**38** asks whether `growthos_app` — the replica's stand-in for a browser
+session — can write a mapping. **45** asks the same of `authenticated` itself,
+the role the migration actually names, because the privilege stopping
+`growthos_app` lives in `supabase/qa/app_role.sql` and not in `0017`. Measured
+2026-08-29: without 45, regranting write to `authenticated` inside the migration
+left every other check green.
+
+`forma_canonica.sql` is the third step and it is not an isolation check. The
+canonical shape of a `property_ref` lives in two places — the `CHECK` in `0017`
+and `src/lib/integrations/google/mapping.ts`, which repeats it in JavaScript so
+the operator gets "expected properties/N" instead of a PostgreSQL error. Two
+copies of a rule drift; this is what says so when they do. Its other half is the
+`describe("los patrones están clavados a un literal escrito")` block in
+`mapping.test.ts`: each side writes the same three patterns as its own literal,
+so changing one alone turns something red.
+
+The `schema isolation` job in CI runs exactly these steps on every pull
 request, so a migration that reopens one of them cannot merge.
 
 **How a tenant is resolved.** Every table that belongs to an organization
@@ -211,6 +236,56 @@ Verified against a second database standing in for hosted: a missing migration,
 a version present in the database but not in the repository, and an index
 created outside the migrations are each caught and named. The last one is the
 case nothing else here would have seen.
+
+## Verifying a test by breaking what it measures
+
+A green test says nothing until you have seen it go red for the right reason.
+
+```bash
+./scripts/mutar.sh --linea-base
+./scripts/mutar.sh <file> '<text to find>' '<replacement>' --espera <test file>
+```
+
+The replacement is literal, not a regex, and the file is always restored. What
+the script buys over doing it by hand is that it separates, **by construction**,
+the three ways a mutation reports a red without having proved anything — all
+three have happened in this project and all three look identical in a terminal:
+
+| result | what it means |
+|---|---|
+| `NO APLICADA` | the text was not in the file; nothing ran, and the code was never changed |
+| `NO CARGA` | fewer tests *executed* than the baseline: the file stopped parsing, so no assertion was reached |
+| `CAYÓ` | tests failed, and it names which ones — `--espera` flags any that live in another file |
+| `SOBREVIVIÓ` | the code changed and everything stayed green: the test is wrong, not the mutation |
+
+`CAYÓ` on a block in another file is the subtle one: something went red, and it
+was not the test being verified.
+
+Schema-side mutations go through `replica.sh` instead, and `defects_test.sql`
+already separates the same three cases: it refuses to report unless all
+forty-five checks recorded a result, and it names the check that fell.
+
+## Google integrations, per organization
+
+`/app/integrations` is where the property mapping is operated. It exists because
+with an agency-wide token the mapping is the boundary between clients, and doing
+that with a hand-written INSERT against production is the most expensive
+possible way to make a typo.
+
+It shows the four states — connected, not connected, expired, error — and, next
+to each, **where it is fixed**. Two of those reasons share a state and are fixed
+in different places: `platform-not-connected` is fixed once, in Google Cloud, by
+whoever operates the platform; `client-not-mapped` is fixed per client, on this
+screen. Showing both as "not connected" sends an operator to configure a client
+that is already fine.
+
+**The mapping is written from the server, with `service_role`.** `0017` grants
+`authenticated` SELECT and nothing else, and that is not tidiness: a browser
+session able to INSERT here can point ITS organization at another client's
+property — the row is legitimately its own, so RLS approves it — and the agency
+token then serves it the other client's data in its own report. The isolation
+holds on the ROW and the leak happens in the CONTENT, so no policy can see it.
+Checks 38 and 45 measure both halves.
 
 ## Project structure (post-Phase 1)
 

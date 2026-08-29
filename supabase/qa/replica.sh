@@ -134,6 +134,7 @@ apply "$REPO_ROOT/supabase/qa/app_role.sql"
 
 # Left in the container so the assertions can be run against it directly.
 docker cp "$REPO_ROOT/supabase/qa/defects_test.sql" "$CONTAINER:/tmp/defects_test.sql" >/dev/null
+docker cp "$REPO_ROOT/supabase/qa/forma_canonica.sql" "$CONTAINER:/tmp/forma_canonica.sql" >/dev/null
 
 TABLES=$(docker exec "$CONTAINER" psql -U postgres -d growthos -tAc \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
@@ -141,5 +142,6 @@ TABLES=$(docker exec "$CONTAINER" psql -U postgres -d growthos -tAc \
 echo
 echo "replica up: $TABLES tables in public"
 echo "  assertions:  docker exec $CONTAINER psql -U postgres -d growthos -v ON_ERROR_STOP=1 -f /tmp/defects_test.sql"
+echo "  shape:       docker exec $CONTAINER psql -U postgres -d growthos -v ON_ERROR_STOP=1 -f /tmp/forma_canonica.sql"
 echo "  as the app:  PGPASSWORD=growthos psql -h localhost -p $PORT -U postgres -d growthos"
 echo "               then: SET ROLE growthos_app;"

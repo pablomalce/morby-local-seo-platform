@@ -18,3 +18,7 @@ coverage
 
 # TypeScript incremental build info (leaks into git status otherwise)
 *.tsbuildinfo
+
+# La línea de base de ./scripts/mutar.sh: cuántos tests corren con el árbol sin
+# tocar. Se regenera con `--linea-base` y es de la máquina, no del repositorio.
+.mutacion-linea-base.json
