@@ -1,105 +1,31 @@
-"use client";
+import { platformStatus } from "@/lib/integrations/platformStatus";
+import { SettingsView } from "./client";
 
-import Link from "next/link";
-import { Badge, Card, HudLabel, PageHeader } from "@/components/ui";
-import { useT } from "@/lib/i18n/I18nProvider";
-import { useSelection } from "@/lib/context/SelectionContext";
-
-const INTEGRATIONS = [
-  "OpenAI API",
-  "OpenAI Image Generation",
-  "Google Places API",
-  "Google Business Profile API",
-  "Google Search Console",
-  "Google Analytics GA4",
-  "LinkedIn",
-  "Meta (Facebook & Instagram)",
-  "X / Twitter",
-  "Buffer / Metricool",
-  "Resend",
-  "Stripe",
-  "Sentry",
-  "PostHog",
-];
+/**
+ * QUÉ IMPIDE ESTA PANTALLA
+ *
+ * Que la lista de integraciones diga «sin conectar» porque está escrita así.
+ *
+ * Hasta el #59 esto era un arreglo de catorce nombres con una insignia fija al
+ * lado. La respuesta correcta hoy y por el motivo equivocado — el día que se
+ * conecte algo, el arreglo sigue ahí y la pantalla sigue diciendo lo mismo. Es el
+ * mismo defecto que el #55 sacó del orquestador y el #56 de la pantalla de
+ * integraciones; éste era el tercer lugar.
+ *
+ * POR QUÉ ES UN COMPONENTE DE SERVIDOR
+ *
+ * Porque lo que hay que mirar son variables de entorno del SERVIDOR, y un
+ * componente de cliente no las ve — sólo vería las `NEXT_PUBLIC_*`, que son
+ * justamente las que no importan acá. Medirlo en el cliente daría «sin
+ * configurar» para todo, para siempre: la respuesta correcta por el motivo
+ * equivocado otra vez, y con un mecanismo entero dándola.
+ *
+ * `platformStatus()` devuelve CUÁNTAS de las que hacen falta están puestas y
+ * nunca sus valores. Un secreto que llega a una pantalla de ajustes es un secreto
+ * en el historial del navegador de quien la abrió.
+ */
+export const dynamic = "force-dynamic";
 
 export default function SettingsPage() {
-  const t = useT();
-  const { business, location, servicesForBusiness, locationsForBusiness } = useSelection();
-
-  return (
-    <>
-      <PageHeader
-        eyebrow={`10 / SETTINGS — ${business.name.toUpperCase()}`}
-        frame="INTEGRATIONS · 14"
-        title={t("settings.title")}
-        description={t("settings.description")}
-        action={<Badge variant="hud">{t("app.demoBadge")}</Badge>}
-      />
-
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <HudLabel>{t("settings.businessInfo")}</HudLabel>
-          <div className="mt-5 space-y-2">
-            <Row label={t("selector.business")} value={business.name} />
-            <Row label="Website" value={business.website} />
-            <Row label={t("settings.industry")} value={business.industry.replace(/_/g, " ")} />
-            <Row label={t("settings.brandTone")} value={business.brandTone} />
-            <Row label={t("settings.primaryLocale")} value={business.primaryLocale.toUpperCase()} />
-            {location && (
-              <Row
-                label={t("selector.location")}
-                value={`${location.label} · ${location.city}, ${location.region}`}
-              />
-            )}
-            <Row label={t("settings.locations")} value={`${locationsForBusiness.length}`} />
-            <Row label={t("settings.services")} value={`${servicesForBusiness.length}`} />
-          </div>
-        </Card>
-        <Card>
-          <HudLabel>{t("settings.integrationChecklist")}</HudLabel>
-          <div className="mt-5 space-y-2">
-            {INTEGRATIONS.map((i, idx) => (
-              <div
-                key={i}
-                className="flex items-center justify-between rounded-vulkan border border-metal-800 bg-metal-950 px-4 py-3"
-              >
-                <span className="flex items-center gap-3">
-                  <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
-                    {String(idx + 1).padStart(2, "0")}
-                  </span>
-                  <span className="text-[13px] text-vulkan-white">{i}</span>
-                </span>
-                <Badge variant="muted">{t("settings.notConnected")}</Badge>
-              </div>
-            ))}
-          </div>
-          <p className="mt-5 font-mono text-[10px] uppercase tracking-hud text-metal-500">
-            {t("settings.envWarning")}
-          </p>
-          {/*
-            Esta lista es de demostración y dice «sin conectar» siempre, porque
-            está escrita así. El estado REAL de las tres superficies de Google es
-            por organización y sale del mapeo, no de un arreglo: vive en
-            /app/integrations. Sin este enlace esa pantalla no se alcanza desde
-            ninguna parte, que es lo mismo que no haberla escrito.
-          */}
-          <Link
-            href="/app/integrations"
-            className="mt-4 inline-block font-mono text-[10px] uppercase tracking-hud text-vulkan-orange underline"
-          >
-            Google integrations, per organization →
-          </Link>
-        </Card>
-      </div>
-    </>
-  );
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-center justify-between rounded-vulkan border border-metal-800 bg-metal-950 px-4 py-3">
-      <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">{label}</span>
-      <span className="text-[13px] text-vulkan-white">{value}</span>
-    </div>
-  );
+  return <SettingsView status={platformStatus()} />;
 }
