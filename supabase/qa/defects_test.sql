@@ -93,6 +93,27 @@ LANGUAGE sql AS $$
     SELECT set_config('request.jwt.claim.sub', p_user::text, true);
 $$;
 
+-- Con qué SQLSTATE murió, o NULL si pasó.
+--
+-- `accepted()` alcanza cuando lo único que puede frenar una sentencia es lo que
+-- el bloque mide. No alcanza cuando puede frenarla OTRA cosa: los bloques 50 y
+-- 51 llaman a una función con argumentos de relleno, y una violación de CHECK
+-- (23514) se ve igual que un permiso denegado (42501) desde afuera.
+--
+-- Medido el 2026-08-30, y por eso existe: con `accepted()` los dos bloques
+-- pasaban en verde mientras `anon`, `authenticated` y `growthos_app` PODÍAN
+-- ejecutar la función. Frenaba el CHECK del slug, no el privilegio. Un bloque que
+-- pasa por el motivo equivocado es peor que uno que falla.
+CREATE OR REPLACE FUNCTION pg_temp.sqlstate_of(p_sql text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE p_sql;
+    RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE;
+END
+$$;
+
 -- Did this statement go through? Used wherever the fix may take the form of a
 -- refusal, so that "rejected" is recorded as a result instead of aborting the
 -- run. A test that cannot survive the fix is a test that gets deleted the day
@@ -1888,9 +1909,80 @@ SELECT 49, 'the authenticated role can read the ingest ledger',
        'grace, como `authenticated`, leyendo qué clientes entraron y cuándo en toda la plataforma';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 50. El rol del navegador puede ejecutar la ingesta
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que una función `SECURITY DEFINER` no sea una manera de saltear la
+-- RLS con más pasos.
+--
+-- `ingest_lead_won` corre como su dueño y escribe en cinco tablas sin que
+-- ninguna policy la mire — tiene que ser así, porque crea la organización cuyo
+-- eje de tenant recién existe al terminar. Eso la vuelve exactamente el objeto
+-- que NO puede quedar al alcance de una sesión de navegador: quien la ejecuta
+-- crea organizaciones, negocios y contactos a voluntad, y ninguna RLS tiene nada
+-- que objetar porque la función no está sujeta a ellas.
+--
+-- Se mide con una llamada que tiene que fallar por PRIVILEGIO. Los argumentos
+-- son deliberadamente basura: si el privilegio no la frena, la llamada llegaría
+-- a ejecutarse, y lo que este bloque afirma es que ni siquiera llega.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+-- Y se afirma sobre el SQLSTATE, no sobre «falló». Con `accepted()` este bloque
+-- pasaba en verde mientras la función era ejecutable por todos: la frenaba el
+-- CHECK del slug con 23514, no el privilegio. El defecto es cualquier cosa que
+-- NO sea 42501 — incluido que la llamada funcione.
+CREATE TEMP TABLE step50 AS SELECT pg_temp.sqlstate_of($sql$
+    SELECT public.ingest_lead_won(
+        'x', 'x', NULL, 'x', 'x', 'en', 'x', 'x', '', 'other',
+        '{}'::jsonb, '{}'::jsonb)
+$sql$) AS estado;
+
+INSERT INTO defect_report
+SELECT 50, 'the browser-side role can execute the lead ingest',
+       (SELECT estado IS DISTINCT FROM '42501' FROM step50),
+       'grace, desde una sesión de navegador, llamando a la función que crea organizaciones: SQLSTATE=' ||
+       coalesce((SELECT estado FROM step50), 'ninguno, la llamada pasó') ||
+       ' (se espera 42501, insufficient_privilege)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 51. El rol `authenticated` puede ejecutar la ingesta
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo mismo, sobre el rol que la migración nombra.
+--
+-- Es la lección del bloque 45 por tercera vez, y acá pesa más que en ninguna: en
+-- PostgreSQL una función nace con `EXECUTE` para `PUBLIC`, así que **el
+-- privilegio por defecto es el peligroso**. La 0019 escribe
+-- `REVOKE ALL ON FUNCTION ... FROM PUBLIC` justamente por eso, y si esa línea
+-- desaparece nada más lo diría: el bloque 50 mide `growthos_app`, cuyo alcance lo
+-- decide `app_role.sql`, un archivo de QA.
+--
+-- El resultado viaja por un GUC de transacción, como en el 45 y el 49:
+-- `authenticated` no puede escribir en `defect_report`, y darle ese permiso sería
+-- ensancharle los privilegios al rol que este bloque mide.
+
+RESET ROLE;
+SELECT set_config('qa.sql51', $sql$
+    SELECT public.ingest_lead_won(
+        'x', 'x', NULL, 'x', 'x', 'en', 'x', 'x', '', 'other',
+        '{}'::jsonb, '{}'::jsonb)
+$sql$, true);
+
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b51', coalesce(pg_temp.sqlstate_of(current_setting('qa.sql51')), 'paso'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 51, 'the authenticated role can execute the lead ingest',
+       current_setting('qa.b51') IS DISTINCT FROM '42501',
+       'grace, como `authenticated`, llamando a una función SECURITY DEFINER: SQLSTATE=' ||
+       current_setting('qa.b51') || ' (se espera 42501, insufficient_privilege)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: forty-nine checks were written, so forty-nine rows must be present.
+-- Anti-vacuity: fifty-one checks were written, so fifty-one rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1900,8 +1992,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 49 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 49 checks recorded a result.', checks;
+    IF checks <> 51 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 51 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1912,11 +2004,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 49 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 51 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 49 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 51 checks green: the schema prevents every one of them.';
 END
 $$;
 

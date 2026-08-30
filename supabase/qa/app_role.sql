@@ -153,3 +153,25 @@ $$;
 
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Y NO la función de ingesta, que el GRANT de arriba le acaba de dar.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- `ingest_lead_won` es `SECURITY DEFINER`: corre como su dueño y escribe en cinco
+-- tablas sin que ninguna policy la mire — tiene que ser así, porque crea la
+-- organización cuyo eje de tenant recién existe al terminar.
+--
+-- Eso la vuelve el objeto que MENOS puede quedar al alcance de una sesión de
+-- navegador: quien la ejecuta crea organizaciones, negocios y contactos a
+-- voluntad, y la RLS no tiene nada que objetar porque la función no está sujeta a
+-- ella. Es saltear el aislamiento con más pasos.
+--
+-- El `GRANT EXECUTE ON ALL FUNCTIONS` de la línea de arriba se la otorga, así que
+-- este REVOKE va DESPUÉS y no antes. El bloque 50 de defects_test.sql lo mide.
+DO $$
+BEGIN
+    IF to_regprocedure('public.ingest_lead_won(text, text, uuid, text, text, text, text, text, text, text, jsonb, jsonb)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.ingest_lead_won(text, text, uuid, text, text, text, text, text, text, text, jsonb, jsonb) FROM growthos_app;
+    END IF;
+END
+$$;
