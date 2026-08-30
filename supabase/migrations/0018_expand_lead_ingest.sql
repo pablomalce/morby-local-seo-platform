@@ -225,7 +225,7 @@ CREATE TABLE IF NOT EXISTS public.contacts (
 );
 
 COMMENT ON TABLE public.contacts IS
-    'Un contacto existe ANTES de ser cliente: por eso business_id es nullable y el eje de tenant no cuelga del negocio.';
+    'Los contactos de un cliente. El eje de tenant es organization_id y no cuelga del negocio; business_id es NOT NULL acá, a diferencia del canónico §6.3, porque Growth OS no tiene fase pre-cliente.';
 COMMENT ON COLUMN public.contacts.business_id IS
     'NOT NULL, a diferencia del canónico §6.3: Growth OS no tiene fase pre-cliente. La FK es compuesta, así que una fila no puede reclamar un tenant que su negocio no tiene.';
 COMMENT ON COLUMN public.contacts.source IS
