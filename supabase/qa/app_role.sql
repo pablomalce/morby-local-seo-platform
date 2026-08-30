@@ -122,5 +122,34 @@ BEGIN
     END IF;
 END
 $$;
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Y NADA sobre `ingest_events`: ni leer.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Es la única tabla de la 0018 que una sesión de navegador no debe alcanzar de
+-- ninguna forma, y las dos direcciones duelen distinto:
+--
+--   ESCRIBIR es reclamar la clave de idempotencia de OTRO lead ganado. La
+--   restricción `(source_system, idempotency_key)` haría entonces exactamente lo
+--   que existe para hacer —rechazar el segundo— sólo que el segundo sería el
+--   verdadero: el cliente nunca se crea, y del lado del productor la entrega
+--   figura como recibida. Es un cliente perdido en silencio.
+--
+--   LEER es la lista de qué clientes entraron y cuándo, para toda la plataforma.
+--   La tabla no tiene RLS —es de la plataforma, como `schema_migrations`— así
+--   que un SELECT no está filtrado por nadie.
+--
+-- Por eso acá se revoca TODO y no sólo la escritura, a diferencia de
+-- `integration_tokens` y `integration_properties`, donde `authenticated` sí lee
+-- lo suyo. El GRANT sobre ALL TABLES de más arriba se lo devolvería entero.
+--
+-- Guardado con `to_regclass` por el mismo motivo que los dos de arriba.
+DO $$
+BEGIN
+    IF to_regclass('public.ingest_events') IS NOT NULL THEN
+        REVOKE ALL ON public.ingest_events FROM growthos_app;
+    END IF;
+END
+$$;
+
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;

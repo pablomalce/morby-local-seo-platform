@@ -1752,9 +1752,145 @@ SELECT 45, 'the authenticated role itself can write a property mapping',
        'grace, como `authenticated` y no como el rol de la réplica, mapeando para su PROPIA organización';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la 0018 — un contacto de bob y un evento de ingesta
+-- ─────────────────────────────────────────────────────────────────────────────
+RESET ROLE;
+
+INSERT INTO contacts (organization_id, business_id, display_name, email, phone, country, source)
+SELECT org_bob, '44444444-4444-4444-8444-444444444444',
+       'Bob Contacto', 'bob@bob.example', '+46700000000', 'SE', 'apify:google-maps'
+  FROM t;
+
+INSERT INTO ingest_events (source_system, idempotency_key, event, organization_id)
+SELECT 'vulkan-lead-engine', 'vulkan-lead-engine:lead:00000000-0000-4000-8000-00000000b0b0',
+       'lead.won', org_bob
+  FROM t;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 46. Un tenant llega a los contactos de otro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la tabla de la 0018 que guarda DATOS DE PERSONAS — nombre, correo,
+-- teléfono— y, sobre todo, `source`: de dónde salió cada contacto. Ése es el
+-- campo que hay que poder contestar cuando alguien ejerce un derecho de GDPR, y
+-- es el que convierte una fuga acá en algo peor que una fuga de métricas.
+--
+-- grace, y no alice, por lo mismo que en los bloques 20, 36 y 37: alice tiene
+-- desde el bloque 5 una membresía en la organización de bob, así que un bloque
+-- escrito con alice mediría esa membresía y no el aislamiento.
+--
+-- Y cuenta los contactos DE BOB, no todos los que grace alcanza, por lo mismo
+-- que el 37: un bloque que cuente todo lo visible se enciende contando una fila
+-- propia de grace si otro bloque le devolvió la escritura — o sea que mentiría
+-- justo cuando alguien va a leer su evidencia.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 46, 'a tenant can reach another tenant''s contacts',
+       count(*) > 0,
+       'grace ve ' || count(*) || ' contactos de bob; debe ver 0'
+  FROM contacts
+ WHERE organization_id = (SELECT org_bob FROM t);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 47. Una policy permisiva nueva ensancha el acceso a los contactos
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo único que compra la policy RESTRICTIVE, que es sobrevivir a la
+-- PRÓXIMA policy. Las permisivas se combinan con OR, así que agregar una más
+-- laxa ensancha el acceso — y así es como esto se rompe de verdad: alguien
+-- agrega una policy para un caso nuevo y se lleva puesto el aislamiento.
+--
+-- Va aparte del 46 por el mismo motivo que el 39 va aparte del 37: la permisiva
+-- sola también aísla HOY, así que sin este bloque borrar la RESTRICTIVA de la
+-- 0018 deja todo en verde.
+
+RESET ROLE;
+CREATE POLICY "contacts_mutacion_permisiva" ON public.contacts
+    FOR SELECT USING (true);
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 47, 'a new permissive policy widens access to another tenant''s contacts',
+       count(*) > 0,
+       'con una policy USING (true) agregada, grace ve ' || count(*) ||
+       ' contactos de bob; debe seguir viendo 0'
+  FROM contacts
+ WHERE organization_id = (SELECT org_bob FROM t);
+
+RESET ROLE;
+DROP POLICY "contacts_mutacion_permisiva" ON public.contacts;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 48. El rol del navegador puede escribir en el registro de ingesta
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que una sesión de navegador no pueda hacer desaparecer el cliente
+-- de otro, en silencio y sin violar ninguna restricción.
+--
+-- `ingest_events` no tiene RLS: es una tabla de la plataforma, como
+-- `schema_migrations`. Todo su aislamiento es el privilegio, y `app_role.sql` se
+-- lo tiene que revocar porque su `GRANT ... ON ALL TABLES` se lo devuelve.
+--
+-- La escalada es ésta, y no se parece a un ataque: alguien inserta la clave
+-- `vulkan-lead-engine:lead:<uuid ajeno>` ANTES de que llegue esa entrega. Cuando
+-- llega, la unicidad hace exactamente lo que existe para hacer —rechazar el
+-- segundo— sólo que el segundo es el verdadero. El cliente nunca se crea, y del
+-- lado del productor la entrega figura entregada. Un cliente perdido sin un solo
+-- error en ningún log.
+--
+-- grace inserta una clave que no colisiona con nada, que es el caso que parece
+-- inocuo. Tiene que ser rechazado igual, y por el privilegio.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+INSERT INTO defect_report
+SELECT 48, 'the browser-side role can write the ingest ledger',
+       pg_temp.accepted(format($sql$
+           INSERT INTO ingest_events (source_system, idempotency_key, event, organization_id)
+           VALUES ('vulkan-lead-engine', 'vulkan-lead-engine:lead:deadbeef', 'lead.won', %L)
+       $sql$, (SELECT organization_id FROM org_members
+                WHERE user_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'))),
+       'grace, desde una sesión de navegador, reclamando una clave de idempotencia';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 49. El rol `authenticated` puede LEER el registro de ingesta
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la otra dirección, sobre el rol que la migración nombra.
+--
+-- Es la lección del bloque 45 aplicada a la tabla nueva. El 48 mide
+-- `growthos_app`, cuyo privilegio lo pone `app_role.sql` —un archivo de QA—; la
+-- `0018` le declara a `authenticated` NADA, y eso no lo mediría nadie.
+--
+-- Y mide LEER, no escribir, porque acá leer ya es la fuga: `ingest_events` no
+-- tiene RLS, así que un SELECT devuelve la lista de qué clientes entraron y
+-- cuándo, para toda la plataforma, sin filtrar por nadie. Es el único caso de
+-- este archivo donde el defecto es un SELECT que funciona.
+--
+-- El resultado viaja por un GUC de transacción: `authenticated` no puede
+-- escribir en `defect_report` y darle ese permiso sería ensancharle los
+-- privilegios al rol que este bloque mide, en el mismo archivo que lo mide. Es
+-- la misma construcción del bloque 45.
+
+RESET ROLE;
+SELECT set_config('qa.sql49', 'SELECT count(*) FROM public.ingest_events', true);
+
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b49', pg_temp.accepted(current_setting('qa.sql49'))::text, true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 49, 'the authenticated role can read the ingest ledger',
+       current_setting('qa.b49')::boolean,
+       'grace, como `authenticated`, leyendo qué clientes entraron y cuándo en toda la plataforma';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: forty-five checks were written, so forty-five rows must be present.
+-- Anti-vacuity: forty-nine checks were written, so forty-nine rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1764,8 +1900,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 45 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 45 checks recorded a result.', checks;
+    IF checks <> 49 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 49 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -1776,11 +1912,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 45 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 49 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 45 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 49 checks green: the schema prevents every one of them.';
 END
 $$;
 
