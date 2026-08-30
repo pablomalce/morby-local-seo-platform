@@ -71,9 +71,9 @@ point reveals nothing — which is the answer to whether these checks were
 measuring the replica or the product. The same change in Lead Engine moved
 twelve lines and uncovered `anon` holding `UPDATE` on all twelve of its
 sequences.
-`defects_test.sql` then runs forty-five isolation checks as a NOSUPERUSER NOBYPASSRLS
+`defects_test.sql` then runs forty-nine isolation checks as a NOSUPERUSER NOBYPASSRLS
 role — as the owner they would prove nothing, since the owner is exempt from
-every policy that is not FORCEd. Exit 0 means the schema refuses all forty-five.
+every policy that is not FORCEd. Exit 0 means the schema refuses all forty-nine.
 The count is written by hand in five places inside that file and is a gate, not
 a nuisance: a check that silently stops recording a result would otherwise leave
 the report lying by omission.
@@ -97,6 +97,24 @@ the role the migration actually names, because the privilege stopping
 `growthos_app` lives in `supabase/qa/app_role.sql` and not in `0017`. Measured
 2026-08-29: without 45, regranting write to `authenticated` inside the migration
 left every other check green.
+
+Checks 46 to 49 arrived with `0018` and cover the two tables the lead ingest
+writes into. **46 and 47** are the ordinary pair for a new tenant table —
+cross-tenant read, and whether a new permissive policy widens it — and `contacts`
+earns them because it holds personal data, including `source`, the field you have
+to be able to answer with when somebody exercises a GDPR right.
+
+**48 and 49** are about `ingest_events`, which is deliberately different: it is a
+platform table like `schema_migrations`, with no RLS, so **the privilege is its
+entire isolation**. 48 asks whether the browser-side role can WRITE it — claiming
+another lead's idempotency key would make the real delivery be rejected as a
+duplicate, so the client is never created and the producer records a successful
+delivery. A client lost with no error in any log. 49 asks whether
+`authenticated` can READ it, which without RLS returns which clients entered and
+when across the whole platform. It is the only check in the file where the defect
+is a SELECT that works, and it exists for the reason check 45 does: the privilege
+stopping `growthos_app` lives in `app_role.sql`, so what the migration declares
+for `authenticated` would otherwise be measured by nobody.
 
 `forma_canonica.sql` is the third step and it is not an isolation check. The
 canonical shape of a `property_ref` lives in two places — the `CHECK` in `0017`
