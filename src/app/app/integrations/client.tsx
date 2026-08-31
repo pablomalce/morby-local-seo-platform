@@ -46,8 +46,14 @@ const RAZON: Record<IntegrationReason, string> = {
     "The agency's Google authorization was revoked. Fixed once, by redoing the OAuth consent — not per client.",
   "platform-token-expired":
     "The agency's Google token expired. Fixed once, by refreshing it — not per client, and the mapping below is unaffected.",
-  "agency-organization-undecided":
-    "No column says which organization is the agency, so the token cannot be looked up. This is a product decision, not a setting on this screen. See ESPINA_VULKAN.md, «El modelo de acceso a Google».",
+  "platform-token-absent":
+    "The agency organization is identified and has no Google token yet. Fixed once, by running the OAuth consent — not per client.",
+  "agency-organization-unset":
+    "VULKAN_AGENCY_ORG_ID is not set, so the agency's token cannot be looked up. The token may well be fine; this is a server setting, not something on this screen.",
+  "agency-organization-malformed":
+    "VULKAN_AGENCY_ORG_ID is set to something that is not a UUID, so it matches no organization. Fix the value — reconnecting Google will not help.",
+  "agency-token-unreadable":
+    "The agency's token state could not be read. This says nothing about the token, which may be active: it is the lookup that failed.",
 };
 
 export function PlatformNotice({

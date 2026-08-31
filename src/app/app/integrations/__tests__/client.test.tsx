@@ -241,8 +241,26 @@ describe("las tres formas canónicas se le dicen al operador", () => {
 describe("el estado de la plataforma", () => {
   it("dice cuál es el estado del token de la agencia", async () => {
     const { PlatformNotice } = await componente();
-    const { container } = render(<PlatformNotice connected={false} tokenState="undecided" />);
-    expect(container.textContent).toContain("UNDECIDED");
+    const { container } = render(<PlatformNotice connected={false} tokenState="absent" />);
+    expect(container.textContent).toContain("ABSENT");
     expect(container.textContent).toContain("NOT CONFIGURED");
+  });
+
+  it("sólo `active` se muestra como bueno; los otros seis no", async () => {
+    // La insignia verde es una afirmación sobre el token. `unset` y
+    // `unreadable` no saben nada de él, y pintarlos de verde diría «conectado»
+    // sobre algo que nadie miró.
+    const { PlatformNotice } = await componente();
+    for (const estado of [
+      "expired",
+      "revoked",
+      "absent",
+      "unset",
+      "malformed",
+      "unreadable",
+    ] as const) {
+      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      expect(container.textContent, `con ${estado}`).toContain(estado.toUpperCase());
+    }
   });
 });
