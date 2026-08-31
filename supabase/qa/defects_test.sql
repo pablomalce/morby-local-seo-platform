@@ -1980,9 +1980,63 @@ SELECT 51, 'the authenticated role can execute the lead ingest',
        current_setting('qa.b51') || ' (se espera 42501, insufficient_privilege)';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 52. Una corrida completada puede no tener costo
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que «registro de coste» sea una restricción y no una costumbre.
+--
+-- R5 pide un único módulo de egreso de IA CON registro de coste. La parte que se
+-- pierde sola es la segunda: un módulo que anota el costo cuando el que lo
+-- escribe se acuerda anota una intención, y el primer camino agregado con prisa
+-- la pierde sin que nada lo diga.
+--
+-- El modo de fallo no es ruidoso, y por eso hace falta un bloque. La fila entra,
+-- el reporte de gasto suma un poco menos, y nadie se entera hasta que la factura
+-- del proveedor no coincide con la contabilidad propia. **Un total que se queda
+-- corto no llama la atención de nadie.**
+--
+-- Se intenta como `postgres`, sin RLS de por medio: lo que se mide es la
+-- RESTRICCIÓN, no una policy. Si esto lo frenara el aislamiento en vez del CHECK,
+-- el bloque pasaría por el motivo equivocado.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 52, 'a completed agent run can carry no cost',
+       pg_temp.accepted(format($sql$
+           INSERT INTO agent_runs (organization_id, business_id, agent_id, scope, scope_id,
+                                   status, finished_at)
+           VALUES (%L, '44444444-4444-4444-8444-444444444444', 'content', 'business',
+                   '44444444-4444-4444-8444-444444444444', 'completed', now())
+       $sql$, (SELECT org_bob FROM t))),
+       'una corrida en `completed` sin tokens_used ni cost_usd';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 53. El costo de una corrida puede ser negativo
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la misma suma, por el otro lado.
+--
+-- El modo de fallo que esto impide no es alguien escribiendo `-5` a mano: es una
+-- resta mal puesta en el módulo de egreso —contar los tokens de salida menos los
+-- de entrada, por ejemplo— que hace que la suma del mes dé menos de lo gastado.
+-- Va aparte del 52 porque una fila con costo negativo SÍ pasa el 52: tiene su
+-- costo, sólo que apunta para el lado equivocado.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 53, 'an agent run can carry a negative cost',
+       pg_temp.accepted(format($sql$
+           INSERT INTO agent_runs (organization_id, business_id, agent_id, scope, scope_id,
+                                   status, tokens_used, cost_usd, finished_at)
+           VALUES (%L, '44444444-4444-4444-8444-444444444444', 'content', 'business',
+                   '44444444-4444-4444-8444-444444444444', 'completed', 100, -1.5, now())
+       $sql$, (SELECT org_bob FROM t))),
+       'una corrida con cost_usd = -1.5, que resta de la suma del mes';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: fifty-one checks were written, so fifty-one rows must be present.
+-- Anti-vacuity: fifty-three checks were written, so fifty-three rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -1992,8 +2046,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 51 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 51 checks recorded a result.', checks;
+    IF checks <> 53 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 53 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2004,11 +2058,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 51 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 53 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 51 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 53 checks green: the schema prevents every one of them.';
 END
 $$;
 
