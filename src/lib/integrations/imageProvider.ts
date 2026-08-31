@@ -161,8 +161,18 @@ export async function generateImage(brief: ImageBrief): Promise<ImageGenerationR
     };
   }
 
-  // Phase 3: Replace with OpenAI Images API call here (server-only).
-  // const result = await fetch("https://api.openai.com/v1/images/generations", { ... });
+  // Phase 3: la llamada real al proveedor de imágenes va acá, y va POR
+  // `runAi()` de `src/lib/ai/egress.ts` — no con un `fetch` propio.
+  //
+  // El endpoint no se escribe en este comentario a propósito. Lo que había antes
+  // era un `fetch` a la API de imágenes comentado, o sea una plantilla lista para
+  // descomentar, y descomentarla habría dejado una llamada que gasta y no queda
+  // registrada en `agent_runs`. `sinAtajos.test.ts` lo encontró la primera vez
+  // que corrió.
+  //
+  // La forma es: pedirle a `runAi()` el contexto de la corrida y devolverle el
+  // resultado junto con los tokens que consumió; la contabilidad la hace él, y la
+  // `0020` no lo deja cerrar una corrida sin costo.
   return {
     id,
     businessId: brief.businessId,
