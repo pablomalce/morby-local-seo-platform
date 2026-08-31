@@ -35,8 +35,16 @@ const MAPEO_COMPLETO: PropertyMapping[] = [
   { provider: "google_business_profile", propertyRef: "locations/123456789" },
 ];
 
-/** Los cuatro estados del token, para recorrerlos donde el resultado no depende de ellos. */
-const TODOS_LOS_TOKENS: AgencyTokenState[] = ["active", "expired", "revoked", "undecided"];
+/** Los siete estados del token, para recorrerlos donde el resultado no depende de ellos. */
+const TODOS_LOS_TOKENS: AgencyTokenState[] = [
+  "active",
+  "expired",
+  "revoked",
+  "absent",
+  "unset",
+  "malformed",
+  "unreadable",
+];
 
 describe("sin credenciales de plataforma, gana esa causa", () => {
   it("dice «sin conectar» y nombra la plataforma, no al cliente", () => {
@@ -60,20 +68,40 @@ describe("sin credenciales de plataforma, gana esa causa", () => {
   });
 });
 
-describe("con la plataforma conectada y el token sin decidir", () => {
-  it("es `error`, no «sin conectar»", () => {
-    // No es lo mismo «no hay conexión» que «no sabemos a quién preguntarle». Con
-    // un token de agencia hay UNA fila y ninguna columna dice de quién es;
-    // buscar la del cliente daría «sin token» para todos, para siempre, que es
-    // la respuesta correcta por el motivo equivocado.
-    const v = viewForSurface("ga4", MAPEO_COMPLETO, "undecided", CONECTADA);
-    expect(v.state).toBe("error");
-    expect(v.reason).toBe("agency-organization-undecided");
+describe("con la plataforma conectada y el estado del token sin averiguar", () => {
+  // Los tres dicen «no pudimos mirar», no «no hay conexión». El token puede
+  // estar vivo, y mostrarlos como «sin conectar» manda a rehacer un OAuth que
+  // ya está hecho — la respuesta correcta por el motivo equivocado, que es el
+  // defecto que este módulo existe para impedir.
+  const SIN_AVERIGUAR: [AgencyTokenState, string][] = [
+    ["unset", "agency-organization-unset"],
+    ["malformed", "agency-organization-malformed"],
+    ["unreadable", "agency-token-unreadable"],
+  ];
+
+  it("los tres son `error`, y cada uno nombra su propio arreglo", () => {
+    for (const [token, razon] of SIN_AVERIGUAR) {
+      const v = viewForSurface("ga4", MAPEO_COMPLETO, token, CONECTADA);
+      expect(v.state, `con el token ${token}`).toBe("error");
+      expect(v.reason, `con el token ${token}`).toBe(razon);
+    }
   });
 
-  it("gana sobre que el cliente no esté mapeado", () => {
-    const v = viewForSurface("ga4", [], "undecided", CONECTADA);
-    expect(v.reason).toBe("agency-organization-undecided");
+  it("las tres razones son distintas entre sí, porque se arreglan en lugares distintos", () => {
+    // Colapsarlas en una sola diría «revisá la configuración» sin decir cuál, y
+    // corregir un uuid mal escrito no se parece en nada a investigar por qué
+    // falló una consulta.
+    const razones = SIN_AVERIGUAR.map(
+      ([token]) => viewForSurface("ga4", MAPEO_COMPLETO, token, CONECTADA).reason
+    );
+    expect(new Set(razones).size).toBe(3);
+  });
+
+  it("ganan sobre que el cliente no esté mapeado", () => {
+    for (const [token, razon] of SIN_AVERIGUAR) {
+      const v = viewForSurface("ga4", [], token, CONECTADA);
+      expect(v.reason, `con el token ${token}`).toBe(razon);
+    }
   });
 });
 
@@ -82,6 +110,21 @@ describe("los estados del token de la agencia", () => {
     const v = viewForSurface("ga4", MAPEO_COMPLETO, "revoked", CONECTADA);
     expect(v.state).toBe("not-connected");
     expect(v.reason).toBe("platform-token-revoked");
+  });
+
+  it("ausente es «sin conectar», y NO se confunde con revocado", () => {
+    // Los dos terminan en el mismo botón y no dicen lo mismo: revocado es que
+    // hubo autorización y se cayó, ausente es que nunca se hizo. Quien lee la
+    // pantalla busca cosas distintas según cuál sea.
+    const v = viewForSurface("ga4", MAPEO_COMPLETO, "absent", CONECTADA);
+    expect(v.state).toBe("not-connected");
+    expect(v.reason).toBe("platform-token-absent");
+    expect(v.reason).not.toBe("platform-token-revoked");
+  });
+
+  it("ausente NO es `error`: la consulta salió bien y la respuesta fue que no hay token", () => {
+    // Es lo que lo separa de `unreadable`, que es el caso en que no sabemos.
+    expect(viewForSurface("ga4", MAPEO_COMPLETO, "absent", CONECTADA).state).not.toBe("error");
   });
 
   it("vencido tiene palabra propia, porque tiene arreglo propio", () => {
@@ -105,8 +148,15 @@ describe("los estados del token de la agencia", () => {
     expect(v.propertyRef).toBe("properties/123456789");
   });
 
-  it("los tres estados rotos muestran el mapeo igual", () => {
-    for (const token of ["expired", "revoked", "undecided"] as AgencyTokenState[]) {
+  it("los seis estados rotos muestran el mapeo igual", () => {
+    for (const token of [
+      "expired",
+      "revoked",
+      "absent",
+      "unset",
+      "malformed",
+      "unreadable",
+    ] as AgencyTokenState[]) {
       const v = viewForSurface("search_console", MAPEO_COMPLETO, token, CONECTADA);
       expect(v.propertyRef, `con el token ${token}`).toBe("https://ejemplo.com/");
     }

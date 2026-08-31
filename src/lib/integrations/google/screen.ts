@@ -27,21 +27,31 @@
  * que existe para editar el mapeo escondería el mapeo justo cuando algo más
  * anda mal, que es cuando hace falta mirarlo.
  *
- * POR QUÉ EXISTE `agency-organization-undecided`
+ * DE DÓNDE SALE EL ESTADO DEL TOKEN, Y POR QUÉ SIGUE SIENDO UN PARÁMETRO
  *
- * Porque el acceso es de agencia con acceso delegado: hay UNA fila en
- * `integration_tokens`, la de la organización de Vulkan, y hoy ninguna columna
- * dice cuál organización es ésa. Buscar el token de la organización del cliente
- * aplicaría el modelo viejo y daría «sin token» para todos, para siempre — la
- * respuesta correcta por el motivo equivocado, que es lo que el #55 dejó de
- * hacer.
+ * El acceso es de agencia con acceso delegado: hay UNA fila en
+ * `integration_tokens`, la de la organización de Vulkan. Cuál organización es
+ * ésa no lo decía nada hasta que se eligió nombrarla por `VULKAN_AGENCY_ORG_ID`
+ * — ver `agency.ts`, que es el único lugar donde eso se resuelve.
  *
- * Así que el estado del token entra como PARÁMETRO y `"undecided"` es un valor
- * legítimo. La pantalla lo pasa hoy porque la decisión es de producto y no de
- * código; el día que exista, cambia un solo lugar. Que ese valor desaparezca es
- * la señal de que la decisión se tomó.
+ * Este archivo sigue recibiendo el estado ya calculado y no lo consulta: leerlo
+ * acá metería el cliente admin en un módulo que el bundle del navegador
+ * importa. `agency.ts` es puro por esa razón, y `agencyToken.ts` —el que sí
+ * toca la base— no lo importa nadie más que la pantalla.
+ *
+ * TRES DE LOS SIETE ESTADOS SON `error`, Y ESO NO ES PEREZA
+ *
+ * `unset`, `malformed` y `unreadable` no dicen nada sobre el token: dicen que
+ * no se pudo averiguar. El token puede estar perfectamente vivo. Mostrarlos
+ * como «sin conectar» mandaría a rehacer un OAuth que ya está hecho, que es el
+ * mismo defecto que este archivo existe para impedir, entrando por otra puerta.
+ *
+ * `absent` sí es «sin conectar», y es el único de los cuatro nuevos que lo es:
+ * la agencia está identificada, la consulta salió bien, y no hay token. Ahí el
+ * OAuth es exactamente lo que falta.
  */
 
+import type { AgencyTokenState } from "./agency";
 import {
   type GoogleSourceReason,
   type GoogleSurface,
@@ -56,14 +66,8 @@ export const GOOGLE_SURFACES: readonly GoogleSurface[] = [
   "google_business_profile",
 ];
 
-/**
- * El estado del token de la agencia.
- *
- * Los tres primeros son los que devuelve `public.integration_token_state()`. El
- * cuarto no es un estado del token: es que todavía no se sabe A QUIÉN
- * preguntarle. Ver el encabezado.
- */
-export type AgencyTokenState = "active" | "expired" | "revoked" | "undecided";
+/** El estado del token de la agencia. Los siete valores viven en `agency.ts`. */
+export type { AgencyTokenState };
 
 /** Dónde se arregla lo que la pantalla está mostrando. */
 export type IntegrationReason =
@@ -72,8 +76,14 @@ export type IntegrationReason =
   | "platform-token-revoked"
   /** El token de la agencia venció. Se refresca; no hace falta rehacer nada. */
   | "platform-token-expired"
-  /** Ninguna columna dice cuál organización es la agencia. Decisión de producto. */
-  | "agency-organization-undecided";
+  /** La agencia está identificada y no tiene token. Se hace el OAuth, una vez. */
+  | "platform-token-absent"
+  /** `VULKAN_AGENCY_ORG_ID` no está puesta. Se pone; no se toca nada de Google. */
+  | "agency-organization-unset"
+  /** `VULKAN_AGENCY_ORG_ID` está puesta y no es un uuid. Se corrige. */
+  | "agency-organization-malformed"
+  /** La consulta del estado falló. El token puede estar vivo; se investiga. */
+  | "agency-token-unreadable";
 
 /** Lo que la pantalla muestra de una superficie, para UNA organización. */
 export interface SurfaceView {
@@ -116,16 +126,33 @@ export function viewForSurface(
     return { surface, state: "not-connected", reason: "platform-not-connected", propertyRef };
   }
 
-  // 2. Hay credenciales, y no se sabe de quién es el token. No es «sin
-  //    conectar»: puede estar conectado y no tenemos cómo mirarlo.
-  if (tokenState === "undecided") {
-    return { surface, state: "error", reason: "agency-organization-undecided", propertyRef };
+  // 2. Hay credenciales, y no se pudo averiguar el estado del token. Los tres
+  //    casos son `error` y no «sin conectar» por la misma razón: el token puede
+  //    estar vivo y lo que falló es nuestra manera de mirarlo. Cada uno lleva
+  //    razón propia porque cada uno se arregla en un lugar distinto — la
+  //    variable que falta, la variable mal escrita, o la consulta que falló.
+  if (tokenState === "unset") {
+    return { surface, state: "error", reason: "agency-organization-unset", propertyRef };
+  }
+  if (tokenState === "malformed") {
+    return { surface, state: "error", reason: "agency-organization-malformed", propertyRef };
+  }
+  if (tokenState === "unreadable") {
+    return { surface, state: "error", reason: "agency-token-unreadable", propertyRef };
   }
 
   // 3. Revocado es «sin conectar» de verdad: la autorización ya no existe y hay
   //    que rehacer el OAuth. Domina sobre vencido, igual que en la `0014`.
   if (tokenState === "revoked") {
     return { surface, state: "not-connected", reason: "platform-token-revoked", propertyRef };
+  }
+
+  // 3bis. Y sin token tampoco hay conexión, con el mismo arreglo y otra razón:
+  //    «revocado» dice que hubo autorización y se cayó, «ausente» dice que
+  //    nunca se hizo. Quien lee la pantalla busca cosas distintas según cuál
+  //    sea, y las dos veces termina en el mismo botón.
+  if (tokenState === "absent") {
+    return { surface, state: "not-connected", reason: "platform-token-absent", propertyRef };
   }
 
   // 4. Vencido tiene palabra propia porque tiene arreglo propio: el refresh, que

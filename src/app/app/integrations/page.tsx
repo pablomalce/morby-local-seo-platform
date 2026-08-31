@@ -1,10 +1,8 @@
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { Card, HudLabel, PageHeader } from "@/components/ui";
-import {
-  type AgencyTokenState,
-  viewForOrganization,
-} from "@/lib/integrations/google/screen";
+import { viewForOrganization } from "@/lib/integrations/google/screen";
+import { agencyTokenState } from "@/lib/integrations/google/agencyToken";
 import {
   type GoogleSurface,
   type PropertyMapping,
@@ -24,19 +22,17 @@ export const dynamic = "force-dynamic";
  * INSERT escrito a mano contra producción es la manera más cara posible de
  * cometer un error de tipeo.
  *
- * POR QUÉ EL ESTADO DEL TOKEN ENTRA COMO `"undecided"`
+ * DE DÓNDE SALE EL ESTADO DEL TOKEN
  *
- * Porque hay UNA fila de token —la de la organización de Vulkan— y ninguna
- * columna dice cuál organización es ésa. Leer el token de la organización del
- * cliente aplicaría el modelo viejo y diría «sin token» para todos, para
- * siempre: la respuesta correcta por el motivo equivocado. Ver
- * `ESPINA_VULKAN.md`, «El modelo de acceso a Google».
+ * Hay UNA fila de token, la de la organización de Vulkan, y cuál organización
+ * es ésa lo dice `VULKAN_AGENCY_ORG_ID`. `agencyTokenState()` resuelve las dos
+ * mitades —a quién preguntarle y en qué estado está— y devuelve una de siete
+ * palabras; esta pantalla no decide ninguna, sólo la pasa.
  *
- * Este es el ÚNICO lugar donde ese valor se escribe. El día que la decisión
- * exista, se reemplaza esta línea por la consulta y nada más de la pantalla
- * cambia.
+ * Se pide UNA vez para todas las organizaciones y no una por cliente: el token
+ * es de la plataforma, así que consultarlo por cliente daría la misma respuesta
+ * N veces y sugeriría, a quien lea este archivo, que es un dato por cliente.
  */
-const ESTADO_DEL_TOKEN: AgencyTokenState = "undecided";
 
 interface Organizacion {
   id: string;
@@ -87,6 +83,7 @@ export default async function IntegrationsPage() {
 
   const organizaciones = (orgRows ?? []) as Organizacion[];
   const plataformaConectada = platformIsConnected();
+  const estadoDelToken = await agencyTokenState();
 
   return (
     <>
@@ -97,7 +94,7 @@ export default async function IntegrationsPage() {
         description="One agency token, one mapping per client. The mapping is what separates one client's numbers from another's."
       />
 
-      <PlatformNotice connected={plataformaConectada} tokenState={ESTADO_DEL_TOKEN} />
+      <PlatformNotice connected={plataformaConectada} tokenState={estadoDelToken} />
 
       {organizaciones.length === 0 ? (
         <Card className="mt-6">
@@ -116,7 +113,7 @@ export default async function IntegrationsPage() {
               organizationSlug={org.slug}
               surfaces={viewForOrganization(
                 porOrganizacion.get(org.id) ?? [],
-                ESTADO_DEL_TOKEN
+                estadoDelToken
               )}
             />
           ))}

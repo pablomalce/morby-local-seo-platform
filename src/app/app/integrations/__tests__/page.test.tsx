@@ -75,6 +75,58 @@ const createSupabaseServerClient = vi.fn(async () => ({
 }));
 vi.mock("@/lib/supabase/server", () => ({ createSupabaseServerClient }));
 
+/** La organización de Vulkan, la que `VULKAN_AGENCY_ORG_ID` nombra. */
+const AGENCIA = "44444444-4444-4444-8444-444444444444";
+
+/**
+ * El token de la agencia, y si la consulta o la clasificación fallan.
+ *
+ * Se mockea `@/lib/supabase/admin` y no `agencyToken.ts` a propósito: mockear
+ * el módulo entero probaría que la pantalla llama a una función, no que esa
+ * función le pregunte a la base por la organización correcta. El cableado que
+ * este archivo mide llega hasta la consulta.
+ */
+let filaDelToken: { expires_at: string; revoked_at: string | null } | null = null;
+let falloDeLectura = false;
+let clasificacion: string | null = "active";
+
+const createSupabaseAdminClient = vi.fn(() => ({
+  from(tabla: string) {
+    const filtros: Record<string, unknown> = {};
+    const registrar = () => consultas.push({ tabla, filtros: { ...filtros } });
+    const encadenable: Record<string, unknown> = {
+      select: () => encadenable,
+      eq: (col: string, val: unknown) => {
+        filtros[col] = val;
+        registrar();
+        return encadenable;
+      },
+      order: (col: string, opts: unknown) => {
+        filtros[`order:${col}`] = opts;
+        registrar();
+        return encadenable;
+      },
+      limit: (n: number) => {
+        filtros.limit = n;
+        registrar();
+        return encadenable;
+      },
+      then: (resolver: (v: unknown) => unknown) =>
+        Promise.resolve(
+          falloDeLectura
+            ? { data: null, error: { message: "falló" } }
+            : { data: filaDelToken ? [filaDelToken] : [], error: null }
+        ).then(resolver),
+    };
+    return encadenable;
+  },
+  rpc: async (nombre: string, args: Record<string, unknown>) => {
+    consultas.push({ tabla: `rpc:${nombre}`, filtros: { ...args } });
+    return { data: clasificacion, error: null };
+  },
+}));
+vi.mock("@/lib/supabase/admin", () => ({ createSupabaseAdminClient }));
+
 /** Todos los nodos del árbol devuelto cuyo componente se llama `nombre`. */
 function nodos(raiz: unknown, nombre: string): { props: Record<string, unknown> }[] {
   const encontrados: { props: Record<string, unknown> }[] = [];
@@ -121,6 +173,10 @@ beforeEach(() => {
   redirect.mockClear();
   delete process.env.GOOGLE_CLIENT_ID;
   delete process.env.GOOGLE_CLIENT_SECRET;
+  process.env.VULKAN_AGENCY_ORG_ID = AGENCIA;
+  filaDelToken = null;
+  falloDeLectura = false;
+  clasificacion = "active";
   vi.resetModules();
 });
 
@@ -210,11 +266,32 @@ describe("lo que llega a la pantalla sale de esas filas", () => {
     expect(ga4.reason).toBe("platform-not-connected");
   });
 
-  it("con credenciales, la razón pasa a ser la que la decisión de la agencia traba", async () => {
-    // Que este valor cambie el día que se decida cuál organización es la agencia
-    // es la señal de que la costura se usó, no de que este test estaba mal.
+  it("con credenciales, agencia y token vivo, la superficie mapeada queda conectada", async () => {
+    // La versión anterior de este test esperaba `agency-organization-undecided`
+    // y decía que cambiarlo sería la señal de que la costura se usó. Esto es esa
+    // señal: la decisión existe, el estado sale de la base, y lo único que
+    // queda decidiendo por cliente es el mapeo.
     process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
     process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
+    filaDelToken = { expires_at: "2099-01-01T00:00:00.000Z", revoked_at: null };
+    clasificacion = "active";
+    mapeos = [{ organization_id: ORG_A, provider: "ga4", property_ref: "properties/123456789" }];
+
+    const bloques = nodos(await pantalla(), "OrganizationIntegrations");
+    const ga4 = (bloques[0].props.surfaces as { surface: string; state: string; reason: string }[]).find(
+      (s) => s.surface === "ga4"
+    )!;
+    expect(ga4.state).toBe("connected");
+    expect(ga4.reason).toBe(null);
+  });
+
+  it("y sin la variable de la agencia, esa misma superficie es `error` y no «conectada»", async () => {
+    // El par del anterior: lo único que cambia entre los dos es saber a quién
+    // preguntarle. Sin eso, afirmar «conectado» sería afirmar algo que nadie
+    // midió.
+    process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
+    process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
+    delete process.env.VULKAN_AGENCY_ORG_ID;
     mapeos = [{ organization_id: ORG_A, provider: "ga4", property_ref: "properties/123456789" }];
 
     const bloques = nodos(await pantalla(), "OrganizationIntegrations");
@@ -222,7 +299,7 @@ describe("lo que llega a la pantalla sale de esas filas", () => {
       (s) => s.surface === "ga4"
     )!;
     expect(ga4.state).toBe("error");
-    expect(ga4.reason).toBe("agency-organization-undecided");
+    expect(ga4.reason).toBe("agency-organization-unset");
   });
 
   it("una organización sin ningún mapeo igual muestra las tres superficies", async () => {
@@ -248,8 +325,83 @@ describe("el estado de la plataforma se muestra medido, no supuesto", () => {
     expect(aviso[0].props.connected).toBe(true);
   });
 
-  it("el estado del token es «sin decidir», y ése es el único lugar donde se escribe", async () => {
+  it("le pregunta a la base por el token de LA AGENCIA, no por el del cliente", async () => {
+    // La consulta por la organización del cliente es el modelo viejo: esa fila
+    // no existe para ningún cliente, así que todos dirían «sin token» para
+    // siempre — la respuesta correcta por el motivo equivocado.
+    await pantalla();
+
+    const c = consultas.filter((q) => q.tabla === "integration_tokens").pop();
+    expect(c, "no se consultó integration_tokens").toBeDefined();
+    expect(c!.filtros.organization_id).toBe(AGENCIA);
+    expect(c!.filtros.organization_id).not.toBe(ORG_A);
+    expect(c!.filtros.provider).toBe("google");
+  });
+
+  it("pide la fila viva primero, porque el índice único de la 0014 es parcial", async () => {
+    // Una organización puede tener varias revocadas y una viva. Sin este orden,
+    // un `limit 1` podría traer una revocada de hace meses y declarar revocado
+    // un token que anda.
+    await pantalla();
+
+    const c = consultas.filter((q) => q.tabla === "integration_tokens").pop();
+    expect(c!.filtros["order:revoked_at"]).toEqual({ ascending: true, nullsFirst: true });
+  });
+
+  it("sin fila, el estado que llega a la pantalla es `absent`", async () => {
+    filaDelToken = null;
     const aviso = nodos(await pantalla(), "PlatformNotice");
-    expect(aviso[0].props.tokenState).toBe("undecided");
+    expect(aviso[0].props.tokenState).toBe("absent");
+  });
+
+  it("con fila, el estado sale de la función de la base y no de la pantalla", async () => {
+    filaDelToken = { expires_at: "2099-01-01T00:00:00.000Z", revoked_at: null };
+    clasificacion = "expired";
+    const aviso = nodos(await pantalla(), "PlatformNotice");
+    // La pantalla no mira `expires_at`: si lo hiciera, esta fila que vence en
+    // 2099 diría «activo» y la respuesta de la base quedaría ignorada.
+    expect(aviso[0].props.tokenState).toBe("expired");
+    expect(consultas.some((q) => q.tabla === "rpc:integration_token_state")).toBe(true);
+  });
+
+  it("una lectura que falla llega como `unreadable`, no como «sin token»", async () => {
+    falloDeLectura = true;
+    const aviso = nodos(await pantalla(), "PlatformNotice");
+    expect(aviso[0].props.tokenState).toBe("unreadable");
+  });
+
+  it("sin `VULKAN_AGENCY_ORG_ID` llega `unset`, y no se consulta la tabla", async () => {
+    delete process.env.VULKAN_AGENCY_ORG_ID;
+    const aviso = nodos(await pantalla(), "PlatformNotice");
+    expect(aviso[0].props.tokenState).toBe("unset");
+    expect(consultas.some((q) => q.tabla === "integration_tokens")).toBe(false);
+  });
+
+  it("el mismo estado va al aviso y a cada organización, porque el token es uno solo", async () => {
+    // Dos fuentes para el mismo dato es como se separan. El token es de la
+    // plataforma: si el aviso dijera una cosa y las tarjetas otra, una de las
+    // dos estaría mintiendo.
+    process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
+    process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
+    organizaciones = [
+      { id: ORG_A, name: "Cliente A", slug: "cliente-a" },
+      { id: ORG_B, name: "Cliente B", slug: "cliente-b" },
+    ];
+    membresias = [{ organization_id: ORG_A }, { organization_id: ORG_B }];
+    filaDelToken = { expires_at: "2099-01-01T00:00:00.000Z", revoked_at: null };
+    clasificacion = "revoked";
+
+    const arbol = await pantalla();
+    const aviso = nodos(arbol, "PlatformNotice");
+    const tarjetas = nodos(arbol, "OrganizationIntegrations");
+
+    expect(aviso[0].props.tokenState).toBe("revoked");
+    expect(tarjetas).toHaveLength(2);
+    for (const t of tarjetas) {
+      const superficies = t.props.surfaces as { reason: string | null }[];
+      for (const s of superficies) {
+        expect(s.reason).toBe("platform-token-revoked");
+      }
+    }
   });
 });

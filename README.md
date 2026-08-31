@@ -305,6 +305,49 @@ token then serves it the other client's data in its own report. The isolation
 holds on the ROW and the leak happens in the CONTENT, so no policy can see it.
 Checks 38 and 45 measure both halves.
 
+### Which organization is the agency: `VULKAN_AGENCY_ORG_ID`
+
+Access to Google is delegated: ONE OAuth token, held by the Vulkan account, with
+permission over every client's properties. So there is one row in
+`integration_tokens` and something has to say whose. That something is an
+environment variable holding the organization's UUID.
+
+It was chosen over a column on `organizations` and over a platform singleton
+table for what it costs to undo: there is nothing to migrate, and moving it into
+the schema later is a trivial migration. Removing a column that already has data
+and policies hanging off it is not.
+
+**The screen reports seven states, and four of them are ways of not having an
+answer.** `active`, `expired` and `revoked` are what
+`public.integration_token_state()` returns when there IS a row. The other four
+each have their own fix:
+
+| state | what it means | where it is fixed |
+|---|---|---|
+| `absent` | the agency is identified and has no token | run the OAuth consent, once |
+| `unset` | `VULKAN_AGENCY_ORG_ID` is not set | set it; Google is untouched |
+| `malformed` | it is set to something that is not a UUID | correct the value |
+| `unreadable` | the lookup failed | investigate; the token may be fine |
+
+`unset`, `malformed` and `unreadable` show as `error` and never as "not
+connected". They say nothing about the token, which may well be active — showing
+them as "not connected" would send someone to redo an OAuth that is already
+done. `absent` is the only one of the four that IS "not connected", because
+there the lookup succeeded and the answer was that no token exists.
+
+**Validating the UUID is what stops the worst of these.** Without it, a mistyped
+id queries an organization that does not exist, finds no row, and the screen says
+"run the OAuth" — someone runs it, it is stored under the correct id, and the
+screen keeps saying the same thing. The right answer for the wrong reason, which
+is the defect this repository has been removing since #55.
+
+**The state is read with `service_role`, not as the user.** `0014` grants
+`authenticated` SELECT on `integration_tokens`, but RLS limits it to the
+organizations it belongs to — and whoever is looking at this screen may not be a
+member of the agency. Reading it as the user would return zero rows and claim
+there is no token over one that exists and works. What is read are two
+timestamps of one organization; the `secret_id` and the Vault are never touched.
+
 ## Project structure (post-Phase 1)
 
 ```text
