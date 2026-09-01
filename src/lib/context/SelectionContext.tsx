@@ -291,7 +291,28 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
     const business = state.businessId
       ? allBusinesses.find((b) => b.id === state.businessId) ?? placeholderBusiness
       : placeholderBusiness;
-    const businessesForOrg = allBusinesses.filter((b) => b.organizationId === organization.id);
+
+    // QUÉ IMPIDE ESTA LÍNEA
+    //
+    // Que los negocios REALES se filtren contra el id de una organización de
+    // MENTIRA, y desaparezcan del selector después de haber llegado.
+    //
+    // `organizations` viene de `@/lib/mock/universal`, que es lo correcto en
+    // modo demo y era todo lo que había cuando esto se escribió. Con sesión, los
+    // negocios llegan de la base con el `organization_id` de su tenant, que
+    // nunca coincide con el de una organización sembrada — así que el filtro de
+    // abajo los descartaba TODOS.
+    //
+    // El síntoma engaña: la petición sale, contesta 200 y trae el negocio, y el
+    // desplegable queda vacío igual. Medido el 2026-09-01 con
+    // `/rest/v1/businesses?organization_id=eq.df6743a9…` en 200 y el selector sin
+    // una sola opción.
+    const organizationIdActiva =
+      isAuthenticated && dbState?.organizationId ? dbState.organizationId : organization.id;
+
+    const businessesForOrg = allBusinesses.filter(
+      (b) => b.organizationId === organizationIdActiva
+    );
     const servicesForBusiness = allServices.filter((s) => s.businessId === business.id);
     const locationsForBusiness = allLocations.filter((l) => l.businessId === business.id);
     return {
