@@ -41,7 +41,7 @@ import type { AccessTokenResult, TokenUnavailable } from "./tokenStore";
 import type { Ga4Result, Ga4Totals } from "./ga4";
 import type { SearchConsoleResult, SearchConsoleTotals } from "./searchConsole";
 import { type GoogleSurface, type PropertyMapping, resolveGoogleSource } from "./sources";
-import { statusForOutcome } from "./status";
+import { type FetchOutcome, statusForOutcome } from "./status";
 
 /** Lo que el reporte necesita de las tres superficies de Google. */
 export interface GoogleHydration {
@@ -73,6 +73,47 @@ export function statusForTokenFailure(reason: TokenUnavailable): DataSourceStatu
   }
 }
 
+/**
+ * QUÉ IMPIDE ESTA FUNCIÓN
+ *
+ * Que «falló» sea todo lo que queda escrito cuando una fuente falla.
+ *
+ * `statusForOutcome()` colapsa seis maneras de fallar en la palabra `error`, y
+ * eso es correcto PARA LA PANTALLA: quien lee un reporte no puede hacer nada
+ * distinto con un 403 que con un timeout. Para quien opera la plataforma es lo
+ * contrario — un 403 se arregla dando permiso sobre la property, un 401 es el
+ * token, un 400 suele ser el identificador mal mapeado, y un timeout se
+ * reintenta.
+ *
+ * Medido el 2026-09-01: GA4 salió `error` en el primer reporte real y no había
+ * NINGUNA manera de saber cuál de los cuatro era — ni en la pantalla, ni en los
+ * logs del servidor, ni en la base. La única salida era adivinar y probar.
+ *
+ * El texto no lleva el token ni ningún dato del cliente: lleva la superficie, el
+ * tipo de fallo, el código si lo hubo, y el `property_ref` —que es un
+ * identificador público y es justamente el que suele estar mal—.
+ */
+export function describirFallo(outcome: FetchOutcome, propertyRef: string): string | null {
+  switch (outcome.kind) {
+    case "ok":
+      return null;
+    case "http":
+      // El número entero, no una familia. `403` y `401` piden acciones distintas
+      // y agruparlos como «4xx» sería volver a perder el motivo.
+      return `http ${outcome.status} sobre ${propertyRef}`;
+    case "timeout":
+      return `se agotó el tiempo sobre ${propertyRef}`;
+    case "network":
+      return `no hubo respuesta sobre ${propertyRef}`;
+    case "malformed":
+      return `respondió 2xx con un cuerpo que no trae lo que el reporte usa, sobre ${propertyRef}`;
+    case "no-credentials":
+      // No debería llegar acá —sin credenciales no se hace la petición— y por eso
+      // se dice así: si aparece en un log, lo que está mal es el llamador.
+      return `se intentó consultar ${propertyRef} sin credenciales`;
+  }
+}
+
 export interface HydrateDeps {
   mappings: readonly PropertyMapping[];
   /** El access token de la agencia, ya resuelto. Se pide UNA vez. */
@@ -80,6 +121,11 @@ export interface HydrateDeps {
   fetchSearchConsole: (accessToken: string, propertyRef: string) => Promise<SearchConsoleResult>;
   fetchGa4: (accessToken: string, propertyRef: string) => Promise<Ga4Result>;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Dónde se anota el motivo de un fallo. Inyectable para poder MEDIR que se
+   * anota: espiar `console` desde un test mide el espía, no el código.
+   */
+  log?: (mensaje: string) => void;
 }
 
 /**
@@ -132,13 +178,28 @@ export async function hydrateGoogle(deps: HydrateDeps): Promise<GoogleHydration>
     ga.ready ? deps.fetchGa4(accessToken, ga.propertyRef) : null,
   ]);
 
+  // Por defecto va a los logs del servidor, que en Vercel es donde alguien puede
+  // leerlo después del hecho. No se escribe en la respuesta: lo que un tercero
+  // podría provocar en un reporte es un fallo, y decirle cuál es entregarle el
+  // mapa. Mismo argumento que la ruta del callback.
+  const registrar =
+    deps.log ??
+    ((mensaje: string) => {
+      // eslint-disable-next-line no-console
+      console.warn(mensaje);
+    });
+
   if (scResultado) {
     salida.searchConsole = statusForOutcome(scResultado.outcome);
     salida.searchConsoleTotals = scResultado.totals;
+    const motivo = sc.ready ? describirFallo(scResultado.outcome, sc.propertyRef) : null;
+    if (motivo) registrar(`[google] search_console: ${motivo}`);
   }
   if (gaResultado) {
     salida.ga4 = statusForOutcome(gaResultado.outcome);
     salida.ga4Totals = gaResultado.totals;
+    const motivo = ga.ready ? describirFallo(gaResultado.outcome, ga.propertyRef) : null;
+    if (motivo) registrar(`[google] ga4: ${motivo}`);
   }
 
   return salida;
