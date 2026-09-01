@@ -84,6 +84,29 @@ export function PlatformNotice({
           </Badge>
         </div>
       </div>
+      {/*
+        El enlace aparece SÓLO cuando hay algo que conectar y con qué conectarlo.
+        Sin credenciales de plataforma el consentimiento no puede ni empezar, y el
+        enlace mandaría a un operador a chocarse con un 503; con el token `active`,
+        ofrecer «conectar» invita a rehacer un OAuth que está hecho — y rehacerlo
+        REVOCA el vivo antes de escribir el nuevo, así que un clic de curiosidad
+        deja a la plataforma sin token si el consentimiento se abandona a la mitad.
+
+        Los tres estados que sí lo muestran se arreglan con el mismo acto. Los
+        cuatro que no —`active` y las tres maneras de no saber— no: `unset`,
+        `malformed` y `unreadable` no dicen nada del token, y ofrecer reconectar
+        ahí es exactamente el defecto que `agency.ts` existe para impedir.
+      */}
+      {connected &&
+        (tokenState === "absent" || tokenState === "revoked" || tokenState === "expired") && (
+          <a
+            href="/api/auth/google/start"
+            className="mt-4 inline-block rounded-vulkan border border-vulkan-orange bg-metal-950 px-4 py-2 font-display text-[12px] uppercase tracking-hud text-vulkan-orange"
+          >
+            {tokenState === "absent" ? "CONNECT GOOGLE" : "RECONNECT GOOGLE"}
+          </a>
+        )}
+
       <p className="mt-4 text-[12px] text-metal-400">
         Access to Google is delegated: one OAuth token, held by the Vulkan account, with permission
         over every client&apos;s properties. Nothing here is per client — the per-client half is the
