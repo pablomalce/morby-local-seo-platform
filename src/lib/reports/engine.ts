@@ -153,6 +153,12 @@ const STRINGS = {
     issueNoCompetitorsRecommendation:
       "Run the Competitor Intelligence Agent — it identifies 3 plausible competitors based on your industry + city and adds them to your tracking list.",
     issueNoCompetitorsEvidence: ["Competitor list is empty"],
+    kpiSearchClicks: "Search clicks (28d)",
+    kpiSearchPosition: "Average position",
+    kpiSessions: "Sessions (28d)",
+    kpiConversions: "Conversions (28d)",
+    targetGrow: "Up vs. previous window",
+    targetPositionGood: "≤ 10",
     kpiLighthouse: "Lighthouse score",
     kpiLcp: "Largest Contentful Paint",
     kpiCls: "Cumulative Layout Shift",
@@ -289,6 +295,12 @@ const STRINGS = {
     issueNoCompetitorsRecommendation:
       "Corre el Competitor Intelligence Agent — identifica 3 competidores plausibles según tu industria + ciudad y los añade a tu lista de seguimiento.",
     issueNoCompetitorsEvidence: ["Lista de competidores vacía"],
+    kpiSearchClicks: "Clics en búsqueda (28d)",
+    kpiSearchPosition: "Posición media",
+    kpiSessions: "Sesiones (28d)",
+    kpiConversions: "Conversiones (28d)",
+    targetGrow: "Al alza vs. la ventana anterior",
+    targetPositionGood: "≤ 10",
     kpiLighthouse: "Score de Lighthouse",
     kpiLcp: "Largest Contentful Paint",
     kpiCls: "Cumulative Layout Shift",
@@ -424,6 +436,12 @@ const STRINGS = {
     issueNoCompetitorsRecommendation:
       "Kör Competitor Intelligence-agenten — den identifierar 3 troliga konkurrenter baserat på din bransch + stad och lägger till dem i din spårningslista.",
     issueNoCompetitorsEvidence: ["Konkurrentlistan är tom"],
+    kpiSearchClicks: "Sökklick (28d)",
+    kpiSearchPosition: "Genomsnittlig position",
+    kpiSessions: "Sessioner (28d)",
+    kpiConversions: "Konverteringar (28d)",
+    targetGrow: "Upp mot föregående period",
+    targetPositionGood: "≤ 10",
     kpiLighthouse: "Lighthouse-poäng",
     kpiLcp: "Largest Contentful Paint",
     kpiCls: "Cumulative Layout Shift",
@@ -491,6 +509,8 @@ function buildKpiSnapshot(snap: BusinessSnapshot): KpiSnapshot {
     competitorsTracked,
     planCompletion,
     webVitals: snap.webVitals,
+    searchConsole: snap.searchConsole,
+    ga4: snap.ga4,
   };
 }
 
@@ -876,6 +896,42 @@ function buildTrackingKpis(snap: BusinessSnapshot, kpis: KpiSnapshot, lang: type
       label: lang.kpiLcp,
       currentValue: `${(snap.webVitals.lcp / 1000).toFixed(1)}s`,
       target: lang.targetLcpGood,
+      cadence: lang.cadenceWeekly,
+    });
+  }
+
+  // Search Console y GA4 — sólo cuando la consulta salió bien. El `if` mira el
+  // objeto y no sus números: un cliente sin tráfico tiene ceros de verdad y esos
+  // ceros se muestran, porque «cero clics este mes» es un dato del reporte y no
+  // un dato faltante.
+  if (snap.searchConsole) {
+    list.push({
+      label: lang.kpiSearchClicks,
+      currentValue: `${snap.searchConsole.clicks}`,
+      target: lang.targetGrow,
+      cadence: lang.cadenceWeekly,
+    });
+    list.push({
+      label: lang.kpiSearchPosition,
+      // Una posición media se lee con un decimal: la diferencia entre 8,4 y 8,9
+      // es media página de resultados, y redondear la borra.
+      currentValue: snap.searchConsole.position.toFixed(1),
+      target: lang.targetPositionGood,
+      cadence: lang.cadenceWeekly,
+    });
+  }
+
+  if (snap.ga4) {
+    list.push({
+      label: lang.kpiSessions,
+      currentValue: `${snap.ga4.sessions}`,
+      target: lang.targetGrow,
+      cadence: lang.cadenceWeekly,
+    });
+    list.push({
+      label: lang.kpiConversions,
+      currentValue: `${snap.ga4.conversions}`,
+      target: lang.targetGrow,
       cadence: lang.cadenceWeekly,
     });
   }

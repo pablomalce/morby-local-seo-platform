@@ -18,11 +18,11 @@ import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mo
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
-import {
-  type GoogleSurface,
-  type PropertyMapping,
-  resolveGoogleSource,
-} from "@/lib/integrations/google/sources";
+import type { GoogleSurface, PropertyMapping } from "@/lib/integrations/google/sources";
+import { hydrateGoogle } from "@/lib/integrations/google/hydrate";
+import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
+import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
+import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
 import type {
@@ -33,7 +33,7 @@ import type {
   ContentAsset,
   Review,
 } from "@/lib/types/core";
-import type { DataSourceHealth, DataSourceStatus, Report } from "./types";
+import type { DataSourceHealth, Report } from "./types";
 
 /**
  * Client-side snapshot passed from the browser when the tenant lives only in localStorage
@@ -260,20 +260,19 @@ async function readPropertyMappings(organizationId: string): Promise<PropertyMap
 }
 
 /**
- * De la resolución al estado que el reporte muestra.
+ * El token de la agencia para ESTE reporte, o por qué no lo hay.
  *
- * ACÁ ENCHUFA EL CLIENTE HTTP DE F2, y hasta que exista `ready` es `error`. No
- * es una elección cómoda y las otras dos son peores: `live` afirmaría datos que
- * nadie trajo, y `missing` diría «conectá esto» sobre una integración que está
- * conectada y mapeada — que es exactamente el defecto que arregló el #46, y
- * volver a introducirlo desde el otro lado sería peor que no haber tocado nada.
- *
- * `error` dice lo que pasó: el reporte no consiguió el dato. Cuando el cliente
- * exista, esta rama lo llama y `statusForOutcome()` traduce la respuesta —
- * `status.ts` ya fija ese contrato y no hace falta cambiar nada de acá arriba.
+ * Un reporte de demostración no tiene sesión ni organización, así que tampoco
+ * tiene mapeos: las tres fuentes salen `missing` por el mapeo y el token nunca se
+ * llega a usar. Se escribe igual, y con un motivo honesto, para que haya UN solo
+ * camino — una rama que saltee la hidratación entera sería una segunda manera de
+ * decidir estados, y dos maneras se separan con el tiempo.
  */
-function statusForResolution(resolution: ReturnType<typeof resolveGoogleSource>): DataSourceStatus {
-  return resolution.ready ? "error" : resolution.status;
+async function tokenParaElReporte(authenticated: boolean): Promise<AccessTokenResult> {
+  if (!authenticated) {
+    return { ok: false, reason: "absent", detail: "reporte de demostración, sin sesión" };
+  }
+  return agencyAccessToken();
 }
 
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
@@ -299,13 +298,31 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
     ? await readPropertyMappings(result.snapshot.business.organizationId)
     : [];
 
-  const report = buildReport(result.snapshot, new Date().toISOString(), {
+  // El token se pide UNA vez para las tres superficies, y las dos consultas que
+  // hoy existen salen en paralelo. Ver `hydrate.ts`.
+  const ahora = new Date();
+  const google = await hydrateGoogle({
+    mappings,
+    token: await tokenParaElReporte(result.authenticated),
+    fetchSearchConsole: (accessToken, propertyRef) =>
+      fetchSearchConsoleTotals({ accessToken, propertyRef, ahora, fetcher: fetch }),
+    fetchGa4: (accessToken, propertyRef) =>
+      fetchGa4Totals({ accessToken, propertyRef, ahora, fetcher: fetch }),
+  });
+
+  // Los números entran al snapshot, como los de PageSpeed: el motor los muestra
+  // si están y no los inventa si no. Un total ausente y un total en cero son
+  // cosas distintas, y ésta es la línea donde se mantienen distintas.
+  if (google.searchConsoleTotals) result.snapshot.searchConsole = google.searchConsoleTotals;
+  if (google.ga4Totals) result.snapshot.ga4 = google.ga4Totals;
+
+  const report = buildReport(result.snapshot, ahora.toISOString(), {
     dataSources: {
       places: placesStatus,
       pagespeed: pagespeedStatus,
-      searchConsole: statusForResolution(resolveGoogleSource("search_console", mappings)),
-      gbp: statusForResolution(resolveGoogleSource("google_business_profile", mappings)),
-      ga4: statusForResolution(resolveGoogleSource("ga4", mappings)),
+      searchConsole: google.searchConsole,
+      gbp: google.gbp,
+      ga4: google.ga4,
     },
     localeOverride: input.locale,
   });

@@ -395,6 +395,32 @@ nothing to refresh tomorrow. Without the second, the SECOND consent by the same
 account returns no refresh token at all — so reconnecting, which is what one does
 when something is wrong, would produce a connection with no way to refresh.
 
+### The numbers themselves: Search Console and GA4
+
+`statusForResolution()` is gone. It used to return `error` for a source whose
+preconditions were met, which was honest — nobody had fetched anything — and the
+test that asserted it said, in writing, that the day the client existed the
+expectation would change to `live`, and that the change would be the signal the
+seam got used. That is what happened.
+
+`hydrateGoogle()` orders the three layers that were already there and adds none:
+`sources.ts` decides without asking Google, `tokenStore.ts` produces an access
+token or one of six reasons there is none, and `status.ts` translates what Google
+answered. The agency token is fetched ONCE for all three surfaces — it is one
+token, and asking per surface would also mean three refreshes racing to write the
+same row.
+
+**The failure that gets lost is zero versus nothing.** A property with no traffic
+answers 200 with no `rows`; a broken body may also have no `rows`. Read as
+`rows?.[0]?.clicks ?? 0` both become "0 clicks", once truthfully and once because
+something failed — and a zero draws nobody's attention. Search Console
+distinguishes them; GA4 has its own version of the same trap, because it returns
+numbers as STRINGS and `Number("")` is 0.
+
+**Google Business Profile is still not queried**, and shows `error` when mapped.
+Its API has no approved quota yet, so saying `live` would be the right answer for
+the wrong reason. The place the call goes is marked in `hydrate.ts`.
+
 ## Project structure (post-Phase 1)
 
 ```text

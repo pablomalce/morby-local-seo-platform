@@ -543,6 +543,29 @@ export interface BusinessSnapshot {
     lighthouseScore: number;
     fetchedAt: string;
   };
+  /**
+   * Totales reales de Search Console para la ventana del reporte. Opcional por el
+   * mismo motivo que `webVitals`: sólo está cuando el orquestador lo hidrató —hay
+   * token de agencia, hay mapeo, y Google contestó bien—.
+   *
+   * AUSENTE Y CERO NO SON LO MISMO, y por eso esto es opcional en vez de nacer en
+   * cero. Un cliente sin tráfico tiene ceros de verdad; uno cuya consulta falló no
+   * tiene nada, y el estado de la fuente lo dice. Inicializarlo en cero borraría
+   * esa diferencia justo donde nadie la mira.
+   */
+  searchConsole?: {
+    clicks: number;
+    impressions: number;
+    ctr: number;
+    position: number;
+    fetchedAt: string;
+  };
+  /** Lo mismo para GA4, sobre la misma ventana. */
+  ga4?: {
+    sessions: number;
+    conversions: number;
+    fetchedAt: string;
+  };
 }
 
 export function getBusinessSnapshot(businessId: string): BusinessSnapshot {
