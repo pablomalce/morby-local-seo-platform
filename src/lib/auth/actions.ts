@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { z } from "zod";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 
 const signInSchema = z.object({
   email: z.string().email("Enter a valid email"),
@@ -16,7 +17,7 @@ export interface SignInResult {
 
 /**
  * Send a magic link to the given email. Once clicked, the link returns to
- * `/auth/callback` which finalises the session and redirects to `/app/dashboard`.
+ * `/auth/callback` which finalises the session and redirects to DESTINO_POST_LOGIN.
  */
 export async function signInWithEmail(formData: FormData): Promise<SignInResult> {
   const parsed = signInSchema.safeParse({
@@ -29,7 +30,7 @@ export async function signInWithEmail(formData: FormData): Promise<SignInResult>
 
   const supabase = await createSupabaseServerClient();
   const origin = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
-  const next = parsed.data.redirectTo ?? "/app/dashboard";
+  const next = parsed.data.redirectTo ?? DESTINO_POST_LOGIN;
 
   const { error } = await supabase.auth.signInWithOtp({
     email: parsed.data.email,

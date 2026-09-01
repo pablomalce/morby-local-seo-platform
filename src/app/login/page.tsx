@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { ArrowRight, Mail } from "lucide-react";
 import { Badge, Button, Card, Field, HudLabel, Input, VulkanLogo } from "@/components/ui";
 import { signInWithEmail, type SignInResult } from "@/lib/auth/actions";
+import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 
 export default function LoginPage() {
   return (
@@ -16,7 +17,7 @@ export default function LoginPage() {
 
 function LoginInner() {
   const params = useSearchParams();
-  const redirectTo = params.get("redirectTo") ?? "/app/dashboard";
+  const redirectTo = params.get("redirectTo") ?? DESTINO_POST_LOGIN;
   const errorParam = params.get("error");
 
   const [pending, startTransition] = useTransition();
