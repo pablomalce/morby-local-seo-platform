@@ -1,4 +1,5 @@
 import { createServerClient } from "@supabase/ssr";
+import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
@@ -58,7 +59,7 @@ export async function middleware(request: NextRequest) {
 
     // If already signed in, /login bounces to /app.
     if (url.pathname === "/login" && user) {
-      url.pathname = "/app/dashboard";
+      url.pathname = DESTINO_POST_LOGIN;
       return NextResponse.redirect(url);
     }
 

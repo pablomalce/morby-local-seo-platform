@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 
 /**
  * Magic link callback. Supabase appends `code` (PKCE) to this URL after the user clicks the
@@ -8,7 +9,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 export async function GET(request: Request) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get("code");
-  const next = searchParams.get("next") ?? "/app/dashboard";
+  const next = searchParams.get("next") ?? DESTINO_POST_LOGIN;
 
   if (code) {
     const supabase = await createSupabaseServerClient();
