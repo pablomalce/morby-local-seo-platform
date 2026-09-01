@@ -41,6 +41,25 @@ export interface KpiSnapshot {
     lighthouseScore: number;
     fetchedAt: string;
   };
+  /**
+   * Real Search Console totals for the report window — present only when
+   * hydrated. Absent and zero are different: a client with no traffic has real
+   * zeroes, a client whose query failed has nothing, and
+   * `dataSources.searchConsole` is what says which.
+   */
+  searchConsole?: {
+    clicks: number;
+    impressions: number;
+    ctr: number;
+    position: number;
+    fetchedAt: string;
+  };
+  /** Real GA4 totals for the same window — present only when hydrated. */
+  ga4?: {
+    sessions: number;
+    conversions: number;
+    fetchedAt: string;
+  };
 }
 
 export interface ReportIssue {
