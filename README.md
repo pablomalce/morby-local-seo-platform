@@ -348,6 +348,53 @@ member of the agency. Reading it as the user would return zero rows and claim
 there is no token over one that exists and works. What is read are two
 timestamps of one organization; the `secret_id` and the Vault are never touched.
 
+### The OAuth consent, and the custody it fills
+
+`0014` built the cabinet — the table, the reference into `vault.secrets`, the
+distinction between expired and revoked — before there was a token to put in it.
+`0021` adds the key, and it has to live in SQL for two reasons: `supabase-js`
+only reaches the `public` schema, and creating the secret and writing the row
+that references it are two writes that have to be one. A crash between them
+leaves an orphaned secret in the Vault — a client's token, encrypted, with no
+owner. Same argument as `0019`.
+
+| function | what it is for |
+|---|---|
+| `store_integration_token` | a NEW authorization: revokes the live one, encrypts the secret, inserts the row |
+| `refresh_integration_token` | the SAME authorization with a new access token: replaces the secret in place |
+| `integration_token_secret` | the decrypted secret of the live row — the only object in `public` that returns a token |
+
+**All three are `SECURITY INVOKER`, which is the opposite of `0019`, and that was
+measured before it was written.** `service_role` already has BYPASSRLS, USAGE on
+`vault`, EXECUTE on `vault.create_secret` and SELECT on `vault.decrypted_secrets`;
+`authenticated` has none of the four. So `SECURITY DEFINER` would not add a
+capability, it would add a loan — and lending the owner's Vault privileges is the
+kind of thing that becomes irreversible in silence.
+
+**And the EXECUTE grants are not decorative because of that.** Checks 54 to 57
+measure them, and they assert on the error MESSAGE and not just on the SQLSTATE:
+with `authenticated` removed from `0021`'s REVOKE, the call still dies with
+`permission denied for schema vault`, which is also `42501`. Measured on
+2026-09-01 — those checks stayed GREEN with the line that protects them deleted.
+Checks 58 to 61 measure behaviour instead of privilege: that a second connection
+leaves exactly one live token, that a refresh does not mint a row, that a blank
+secret is refused, and that refreshing a connection that does not exist returns
+`false`.
+
+**The flow itself is two thin routes and one pure module.**
+`/api/auth/google/start` checks that the caller is a member of the agency
+organization, draws a `state` with `randomBytes`, keeps a copy in an `httpOnly`
+cookie, and redirects to Google. `/api/auth/google/callback` compares the state
+BEFORE exchanging anything, re-checks the membership, exchanges the code, and
+stores in one RPC. The cookie is deleted on every path: a `state` that survives
+its own exchange is a reusable one.
+
+`access_type=offline` and `prompt=consent` are both required and both fail
+quietly. Without the first, Google returns only an access token and there is
+nothing to refresh tomorrow. Without the second, the SECOND consent by the same
+account returns no refresh token at all — so reconnecting, which is what one does
+when something is wrong, would produce a connection with no way to refresh.
+
 ## Project structure (post-Phase 1)
 
 ```text

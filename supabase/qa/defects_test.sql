@@ -114,6 +114,37 @@ EXCEPTION WHEN OTHERS THEN
 END
 $$;
 
+-- Con qué MENSAJE murió, que es lo que el SQLSTATE no alcanza a decir cuando dos
+-- denegaciones distintas comparten código.
+--
+-- `sqlstate_of()` fue el arreglo de que `accepted()` midiera «falló» sin decir
+-- por qué. Esto es el mismo arreglo un paso más allá, y existe por una medición:
+-- las funciones de la 0021 son `SECURITY INVOKER` y tocan el esquema `vault`, así
+-- que un rol al que le sobre el EXECUTE igual muere con
+--
+--     42501 | permission denied for schema vault
+--
+-- que es indistinguible, por SQLSTATE, de
+--
+--     42501 | permission denied for function integration_token_secret
+--
+-- Medido el 2026-09-01: con `authenticated` sacado del REVOKE de la 0021, los
+-- bloques 54, 56 y 57 seguían VERDES. Pasaban porque el Vault los frenaba, no
+-- porque el privilegio que dicen medir estuviera puesto.
+--
+-- El mensaje viene en inglés porque así corren la réplica, el CI y hosted. Si
+-- algún día el servidor hablara otro idioma, estos bloques se pondrían en rojo
+-- —no en verde—, que es la dirección barata del error.
+CREATE OR REPLACE FUNCTION pg_temp.denied_on_function(p_sql text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE p_sql;
+    RETURN 'la llamada pasó';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' | ' || SQLERRM;
+END
+$$;
+
 -- Did this statement go through? Used wherever the fix may take the form of a
 -- refusal, so that "rejected" is recorded as a result instead of aborting the
 -- run. A test that cannot survive the fix is a test that gets deleted the day
@@ -2034,9 +2065,301 @@ SELECT 53, 'an agent run can carry a negative cost',
        'una corrida con cost_usd = -1.5, que resta de la suma del mes';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 54. El rol del navegador puede guardar un token
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la custodia de la 0014 tenga una llave y no una manija.
+--
+-- `store_integration_token` es `SECURITY INVOKER` a propósito, así que quien la
+-- ejecute sin USAGE sobre `vault` va a fallar apenas lo toque. Eso es lo que hace
+-- tentador saltear este bloque, y es exactamente por qué existe: la función
+-- REVOCA el token vivo ANTES de llegar al Vault, y el error que devuelve después
+-- no deshace ese UPDATE. O sea que una sesión de navegador capaz de ejecutarla
+-- deja a la plataforma entera sin token con una llamada, y lee un error que
+-- parece decir que no pasó nada.
+--
+-- Es la misma forma del bloque 50 con el argumento invertido: allá el peligro es
+-- que la función CORRA, acá es lo que alcanza a hacer antes de no correr.
+--
+-- La organización es un uuid que no existe: si el privilegio no frena la llamada,
+-- lo que se mide es el privilegio y no el daño.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+CREATE TEMP TABLE step54 AS SELECT pg_temp.denied_on_function($sql$
+    SELECT public.store_integration_token(
+        'ffffffff-ffff-4fff-8fff-ffffffffffff'::uuid, 'google', 'x', now())
+$sql$) AS error;
+
+-- Se afirma sobre el MENSAJE y no sólo sobre el SQLSTATE. Sin el EXECUTE, esta
+-- llamada muere igual: primero en el UPDATE, con `permission denied for table
+-- integration_tokens`. O sea que con `sqlstate_of()` este bloque pasaba en verde
+-- midiendo el privilegio de TABLA, que es otra línea de otro archivo — y que
+-- podría cambiar sin que nadie tocara este bloque.
+INSERT INTO defect_report
+SELECT 54, 'the browser-side role can store an integration token',
+       (SELECT error NOT LIKE '42501 | permission denied for function store_integration_token%'
+          FROM step54),
+       'grace, desde una sesión de navegador, llamando a la función que revoca el token vivo: ' ||
+       (SELECT error FROM step54) ||
+       ' (se espera 42501 sobre la FUNCIÓN, no sobre la tabla ni sobre el Vault)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 55. El rol del navegador puede refrescar el token
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo mismo, sobre la función que REESCRIBE el secreto.
+--
+-- Va aparte del 54 y no como una segunda afirmación del mismo bloque porque los
+-- privilegios se otorgan de a una función: el día que alguien agregue un
+-- `GRANT EXECUTE` de más va a ser sobre una sola, y un bloque que mide tres cosas
+-- en una fila no dice cuál.
+--
+-- Y lo que ésta alcanza a hacer sin llegar al Vault es distinto:
+-- `vault.update_secret` va ANTES del UPDATE de `expires_at`, así que un fallo de
+-- privilegio ahí deja la fila intacta. Lo que este bloque impide es lo otro: que
+-- alguien con USAGE sobre `vault` —hoy nadie del navegador, mañana quién sabe—
+-- reemplace el token de la plataforma por uno suyo.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+CREATE TEMP TABLE step55 AS SELECT pg_temp.denied_on_function($sql$
+    SELECT public.refresh_integration_token(
+        'ffffffff-ffff-4fff-8fff-ffffffffffff'::uuid, 'google', 'x', now())
+$sql$) AS error;
+
+-- Y acá el mensaje importa todavía más que en el 54, porque medido el 2026-09-01
+-- con el EXECUTE puesto esta llamada NO FALLA: la RLS le esconde la fila, el
+-- SELECT no encuentra nada, la función devuelve `false` y no hay excepción
+-- ninguna. Un bloque que sólo mirara «falló o no» leería ese `false` como una
+-- llamada que pasó —correcto— pero uno que mirara sólo el SQLSTATE de un error
+-- que nunca ocurrió leería NULL, que es lo mismo que «pasó» y por accidente.
+INSERT INTO defect_report
+SELECT 55, 'the browser-side role can refresh the integration token',
+       (SELECT error NOT LIKE '42501 | permission denied for function refresh_integration_token%'
+          FROM step55),
+       'grace, desde una sesión de navegador, reemplazando el secreto de la plataforma: ' ||
+       (SELECT error FROM step55) ||
+       ' (se espera 42501 sobre la FUNCIÓN)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 56. El rol del navegador puede leer el token en claro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: el único objeto de `public` que devuelve un token descifrado.
+--
+-- Todo el diseño de la 0014 se apoya en que el secreto no esté en ninguna columna
+-- de `public`, y esta función es la excepción que ese diseño necesita para que la
+-- aplicación pueda llamar a Google. Una excepción con el privilegio mal puesto es
+-- la columna en claro otra vez, con más pasos.
+--
+-- Y el token es de AGENCIA: no es el de un cliente, es el que llega a las
+-- properties de todos.
+
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+
+CREATE TEMP TABLE step56 AS SELECT pg_temp.denied_on_function($sql$
+    SELECT public.integration_token_secret(
+        'ffffffff-ffff-4fff-8fff-ffffffffffff'::uuid, 'google')
+$sql$) AS error;
+
+INSERT INTO defect_report
+SELECT 56, 'the browser-side role can read the decrypted token',
+       (SELECT error NOT LIKE '42501 | permission denied for function integration_token_secret%'
+          FROM step56),
+       'grace, desde una sesión de navegador, pidiendo el token de agencia en claro: ' ||
+       (SELECT error FROM step56) ||
+       ' (se espera 42501 sobre la FUNCIÓN, no sobre el esquema vault)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 57. El rol `authenticated` puede leer el token en claro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo mismo que el 56, sobre el rol que la MIGRACIÓN nombra.
+--
+-- Es la lección del bloque 45 por cuarta vez: el 56 mide `growthos_app`, cuyo
+-- alcance lo decide `app_role.sql`, un archivo de QA. Si el
+-- `REVOKE ... FROM PUBLIC, anon, authenticated, service_role` de la 0021
+-- desapareciera, el 56 seguiría verde y la llave del Vault quedaría al alcance de
+-- cualquier sesión de navegador.
+--
+-- El resultado viaja por un GUC de transacción, como en el 45, el 49 y el 51:
+-- `authenticated` no puede escribir en `defect_report`, y darle ese permiso sería
+-- ensancharle los privilegios al rol que este bloque mide.
+
+RESET ROLE;
+SELECT set_config('qa.sql57', $sql$
+    SELECT public.integration_token_secret(
+        'ffffffff-ffff-4fff-8fff-ffffffffffff'::uuid, 'google')
+$sql$, true);
+
+SELECT pg_temp.be('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b57', pg_temp.denied_on_function(current_setting('qa.sql57')), true);
+RESET ROLE;
+
+-- Éste es el bloque donde la diferencia entre SQLSTATE y mensaje se midió: con
+-- `authenticated` sacado del REVOKE de la 0021, la llamada pasa el control de la
+-- función y muere en `permission denied for schema vault`, que también es 42501.
+-- El bloque quedaba verde con la línea que existe para protegerlo borrada.
+INSERT INTO defect_report
+SELECT 57, 'the authenticated role can read the decrypted token',
+       current_setting('qa.b57')
+           NOT LIKE '42501 | permission denied for function integration_token_secret%',
+       'grace, como `authenticated`, pidiendo el token de agencia en claro: ' ||
+       current_setting('qa.b57') ||
+       ' (se espera 42501 sobre la FUNCIÓN, no sobre el esquema vault)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 58. Reconectar deja dos tokens vivos, o no se puede reconectar
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el índice único PARCIAL de la 0014 y el orden de
+-- `store_integration_token` digan lo mismo.
+--
+-- El índice deja UNA viva por organización y proveedor y conserva las revocadas.
+-- La función revoca la viva ANTES de insertar la nueva, y ese orden no es
+-- intercambiable: al revés, el INSERT choca con el índice y **reconectar es
+-- imposible** — justo el día que hace falta, porque se reconecta cuando el token
+-- anterior dejó de servir. El modo de fallo del otro lado, dos vivas a la vez, lo
+-- ataja el índice; el de éste no lo ataja nadie.
+--
+-- Los dos se miden con la misma afirmación: después de dos conexiones tiene que
+-- haber DOS filas y UNA viva. Un 23505 deja la cuenta en uno y una, y una
+-- inversión que el índice no viera la dejaría en dos y dos.
+--
+-- Corre como el dueño y no como `growthos_app`, que es quien corre el resto del
+-- archivo: los bloques 54 a 56 acaban de afirmar que el rol de la aplicación NO
+-- puede llamar a estas funciones, así que medir su comportamiento desde ahí sería
+-- medir el privilegio dos veces y el comportamiento ninguna.
+
+-- La cuenta se mide como DIFERENCIA y no como total: los bloques 20 y 25 ya
+-- dejaron filas de token para esta organización, así que un total absoluto mide
+-- lo que hicieron ellos además de lo que hace éste. Medido acá: daba 3 donde el
+-- bloque esperaba 2, y lo que estaba mal era la expectativa.
+RESET ROLE;
+
+CREATE TEMP TABLE antes58 AS
+SELECT count(*) AS filas FROM integration_tokens
+ WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google';
+
+CREATE TEMP TABLE step58 AS
+SELECT pg_temp.sqlstate_of(format($sql$
+    SELECT public.store_integration_token(%L::uuid, 'google',
+        '{"refresh_token":"uno"}', now() + interval '1 hour');
+    SELECT public.store_integration_token(%L::uuid, 'google',
+        '{"refresh_token":"dos"}', now() + interval '1 hour');
+$sql$, (SELECT org_bob FROM t), (SELECT org_bob FROM t))) AS estado;
+
+INSERT INTO defect_report
+SELECT 58, 'a second connection leaves two live tokens, or cannot be made',
+       (SELECT estado IS NOT NULL FROM step58)
+       OR (SELECT count(*) - (SELECT filas FROM antes58) <> 2
+                  OR count(*) FILTER (WHERE revoked_at IS NULL) <> 1
+             FROM integration_tokens
+            WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google'),
+       'dos conexiones seguidas de la misma organización: SQLSTATE=' ||
+       coalesce((SELECT estado FROM step58), 'ninguno') || ', filas=' ||
+       (SELECT (count(*) - (SELECT filas FROM antes58))::text || ' nuevas / ' ||
+               count(*) FILTER (WHERE revoked_at IS NULL)::text || ' vivas'
+          FROM integration_tokens
+         WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google') ||
+       ' (se esperan 2 nuevas / 1 viva)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 59. Refrescar acuña una fila nueva
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que `revoked_at` siga significando «alguien dio de baja este
+-- acceso».
+--
+-- Un access token de Google dura una hora. Si refrescar creara fila —o revocara
+-- la anterior— el historial de revocaciones de la 0014, que existe para poder
+-- contestar quién tuvo acceso y hasta cuándo, se llenaría de una fila por hora y
+-- dejaría de poder contestarlo. Es el mismo error que confundir vencido con
+-- revocado, una capa más abajo.
+--
+-- Se mide sobre la fila viva del bloque anterior: la cuenta no se mueve, y el
+-- secreto sí. Las dos mitades hacen falta — una función que no hiciera nada
+-- también dejaría la cuenta quieta.
+
+RESET ROLE;
+
+CREATE TEMP TABLE step59 AS
+SELECT (SELECT count(*) FROM integration_tokens
+         WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google') AS antes,
+       public.refresh_integration_token((SELECT org_bob FROM t), 'google',
+           '{"refresh_token":"tres"}', now() + interval '2 hours') AS refresco;
+
+INSERT INTO defect_report
+SELECT 59, 'refreshing a token mints a new row instead of replacing the secret',
+       (SELECT NOT refresco FROM step59)
+       OR (SELECT count(*) <> (SELECT antes FROM step59) FROM integration_tokens
+            WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google')
+       OR (SELECT public.integration_token_secret((SELECT org_bob FROM t), 'google')
+             IS DISTINCT FROM '{"refresh_token":"tres"}'),
+       'un refresco sobre la conexión viva: devolvió ' ||
+       (SELECT refresco::text FROM step59) || ', filas ' ||
+       (SELECT antes::text FROM step59) || ' antes y ' ||
+       (SELECT count(*)::text FROM integration_tokens
+         WHERE organization_id = (SELECT org_bob FROM t) AND provider = 'google') ||
+       ' después (se espera true, la misma cuenta, y el secreto nuevo)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 60. Se puede guardar una conexión con el secreto en blanco
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que una fila que dice «hay un token» tenga un token.
+--
+-- La foránea RESTRICT de la 0014 cuida el caso en que el secreto NO EXISTA. Que
+-- exista y esté vacío no lo cuida nadie: el Vault cifra la cadena vacía sin
+-- protestar, la fila queda perfecta, `integration_token_state()` dice `active` y
+-- la pantalla dice «conectado». El fallo aparece recién contra Google, como un
+-- 401, y ahí se lee como un token vencido o revocado — o sea que manda a
+-- reconectar en vez de decir que lo que se guardó nunca fue un token.
+--
+-- Es la respuesta correcta por el motivo equivocado, la misma familia que
+-- `absent` contra `malformed` en `agency.ts`.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 60, 'a connection can be stored with a blank secret',
+       pg_temp.accepted(format($sql$
+           SELECT public.store_integration_token(%L::uuid, 'google', '   ',
+                                                 now() + interval '1 hour')
+       $sql$, (SELECT org_alice FROM t))),
+       'una conexión guardada con un secreto en blanco, que la pantalla muestra como conectada';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 61. Refrescar una conexión que no existe se informa como éxito
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que «no había nada que refrescar» llegue a la aplicación como una
+-- respuesta y no como un éxito.
+--
+-- Es el caso de la revocación: alguien da de baja el acceso en la cuenta de
+-- Google, la fila queda revocada, y el próximo refresco no encuentra ninguna
+-- viva. Un `true` ahí le dice a la aplicación que el token está al día — así que
+-- sigue llamando a Google con uno muerto, cobra 401, y muestra `error` cuando lo
+-- que corresponde es mandar a reconectar. El estado que la 0014 se tomó el
+-- trabajo de distinguir se pierde en el valor de retorno.
+--
+-- Va aparte del 59, que mide el camino feliz: una función que devolviera `true`
+-- siempre pasaría aquél y sólo cae acá.
+
+RESET ROLE;
+
+CREATE TEMP TABLE step61 AS
+SELECT public.refresh_integration_token(
+    'ffffffff-ffff-4fff-8fff-ffffffffffff'::uuid, 'google',
+    '{"refresh_token":"x"}', now() + interval '1 hour') AS resultado;
+
+INSERT INTO defect_report
+SELECT 61, 'refreshing a connection that does not exist is reported as success',
+       (SELECT resultado IS DISTINCT FROM false FROM step61),
+       'un refresco sobre una organización sin token vivo devolvió ' ||
+       (SELECT coalesce(resultado::text, 'NULL') FROM step61) || ' (se espera false)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: fifty-three checks were written, so fifty-three rows must be present.
+-- Anti-vacuity: sixty-one checks were written, so sixty-one rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -2046,8 +2369,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 53 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 53 checks recorded a result.', checks;
+    IF checks <> 61 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 61 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2058,11 +2381,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 53 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 61 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 53 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 61 checks green: the schema prevents every one of them.';
 END
 $$;
 

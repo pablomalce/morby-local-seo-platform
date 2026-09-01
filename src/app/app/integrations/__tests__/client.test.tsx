@@ -263,4 +263,43 @@ describe("el estado de la plataforma", () => {
       expect(container.textContent, `con ${estado}`).toContain(estado.toUpperCase());
     }
   });
+
+  /**
+   * El enlace al consentimiento. Es la única manera de empezar el OAuth desde la
+   * aplicación, y a la vez el único control de esta pantalla que puede dejar a la
+   * PLATAFORMA sin token: `store_integration_token` revoca el vivo antes de
+   * escribir el nuevo, así que un consentimiento abandonado a la mitad no deja
+   * las cosas como estaban.
+   */
+  it("ofrece conectar exactamente en los tres estados que se arreglan conectando", async () => {
+    const { PlatformNotice } = await componente();
+
+    for (const estado of ["absent", "revoked", "expired"] as const) {
+      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      expect(
+        container.querySelector('a[href="/api/auth/google/start"]'),
+        `con ${estado} tendría que ofrecerlo`
+      ).not.toBeNull();
+      cleanup();
+    }
+  });
+
+  it("no ofrece conectar sin credenciales de plataforma: el consentimiento no puede empezar", async () => {
+    const { PlatformNotice } = await componente();
+    const { container } = render(<PlatformNotice connected={false} tokenState="absent" />);
+    expect(container.querySelector('a[href="/api/auth/google/start"]')).toBeNull();
+  });
+
+  it("no lo ofrece con el token vivo ni cuando no se sabe nada de él", async () => {
+    const { PlatformNotice } = await componente();
+
+    for (const estado of ["active", "unset", "malformed", "unreadable"] as const) {
+      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      expect(
+        container.querySelector('a[href="/api/auth/google/start"]'),
+        `con ${estado} NO tendría que ofrecerlo`
+      ).toBeNull();
+      cleanup();
+    }
+  });
 });

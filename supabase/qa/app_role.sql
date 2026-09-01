@@ -175,3 +175,36 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Y NO las tres funciones de la custodia de tokens, que el GRANT de arriba le
+-- acaba de dar.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- `integration_token_secret` es el único objeto de `public` que devuelve un token
+-- en claro, y las otras dos escriben uno. Las tres son `SECURITY INVOKER` —o sea
+-- que quien las ejecute sin USAGE sobre `vault` va a fallar apenas lo toque— y
+-- eso NO vuelve decorativo este REVOKE: `store_integration_token` alcanza a
+-- REVOCAR el token vivo antes de llegar al Vault, y el error que devuelve después
+-- no deshace ese UPDATE.
+--
+-- O sea que sin estas líneas el rol de la aplicación puede dejar a la plataforma
+-- entera sin token con una sola llamada. Los bloques 54, 55 y 56 de
+-- defects_test.sql lo miden, uno por función.
+--
+-- Guardado con `to_regprocedure` por el mismo motivo que el de arriba:
+-- `rollback.sh` aplica este archivo sobre el esquema tal como estaba ANTES de la
+-- migración que prueba, y al probar la 0021 lo corre cuando las tres funciones
+-- todavía no existen.
+DO $$
+BEGIN
+    IF to_regprocedure('public.store_integration_token(uuid, text, text, timestamptz)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.store_integration_token(uuid, text, text, timestamptz) FROM growthos_app;
+    END IF;
+    IF to_regprocedure('public.refresh_integration_token(uuid, text, text, timestamptz)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.refresh_integration_token(uuid, text, text, timestamptz) FROM growthos_app;
+    END IF;
+    IF to_regprocedure('public.integration_token_secret(uuid, text)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.integration_token_secret(uuid, text) FROM growthos_app;
+    END IF;
+END
+$$;
