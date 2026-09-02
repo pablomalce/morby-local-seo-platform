@@ -8,6 +8,7 @@ import {
   type PropertyMapping,
   platformIsConnected,
 } from "@/lib/integrations/google/sources";
+import type { SondaVista } from "@/lib/integrations/google/probeView";
 import { OrganizationIntegrations, PlatformNotice } from "./client";
 
 export const dynamic = "force-dynamic";
@@ -33,6 +34,16 @@ export const dynamic = "force-dynamic";
  * es de la plataforma, así que consultarlo por cliente daría la misma respuesta
  * N veces y sugeriría, a quien lea este archivo, que es un dato por cliente.
  */
+
+/** Una fila de `integration_probe`, tal como vuelve de la base. */
+interface ProbeRow {
+  organization_id: string;
+  provider: string;
+  outcome: string;
+  http_status: number | null;
+  property_ref: string;
+  checked_at: string;
+}
 
 interface Organizacion {
   id: string;
@@ -81,6 +92,33 @@ export default async function IntegrationsPage() {
     porOrganizacion.set(row.organization_id as string, lista);
   }
 
+  // La última respuesta de Google por superficie, de la 0022. Es lo que convierte
+  // un `error` en algo accionable: sin esto, la pantalla dice que falló y el
+  // motivo vive en un log que en el plan Hobby dura minutos.
+  //
+  // Se lee con el cliente de SESIÓN y no con el admin, a diferencia del estado
+  // del token: esto SÍ es un dato por cliente, y la RLS de la 0022 es justamente
+  // la que impide que alguien vea contra qué property consulta otro.
+  const { data: probeRows } = orgIds.length
+    ? await supabase
+        .from("integration_probe")
+        .select("organization_id, provider, outcome, http_status, property_ref, checked_at")
+        .in("organization_id", orgIds)
+    : { data: [] as ProbeRow[] };
+
+  const sondasPorOrganizacion = new Map<string, SondaVista[]>();
+  for (const row of (probeRows ?? []) as ProbeRow[]) {
+    const lista = sondasPorOrganizacion.get(row.organization_id) ?? [];
+    lista.push({
+      surface: row.provider as GoogleSurface,
+      outcome: row.outcome,
+      httpStatus: row.http_status,
+      propertyRef: row.property_ref,
+      checkedAt: row.checked_at,
+    });
+    sondasPorOrganizacion.set(row.organization_id, lista);
+  }
+
   const organizaciones = (orgRows ?? []) as Organizacion[];
   const plataformaConectada = platformIsConnected();
   const estadoDelToken = await agencyTokenState();
@@ -115,6 +153,7 @@ export default async function IntegrationsPage() {
                 porOrganizacion.get(org.id) ?? [],
                 estadoDelToken
               )}
+              probes={sondasPorOrganizacion.get(org.id) ?? []}
             />
           ))}
         </div>

@@ -6,6 +6,7 @@ import { mapProperty, unmapProperty } from "@/lib/integrations/property-actions"
 import { FORMA_ESPERADA } from "@/lib/integrations/google/mapping";
 import type { AgencyTokenState, IntegrationReason, SurfaceView } from "@/lib/integrations/google/screen";
 import type { GoogleSurface } from "@/lib/integrations/google/sources";
+import { type SondaVista, haceCuanto, queHacer } from "@/lib/integrations/google/probeView";
 
 /**
  * Cómo se llama cada superficie para quien la opera. `provider` es el
@@ -122,11 +123,14 @@ export function OrganizationIntegrations({
   organizationName,
   organizationSlug,
   surfaces,
+  probes = [],
 }: {
   organizationId: string;
   organizationName: string;
   organizationSlug: string;
   surfaces: SurfaceView[];
+  /** La última respuesta de Google por superficie. Vacío cuando nadie consultó todavía. */
+  probes?: SondaVista[];
 }) {
   return (
     <Card>
@@ -138,7 +142,12 @@ export function OrganizationIntegrations({
       </div>
       <div className="mt-5 space-y-3">
         {surfaces.map((view) => (
-          <SurfaceRow key={view.surface} organizationId={organizationId} view={view} />
+          <SurfaceRow
+            key={view.surface}
+            organizationId={organizationId}
+            view={view}
+            probe={probes.find((p) => p.surface === view.surface)}
+          />
         ))}
       </div>
     </Card>
@@ -148,9 +157,11 @@ export function OrganizationIntegrations({
 function SurfaceRow({
   organizationId,
   view,
+  probe,
 }: {
   organizationId: string;
   view: SurfaceView;
+  probe?: SondaVista;
 }) {
   const [valor, setValor] = useState(view.propertyRef ?? "");
   const [error, setError] = useState<string | null>(null);
@@ -189,6 +200,22 @@ function SurfaceRow({
 
       {view.reason && (
         <p className="mt-2 text-[12px] text-metal-400">{RAZON[view.reason]}</p>
+      )}
+
+      {/*
+        Lo que Google contestó la última vez. Va DESPUÉS de la razón y no en su
+        lugar: la razón dice qué falta configurar, y esto dice qué pasó cuando se
+        preguntó. Son dos cosas distintas y las dos pueden ser ciertas a la vez.
+
+        Se muestra sólo cuando hay algo que decir — `queHacer` devuelve null si la
+        última consulta salió bien— porque un cartel que aparece siempre se deja
+        de leer.
+      */}
+      {probe && queHacer(probe) && (
+        <p className="mt-2 text-[12px] text-vulkan-orange" data-testid={`sonda-${view.surface}`}>
+          {queHacer(probe)}{" "}
+          <span className="text-metal-500">· medido {haceCuanto(probe.checkedAt)}</span>
+        </p>
       )}
 
       <div className="mt-4 flex flex-col gap-2 sm:flex-row">
