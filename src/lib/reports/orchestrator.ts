@@ -18,6 +18,7 @@ import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mo
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
+import { guardarSonda } from "@/lib/integrations/google/probe";
 import type { GoogleSurface, PropertyMapping } from "@/lib/integrations/google/sources";
 import { hydrateGoogle } from "@/lib/integrations/google/hydrate";
 import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
@@ -308,6 +309,11 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
       fetchSearchConsoleTotals({ accessToken, propertyRef, ahora, fetcher: fetch }),
     fetchGa4: (accessToken, propertyRef) =>
       fetchGa4Totals({ accessToken, propertyRef, ahora, fetcher: fetch }),
+    // Sólo con sesión: `integration_probe` tiene `organization_id NOT NULL`, y un
+    // reporte de demostración no tiene tenant que anotar. Sin esto, la sonda del
+    // demo escribiría contra la organización sembrada, que no existe en la base.
+    organizationId: result.authenticated ? result.snapshot.business.organizationId : null,
+    recordProbe: guardarSonda,
   });
 
   // Los números entran al snapshot, como los de PageSpeed: el motor los muestra
