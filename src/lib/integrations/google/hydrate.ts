@@ -42,6 +42,7 @@ import type { Ga4Result, Ga4Totals } from "./ga4";
 import type { SearchConsoleResult, SearchConsoleTotals } from "./searchConsole";
 import { type GoogleSurface, type PropertyMapping, resolveGoogleSource } from "./sources";
 import { type FetchOutcome, statusForOutcome } from "./status";
+import { type Sonda, sondaDeOutcome } from "./probe";
 
 /** Lo que el reporte necesita de las tres superficies de Google. */
 export interface GoogleHydration {
@@ -126,6 +127,17 @@ export interface HydrateDeps {
    * anota: espiar `console` desde un test mide el espía, no el código.
    */
   log?: (mensaje: string) => void;
+  /**
+   * La organización cuyo reporte se está armando. Sin ella no se guarda sonda:
+   * `integration_probe` tiene `organization_id NOT NULL` porque una fila sin
+   * tenant no la puede ver nadie, y un reporte de demostración no tiene ninguna.
+   */
+  organizationId?: string | null;
+  /**
+   * Dónde queda el resultado, además del log. Inyectable por lo mismo que `log`,
+   * y porque el que va de verdad escribe en la base.
+   */
+  recordProbe?: (sonda: Sonda) => Promise<unknown>;
 }
 
 /**
@@ -189,17 +201,40 @@ export async function hydrateGoogle(deps: HydrateDeps): Promise<GoogleHydration>
       console.warn(mensaje);
     });
 
+  // La sonda se guarda SIEMPRE, también cuando salió bien: «anduvo hace un
+  // minuto» es la mitad del diagnóstico cuando algo empieza a fallar, y una tabla
+  // que sólo tiene fallos no puede distinguir «nunca se consultó» de «anduvo».
+  // Es lo contrario del log, que sólo habla cuando hay algo raro que decir.
+  const sondas: Sonda[] = [];
+  const anotar = (superficie: GoogleSurface, outcome: FetchOutcome, propertyRef: string) => {
+    if (!deps.organizationId || !deps.recordProbe) return;
+    sondas.push(sondaDeOutcome(deps.organizationId, superficie, outcome, propertyRef));
+  };
+
   if (scResultado) {
     salida.searchConsole = statusForOutcome(scResultado.outcome);
     salida.searchConsoleTotals = scResultado.totals;
-    const motivo = sc.ready ? describirFallo(scResultado.outcome, sc.propertyRef) : null;
-    if (motivo) registrar(`[google] search_console: ${motivo}`);
+    if (sc.ready) {
+      const motivo = describirFallo(scResultado.outcome, sc.propertyRef);
+      if (motivo) registrar(`[google] search_console: ${motivo}`);
+      anotar("search_console", scResultado.outcome, sc.propertyRef);
+    }
   }
   if (gaResultado) {
     salida.ga4 = statusForOutcome(gaResultado.outcome);
     salida.ga4Totals = gaResultado.totals;
-    const motivo = ga.ready ? describirFallo(gaResultado.outcome, ga.propertyRef) : null;
-    if (motivo) registrar(`[google] ga4: ${motivo}`);
+    if (ga.ready) {
+      const motivo = describirFallo(gaResultado.outcome, ga.propertyRef);
+      if (motivo) registrar(`[google] ga4: ${motivo}`);
+      anotar("ga4", gaResultado.outcome, ga.propertyRef);
+    }
+  }
+
+  // Se espera a que terminen, y sus fallos NO cambian lo que se devuelve: ver el
+  // encabezado de `probe.ts`. `allSettled` y no `all` porque un rechazo acá no
+  // puede tumbar el reporte que produjo el dato.
+  if (deps.recordProbe && sondas.length > 0) {
+    await Promise.allSettled(sondas.map((s) => deps.recordProbe!(s)));
   }
 
   return salida;

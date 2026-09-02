@@ -208,3 +208,16 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Y lo mismo para la sonda de integraciones, por el mismo motivo que las dos de
+-- arriba. La 0022 le da a `authenticated` SÓLO SELECT: escribir el resultado de
+-- una consulta es consecuencia de haberla hecho, y una sesión que pueda escribirlo
+-- declara «ok» sobre una integración rota. El GRANT sobre ALL TABLES se lo
+-- devolvería, y el bloque 63 estaría midiendo un rol que no existe en producción.
+DO $$
+BEGIN
+    IF to_regclass('public.integration_probe') IS NOT NULL THEN
+        REVOKE INSERT, UPDATE, DELETE ON public.integration_probe FROM growthos_app;
+    END IF;
+END
+$$;

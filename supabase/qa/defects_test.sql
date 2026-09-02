@@ -2357,9 +2357,120 @@ SELECT 61, 'refreshing a connection that does not exist is reported as success',
        (SELECT coalesce(resultado::text, 'NULL') FROM step61) || ' (se espera false)';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 62. Un tenant puede leer la sonda de otro
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que `integration_probe` no filtre a qué property apunta otro
+-- cliente.
+--
+-- La tabla guarda `property_ref`, que en el modelo de agencia es LO ÚNICO que
+-- separa los datos de un cliente de los de otro. Una fila visible de más no es un
+-- detalle de presentación: le dice a alguien cuál es la property de otro, que es
+-- la mitad del trabajo de apuntar la suya ahí.
+
+RESET ROLE;
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+
+INSERT INTO defect_report
+SELECT 62, 'a tenant can read another tenant''s integration probe',
+       EXISTS (SELECT 1 FROM integration_probe p WHERE p.organization_id = (SELECT org_bob FROM t)),
+       'alice, como miembro de su organización, viendo la sonda de bob';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 63. El rol del navegador puede escribir una sonda
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el resultado de una consulta lo escriba quien la HIZO.
+--
+-- Una sesión que pueda escribir acá declara «ok» sobre una integración rota, o
+-- «http 403» sobre una que anda. Las dos direcciones duelen: la primera esconde
+-- un problema y la segunda manda a alguien a arreglar lo que no está roto — y las
+-- dos son peores que no tener la tabla, porque esto existe justamente para que
+-- alguien le crea.
+
+RESET ROLE;
+SET LOCAL ROLE growthos_app;
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+
+CREATE TEMP TABLE step63 AS SELECT pg_temp.sqlstate_of(format($sql$
+    INSERT INTO integration_probe (organization_id, provider, outcome)
+    VALUES (%L, 'ga4', 'ok')
+$sql$, (SELECT org_alice FROM t))) AS estado;
+
+INSERT INTO defect_report
+SELECT 63, 'the browser-side role can write an integration probe',
+       (SELECT estado IS DISTINCT FROM '42501' FROM step63),
+       'grace escribiendo el resultado de una consulta que no hizo: SQLSTATE=' ||
+       coalesce((SELECT estado FROM step63), 'ninguno, la escritura pasó') ||
+       ' (se espera 42501, insufficient_privilege)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 64. El rol `authenticated` puede escribir una sonda
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: lo mismo que el 63, sobre el rol que la MIGRACIÓN nombra.
+--
+-- La lección del bloque 45 otra vez: el 63 mide `growthos_app`, cuyo alcance lo
+-- decide `app_role.sql`. Si el `GRANT SELECT` de la 0022 se convirtiera en un
+-- `GRANT ALL`, el 63 seguiría verde.
+
+RESET ROLE;
+SELECT set_config('qa.sql64', format($sql$
+    INSERT INTO integration_probe (organization_id, provider, outcome)
+    VALUES (%L, 'ga4', 'ok')
+$sql$, (SELECT org_alice FROM t)), true);
+
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b64', coalesce(pg_temp.sqlstate_of(current_setting('qa.sql64')), 'paso'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 64, 'the authenticated role can write an integration probe',
+       current_setting('qa.b64') IS DISTINCT FROM '42501',
+       'alice, como `authenticated`, escribiendo una sonda: SQLSTATE=' ||
+       current_setting('qa.b64') || ' (se espera 42501, insufficient_privilege)';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 65. Una sonda puede llevar un código HTTP sin haber habido respuesta
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el código no describa una respuesta que nunca existió.
+--
+-- `timeout` y `network` son «no hubo respuesta». Una fila que diga `network` con
+-- un 500 al lado inventa que Google contestó algo, y quien la lea va a buscar el
+-- problema del lado de Google en vez del de la red.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 65, 'a probe can carry an HTTP code with no response behind it',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_probe (organization_id, provider, outcome, http_status)
+           VALUES (%L, 'ga4', 'network', 500)
+       $sql$, (SELECT org_bob FROM t))),
+       'una sonda `network` con código 500, que describe una respuesta que no hubo';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 66. Una sonda `http` puede no decir con qué código
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la otra mitad, y es la que motivó la tabla entera.
+--
+-- Un `http` sin número es exactamente el estado del que veníamos: «falló» sin
+-- decir si fue permiso, identificador o token. Guardar eso sería construir la
+-- tabla y perder lo único que la justifica.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 66, 'an http probe can omit the status code',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_probe (organization_id, provider, outcome)
+           VALUES (%L, 'search_console', 'http')
+       $sql$, (SELECT org_bob FROM t))),
+       'una sonda `http` sin código, que es «falló» sin decir por qué';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: sixty-one checks were written, so sixty-one rows must be present.
+-- Anti-vacuity: sixty-six checks were written, so sixty-six rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -2369,8 +2480,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 61 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 61 checks recorded a result.', checks;
+    IF checks <> 66 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 66 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2381,11 +2492,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 61 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 66 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 61 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 66 checks green: the schema prevents every one of them.';
 END
 $$;
 

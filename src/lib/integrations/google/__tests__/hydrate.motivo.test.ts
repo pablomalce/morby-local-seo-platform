@@ -118,3 +118,84 @@ describe("hydrateGoogle y el registro", () => {
     expect(anotado.join(" ")).not.toContain("no-es-un-token-real");
   });
 });
+
+/**
+ * QUÉ IMPIDE ESTE BLOQUE
+ *
+ * Que el motivo siga viviendo sólo en un log que se borra.
+ *
+ * La #67 anotaba en el log del servidor. En el plan Hobby de Vercel eso dura
+ * minutos: el 2026-09-02, con GA4 fallando, el panel contestó «There are no
+ * request logs in this time range». La sonda va a la base y sobrevive.
+ */
+describe("la sonda que sobrevive al log", () => {
+  const ORG = "df6743a9-6f98-400e-8efb-fdcc37b3cb45";
+
+  it("guarda el código y la property cuando falla", async () => {
+    const sondas: Record<string, unknown>[] = [];
+    await hydrateGoogle(
+      deps({
+        organizationId: ORG,
+        recordProbe: async (s: Record<string, unknown>) => {
+          sondas.push(s);
+        },
+        fetchGa4: async () => ({ outcome: { kind: "http" as const, status: 403 }, totals: null }),
+      })
+    );
+
+    const ga = sondas.find((s) => s.provider === "ga4");
+    expect(ga).toMatchObject({
+      organizationId: ORG,
+      outcome: "http",
+      httpStatus: 403,
+      propertyRef: "properties/123456789",
+    });
+  });
+
+  it("guarda también cuando salió bien, que es la mitad del diagnóstico", async () => {
+    // «Anduvo hace un minuto» es lo que distingue «se rompió recién» de «nunca
+    // anduvo». Una tabla que sólo tiene fallos no puede decir la diferencia.
+    const sondas: Record<string, unknown>[] = [];
+    await hydrateGoogle(
+      deps({
+        organizationId: ORG,
+        recordProbe: async (s: Record<string, unknown>) => {
+          sondas.push(s);
+        },
+      })
+    );
+
+    expect(sondas).toHaveLength(2);
+    expect(sondas.every((s) => s.outcome === "ok")).toBe(true);
+    expect(sondas.every((s) => s.httpStatus === null)).toBe(true);
+  });
+
+  it("sin organización no guarda nada: un reporte de demostración no tiene tenant", async () => {
+    const sondas: unknown[] = [];
+    await hydrateGoogle(
+      deps({
+        organizationId: null,
+        recordProbe: async (s: unknown) => {
+          sondas.push(s);
+        },
+        fetchGa4: async () => ({ outcome: { kind: "http" as const, status: 403 }, totals: null }),
+      })
+    );
+    expect(sondas).toHaveLength(0);
+  });
+
+  it("si la escritura falla, el reporte sigue", async () => {
+    // La sonda es telemetría. Un reporte que se cae porque no pudo anotar por qué
+    // falló otra cosa convierte una molestia en una caída.
+    const r = await hydrateGoogle(
+      deps({
+        organizationId: ORG,
+        recordProbe: async () => {
+          throw new Error("la base no contestó");
+        },
+      })
+    );
+    expect(r.searchConsole).toBe("live");
+    expect(r.ga4).toBe("live");
+  });
+});
