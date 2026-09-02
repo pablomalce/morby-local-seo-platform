@@ -30,7 +30,26 @@ import { VENTANA_DIAS, ventana } from "./searchConsole";
 export const GA4_ENDPOINT = "https://analyticsdata.googleapis.com/v1beta";
 
 /** Las dos métricas que el reporte usa, en el orden en que se piden. */
-export const GA4_METRICAS = ["sessions", "conversions"] as const;
+/**
+ * QUÉ IMPIDE ESTA LÍNEA
+ *
+ * Que se le pida a Google una métrica que Google retiró.
+ *
+ * La métrica se llamaba `conversions` y GA4 la renombró a `keyEvents`. No es un
+ * alias: la vieja SALIÓ de la Data API, así que una property creada después del
+ * cambio la rechaza — y no devuelve ceros ni omite la columna, sino que **falla
+ * la petición entera** con 400. O sea que una sola métrica mal nombrada se lleva
+ * puestas también las sesiones, que sí existen.
+ *
+ * Medido el 2026-09-01 sobre `properties/456666287`: la Data API habilitada, el
+ * permiso correcto, Search Console devolviendo datos con el MISMO token, y GA4 en
+ * `error` siempre — con datos o sin ellos.
+ *
+ * El nombre INTERNO sigue siendo `conversions` a propósito: es el vocabulario del
+ * reporte y de `DataSourceHealth`, y renombrarlo también ahí mezclaría dos
+ * cambios en uno. Lo que se corrige acá es lo que viaja a Google.
+ */
+export const GA4_METRICAS = ["sessions", "keyEvents"] as const;
 
 /** Lo que el reporte usa de GA4. */
 export interface Ga4Totals {
@@ -97,7 +116,11 @@ export function readRunReport(body: unknown, fetchedAt: string): Ga4Result {
   };
 
   const sessions = leer("sessions");
-  const conversions = leer("conversions");
+  // El encabezado vuelve con el nombre que se pidió, así que acá se busca el
+  // nombre de GOOGLE y no el nuestro. Buscar `conversions` sobre una respuesta a
+  // `keyEvents` no encuentra la columna, y eso se leería como `malformed` — un
+  // cuerpo perfecto contado como roto.
+  const conversions = leer("keyEvents");
   if (sessions === null || conversions === null) {
     return { outcome: { kind: "malformed" }, totals: null };
   }

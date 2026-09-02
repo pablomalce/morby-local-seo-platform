@@ -215,7 +215,7 @@ function googleContesta(cuerpos: { searchConsole?: unknown; ga4?: unknown } = {}
           rows: [{ clicks: 128, impressions: 4021, ctr: 0.0318, position: 8.4 }],
         })
       : (cuerpos.ga4 ?? {
-          metricHeaders: [{ name: "sessions" }, { name: "conversions" }],
+          metricHeaders: [{ name: "sessions" }, { name: "keyEvents" }],
           rows: [{ metricValues: [{ value: "512" }, { value: "17" }] }],
         });
     return { ok: true, status: 200, json: async () => cuerpo } as unknown as Response;
