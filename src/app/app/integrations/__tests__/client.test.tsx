@@ -303,3 +303,71 @@ describe("el estado de la plataforma", () => {
     }
   });
 });
+
+/**
+ * QUÉ IMPIDE ESTE BLOQUE
+ *
+ * Que el motivo se calcule bien y la pantalla no lo muestre.
+ *
+ * `probeView.test.ts` prueba las frases. Lo que no puede probar es el CABLEADO:
+ * que la sonda llegue a la fila correcta y se pinte. Es el mismo defecto que este
+ * repositorio ya se comió dos veces — un módulo probado que nadie invoca.
+ */
+describe("el motivo del último fallo, en la fila", () => {
+  const SONDA = {
+    surface: "ga4" as const,
+    outcome: "http",
+    httpStatus: 403,
+    propertyRef: "properties/456666287",
+    checkedAt: new Date().toISOString(),
+  };
+
+  it("muestra qué pasó y contra qué property", async () => {
+    const { OrganizationIntegrations } = await componente();
+    const { container } = render(
+      <OrganizationIntegrations
+        organizationId={ORG}
+        organizationName="Vulkan Studios"
+        organizationSlug="vulkan-studios"
+        surfaces={[vista({ surface: "ga4", state: "error", reason: null })]}
+        probes={[SONDA]}
+      />
+    );
+
+    const texto = container.textContent ?? "";
+    expect(texto).toContain("permiso");
+    expect(texto).toContain("properties/456666287");
+    expect(texto).toContain("medido");
+  });
+
+  it("no muestra nada cuando la última consulta salió bien", async () => {
+    const { OrganizationIntegrations } = await componente();
+    const { container } = render(
+      <OrganizationIntegrations
+        organizationId={ORG}
+        organizationName="Vulkan Studios"
+        organizationSlug="vulkan-studios"
+        surfaces={[vista({ surface: "ga4", state: "connected", reason: null })]}
+        probes={[{ ...SONDA, outcome: "ok", httpStatus: null }]}
+      />
+    );
+    expect(container.querySelector('[data-testid="sonda-ga4"]')).toBeNull();
+  });
+
+  it("no le pone a una superficie la sonda de otra", async () => {
+    // El mapeo es la frontera entre clientes; el motivo también tiene que
+    // respetarla. Un 403 de GA4 mostrado bajo Search Console manda a arreglar la
+    // integración equivocada.
+    const { OrganizationIntegrations } = await componente();
+    const { container } = render(
+      <OrganizationIntegrations
+        organizationId={ORG}
+        organizationName="Vulkan Studios"
+        organizationSlug="vulkan-studios"
+        surfaces={[vista({ surface: "search_console", state: "error", reason: null })]}
+        probes={[SONDA]}
+      />
+    );
+    expect(container.querySelector('[data-testid="sonda-search_console"]')).toBeNull();
+  });
+});
