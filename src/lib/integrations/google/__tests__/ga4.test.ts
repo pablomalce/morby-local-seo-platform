@@ -11,12 +11,12 @@
  * medio del pedido.
  */
 import { describe, expect, it } from "vitest";
-import { fetchGa4Totals, readRunReport } from "../ga4";
+import { GA4_METRICAS, fetchGa4Totals, readRunReport } from "../ga4";
 
 const AHORA = new Date("2026-09-01T12:00:00.000Z");
 const CUANDO = AHORA.toISOString();
 
-const ENCABEZADOS = [{ name: "sessions" }, { name: "conversions" }];
+const ENCABEZADOS = [{ name: "sessions" }, { name: "keyEvents" }];
 
 function fetchQueContesta(
   respuesta: { ok: boolean; status: number; json: () => Promise<unknown> },
@@ -43,7 +43,7 @@ describe("readRunReport", () => {
   it("lee por NOMBRE, así que el orden del pedido puede cambiar sin mentir", () => {
     const r = readRunReport(
       {
-        metricHeaders: [{ name: "conversions" }, { name: "sessions" }],
+        metricHeaders: [{ name: "keyEvents" }, { name: "sessions" }],
         rows: [{ metricValues: [{ value: "17" }, { value: "512" }] }],
       },
       CUANDO
@@ -117,7 +117,7 @@ describe("fetchGa4Totals", () => {
     );
     expect(JSON.parse(registro.body ?? "{}")).toEqual({
       dateRanges: [{ startDate: "2026-08-02", endDate: "2026-08-29" }],
-      metrics: [{ name: "sessions" }, { name: "conversions" }],
+      metrics: [{ name: "sessions" }, { name: "keyEvents" }],
     });
   });
 
@@ -141,5 +141,36 @@ describe("fetchGa4Totals", () => {
       },
     });
     expect(r.outcome).toEqual({ kind: "network" });
+  });
+});
+
+/**
+ * QUÉ IMPIDE ESTE BLOQUE
+ *
+ * Que alguien vuelva a escribir `conversions` en lo que viaja a Google.
+ *
+ * Es el nombre que el reporte usa por dentro, así que la tentación de que
+ * coincidan los dos lados es permanente — y el castigo no es una columna vacía:
+ * la Data API rechaza la petición ENTERA con 400, y se pierden también las
+ * sesiones. Medido en producción el 2026-09-01.
+ */
+describe("la métrica que Google retiró", () => {
+  it("pide keyEvents y NO conversions", () => {
+    expect(GA4_METRICAS).toContain("keyEvents");
+    expect(GA4_METRICAS).not.toContain("conversions");
+  });
+
+  it("lee el total desde el encabezado que Google devuelve, no desde el nuestro", () => {
+    // Un cuerpo con el nombre nuevo tiene que leerse. Si el lector buscara
+    // `conversions`, esto daría `malformed` sobre una respuesta perfecta.
+    const r = readRunReport(
+      {
+        metricHeaders: [{ name: "sessions" }, { name: "keyEvents" }],
+        rows: [{ metricValues: [{ value: "40" }, { value: "3" }] }],
+      },
+      CUANDO
+    );
+    expect(r.outcome).toEqual({ kind: "ok" });
+    expect(r.totals).toEqual({ sessions: 40, conversions: 3, fetchedAt: CUANDO });
   });
 });
