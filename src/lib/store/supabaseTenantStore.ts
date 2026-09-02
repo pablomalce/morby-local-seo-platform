@@ -161,6 +161,57 @@ function mapContent(row: any): ContentAsset {
 
 // ---------- Reads ----------
 
+/** Una membresía, con lo único que hace falta para elegir. */
+export interface MembresiaElegible {
+  organization_id: string;
+  role?: string | null;
+  state?: string | null;
+}
+
+/** El orden en que un rol pesa. Menor gana. */
+const PESO: Record<string, number> = { owner: 0, admin: 1, member: 2 };
+
+/**
+ * QUÉ IMPIDE ESTA FUNCIÓN
+ *
+ * Que la organización activa la elija el azar.
+ *
+ * Lo que había era `order("role").limit(1)`, con un comentario que prometía
+ * «primero la que posee, si no la primera de la que es miembro». Hacía lo
+ * contrario: `order` es alfabético ascendente, así que `admin` gana sobre
+ * `owner`. Y con DOS membresías del mismo rol —que es lo que pasa apenas alguien
+ * opera su propia organización y la de la agencia— el desempate no lo decidía
+ * nadie.
+ *
+ * Medido el 2026-09-01: con dos `owner`, la base devolvió la organización SIN
+ * negocios, y el selector quedó vacío mientras la petición contestaba 200. Se
+ * destrabó archivando la otra membresía, que es un arreglo de datos para un
+ * defecto de código.
+ *
+ * TRES REGLAS, Y LAS TRES HACEN FALTA
+ *
+ *   1. las archivadas no cuentan. Se filtra ACÁ y no se confía en que la RLS lo
+ *      haga: la baja archiva desde la 0013, y un cliente que dependa de que la
+ *      policy lo esconda deja de funcionar el día que la policy cambie;
+ *   2. `owner` antes que `admin` antes que `member`, que es lo que el comentario
+ *      viejo decía y el código no hacía;
+ *   3. a igual rol, el uuid más chico. No es «mejor»: es DETERMINISTA, y eso es
+ *      lo único que impide que dos cargas de la misma pantalla elijan distinto.
+ */
+export function elegirOrganizacion(membresias: readonly MembresiaElegible[]): string | null {
+  const activas = membresias.filter((m) => (m.state ?? "active") === "active");
+  if (activas.length === 0) return null;
+
+  const ordenadas = [...activas].sort((a, b) => {
+    const pa = PESO[a.role ?? ""] ?? 9;
+    const pb = PESO[b.role ?? ""] ?? 9;
+    if (pa !== pb) return pa - pb;
+    return a.organization_id.localeCompare(b.organization_id);
+  });
+
+  return ordenadas[0].organization_id;
+}
+
 export async function fetchMyBusinesses(): Promise<{
   organizationId: string | null;
   businesses: Business[];
@@ -169,15 +220,15 @@ export async function fetchMyBusinesses(): Promise<{
 }> {
   const supabase = client();
 
-  // Resolve the active organization (a member can be in multiple — pick the first they own,
-  // else first they're a member of).
+  // Se traen TODAS las membresías y se elige acá. Ver `elegirOrganizacion()`:
+  // delegarle el orden a la base con `order("role").limit(1)` elegía al revés de
+  // lo que su propio comentario prometía, y encima dependía de que la RLS
+  // escondiera las archivadas.
   const { data: membership } = await supabase
     .from("org_members")
-    .select("organization_id, role")
-    .order("role")
-    .limit(1);
+    .select("organization_id, role, state");
 
-  const organizationId = membership?.[0]?.organization_id ?? null;
+  const organizationId = elegirOrganizacion(membership ?? []);
   if (!organizationId) return { organizationId, businesses: [], locations: [], services: [] };
 
   const [biz, locs, svcs] = await Promise.all([
