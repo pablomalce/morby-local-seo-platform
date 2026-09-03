@@ -18,9 +18,9 @@ import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mo
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
-import { guardarSonda } from "@/lib/integrations/google/probe";
+import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
 import type { GoogleSurface, PropertyMapping } from "@/lib/integrations/google/sources";
-import { hydrateGoogle } from "@/lib/integrations/google/hydrate";
+import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
 import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
 import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
 import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
@@ -183,8 +183,25 @@ const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
  * SUCCESSFUL results in the `pagespeed_cache` table (keyed by url+strategy, 24h TTL). A fresh hit
  * is served instantly and survives redeploys; failures are never cached. All cache access is
  * best-effort — if the table/RLS isn't present yet, we transparently fall back to a live call.
+ *
+ * POR QUÉ ADEMÁS ANOTA UNA SONDA
+ *
+ * Porque `error` sin motivo fue exactamente el estado en que PageSpeed quedó los
+ * dos primeros reportes reales, y `missing-key` es un estado aparte: la clave
+ * está y la llamada falló, sin decir si fue permiso, cuota o tiempo. La 0023
+ * abre la tabla de la 0022 para que ese motivo sobreviva al log — ver su
+ * encabezado.
+ *
+ * `organizationId` llega en null cuando el reporte es de demostración, y ahí no
+ * se anota nada: la tabla tiene `organization_id NOT NULL`, y una demo no tiene
+ * organización. Sólo se anota cuando de verdad hubo una llamada — un cache hit no
+ * consultó a Google, así que declarar `ok` sería afirmar sobre una consulta que
+ * no ocurrió.
  */
-async function hydrateWithPageSpeed(snap: BusinessSnapshot): Promise<DataSourceHealth["pagespeed"]> {
+async function hydrateWithPageSpeed(
+  snap: BusinessSnapshot,
+  organizationId: string | null
+): Promise<DataSourceHealth["pagespeed"]> {
   if (!process.env.GOOGLE_PAGESPEED_API_KEY) return "missing";
   const website = snap.business.website;
   if (!website) return "missing";
@@ -206,6 +223,18 @@ async function hydrateWithPageSpeed(snap: BusinessSnapshot): Promise<DataSourceH
 
   // 2. Cache miss / stale → fresh lookup.
   const result = await lookupPageSpeed({ url: website, strategy });
+
+  // La sonda va antes de mirar el resultado, y se guarda también cuando salió
+  // bien: «anduvo hace un rato» es la mitad del diagnóstico. Sus fallos no
+  // cambian nada — ver el encabezado de `probe.ts`.
+  if (organizationId) {
+    const motivo = describirFallo(result.outcome, website);
+    if (motivo) console.warn(`[google] pagespeed: ${motivo}`);
+    // `guardarSonda` no tira: traga su propio error a propósito, porque un
+    // reporte que se cae por no poder anotar por qué falló otra cosa convierte
+    // una molestia en una caída.
+    await guardarSonda(sondaDeOutcome(organizationId, "pagespeed", result.outcome, website));
+  }
 
   if (result.status === "live" && result.lighthouseScore !== undefined) {
     const webVitals = {
@@ -289,7 +318,10 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
   // Both hydrations mutate the same snapshot but write disjoint fields, so they're safe in parallel.
   const [placesStatus, pagespeedStatus] = await Promise.all([
     hydrateWithPlaces(result.snapshot),
-    hydrateWithPageSpeed(result.snapshot),
+    hydrateWithPageSpeed(
+      result.snapshot,
+      result.authenticated ? result.snapshot.business.organizationId : null
+    ),
   ]);
 
   // Sin sesión no hay mapeo que leer: la tabla es por organización y un reporte

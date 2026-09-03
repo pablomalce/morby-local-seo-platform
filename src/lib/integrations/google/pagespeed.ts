@@ -15,9 +15,19 @@
  */
 
 import "server-only";
+import type { FetchOutcome } from "./status";
 
 export interface PageSpeedResult {
   status: "live" | "missing-key" | "error";
+  /**
+   * CÓMO terminó el intento, no sólo si sirvió.
+   *
+   * `status` colapsa un 403, un 429 y un timeout en la palabra `error`, y los
+   * tres se arreglan en lugares distintos: habilitando la API en el proyecto,
+   * esperando la cuota, o reintentando sobre un sitio lento. Este campo es lo que
+   * la 0023 guarda para que ese motivo no dependa de un log efímero.
+   */
+  outcome: FetchOutcome;
   url?: string;
   /** Largest Contentful Paint in ms. */
   lcp?: number;
@@ -46,7 +56,7 @@ export async function lookupPageSpeed(opts: {
   strategy?: "mobile" | "desktop";
 }): Promise<PageSpeedResult> {
   const apiKey = process.env.GOOGLE_PAGESPEED_API_KEY;
-  if (!apiKey) return { status: "missing-key" };
+  if (!apiKey) return { status: "missing-key", outcome: { kind: "no-credentials" } };
 
   const strategy = opts.strategy ?? "mobile";
   const endpoint = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
@@ -94,7 +104,10 @@ async function runOnce(
       const detail = await response.text().catch(() => "");
       // eslint-disable-next-line no-console
       console.warn(`[pagespeed] HTTP ${response.status} for ${url}: ${detail.slice(0, 300)}`);
-      return { result: { status: "error", url }, timedOut: false };
+      return {
+        result: { status: "error", url, outcome: { kind: "http", status: response.status } },
+        timedOut: false,
+      };
     }
 
     const payload = (await response.json()) as PageSpeedApiResponse;
@@ -108,7 +121,13 @@ async function runOnce(
           payload.lighthouseResult?.runtimeError,
         )} hasAudits=${!!audits} score=${perfScore}`,
       );
-      return { result: { status: "error", url }, timedOut: false };
+      // 2xx con un cuerpo que no trae lo que se pidió: es `malformed`, no `http`.
+      // Un código junto a un 200 mandaría a buscar el problema del lado del
+      // permiso cuando lo que falló fue la corrida de Lighthouse.
+      return {
+        result: { status: "error", url, outcome: { kind: "malformed" } },
+        timedOut: false,
+      };
     }
 
     return {
@@ -121,6 +140,7 @@ async function runOnce(
         inp: audits["interactive"]?.numericValue,
         lighthouseScore: Math.round(perfScore * 100),
         fetchedAt: new Date().toISOString(),
+        outcome: { kind: "ok" },
       },
       timedOut: false,
     };
@@ -130,7 +150,17 @@ async function runOnce(
     console.warn(
       `[pagespeed] fetch failed for ${url}: ${err instanceof Error ? `${err.name} ${err.message}` : String(err)}`,
     );
-    return { result: { status: "error", url }, timedOut };
+    return {
+      result: {
+        status: "error",
+        url,
+        // El abort propio es `timeout`; cualquier otra excepción del fetch es que
+        // no llegó a haber respuesta. Llamar `timeout` a un DNS caído mandaría a
+        // reintentar algo que no va a mejorar solo.
+        outcome: timedOut ? { kind: "timeout" } : { kind: "network" },
+      },
+      timedOut,
+    };
   } finally {
     clearTimeout(timer);
   }

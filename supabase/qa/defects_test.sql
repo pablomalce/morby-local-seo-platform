@@ -2468,9 +2468,49 @@ SELECT 66, 'an http probe can omit the status code',
        'una sonda `http` sin código, que es «falló» sin decir por qué';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 67. PageSpeed no puede anotar por qué falló
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la fuente que la 0022 dejó afuera.
+--
+-- El CHECK de `provider` copió el vocabulario de la 0017 —las superficies que se
+-- MAPEAN por cliente— y PageSpeed no se mapea: sale del `website` del negocio.
+-- El efecto medido es que en los dos primeros reportes reales salió `error` las
+-- dos veces sin manera de saber si fue permiso, cuota o tiempo. La 0023 lo
+-- admite; este bloque es lo que impide que vuelva a caerse de la lista.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 67, 'pagespeed cannot record why it failed',
+       NOT pg_temp.accepted(format($sql$
+           INSERT INTO integration_probe (organization_id, provider, outcome, http_status)
+           VALUES (%L, 'pagespeed', 'http', 429)
+       $sql$, (SELECT org_bob FROM t))),
+       'la tabla rechaza la sonda de PageSpeed, que vuelve a dejar su `error` sin motivo';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 68. Un proveedor inventado entra igual
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la otra mitad de ampliar una lista.
+--
+-- El CHECK vale por lo que RECHAZA. Ampliarlo sin medir eso deja el camino
+-- abierto a que un typo en el código —`page_speed`, `pagespeeed`— escriba una
+-- fila que ninguna pantalla lee y que nadie relaciona con la fuente que calla.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 68, 'an invented provider is accepted anyway',
+       pg_temp.accepted(format($sql$
+           INSERT INTO integration_probe (organization_id, provider, outcome)
+           VALUES (%L, 'page_speed', 'ok')
+       $sql$, (SELECT org_bob FROM t))),
+       'una sonda con un proveedor que no existe, que se escribe y nadie lee';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: sixty-six checks were written, so sixty-six rows must be present.
+-- Anti-vacuity: sixty-eight checks were written, so sixty-eight rows must be present.
 -- Fewer means a check silently failed to record and the report is lying by omission.
 
 DO $$
@@ -2480,8 +2520,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 66 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 66 checks recorded a result.', checks;
+    IF checks <> 68 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 68 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2492,11 +2532,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 66 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 68 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 66 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 68 checks green: the schema prevents every one of them.';
 END
 $$;
 

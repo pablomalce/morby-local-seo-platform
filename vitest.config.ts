@@ -23,6 +23,9 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
+      // `server-only` lo resuelve el build de Next, no npm — ver el encabezado
+      // del stub. Sin este alias, todo módulo que lo importe es intesteable.
+      "server-only": fileURLToPath(new URL("./src/test/server-only.stub.ts", import.meta.url)),
     },
   },
 });
