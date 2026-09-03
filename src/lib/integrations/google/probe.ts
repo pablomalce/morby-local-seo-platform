@@ -29,10 +29,21 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { FetchOutcome } from "./status";
 import type { GoogleSurface } from "./sources";
 
+/**
+ * Qué se consultó.
+ *
+ * Es MÁS ancho que `GoogleSurface` a propósito, y la 0023 dice por qué:
+ * `GoogleSurface` son las superficies que se MAPEAN por cliente, y PageSpeed no
+ * se mapea —sale del `website` del negocio—. Compartir el tipo obligaría a
+ * inventarle un mapeo que nadie va a llenar, sólo para poder anotar por qué
+ * falló.
+ */
+export type ProbeProvider = GoogleSurface | "pagespeed";
+
 /** Una fila de `integration_probe`, tal como se escribe. */
 export interface Sonda {
   organizationId: string;
-  provider: GoogleSurface;
+  provider: ProbeProvider;
   outcome: FetchOutcome["kind"];
   httpStatus: number | null;
   propertyRef: string;
@@ -48,7 +59,7 @@ export interface Sonda {
  */
 export function sondaDeOutcome(
   organizationId: string,
-  provider: GoogleSurface,
+  provider: ProbeProvider,
   outcome: FetchOutcome,
   propertyRef: string
 ): Sonda {
