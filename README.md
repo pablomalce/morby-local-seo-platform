@@ -421,6 +421,40 @@ numbers as STRINGS and `Number("")` is 0.
 Its API has no approved quota yet, so saying `live` would be the right answer for
 the wrong reason. The place the call goes is marked in `hydrate.ts`.
 
+### Why a source failed, in a place that outlives the log
+
+`error` is everything the report vocabulary can say, and for whoever operates the
+platform it is not enough: a 403 is fixed by granting access to a property, a 401
+is the platform token, a 400 is usually a mis-mapped identifier, and a timeout is
+retried. Four different actions behind one word.
+
+Writing the reason to the server log was tried first and did not survive contact
+with reality: the project is on Vercel's Hobby plan, where function logs are
+ephemeral. Measured on 2026-09-02, with GA4 genuinely failing, the panel answered
+"There are no request logs in this time range" over the window in which it had
+happened.
+
+So `integration_probe` (migration 0022) holds the LAST result per organization and
+provider — not a history: the question it answers is "what is happening now?".
+`probeView.ts` turns a row into one sentence naming where the fix lives, and
+`/app/integrations` shows it next to the source that failed. The row is written
+with `service_role` only: recording a result is a consequence of a query the
+server made, and a browser session that could write it could declare "fine" over a
+broken integration.
+
+Migration 0023 adds `pagespeed` to that table. Its provider list is deliberately
+WIDER than `integration_properties`': one answers "what can be mapped?", the other
+"what was queried?", and PageSpeed is not mapped — it comes from the business
+`website`. Copying the first list into the second is exactly what left PageSpeed
+unable to say why it failed.
+
+Read it directly when you need the reason and cannot open the screen:
+
+```sql
+select provider, outcome, http_status, property_ref, checked_at
+  from public.integration_probe order by checked_at desc;
+```
+
 ## Project structure (post-Phase 1)
 
 ```text
