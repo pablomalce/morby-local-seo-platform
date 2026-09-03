@@ -455,6 +455,47 @@ select provider, outcome, http_status, property_ref, checked_at
   from public.integration_probe order by checked_at desc;
 ```
 
+## Publishing, and the rehearsal that is not a simulation
+
+Nothing publishes yet: the Google Business Profile API has no quota. What exists
+is the transport, `src/lib/publishing/transport.ts`, and it can walk the whole
+path without publishing.
+
+```ts
+import { publicar } from "@/lib/publishing/transport";
+
+// The rehearsal. The publisher is never called.
+await publicar(
+  { organizationId, assetId, approvedHash, destino: "google_business_profile" },
+  "dry-run"
+);
+```
+
+**The dry run performs the real reservation.** It would have been easier to check
+with a `SELECT` that the asset is approved and that no publication exists yet —
+and that `SELECT` would be a copy of what the composite FK and the uniqueness
+already guarantee in the `0016`. Copies diverge. So the rehearsal writes, and the
+database decides.
+
+Writing does not pollute the ledger. `pending` is literally true: the publication
+is reserved and did not ship. Nothing claims `published` that was not published —
+the CHECK would not allow it without a network id and a timestamp — and `attempts`
+at 0 says the network was never called. By the `(asset_id, destination)`
+uniqueness, the row a rehearsal reserves is the same one a later live send uses.
+
+**A live send with no publisher fails.** It returns `sin-transporte` rather than
+quietly succeeding, because a ledger claiming that something shipped when nothing
+did is a defect nobody would ever investigate.
+
+The mode is an argument from the caller and not an environment variable, on
+purpose. A transport chosen by the environment answers `ok: true` either way, so a
+deployment missing its credential believes it published.
+
+`src/lib/publishing/__tests__/sinAtajos.test.ts` is the wall: it reads the file
+tree and fails if anything outside `src/lib/publishing/` chains a write onto
+`from("publications")`. Reads are fine — any screen that shows the ledger needs
+them.
+
 ## Project structure (post-Phase 1)
 
 ```text
