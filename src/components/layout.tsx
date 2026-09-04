@@ -22,6 +22,7 @@ import { Badge, StatusDot, VulkanLogo } from "@/components/ui";
 import { BusinessSelector } from "@/components/selectors/BusinessSelector";
 import { ServiceSelector } from "@/components/selectors/ServiceSelector";
 import { LocaleSwitcher } from "@/components/selectors/LocaleSwitcher";
+import { MarcaDeDatos } from "@/components/MarcaDeDatos";
 import { useT } from "@/lib/i18n/I18nProvider";
 import { useSelection } from "@/lib/context/SelectionContext";
 import { useAuth } from "@/lib/auth/AuthProvider";
@@ -130,13 +131,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
 
         {/* Status strip */}
+        {/*
+          Acá vivía un literal `DEMO` fijo: decía lo mismo sobre datos sembrados
+          y sobre los de un cliente real, o sea que no marcaba nada. La marca se
+          mudó a la barra de arriba, que se ve en todos los tamaños — esta barra
+          lateral es `hidden lg:flex`, y una marca que desaparece en un teléfono
+          no es una marca.
+        */}
         <div className="flex items-center justify-between border-b border-metal-800 px-5 py-3">
           <span className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-hud text-metal-400">
             <StatusDot tone="online" />
             SYSTEM ONLINE
-          </span>
-          <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
-            DEMO
           </span>
         </div>
 
@@ -169,6 +174,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="flex flex-wrap items-center gap-2">
               <BusinessSelector />
               <ServiceSelector />
+              <MarcaDeDatos />
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {!authLoading &&
