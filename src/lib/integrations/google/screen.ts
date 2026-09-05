@@ -75,7 +75,6 @@ export type IntegrationReason =
   /** El token de la agencia fue revocado. Se rehace el OAuth, una vez. */
   | "platform-token-revoked"
   /** El token de la agencia venció. Se refresca; no hace falta rehacer nada. */
-  | "platform-token-expired"
   /** La agencia está identificada y no tiene token. Se hace el OAuth, una vez. */
   | "platform-token-absent"
   /** `VULKAN_AGENCY_ORG_ID` no está puesta. Se pone; no se toca nada de Google. */
@@ -89,12 +88,10 @@ export type IntegrationReason =
 export interface SurfaceView {
   surface: GoogleSurface;
   /** Las cuatro palabras. `error` es «no se pudo saber», nunca «no configurado». */
-  state: "connected" | "not-connected" | "expired" | "error";
+  state: "connected" | "not-connected" | "error";
   /**
    * Dónde se arregla. `null` EXACTAMENTE cuando el estado es `connected`, que es
-   * el único caso sin nada que arreglar — `expired` lleva razón igual, porque
-   * «vencido» a secas se lee como que venció la conexión de ESTE cliente, y lo
-   * que venció es el token de la plataforma, que es de todos.
+   * el único caso sin nada que arreglar.
    */
   reason: IntegrationReason | null;
   /** El mapeo vivo de este cliente, o `null`. Independiente del estado. */
@@ -155,12 +152,28 @@ export function viewForSurface(
     return { surface, state: "not-connected", reason: "platform-token-absent", propertyRef };
   }
 
-  // 4. Vencido tiene palabra propia porque tiene arreglo propio: el refresh, que
-  //    no le pide nada a nadie. Decir «sin conectar» acá manda a rehacer un
-  //    OAuth que no hace falta.
-  if (tokenState === "expired") {
-    return { surface, state: "expired", reason: "platform-token-expired", propertyRef };
-  }
+  // 4. `expired` NO tiene caso propio, y ésa es la corrección.
+  //
+  //    Tenía uno, y su comentario decía lo correcto: «tiene arreglo propio: el
+  //    refresh, que no le pide nada a nadie». Pero pintaba las TRES superficies
+  //    de naranja con la palabra `EXPIRED`, y eso se lee como que la conexión de
+  //    este cliente está rota.
+  //
+  //    Medido en producción el 2026-09-05, con el estado en `expired`: Search
+  //    Console, GA4 y PageSpeed contestaron las tres `ok` en la misma corrida, y
+  //    el reporte salió con datos reales. La palabra describía una marca de
+  //    tiempo —el access token pasó su vencimiento— y no el estado de la
+  //    conexión, que es lo que alguien busca al abrir esta pantalla.
+  //
+  //    Y no queda sin red: si el refresh de verdad está muerto, la llamada falla
+  //    y `integration_probe` lo anota por fuente. Esta misma pantalla dibuja esa
+  //    sonda al lado, con `queHacer()` y `haceCuanto()`. O sea que lo que
+  //    reemplaza a la palabra es EVIDENCIA MEDIDA en vez de una resta de fechas
+  //    — y `readAgencyTokenState` sigue reportando `expired` en la franja de
+  //    plataforma, que es donde esa marca de tiempo sí significa algo.
+  //
+  //    `revoked` y `absent`, arriba, siguen teniendo caso propio: ésos SÍ dicen
+  //    que no hay con qué llamar, y no dependen de que alguien mire una sonda.
 
   // 5. La plataforma está entera y este cliente no tiene property. Es lo único
   //    de esta lista que se arregla en esta pantalla.
