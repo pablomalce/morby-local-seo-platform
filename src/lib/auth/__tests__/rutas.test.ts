@@ -13,7 +13,7 @@
  * lugares y nunca existió. Sobrevivió porque hasta el 2026-09-01 la producción
  * apuntaba a un proyecto Supabase borrado y ningún login llegaba hasta ahí.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DESTINO_POST_LOGIN } from "../rutas";
@@ -38,11 +38,26 @@ describe("el destino de después del login", () => {
     expect(DESTINO_POST_LOGIN.endsWith("/")).toBe(false);
   });
 
-  it("no está bajo /app, que es la mitad gateada y donde vivía el 404", () => {
-    // No es una regla de estilo. `/app/*` lo gatea el middleware y sólo tiene
-    // `account` e `integrations`; el destino natural de un login es el dashboard,
-    // que vive fuera. Escribirlo bajo `/app` es exactamente el error que este
-    // archivo existe para impedir.
-    expect(DESTINO_POST_LOGIN.startsWith("/app/")).toBe(false);
+  it("está bajo /app, que es la mitad que el middleware gatea", () => {
+    // ESTA REGLA SE INVIRTIÓ, y conviene que quede escrito por qué.
+    //
+    // Decía «NO debajo de /app», y era correcta en su momento por un motivo que
+    // ya no existe: entonces `/app/dashboard` no existía y el destino era un 404
+    // —el defecto que arregló la #65— así que la regla protegía contra apuntar a
+    // una página inventada. De eso ya se ocupa el primer test de este archivo,
+    // que le pregunta al árbol.
+    //
+    // Lo que hay que sostener es lo otro: que el destino del login esté GATEADO.
+    // Un destino público es, por definición, un lugar al que se puede llegar sin
+    // haber entrado — y eso fue exactamente el defecto del 2026-09-04, con el
+    // login depositando al usuario en la demo pública.
+    expect(DESTINO_POST_LOGIN.startsWith("/app/")).toBe(true);
+  });
+
+  it("y el middleware gatea de verdad el prefijo al que apunta", () => {
+    // Sin esto, la afirmación de arriba mide una convención de nombres. Le
+    // pregunta al middleware, que es quien decide.
+    const middleware = readFileSync(join(__dirname, "..", "..", "..", "middleware.ts"), "utf8");
+    expect(middleware).toContain('url.pathname.startsWith("/app")');
   });
 });
