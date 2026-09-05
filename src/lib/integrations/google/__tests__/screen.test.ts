@@ -127,12 +127,34 @@ describe("los estados del token de la agencia", () => {
     expect(viewForSurface("ga4", MAPEO_COMPLETO, "absent", CONECTADA).state).not.toBe("error");
   });
 
-  it("vencido tiene palabra propia, porque tiene arreglo propio", () => {
-    // Decir «sin conectar» acá manda a rehacer un consentimiento OAuth que no
-    // hace falta: un token vencido se refresca.
-    const v = viewForSurface("ga4", MAPEO_COMPLETO, "expired", CONECTADA);
-    expect(v.state).toBe("expired");
-    expect(v.reason).toBe("platform-token-expired");
+  it("vencido se ve IGUAL que activo: no es un estado de la superficie", () => {
+    // Este test decía «vencido tiene palabra propia, porque tiene arreglo
+    // propio». La segunda mitad era cierta y la primera hacía daño: pintaba las
+    // tres superficies de naranja con `EXPIRED`, que se lee como que la conexión
+    // de este cliente está rota.
+    //
+    // Medido en producción el 2026-09-05, con el estado en `expired`: Search
+    // Console, GA4 y PageSpeed contestaron las tres `ok` en la misma corrida y
+    // el reporte salió con datos reales del cliente. La palabra describía una
+    // resta de fechas, no el estado de la conexión.
+    //
+    // Lo que la reemplaza es la sonda, que esta misma pantalla ya dibuja al
+    // lado: si el refresh estuviera muerto, la llamada falla y
+    // `integration_probe` lo anota por fuente, con su motivo y hace cuánto.
+    const vencido = viewForSurface("ga4", MAPEO_COMPLETO, "expired", CONECTADA);
+    const activo = viewForSurface("ga4", MAPEO_COMPLETO, "active", CONECTADA);
+    expect(vencido).toEqual(activo);
+    expect(vencido.state).toBe("connected");
+    expect(vencido.reason).toBeNull();
+  });
+
+  it("y sin mapeo, vencido tampoco tapa lo que de verdad falta", () => {
+    // La otra mitad: que «se ve igual que activo» no signifique «se ve bien
+    // siempre». Un cliente sin property tiene que seguir diciendo que le falta
+    // la property, con el token vencido o sin él.
+    const v = viewForSurface("ga4", [], "expired", CONECTADA);
+    expect(v.state).toBe("not-connected");
+    expect(v.reason).toBe("client-not-mapped");
   });
 
   it("revocado domina sobre vencido, igual que en la 0014", () => {
@@ -218,7 +240,13 @@ describe("la invariante que hace legible la pantalla", () => {
     }
     // Anti-vacuidad: si ninguna combinación llega a «conectado», el bucle de
     // arriba no probó la mitad que importa y pasa igual.
-    expect(conectados).toBe(3);
+    //
+    // SEIS y no tres: tres superficies por los DOS estados de token que ahora
+    // llegan a «conectado», `active` y `expired`. Decía tres cuando `expired`
+    // tenía estado propio. El número está escrito a mano a propósito — si otro
+    // estado empezara a contar como conectado, esta línea tiene que ponerse en
+    // rojo y obligar a decidirlo, en vez de absorberlo en silencio.
+    expect(conectados).toBe(6);
   });
 });
 
