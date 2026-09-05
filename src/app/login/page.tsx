@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { ArrowRight, Mail } from "lucide-react";
 import { Badge, Button, Card, Field, HudLabel, Input, VulkanLogo } from "@/components/ui";
 import { signInWithEmail, type SignInResult } from "@/lib/auth/actions";
+import { porQueFalloElEnlace } from "@/lib/auth/porQueFalloElEnlace";
 import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 
 export default function LoginPage() {
@@ -57,11 +58,20 @@ function LoginInner() {
           )}
         </Button>
 
-        {errorParam && !result && (
-          <div className="rounded-vulkan border border-red-900/60 bg-red-950/30 p-3 text-[12px] text-red-200">
-            {decodeURIComponent(errorParam)}
-          </div>
-        )}
+        {/*
+          QUÉ IMPIDE ESTE BLOQUE
+
+          Que acá se imprima el `error.message` de Supabase tal cual. Decía
+          `{decodeURIComponent(errorParam)}`, y lo que una persona leía era
+
+              code challenge does not match previously saved code verifier
+
+          —medido en producción el 2026-09-05—. Es cierto, es exacto, y no
+          contiene ninguna acción. `porQueFalloElEnlace()` la agrega, y en el
+          caso que todavía no sabe explicar muestra el crudo igual en vez de
+          taparlo.
+        */}
+        {errorParam && !result && <FalloDelEnlace crudo={decodeURIComponent(errorParam)} />}
 
         {result && (
           <div
@@ -76,6 +86,25 @@ function LoginInner() {
         )}
       </form>
     </LoginShell>
+  );
+}
+
+/** Un enlace que falló, dicho con lo que hay que hacer. */
+function FalloDelEnlace({ crudo }: { crudo: string }) {
+  const { quePaso, queHacer, mostrarCrudo } = porQueFalloElEnlace(crudo);
+  return (
+    <div
+      data-testid="fallo-del-enlace"
+      className="rounded-vulkan border border-red-900/60 bg-red-950/30 p-3 text-[12px] text-red-200"
+    >
+      <p>{quePaso}</p>
+      <p className="mt-2 text-red-100">{queHacer}</p>
+      {mostrarCrudo && (
+        <p className="mt-2 font-mono text-[11px] text-red-300/80" data-testid="fallo-crudo">
+          {crudo}
+        </p>
+      )}
+    </div>
   );
 }
 
