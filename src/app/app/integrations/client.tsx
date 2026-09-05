@@ -26,7 +26,6 @@ const ESTADO: Record<
 > = {
   connected: { label: "CONNECTED", variant: "success" },
   "not-connected": { label: "NOT CONNECTED", variant: "hud" },
-  expired: { label: "EXPIRED", variant: "orange" },
   error: { label: "ERROR", variant: "critical" },
 };
 
@@ -45,8 +44,6 @@ const RAZON: Record<IntegrationReason, string> = {
     "The platform is connected; this client has no property assigned. Fixed here, for this client.",
   "platform-token-revoked":
     "The agency's Google authorization was revoked. Fixed once, by redoing the OAuth consent — not per client.",
-  "platform-token-expired":
-    "The agency's access token has passed its expiry. The platform exchanges the refresh token by itself on the next request, so there is nothing to do here — if a source is actually failing, the reason is recorded per source below.",
   "platform-token-absent":
     "The agency organization is identified and has no Google token yet. Fixed once, by running the OAuth consent — not per client.",
   "agency-organization-unset":
