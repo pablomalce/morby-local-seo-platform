@@ -271,10 +271,10 @@ describe("el estado de la plataforma", () => {
    * escribir el nuevo, así que un consentimiento abandonado a la mitad no deja
    * las cosas como estaban.
    */
-  it("ofrece conectar exactamente en los tres estados que se arreglan conectando", async () => {
+  it("ofrece conectar exactamente en los dos estados que se arreglan conectando", async () => {
     const { PlatformNotice } = await componente();
 
-    for (const estado of ["absent", "revoked", "expired"] as const) {
+    for (const estado of ["absent", "revoked"] as const) {
       const { container } = render(<PlatformNotice connected tokenState={estado} />);
       expect(
         container.querySelector('a[href="/api/auth/google/start"]'),
@@ -290,10 +290,19 @@ describe("el estado de la plataforma", () => {
     expect(container.querySelector('a[href="/api/auth/google/start"]')).toBeNull();
   });
 
-  it("no lo ofrece con el token vivo ni cuando no se sabe nada de él", async () => {
+  it("no lo ofrece con el token vivo, ni VENCIDO, ni cuando no se sabe nada de él", async () => {
+    // `expired` estaba en la lista de los que SÍ lo ofrecían, y este archivo lo
+    // sostenía. Un token vencido no está desconectado: `tokenStore.ts` lo trata
+    // como camino normal y canjea el refresh solo.
+    //
+    // Medido en producción el 2026-09-05, con el estado en `expired`: Search
+    // Console y PageSpeed contestaron `ok` en la misma corrida y el reporte
+    // salió con datos reales. La pantalla ofrecía reconectar sobre un token
+    // VIVO — y reconectar revoca el vivo antes de escribir el nuevo, así que
+    // seguir el consejo rompía lo que funcionaba.
     const { PlatformNotice } = await componente();
 
-    for (const estado of ["active", "unset", "malformed", "unreadable"] as const) {
+    for (const estado of ["active", "expired", "unset", "malformed", "unreadable"] as const) {
       const { container } = render(<PlatformNotice connected tokenState={estado} />);
       expect(
         container.querySelector('a[href="/api/auth/google/start"]'),

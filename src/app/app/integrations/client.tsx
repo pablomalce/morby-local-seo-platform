@@ -46,7 +46,7 @@ const RAZON: Record<IntegrationReason, string> = {
   "platform-token-revoked":
     "The agency's Google authorization was revoked. Fixed once, by redoing the OAuth consent — not per client.",
   "platform-token-expired":
-    "The agency's Google token expired. Fixed once, by refreshing it — not per client, and the mapping below is unaffected.",
+    "The agency's access token has passed its expiry. The platform exchanges the refresh token by itself on the next request, so there is nothing to do here — if a source is actually failing, the reason is recorded per source below.",
   "platform-token-absent":
     "The agency organization is identified and has no Google token yet. Fixed once, by running the OAuth consent — not per client.",
   "agency-organization-unset":
@@ -93,13 +93,28 @@ export function PlatformNotice({
         REVOCA el vivo antes de escribir el nuevo, así que un clic de curiosidad
         deja a la plataforma sin token si el consentimiento se abandona a la mitad.
 
-        Los tres estados que sí lo muestran se arreglan con el mismo acto. Los
-        cuatro que no —`active` y las tres maneras de no saber— no: `unset`,
-        `malformed` y `unreadable` no dicen nada del token, y ofrecer reconectar
-        ahí es exactamente el defecto que `agency.ts` existe para impedir.
+        Los DOS estados que sí lo muestran se arreglan con el mismo acto. Los
+        cinco que no —`active`, `expired` y las tres maneras de no saber— no:
+        `unset`, `malformed` y `unreadable` no dicen nada del token, y ofrecer
+        reconectar ahí es exactamente el defecto que `agency.ts` existe para
+        impedir.
+
+        `expired` estaba en la lista de los que lo muestran, y era el mismo
+        defecto que el párrafo de arriba describe para `active`. Un token
+        vencido NO está desconectado: `tokenStore.ts` trata `expired` como un
+        camino normal y canjea el refresh solo. Medido en producción el
+        2026-09-05, con el estado en `expired`: Search Console contestó `ok` y
+        PageSpeed contestó `ok` en la misma corrida, y el reporte salió con
+        datos reales del cliente —13 clics y posición media 32.9—.
+
+        O sea que la pantalla ofrecía reconectar sobre un token VIVO, y
+        reconectar revoca el vivo antes de escribir el nuevo. Seguir el consejo
+        de la pantalla rompía lo que estaba funcionando.
+
+        Si de verdad falla algo, el motivo está por fuente en
+        `integration_probe`, que es evidencia medida y no una marca de tiempo.
       */}
-      {connected &&
-        (tokenState === "absent" || tokenState === "revoked" || tokenState === "expired") && (
+      {connected && (tokenState === "absent" || tokenState === "revoked") && (
           <a
             href="/api/auth/google/start"
             className="mt-4 inline-block rounded-vulkan border border-vulkan-orange bg-metal-950 px-4 py-2 font-display text-[12px] uppercase tracking-hud text-vulkan-orange"
