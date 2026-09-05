@@ -151,13 +151,33 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
   // If the previously selected business no longer exists, clear the selection (don't auto-pick
   // another tenant) so the user explicitly picks a new one.
   useEffect(() => {
+    // QUÉ IMPIDE ESTA GUARDA
+    //
+    // Que la selección de un negocio REAL se borre sola al cambiar de página.
+    //
+    // Con sesión y antes de que llegue `dbState`, `allBusinesses` son los
+    // SEMBRADOS. El uuid restaurado de `localStorage` no está entre ellos, así
+    // que este efecto lo leía como «el negocio ya no existe» y limpiaba — y el
+    // efecto de persistencia escribía el vacío encima. Medido en producción el
+    // 2026-09-05: `businessId` pasó de `7d703707-…` a `""` con sólo navegar de
+    // `/reports` a `/dashboard`.
+    //
+    // Y no alcanza con que el efecto de restauración corra primero: los dos
+    // `setState` caen en el mismo lote, y el actualizador de acá recibe el
+    // estado YA restaurado. O sea que el orden de los efectos no protege nada.
+    //
+    // `dbState === null` es «todavía no contestó», y es distinto de haber
+    // contestado sin negocios: en ese caso `dbState` es un objeto con la lista
+    // vacía y limpiar es correcto, porque el negocio de verdad no está.
+    if (isAuthenticated && dbState === null) return;
+
     setState((prev) => {
       if (!prev.businessId) return prev; // No selection yet — leave it.
       const stillExists = allBusinesses.some((b) => b.id === prev.businessId);
       if (stillExists) return prev;
       return { ...emptySelection(), organizationId: prev.organizationId };
     });
-  }, [allBusinesses]);
+  }, [allBusinesses, isAuthenticated, dbState]);
 
   // Persist selection to localStorage so reloads keep context. Guarded so it never writes
   // the empty default state before restore has had a chance to run.
