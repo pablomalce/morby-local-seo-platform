@@ -142,7 +142,32 @@ export async function fetchGa4Totals(deps: {
   fetcher: Fetcher;
 }): Promise<Ga4Result> {
   const { startDate, endDate } = ventana(deps.ahora);
-  const url = `${GA4_ENDPOINT}/${encodeURIComponent(deps.propertyRef)}:runReport`;
+  // QUÉ IMPIDE ESTA LÍNEA
+  //
+  // Que la barra del identificador se codifique y Google conteste que la
+  // property no existe.
+  //
+  // Decía `encodeURIComponent(deps.propertyRef)`. Sobre `properties/456666287`
+  // eso da `properties%2F456666287`, o sea UN solo segmento de ruta, y la ruta
+  // que la Data API publica es `v1beta/{property=properties/*}:runReport`. No
+  // coincide con nada, así que Google devuelve **404** — y un 404 se lee como
+  // «el identificador apunta a algo que no existe o que esta cuenta no ve», que
+  // manda a revisar permisos en Analytics. Medido en producción el 2026-09-05:
+  // `ga4` en `http 404` mientras Search Console contestaba `ok` con el MISMO
+  // token, en la misma corrida.
+  //
+  // Y por qué acá no es igual que en `searchConsole.ts`, que sí codifica el
+  // identificador entero y está bien: allá el identificador es
+  // `sc-domain:vulkan-studios.com`, que ES un segmento único. Acá es un nombre
+  // de recurso cuya barra es un SEPARADOR de ruta. La misma línea es correcta
+  // en un lado e incorrecta en el otro.
+  //
+  // Se codifica segmento por segmento y no se interpola crudo: la forma está
+  // validada por `FORMAS.ga4` y por el CHECK de la `0017`, pero esta función
+  // recibe un `string` y no una forma probada — dejar de escapar porque otro
+  // archivo valida es confiar en un invariante que esta firma no exige.
+  const ruta = deps.propertyRef.split("/").map(encodeURIComponent).join("/");
+  const url = `${GA4_ENDPOINT}/${ruta}:runReport`;
 
   let respuesta: Response;
   try {

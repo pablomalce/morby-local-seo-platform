@@ -109,9 +109,15 @@ describe("fetchGa4Totals", () => {
       ),
     });
 
+    // La ruta que la Data API publica es `v1beta/{property=properties/*}:runReport`,
+    // o sea que la barra es un SEPARADOR y no parte del identificador. Esta línea
+    // decía `properties%2F123456789` — el mismo error que el código— así que el
+    // test confirmaba a la implementación en vez de medirla contra Google.
+    // Costó un 404 en producción, leído como un problema de permisos.
     expect(registro.url).toBe(
-      "https://analyticsdata.googleapis.com/v1beta/properties%2F123456789:runReport"
+      "https://analyticsdata.googleapis.com/v1beta/properties/123456789:runReport"
     );
+    expect(registro.url).not.toContain("%2F");
     expect((registro.headers as Record<string, string>).authorization).toBe(
       "Bearer ACCESO-sintetico"
     );
@@ -119,6 +125,27 @@ describe("fetchGa4Totals", () => {
       dateRanges: [{ startDate: "2026-08-02", endDate: "2026-08-29" }],
       metrics: [{ name: "sessions" }, { name: "keyEvents" }],
     });
+  });
+
+  it("escapa lo raro DENTRO de un segmento, sin tocar la barra que separa", async () => {
+    // La forma la validan `FORMAS.ga4` y el CHECK de la `0017`, pero esta función
+    // recibe un `string`. Dejar de escapar porque otro archivo valida es confiar
+    // en un invariante que esta firma no exige — y un identificador con un `?`
+    // convertiría el resto en query string.
+    const registro: { url?: string; body?: string; headers?: HeadersInit } = {};
+    await fetchGa4Totals({
+      accessToken: "t",
+      propertyRef: "properties/12 3?x",
+      ahora: AHORA,
+      fetcher: fetchQueContesta(
+        { ok: true, status: 200, json: async () => ({ metricHeaders: ENCABEZADOS }) },
+        registro
+      ),
+    });
+
+    expect(registro.url).toBe(
+      "https://analyticsdata.googleapis.com/v1beta/properties/12%203%3Fx:runReport"
+    );
   });
 
   it("un 403 viaja con su número: suele ser el permiso de la property", async () => {
