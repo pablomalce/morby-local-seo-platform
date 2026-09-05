@@ -324,7 +324,22 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
       businessesForOrg,
       servicesForBusiness,
       locationsForBusiness,
-      isUserCreatedBusiness: isAuthenticated ? true : isUserCreated(business.id),
+      // QUÉ IMPIDE ESTA LÍNEA
+      //
+      // Que la SESIÓN conteste una pregunta sobre el DATO.
+      //
+      // Decía `isAuthenticated ? true : isUserCreated(business.id)`. En el caso
+      // ya cargado da lo mismo —los negocios de la base traen uuid y ninguno
+      // está en la lista de sembrados—, así que el cambio no mueve nada ahí. Lo
+      // que arregla es la ventana intermedia: entre que hay sesión y que llegan
+      // los tenants de la base, `allBusinesses` son los SEMBRADOS, y una
+      // selección restaurada de `localStorage` puede apuntar a Mörby. Con la
+      // versión vieja, esa pantalla llena de datos de demostración se anunciaba
+      // como propia del usuario.
+      //
+      // `SelectionContext.marcaAntesDeLaBase.test.tsx` sostiene exactamente esa
+      // ventana, con el `fetch` colgado a propósito.
+      isUserCreatedBusiness: isUserCreated(business.id),
       isAuthenticated,
       setBusinessId,
       setServiceId,
