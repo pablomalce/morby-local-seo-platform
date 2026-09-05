@@ -169,6 +169,21 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
     // `dbState === null` es «todavía no contestó», y es distinto de haber
     // contestado sin negocios: en ese caso `dbState` es un objeto con la lista
     // vacía y limpiar es correcto, porque el negocio de verdad no está.
+    //
+    // Y `authLoading` es la MITAD QUE FALTABA, medida en producción el
+    // 2026-09-05 con el arreglo anterior ya desplegado: la selección se seguía
+    // borrando. La ventana no empieza cuando hay sesión, empieza ANTES —
+    // mientras el proveedor de auth todavía no contestó, `user` es null y
+    // `isAuthenticated` es `false`, así que una guarda que sólo mira
+    // `isAuthenticated` no se aplica y el efecto limpia igual.
+    //
+    // El test anterior no lo veía porque su doble de `useAuth` devolvía
+    // `{ loading: false, user }` desde el primer render, o sea que empezaba la
+    // historia después del momento que rompía.
+    //
+    // Dicho de una vez: no se limpia mientras no se pueda SABER. Y se sabe
+    // cuando la sesión se resolvió y, si la hay, la base ya contestó.
+    if (authLoading) return;
     if (isAuthenticated && dbState === null) return;
 
     setState((prev) => {
@@ -177,7 +192,7 @@ export function SelectionProvider({ children }: { children: React.ReactNode }) {
       if (stillExists) return prev;
       return { ...emptySelection(), organizationId: prev.organizationId };
     });
-  }, [allBusinesses, isAuthenticated, dbState]);
+  }, [allBusinesses, isAuthenticated, dbState, authLoading]);
 
   // Persist selection to localStorage so reloads keep context. Guarded so it never writes
   // the empty default state before restore has had a chance to run.
