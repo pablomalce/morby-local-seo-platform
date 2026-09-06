@@ -2508,6 +2508,94 @@ SELECT 68, 'an invented provider is accepted anyway',
        'una sonda con un proveedor que no existe, que se escribe y nadie lee';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 69 a 72. Dar de alta un cliente: quién puede, y quién no
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que `create_client_organization` sea una capacidad y no un agujero.
+--
+-- La función es `SECURITY DEFINER`, o sea que corre con los privilegios de quien
+-- la creó y saltea la RLS por definición. Eso es exactamente lo que hace falta
+-- —`authenticated` no puede insertar en `organizations` de ninguna manera— y es
+-- también lo que la vuelve peligrosa si la puede ejecutar cualquiera.
+--
+-- SE PREGUNTA POR EL PRIVILEGIO, NO SE INTENTA LA LLAMADA
+--
+-- Un `accepted()` mediría que algo falló, no POR QUÉ, y acá `42501` es el mismo
+-- código para «no podés sobre la función», «sobre la tabla» y «sobre el esquema».
+-- `has_function_privilege` contesta la pregunta exacta, y no se puede confundir
+-- con otra denegación.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 69, 'anon can create an organization',
+       has_function_privilege('anon', 'public.create_client_organization(text)', 'EXECUTE'),
+       'cualquiera sin sesión podría fabricar organizaciones';
+
+-- `growthos_app` NO se mide acá, y conviene decir por qué: `app_role.sql` hace
+-- `GRANT EXECUTE ON ALL FUNCTIONS` a ese rol por diseño, así que un bloque que
+-- exigiera lo contrario se pondría rojo después de cada corrida del quinto paso.
+-- Sería una pared peleándose con el procedimiento. Y no hace falta: lo que impide
+-- que ese rol cree una organización huérfana no es el privilegio sino
+-- `auth.uid()`, que es el bloque 72.
+--
+-- Lo que sí se mide es que la función SIGA siendo `SECURITY DEFINER`. Si alguien
+-- la recrea sin eso, corre con los privilegios de quien llama —`authenticated`,
+-- que no puede insertar en `organizations`— y dar de alta un cliente vuelve a
+-- fallar, en silencio y sólo en producción.
+INSERT INTO defect_report
+SELECT 70, 'create_client_organization stopped being SECURITY DEFINER',
+       NOT (SELECT p.prosecdef FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public' AND p.proname = 'create_client_organization'),
+       'sin SECURITY DEFINER la función no puede insertar, y el alta de clientes muere en silencio';
+
+INSERT INTO defect_report
+SELECT 71, 'the agency cannot create a client at all',
+       NOT has_function_privilege('authenticated', 'public.create_client_organization(text)', 'EXECUTE'),
+       'sin este privilegio la plataforma vuelve a servir a una sola organización';
+
+-- Y la guarda que importa: sin sesión no hay `auth.uid()`, así que no hay a quién
+-- hacer dueño. Crear igual dejaría una organización huérfana que NADIE puede
+-- alcanzar —no aparece en `current_user_org_ids()`, ni para su creador— y que
+-- sólo `service_role` podría limpiar.
+--
+-- NO se cambia de rol acá, y no es un olvido: lo que se mide es la ausencia de
+-- `auth.uid()`, no un privilegio. Esta corrida no lleva JWT, así que `auth.uid()`
+-- es NULL cualquiera sea el rol — y cambiarlo además rompería el INSERT de abajo,
+-- porque `defect_report` no es de `authenticated`.
+
+-- SE LIMPIA LA SESIÓN HEREDADA, Y ESTO COSTÓ UNA VUELTA.
+--
+-- El ayudante de la línea 93 impersona usuarios con
+-- `set_config('request.jwt.claim.sub', …, true)`, y ese ajuste sobrevive al
+-- bloque que lo puso: `auth.uid()` seguía devolviendo el usuario de OTRA prueba.
+-- Sin esta línea, este bloque medía «con sesión ajena se crea», que es cierto y
+-- no es lo que dice medir.
+SELECT set_config('request.jwt.claim.sub', '', true);
+
+INSERT INTO defect_report
+SELECT 72, 'an organization is created with no session',
+       pg_temp.accepted($sql$
+           SELECT public.create_client_organization('Sin sesion')
+       $sql$),
+       'una organización sin dueño, invisible para todos y permanente';
+
+-- QUÉ RECHAZA DE VERDAD, QUE NO ES LO QUE PARECE.
+--
+-- Se mutó la función sacándole la guarda `IF v_user IS NULL` y este bloque siguió
+-- verde. El mutante SOBREVIVIÓ, y la lección vale más que el bloque: lo que
+-- impide la organización huérfana NO es el `IF`, es `org_members.user_id` —su
+-- `NOT NULL` y su FK contra `auth.users`—. La función es atómica, así que el
+-- rechazo del INSERT de la membresía se lleva puesta también la organización.
+--
+-- O sea que el `IF` es ERGONOMÍA: convierte un error de restricción en un mensaje
+-- legible. La garantía es estructural, igual que el CHECK de la `0015` frente a
+-- su trigger. Se deja escrito para que nadie lo lea al revés y crea que sacando
+-- el `IF` se abre un agujero — no se abre, se empeora el mensaje.
+
+RESET ROLE;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Anti-vacuity: sixty-eight checks were written, so sixty-eight rows must be present.
@@ -2520,8 +2608,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 68 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 68 checks recorded a result.', checks;
+    IF checks <> 72 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 72 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2532,11 +2620,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 68 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 72 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 68 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 72 checks green: the schema prevents every one of them.';
 END
 $$;
 
