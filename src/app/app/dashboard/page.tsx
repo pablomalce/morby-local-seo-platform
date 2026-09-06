@@ -2,6 +2,8 @@ import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { HudLabel } from "@/components/ui";
 import { ProductoResumen, type NegocioResumen } from "./client";
+import { SelectorDeOrganizacion } from "@/components/SelectorDeOrganizacion";
+import { organizacionActiva } from "@/lib/org/servidor";
 import type { EstadoDelProducto } from "@/lib/product/proximoPaso";
 
 export const dynamic = "force-dynamic";
@@ -34,19 +36,10 @@ export default async function ProductDashboardPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/login?redirectTo=/app/dashboard");
 
-  const { data: memberships } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("state", "active");
-
-  const orgIds = (memberships ?? []).map((m) => m.organization_id as string);
-
-  const { data: orgRows } = orgIds.length
-    ? await supabase.from("organizations").select("id, name").in("id", orgIds).order("name")
-    : { data: [] as { id: string; name: string }[] };
-
-  const organizacion = (orgRows ?? [])[0] as { id: string; name: string } | undefined;
+  // La organización activa la resuelve UN solo lugar. Cuatro pantallas con cuatro
+  // copias del criterio divergen en cuanto una agregue una regla, y entonces dos
+  // pantallas de la misma sesión muestran clientes distintos.
+  const organizacion = await organizacionActiva();
 
   // Sin organización activa no hay nada que contar, y contarlo igual daría ceros
   // que se leen como «no falta nada».
@@ -122,6 +115,7 @@ export default async function ProductDashboardPage() {
     <div className="mx-auto max-w-3xl">
       <HudLabel>00 / PRODUCT</HudLabel>
       <h1 className="mt-3 display-h text-3xl">{organizacion.name}</h1>
+      <SelectorDeOrganizacion actual={organizacion.id} disponibles={organizacion.disponibles} />
       <ProductoResumen organizacion={organizacion.name} negocios={negocios} estado={estado} />
     </div>
   );

@@ -7,6 +7,11 @@
  */
 
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import {
+  COOKIE_ORG_ACTIVA,
+  elegirOrganizacion,
+  type MembresiaElegible,
+} from "@/lib/org/eleccion";
 import type {
   Business,
   BusinessLocation,
@@ -161,55 +166,28 @@ function mapContent(row: any): ContentAsset {
 
 // ---------- Reads ----------
 
-/** Una membresía, con lo único que hace falta para elegir. */
-export interface MembresiaElegible {
-  organization_id: string;
-  role?: string | null;
-  state?: string | null;
-}
-
-/** El orden en que un rol pesa. Menor gana. */
-const PESO: Record<string, number> = { owner: 0, admin: 1, member: 2 };
+// `elegirOrganizacion` se mudó a `@/lib/org/eleccion`: las pantallas de servidor
+// también la necesitan, y este archivo importa el cliente de navegador. Se
+// reexporta para no romper a quien ya la importaba de acá.
+export { elegirOrganizacion };
+export type { MembresiaElegible };
 
 /**
- * QUÉ IMPIDE ESTA FUNCIÓN
+ * La elección guardada, leída desde el navegador.
  *
- * Que la organización activa la elija el azar.
- *
- * Lo que había era `order("role").limit(1)`, con un comentario que prometía
- * «primero la que posee, si no la primera de la que es miembro». Hacía lo
- * contrario: `order` es alfabético ascendente, así que `admin` gana sobre
- * `owner`. Y con DOS membresías del mismo rol —que es lo que pasa apenas alguien
- * opera su propia organización y la de la agencia— el desempate no lo decidía
- * nadie.
- *
- * Medido el 2026-09-01: con dos `owner`, la base devolvió la organización SIN
- * negocios, y el selector quedó vacío mientras la petición contestaba 200. Se
- * destrabó archivando la otra membresía, que es un arreglo de datos para un
- * defecto de código.
- *
- * TRES REGLAS, Y LAS TRES HACEN FALTA
- *
- *   1. las archivadas no cuentan. Se filtra ACÁ y no se confía en que la RLS lo
- *      haga: la baja archiva desde la 0013, y un cliente que dependa de que la
- *      policy lo esconda deja de funcionar el día que la policy cambie;
- *   2. `owner` antes que `admin` antes que `member`, que es lo que el comentario
- *      viejo decía y el código no hacía;
- *   3. a igual rol, el uuid más chico. No es «mejor»: es DETERMINISTA, y eso es
- *      lo único que impide que dos cargas de la misma pantalla elijan distinto.
+ * La cookie NO es `httpOnly` a propósito: esta mitad de la aplicación corre en el
+ * navegador y necesita elegir la misma organización que eligieron las pantallas
+ * de servidor. Que se pueda escribir a mano no abre nada — `elegirOrganizacion`
+ * la valida contra las membresías ACTIVAS, y quien decide qué filas se ven es la
+ * RLS. Una cookie inventada termina en una organización vacía, no en los datos de
+ * otro.
  */
-export function elegirOrganizacion(membresias: readonly MembresiaElegible[]): string | null {
-  const activas = membresias.filter((m) => (m.state ?? "active") === "active");
-  if (activas.length === 0) return null;
-
-  const ordenadas = [...activas].sort((a, b) => {
-    const pa = PESO[a.role ?? ""] ?? 9;
-    const pb = PESO[b.role ?? ""] ?? 9;
-    if (pa !== pb) return pa - pb;
-    return a.organization_id.localeCompare(b.organization_id);
-  });
-
-  return ordenadas[0].organization_id;
+function leerEleccionDelNavegador(): string | null {
+  if (typeof document === "undefined") return null;
+  const par = document.cookie
+    .split("; ")
+    .find((c) => c.startsWith(`${COOKIE_ORG_ACTIVA}=`));
+  return par ? decodeURIComponent(par.slice(COOKIE_ORG_ACTIVA.length + 1)) : null;
 }
 
 export async function fetchMyBusinesses(): Promise<{
@@ -228,7 +206,7 @@ export async function fetchMyBusinesses(): Promise<{
     .from("org_members")
     .select("organization_id, role, state");
 
-  const organizationId = elegirOrganizacion(membership ?? []);
+  const organizationId = elegirOrganizacion(membership ?? [], leerEleccionDelNavegador());
   if (!organizationId) return { organizationId, businesses: [], locations: [], services: [] };
 
   const [biz, locs, svcs] = await Promise.all([
