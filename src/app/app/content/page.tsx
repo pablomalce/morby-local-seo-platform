@@ -3,6 +3,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { HudLabel } from "@/components/ui";
 import { ContenidoDeLaOrganizacion } from "./client";
 import type { AssetVisto } from "@/lib/content/estadoDelAsset";
+import { organizacionActiva } from "@/lib/org/servidor";
 
 export const dynamic = "force-dynamic";
 
@@ -25,15 +26,10 @@ export default async function ContentPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/login?redirectTo=/app/content");
 
-  const { data: memberships } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("state", "active");
+  // Una sola fuente para «cuál es el cliente activo». Ver `@/lib/org/servidor`.
+  const organizacion = await organizacionActiva();
 
-  const orgIds = (memberships ?? []).map((m) => m.organization_id as string);
-
-  if (orgIds.length === 0) {
+  if (!organizacion) {
     return (
       <div className="mx-auto max-w-3xl">
         <HudLabel>05 / CONTENT</HudLabel>
@@ -48,9 +44,9 @@ export default async function ContentPage() {
     supabase
       .from("content_assets")
       .select("id, title, kind, locale, status, approved_hash, payload_hash")
-      .in("organization_id", orgIds)
+      .eq("organization_id", organizacion.id)
       .order("created_at", { ascending: false }),
-    supabase.from("businesses").select("id").in("organization_id", orgIds).limit(1),
+    supabase.from("businesses").select("id").eq("organization_id", organizacion.id).limit(1),
   ]);
 
   // Un fallo de lectura no es «no hay contenido». Se dice, y no se dibuja una

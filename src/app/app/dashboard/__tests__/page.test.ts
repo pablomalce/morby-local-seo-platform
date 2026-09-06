@@ -51,9 +51,15 @@ describe("de dónde salen los datos de esta pantalla", () => {
     expect(PAGINA).toContain("sin-organizacion");
   });
 
-  it("sólo mira membresías ACTIVAS", () => {
-    // Una archivada es exactamente lo que la #69 usó para desempatar. Contarla
-    // devolvería la organización vacía que se archivó a propósito.
-    expect(PAGINA).toMatch(/\.eq\("state", "active"\)/);
+  it("delega la organización activa en UN solo lugar", () => {
+    // La regla «sólo membresías activas» vivía acá y se mudó a
+    // `@/lib/org/servidor`, porque cuatro pantallas con cuatro copias del
+    // criterio divergen en cuanto una agregue una regla — y entonces dos
+    // pantallas de la misma sesión muestran clientes distintos.
+    //
+    // La pared se mudó con el código en vez de borrarse: lo que sostiene ahora
+    // es que la pantalla NO resuelva la organización por su cuenta.
+    expect(PAGINA).toContain("organizacionActiva()");
+    expect(PAGINA).not.toMatch(/\.eq\("user_id", user\.id\)/);
   });
 });

@@ -3,6 +3,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { HudLabel } from "@/components/ui";
 import { Ledger } from "./client";
 import type { FilaLedger } from "@/lib/publishing/ledgerView";
+import { organizacionActiva } from "@/lib/org/servidor";
 
 export const dynamic = "force-dynamic";
 
@@ -32,10 +33,18 @@ export default async function PublishingPage() {
   // del usuario. Filtrar acá además no agregaría seguridad —la RLS no se puede
   // saltear desde el cliente de sesión— y sí agregaría un segundo lugar donde el
   // criterio puede quedar desincronizado.
-  const { data, error } = await supabase
-    .from("publications")
-    .select("id, asset_id, destination, status, external_id, attempts, created_at, published_at")
-    .order("created_at", { ascending: false });
+  // Se filtra por la organización ACTIVA además de la RLS, y no es una copia: la
+  // RLS dice qué filas ALCANZA el usuario —todos sus clientes— y esta pantalla
+  // muestra UNO. Sin el filtro, un agencia con diez clientes vería las diez
+  // listas mezcladas en la pantalla de uno.
+  const organizacion = await organizacionActiva();
+  const { data, error } = organizacion
+    ? await supabase
+        .from("publications")
+        .select("id, asset_id, destination, status, external_id, attempts, created_at, published_at")
+        .eq("organization_id", organizacion.id)
+        .order("created_at", { ascending: false })
+    : { data: [], error: null };
 
   // Un fallo de lectura NO es un ledger vacío. Decir «no hay publicaciones»
   // cuando la consulta falló es el cero inventado de esta pantalla.
