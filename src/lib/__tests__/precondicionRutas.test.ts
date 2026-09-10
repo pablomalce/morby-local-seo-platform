@@ -677,6 +677,23 @@ function clave(m: Medicion): string {
   return `${m.verbo} ${m.ruta}`;
 }
 
+/**
+ * El host que usa el test que comprueba el espía a sí mismo.
+ *
+ * Tiene que estar excluido de la bitácora global, y descubrirlo fue el propio
+ * `afterAll` haciendo su trabajo: la primera versión de la red falló nombrando
+ * `ejemplo-de-control.test`, o sea la llamada que el test de control dispara a
+ * propósito. Sin la exclusión, la red se disparaba por su propio control, y la
+ * aserción de dentro de la corrida pasaba sólo porque el control corría después
+ * — un orden de tests decidiendo un resultado, que es otra forma de no medir.
+ */
+const HOST_DE_CONTROL = "ejemplo-de-control.test";
+
+/** La bitácora global sin las llamadas que el test de control hace a propósito. */
+function fugasReales(): string[] {
+  return arnes.todasLasSalientes.filter((s) => !s.includes(HOST_DE_CONTROL));
+}
+
 /** Host y path de una salida registrada, sin la query. */
 function destinoDe(salida: string): string {
   const [verbo, url] = salida.split(" ");
@@ -888,9 +905,27 @@ beforeAll(async () => {
   }
 }, 120_000);
 
+/**
+ * La última palabra sobre las fugas, y la única que no tiene ventana.
+ *
+ * `afterAll` corre cuando ya no queda test, así que una salida diferida con
+ * CUALQUIER retardo dentro de la corrida ya pasó por el espía cuando esto se
+ * ejecuta. No dice de qué handler fue —eso lo dice la cuenta por handler— dice
+ * que salió algo, que es la garantía que promete la propiedad 3.
+ */
 afterAll(() => {
   globalThis.fetch = fetchOriginal;
   for (const { nativo, metodo, original } of nativosOriginales) nativo[metodo] = original;
+
+  const declaradas = FUGAS_HOY.flatMap((f) => f.destinos).sort().join(" | ");
+  const todas = fugasReales().map(destinoDe).sort().join(" | ");
+  if (todas !== declaradas) {
+    throw new Error(
+      `[precondición] al terminar el archivo las salidas registradas sin sesión eran ` +
+        `«${todas}» y FUGAS_HOY declara «${declaradas}». El espía las rechazó, así que la ` +
+        `suite no gastó; en producción no hay espía.`
+    );
+  }
 });
 
 /** Lo medido, en una línea legible para el mensaje de una falla. */
@@ -1284,9 +1319,19 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       ).toEqual([]);
     });
 
-    it("no salió nada a la red fuera de la foto de ningún handler", () => {
+    it("no salió nada a la red fuera de la foto de ningún handler", async () => {
+      // La espera, y por qué tiene un número escrito.
+      //
+      // MEDIDO en el repositorio vecino, con la misma aserción escrita
+      // sincrónica: el ataque de un refutador —un `void async` que duerme
+      // 400ms antes de su fetch— quedaba VERDE, porque el test corría antes de
+      // que la fuga saliera, y el error del espía se imprimía DESPUÉS del
+      // «passed». Un segundo cubre esa clase de diferido; lo que quede más allá
+      // lo agarra la red del `afterAll`, que corre cuando ya no queda test.
+      await new Promise((listo) => setTimeout(listo, 1000));
+
       const declaradas = FUGAS_HOY.flatMap((f) => f.destinos).sort();
-      const todas = arnes.todasLasSalientes.map(destinoDe).sort();
+      const todas = fugasReales().map(destinoDe).sort();
 
       expect(
         todas,
@@ -1339,11 +1384,11 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       // registrara, la llamada SALDRÍA: la suite pagaría PageSpeed de verdad en
       // cada corrida y el hallazgo quedaría anotado después de haberse cobrado.
       // Si sólo rechazara, no habría nada que afirmar.
-      await expect(globalThis.fetch("https://ejemplo-de-control.test/espia")).rejects.toThrow(
+      await expect(globalThis.fetch(`https://${HOST_DE_CONTROL}/espia`)).rejects.toThrow(
         "[espia]"
       );
       expect(arnes.salientes.length, "el espía no registró la llamada de control").toBe(antes + 1);
-      expect(arnes.salientes[arnes.salientes.length - 1]).toContain("ejemplo-de-control.test");
+      expect(arnes.salientes[arnes.salientes.length - 1]).toContain(HOST_DE_CONTROL);
 
       arnes.salientes.length = antes;
     });
