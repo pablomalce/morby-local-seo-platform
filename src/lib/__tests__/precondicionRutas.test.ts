@@ -338,6 +338,155 @@ const EXENCIONES: Array<{
 ];
 
 /**
+ * Lo que hoy está abierto, escrito con nombre y apellido, y con trinquete.
+ *
+ * QUÉ AGUJERO CIERRA ESTA LISTA, Y POR QUÉ EXISTE EN VEZ DE UN TEST ROJO
+ *
+ * Medido por mutación el 2026-09-10, y es la razón por la que esta lista se
+ * escribió. La primera versión de este archivo dejaba las dos aserciones de
+ * abajo en rojo, con los ocho handlers y la fuga dentro del mensaje de falla.
+ * Se borró entonces, a propósito, la comprobación de sesión de
+ * `POST /api/publishing/publish` —la ruta que escribe EN VIVO en la ficha de
+ * Google Business Profile de un cliente— y el resumen de la corrida fue
+ * `Tests 2 failed | 12 passed (14)` antes, con la mutación aplicada y después de
+ * restaurarla. Idéntico las tres veces. Un gate de CI mira el código de salida,
+ * y el código de salida era 1 en los tres estados: la detección vivía sólo en el
+ * CONTENIDO de una lista dentro de un mensaje que alguien tenía que leer.
+ *
+ * Un archivo permanentemente rojo no es una reja: es un cartel. Con el
+ * trinquete, el rojo vuelve a significar algo — que ALGO CAMBIÓ desde la
+ * medición— y la mutación de arriba pasa de invisible a roja.
+ *
+ * POR QUÉ NO ES UNA ABSOLUCIÓN
+ *
+ * Es el mismo criterio que `HANDLERS_CON_SERVICE_ROLE` en el Lead Engine, y por
+ * el mismo motivo: la igualdad es EXACTA en las dos direcciones. Un handler que
+ * se abre y no está acá pone el test rojo. Y un handler que se CIERRA y sigue
+ * acá TAMBIÉN lo pone rojo, así que arreglar una ruta obliga a venir hasta esta
+ * lista y borrar su línea. La lista no puede envejecer hacia arriba ni hacia
+ * abajo sin que alguien la edite a propósito, y este comentario es lo que va a
+ * leer cuando lo haga.
+ *
+ * BAJARLA ES EL TRABAJO. Siete de estas ocho se cierran con una sola línea:
+ * `requireInternalSecret` (src/lib/api/internal-guard.ts:14-15) contesta `null`
+ * —o sea «pasá»— cuando `INTERNAL_API_SECRET` no está en el entorno, y esa
+ * variable no figura en `.env.example`. O sea que el estado por defecto del
+ * repositorio es ABIERTO, y el status de siete rutas lo decide una variable de
+ * Vercel en vez del código. La octava, `/api/reports/generate`, no tiene
+ * guardia de ninguna clase y es la que además gasta.
+ */
+const ABIERTAS_HOY: Array<{
+  ruta: string;
+  verbo: string;
+  statusMedido: number;
+  porque: string;
+  queLaCierra: string;
+}> = [
+  {
+    ruta: "/api/reports/generate",
+    verbo: "POST",
+    statusMedido: 200,
+    porque:
+      "No hay NINGUNA línea de identidad en el handler (route.ts:70-89): sólo rateLimit y zod. " +
+      "El getUser() de src/lib/reports/orchestrator.ts:70-73 no decide permiso, decide FUENTE de " +
+      "datos, y sin sesión cae a la rama sembrada. Su propio comentario admite que es pública y " +
+      "que dispara llamadas facturables.",
+    queLaCierra:
+      "Un guardia propio antes del trabajo. Es la única de las ocho que sigue en 200 incluso con " +
+      "INTERNAL_API_SECRET puesta, y la única que además sale a la red: va primera.",
+  },
+  {
+    ruta: "/api/seo/audit",
+    verbo: "POST",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:5) es un no-op sin la variable.",
+    queLaCierra: "Que requireInternalSecret falle cerrado, y la variable en .env.example.",
+  },
+  {
+    ruta: "/api/agents/run-all",
+    verbo: "POST",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:13) es un no-op sin la variable.",
+    queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
+  },
+  {
+    ruta: "/api/agents/run",
+    verbo: "POST",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:15) es un no-op sin la variable.",
+    queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
+  },
+  {
+    ruta: "/api/content/generate",
+    verbo: "POST",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:15) es un no-op sin la variable.",
+    queLaCierra:
+      "Ídem. El espía queda en 0 sólo porque la rama live de " +
+      "src/lib/integrations/openai.ts:32-39 es todavía un placeholder sin fetch: es la puerta por " +
+      "donde entra el gasto el día que se implemente, no un guardia.",
+  },
+  {
+    ruta: "/api/integrations/gbp/profile",
+    verbo: "GET",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:6) es un no-op sin la variable.",
+    queLaCierra: "Ídem. Mientras tanto expone el snapshot de un negocio a cualquiera.",
+  },
+  {
+    ruta: "/api/integrations/images/generate",
+    verbo: "POST",
+    statusMedido: 200,
+    porque:
+      "requireInternalSecret(route.ts:34) es un no-op sin la variable, y el chequeo de businessId " +
+      "(route.ts:41) corre ANTES de cualquier decisión de identidad.",
+    queLaCierra: "Ídem, y mover el guardia arriba del 404 de negocio.",
+  },
+  {
+    ruta: "/api/integrations/places/search",
+    verbo: "POST",
+    statusMedido: 200,
+    porque: "requireInternalSecret(route.ts:13) es un no-op sin la variable.",
+    queLaCierra:
+      "Ídem. El espía queda en 0 porque esta ruta está cableada al cliente FALSO de Places " +
+      "(src/lib/integrations/googlePlaces.ts:19, un placeholder sin fetch). El fetch real vive en " +
+      "src/lib/integrations/google/places.ts:66 y se alcanza sin sesión por /api/reports/generate.",
+  },
+];
+
+/**
+ * La única fuga de red medida sin sesión, con trinquete por destino.
+ *
+ * Se compara por PREFIJO de la URL —host y path, sin la query— porque la clave
+ * de PageSpeed viaja en la query string y no tiene por qué entrar en un archivo
+ * de tests. El prefijo alcanza para lo que la lista tiene que impedir: que
+ * aparezca un destino nuevo, o que aparezca un segundo handler que salga a la
+ * red sin sesión.
+ */
+const FUGAS_HOY: Array<{ ruta: string; verbo: string; destinos: string[] }> = [
+  {
+    ruta: "/api/reports/generate",
+    verbo: "POST",
+    destinos: [
+      "POST https://places.googleapis.com/v1/places:searchText",
+      "GET https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+      "GET https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+    ],
+  },
+];
+
+/** La clave con la que un handler medido se busca en las listas de arriba. */
+function clave(m: Medicion): string {
+  return `${m.verbo} ${m.ruta}`;
+}
+
+/** Host y path de una salida registrada, sin la query. */
+function destinoDe(salida: string): string {
+  const [verbo, url] = salida.split(" ");
+  return `${verbo} ${(url ?? "").split("?")[0]}`;
+}
+
+/**
  * Handlers que este arnés no puede invocar, con el motivo.
  *
  * Vacía a propósito. Un handler que no se puede llamar se REPORTA — el test
@@ -569,19 +718,58 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       ).toEqual([]);
     });
 
-    it("todo handler no exento contesta 401 o 403", () => {
+    it("todo handler no exento contesta 401 o 403, salvo los ya medidos como abiertos", () => {
       const exentas = new Set(EXENCIONES.map((e) => e.ruta));
+      const yaAbiertos = new Set(ABIERTAS_HOY.map((a) => `${a.verbo} ${a.ruta}`));
       const abiertos = mediciones
         .filter((m) => !exentas.has(m.ruta))
         .filter((m) => m.status !== 401 && m.status !== 403)
+        .filter((m) => !yaAbiertos.has(clave(m)))
         .map((m) => linea(m));
 
       expect(
         abiertos,
-        "Estos handlers atendieron a un llamador SIN SESIÓN con algo que no es una negación. Un " +
-          "200 es la puerta abierta; un 400 de esquema es peor que un 401 porque se lee como una " +
-          "negación y no lo es (el pedido murió en zod, el guardia nunca corrió). O contestan " +
-          "401/403, o van a EXENCIONES con motivo, mecanismo, huellas y status esperado."
+        "Estos handlers atendieron a un llamador SIN SESIÓN con algo que no es una negación, y no " +
+          "estaban en la medición del 2026-09-10. Un 200 es la puerta abierta; un 400 de esquema " +
+          "es peor que un 401 porque se lee como una negación y no lo es (el pedido murió en zod, " +
+          "el guardia nunca corrió). Un 404 tampoco: puede venir de la RLS y no del handler. O " +
+          "contestan 401/403, o van a EXENCIONES con motivo, mecanismo, huellas y status " +
+          "esperado. Agregarlos a ABIERTAS_HOY es la salida de último recurso y hay que " +
+          "justificarla ahí."
+      ).toEqual([]);
+    });
+
+    it("la lista de abiertas de hoy sigue siendo exactamente lo que está abierto", () => {
+      const porClave = new Map(mediciones.map((m) => [clave(m), m]));
+      const vencidas: string[] = [];
+
+      for (const a of ABIERTAS_HOY) {
+        const m = porClave.get(`${a.verbo} ${a.ruta}`);
+        if (!m) {
+          vencidas.push(`${a.verbo} ${a.ruta}: listada como abierta y el barrido ya no la llama`);
+          continue;
+        }
+        if (m.status === 401 || m.status === 403) {
+          vencidas.push(
+            `${a.verbo} ${a.ruta}: YA ESTÁ CERRADA (contesta ${m.status}). Borrá su entrada de ` +
+              `ABIERTAS_HOY: dejarla ahí vuelve a permitir que se abra sin que nada falle.`
+          );
+          continue;
+        }
+        if (m.status !== a.statusMedido) {
+          vencidas.push(
+            `${a.verbo} ${a.ruta}: contesta ${m.status} y su entrada dice ${a.statusMedido}. ` +
+              `Cambió algo en el camino; releé el motivo antes de actualizar el número.`
+          );
+        }
+      }
+
+      expect(
+        vencidas,
+        "El trinquete es exacto en las DOS direcciones, y por eso esta lista no es una " +
+          "absolución: un handler que se abre y no está en ella pone rojo el test de arriba, y un " +
+          "handler que se CIERRA y sigue en ella pone rojo éste. Arreglar una ruta obliga a venir " +
+          "hasta acá y borrar su línea."
       ).toEqual([]);
     });
 
@@ -633,18 +821,48 @@ describe("la precondición global se mide llamando, no leyendo", () => {
   });
 
   describe("propiedad 3: el espía de fetch en cero", () => {
-    it("ningún handler sale a la red sin sesión", () => {
-      const fugas = mediciones
-        .filter((m) => m.fetchSalientes.length > 0)
-        .map((m) => `${m.verbo} ${m.ruta} [${m.archivo}] -> ${m.fetchSalientes.join(" | ")}`);
+    it("ningún handler sale a la red sin sesión, salvo la fuga ya medida", () => {
+      const conocidas = new Map(FUGAS_HOY.map((f) => [`${f.verbo} ${f.ruta}`, f.destinos]));
+      const fugas: string[] = [];
+
+      for (const m of mediciones) {
+        if (m.fetchSalientes.length === 0) continue;
+        const esperados = conocidas.get(clave(m));
+        const medidos = m.fetchSalientes.map(destinoDe);
+        if (!esperados) {
+          fugas.push(`${clave(m)} [${m.archivo}] -> ${medidos.join(" | ")}`);
+          continue;
+        }
+        const sobran = medidos.filter((d, i) => esperados[i] !== d || medidos.length !== esperados.length);
+        if (sobran.length > 0) {
+          fugas.push(
+            `${clave(m)} [${m.archivo}] -> salió a ${medidos.join(" | ")} y su entrada en ` +
+              `FUGAS_HOY declara ${esperados.join(" | ")}`
+          );
+        }
+      }
 
       expect(
         fugas,
-        "Un llamador SIN SESIÓN disparó estas llamadas salientes. Eso es gasto que un anónimo " +
-          "puede provocar —Places y PageSpeed cobran por request— y superficie: la clave de " +
-          "PageSpeed viaja en la query string de su propia URL. El espía las rechazó, así que la " +
-          "suite no gastó nada; en producción no hay espía."
+        "Un llamador SIN SESIÓN disparó llamadas salientes que no estaban en la medición del " +
+          "2026-09-10. Eso es gasto que un anónimo puede provocar —Places y PageSpeed cobran por " +
+          "request— y superficie: la clave de PageSpeed viaja en la query string de su propia " +
+          "URL. El espía las rechaza, así que la suite no gasta nada; en producción no hay espía."
       ).toEqual([]);
+    });
+
+    it("la fuga listada sigue existiendo, o hay que borrarla de la lista", () => {
+      const medidas = new Map(
+        mediciones.filter((m) => m.fetchSalientes.length > 0).map((m) => [clave(m), m])
+      );
+
+      const vencidas = FUGAS_HOY.filter((f) => !medidas.has(`${f.verbo} ${f.ruta}`)).map(
+        (f) =>
+          `${f.verbo} ${f.ruta}: listada como fuga y ya no sale a la red sin sesión. Borrá su ` +
+          `entrada de FUGAS_HOY para que el trinquete no vuelva a permitir la que se acaba de cerrar.`
+      );
+
+      expect(vencidas, "una fuga arreglada tiene que salir de la lista").toEqual([]);
     });
 
     it("el espía registra Y rechaza", async () => {
