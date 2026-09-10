@@ -109,6 +109,7 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -124,6 +125,37 @@ const arnes = vi.hoisted(() => ({
   cookies: new Map<string, string>(),
   /** Toda llamada saliente registrada, en orden. */
   salientes: [] as string[],
+  /**
+   * Lo mismo, pero SIN vaciarse nunca entre handlers.
+   *
+   * Existe por una salida que el registro por handler no puede ver: un
+   * refutador midió que una llamada diferida —un `setTimeout`, o un `void
+   * async` sin `await`— se dispara DESPUÉS de que el handler contestó, o sea
+   * después de la foto, y el barrido quedaba verde con la fuga saliendo de
+   * verdad. Atribuirla a un handler exacto ya no siempre se puede; que exista
+   * sí, y una fuga sin dueño sigue siendo una fuga.
+   */
+  todasLasSalientes: [] as string[],
+  /**
+   * Cuántas veces el handler en curso PREGUNTÓ quién llama.
+   *
+   * Es el control positivo, y existe porque un refutador midió lo siguiente en
+   * el repositorio vecino: le borró el guardia de identidad a 58 handlers y 40
+   * siguieron contestando 401/403. La negación venía de otra parte —de la RLS,
+   * de un esquema, de una fila que no existe— y la propiedad titular del
+   * archivo se satisfacía sin que el handler decidiera nada.
+   *
+   * Y en este repositorio midió el caso límite: en la ruta que publica EN VIVO
+   * en la ficha de un cliente reemplazó `auth.getUser()` por confiar en un
+   * header `x-user-id`, dejando intacto el `if (!user) 401`. El barrido quedó
+   * VERDE: una autenticación falsa que cualquiera puede mandar pasaba por
+   * negación legítima.
+   *
+   * Un status no distingue «negó porque decidió» de «negó de casualidad». Un
+   * contador sí, porque cuenta en la unidad en la que la garantía falla: la
+   * pregunta.
+   */
+  consultasIdentidad: 0,
 }));
 
 /**
@@ -176,8 +208,21 @@ function consultaVacia(): unknown {
 function clienteSinSesion() {
   return {
     auth: {
-      getUser: async () => ({ data: { user: null }, error: null }),
-      getSession: async () => ({ data: { session: null }, error: null }),
+      getUser: async () => {
+        arnes.consultasIdentidad++;
+        return { data: { user: null }, error: null };
+      },
+      getSession: async () => {
+        arnes.consultasIdentidad++;
+        return { data: { session: null }, error: null };
+      },
+      // El callback de magic link lo llama con el `code` de PKCE. Contesta un
+      // error en vez de tirar por el mismo motivo que el resto del cliente: un
+      // mock que tira mide ceros que no son guardias.
+      exchangeCodeForSession: async () => ({
+        data: { session: null, user: null },
+        error: { message: "codigo invalido en el arnes" },
+      }),
     },
     from: () => consultaVacia(),
     rpc: () => consultaVacia(),
@@ -186,7 +231,41 @@ function clienteSinSesion() {
 }
 
 const RAIZ = process.cwd();
-const DIRECTORIO_API = path.join(RAIZ, "src", "app", "api");
+
+/**
+ * TODO el árbol de rutas, no sólo `api`.
+ *
+ * QUÉ AGUJERO CIERRA, MEDIDO
+ *
+ * Este barrido apuntaba a `src/app/api`, y un agente escéptico lo refutó con un
+ * comando: `find src/app -name 'route.ts' -not -path 'src/app/api/*'` devuelve
+ * `src/app/auth/callback/route.ts`, un handler REAL que canjea un code de PKCE
+ * por una sesión y que el barrido nunca ejercitaba. Plantó además una ruta
+ * abierta fuera de `api` y la suite entera siguió verde.
+ *
+ * Un route handler de Next no es «un archivo de la carpeta api»: es cualquier
+ * `route.<ext>` en cualquier parte del árbol de la aplicación. La unidad en la
+ * que esta garantía puede fallar es la ruta que Next SERVIRÍA, así que el
+ * alcance es el árbol entero.
+ */
+const DIRECTORIO_RUTAS = path.join(RAIZ, "src", "app");
+
+/**
+ * Las extensiones que Next acepta para un route handler.
+ *
+ * `pageExtensions` por defecto es `["tsx", "ts", "jsx", "js"]`
+ * (node_modules/next/dist/server/config-shared.js), así que aceptar sólo
+ * `route.ts` es más angosto que el framework: el refutador plantó un
+ * `route.tsx` con un `GET` abierto y sin guardia, y el barrido no lo vio.
+ *
+ * La expresión ancla los dos extremos, y por eso `route.test.ts` y
+ * `route.spec.ts` quedan afuera sin necesitar una lista de exclusiones: su
+ * nombre base no es `route.<ext>`. Y hay un test más abajo que falla si
+ * aparece en el disco un `route.<algo>` con una extensión que esta expresión
+ * NO acepta — porque el defecto que se paga no es tener la lista corta, es no
+ * enterarse.
+ */
+const ARCHIVO_DE_RUTA = /^route\.(tsx|ts|jsx|js)$/;
 
 /** Los verbos que Next reconoce como handler exportado de un `route.ts`. */
 const VERBOS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
@@ -268,6 +347,9 @@ const FORMA_DE_LLAMADA: Record<
   // Sin header `x-vulkan-signature`: es el pedido de un desconocido, que es el
   // caso que la firma existe para rechazar.
   "/api/webhooks/lead-won": { cuerpo: { event: "lead.won" } },
+  // Sin `code`, que es el caso del que entra a mano a la URL. El caso CON code
+  // —el mecanismo ejercitado del otro lado— tiene su propio test más abajo.
+  "/auth/callback": {},
 };
 
 /**
@@ -283,12 +365,70 @@ const FORMA_DE_LLAMADA: Record<
  * huellas, que ya no están en el archivo y hacen fallar la exención. Una
  * exención tiene que caducar cuando caduca su razón.
  */
+/**
+ * QUÉ ES UNA HUELLA, DESPUÉS DE QUE TRES ATAQUES LA ATRAVESARAN
+ *
+ * Una huella es la prueba de que el mecanismo que una exención invoca SIGUE
+ * SIENDO CÓDIGO QUE CORRE. Empezó siendo `fuente.includes(texto)` sobre el
+ * `route.ts`, y un refutador la rompió tres veces distintas:
+ *
+ *  1. La palabra sobrevive en un COMENTARIO. Borró el mecanismo y dejó su
+ *     nombre en la prosa que lo explicaba: verde. Es el mismo defecto que este
+ *     proyecto ya pagó una vez —un comentario hizo sobrevivir la mutación de su
+ *     propio arreglo— y por eso hay que tapar comentarios antes de buscar.
+ *  2. La palabra sobrevive en la DECLARACIÓN de la función muerta. Borró el
+ *     sitio de llamada del CSRF del `state` y la firma `estadoCoincide(esperado`
+ *     siguió satisfaciendo la huella: verde, con el CSRF ya sin ejecutar.
+ *  3. La palabra vive en OTRO ARCHIVO que el mecanismo. Vació
+ *     `signature.ts` a `return { ok: true }` y la exención de `lead-won` siguió
+ *     verde, porque sus huellas se buscaban en `route.ts`.
+ *
+ * De ahí las tres reglas: cada huella dice EN QUÉ ARCHIVO se busca, se busca
+ * sobre el código con los comentarios tapados, y se busca en posición de
+ * LLAMADA —los import y las declaraciones del propio símbolo se descartan—.
+ * Lo que esto todavía no puede ver: que la función llamada haga lo que su
+ * nombre promete. Eso no se lee, se ejercita, y para eso están los tests del
+ * bloque «los mecanismos ejercitados de los dos lados».
+ */
+interface Huella {
+  /** Relativo a la raíz del repositorio: el archivo donde vive el mecanismo. */
+  archivo: string;
+  /** El texto que tiene que aparecer en posición de llamada. */
+  texto: string;
+}
+
+/** Tapa comentarios de bloque y de línea. Ver el comentario de `Huella`. */
+function sinComentarios(fuente: string): string {
+  return fuente.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+}
+
+/**
+ * El código de un archivo sin sus `import` ni las declaraciones del símbolo
+ * buscado, para que la huella sólo pueda satisfacerse desde una LLAMADA.
+ *
+ * `simbolo` sale del propio texto de la huella: `auth.getUser(` -> `getUser`.
+ */
+function codigoQueLlama(fuente: string, texto: string): string {
+  const simbolo = (texto.match(/([A-Za-z_$][\w$]*)\s*\(/) ?? [])[1];
+  let codigo = sinComentarios(fuente).replace(/^\s*import\s[\s\S]*?from\s+["'][^"']+["'];?/gm, " ");
+  if (simbolo) {
+    codigo = codigo.replace(
+      new RegExp(
+        `(?:export\\s+)?(?:async\\s+)?function\\s+${simbolo}\\s*\\(|(?:const|let|var)\\s+${simbolo}\\s*=`,
+        "g"
+      ),
+      " "
+    );
+  }
+  return codigo;
+}
+
 const EXENCIONES: Array<{
   ruta: string;
   publicaAProposito: boolean;
   porque: string;
   mecanismo: string;
-  huellas: string[];
+  huellas: Huella[];
   statusEsperado: number[];
 }> = [
   {
@@ -302,7 +442,14 @@ const EXENCIONES: Array<{
       "HMAC-SHA256 del cuerpo CRUDO con GROWTH_OS_WEBHOOK_SECRET, header x-vulkan-signature, " +
       "comparado en tiempo constante (src/lib/integrations/leadEngine/signature.ts:54-78). Falla " +
       "cerrado: sin secreto de este lado devuelve no-secret y la ruta contesta 401 igual.",
-    huellas: ["verifySignature(", "x-vulkan-signature"],
+    huellas: [
+      { archivo: "src/app/api/webhooks/lead-won/route.ts", texto: "verifySignature(" },
+      { archivo: "src/app/api/webhooks/lead-won/route.ts", texto: "x-vulkan-signature" },
+      // El mecanismo NO vive en el route.ts, y ahí estaba el agujero: vaciar
+      // este archivo a `return { ok: true }` dejaba la exención verde.
+      { archivo: "src/lib/integrations/leadEngine/signature.ts", texto: "createHmac(" },
+      { archivo: "src/lib/integrations/leadEngine/signature.ts", texto: "timingSafeEqual(" },
+    ],
     statusEsperado: [401],
   },
   {
@@ -317,7 +464,30 @@ const EXENCIONES: Array<{
       "(route.ts:65 y :109-112), borrada siempre en :59 para que valga una sola vez; (b) ADEMÁS " +
       "membresía de agencia en :69, porque la cookie prueba que este navegador arrancó el flujo, " +
       "no que la sesión siga siendo la misma.",
-    huellas: ["estadoCoincide(esperado", "esOperadorDeLaAgencia()"],
+    huellas: [
+      { archivo: "src/app/api/auth/google/callback/route.ts", texto: "estadoCoincide(esperado" },
+      { archivo: "src/app/api/auth/google/callback/route.ts", texto: "esOperadorDeLaAgencia()" },
+      { archivo: "src/lib/integrations/google/agencyGuard.ts", texto: "auth.getUser(" },
+    ],
+    statusEsperado: [307],
+  },
+  {
+    ruta: "/auth/callback",
+    publicaAProposito: true,
+    porque:
+      "Es el aterrizaje del magic link: lo abre un NAVEGADOR que todavía no tiene sesión, así " +
+      "que exigirle una sería exigirle lo que viene a conseguir. Su negación es un 307 a " +
+      "/login?error=missing_code, que es la forma que el medio entiende. Entró al barrido el " +
+      "2026-09-10, cuando el alcance dejó de ser `src/app/api` y pasó a ser el árbol: hasta ese " +
+      "día era un handler real que nadie ejercitaba.",
+    mecanismo:
+      "El `code` de PKCE, canjeado por Supabase en exchangeCodeForSession (route.ts:16). Quien " +
+      "no trae code no pasa; quien trae uno inválido tampoco, y el error vuelve en la query del " +
+      "login. La validación es del proveedor, no de esta ruta, y eso es exactamente lo que " +
+      "reemplaza a la sesión acá.",
+    huellas: [
+      { archivo: "src/app/auth/callback/route.ts", texto: "auth.exchangeCodeForSession(code)" },
+    ],
     statusEsperado: [307],
   },
   {
@@ -332,7 +502,10 @@ const EXENCIONES: Array<{
     mecanismo:
       "esOperadorDeLaAgencia() en la primera línea -> getUser + consulta de org_members como el " +
       "usuario (src/lib/integrations/google/agencyGuard.ts:51-72).",
-    huellas: ["esOperadorDeLaAgencia()"],
+    huellas: [
+      { archivo: "src/app/api/auth/google/start/route.ts", texto: "esOperadorDeLaAgencia()" },
+      { archivo: "src/lib/integrations/google/agencyGuard.ts", texto: "auth.getUser(" },
+    ],
     statusEsperado: [307],
   },
 ];
@@ -381,6 +554,22 @@ const ABIERTAS_HOY: Array<{
   statusMedido: number;
   porque: string;
   queLaCierra: string;
+  /**
+   * La huella del mecanismo que el motivo invoca, o `null` cuando el motivo es
+   * que NO HAY mecanismo.
+   *
+   * Un refutador midió por qué hace falta: borró entero el import y la llamada
+   * de `requireInternalSecret` de /api/seo/audit y el barrido quedó verde
+   * 16/16, con esta lista todavía diciendo «requireInternalSecret es un no-op
+   * sin la variable». La prosa pasó a mentir y nada la contradecía. Una entrada
+   * cuyo motivo nombra un mecanismo tiene que caducar con él, igual que una
+   * exención.
+   *
+   * `null` no es un descuido: /api/reports/generate está abierta porque no
+   * llama a nadie, y a la ausencia no se le puede tomar la huella. A esa se le
+   * comprueba lo medido —cero consultas de identidad— en su propio test.
+   */
+  huella: Huella | null;
 }> = [
   {
     ruta: "/api/reports/generate",
@@ -394,6 +583,7 @@ const ABIERTAS_HOY: Array<{
     queLaCierra:
       "Un guardia propio antes del trabajo. Es la única de las ocho que sigue en 200 incluso con " +
       "INTERNAL_API_SECRET puesta, y la única que además sale a la red: va primera.",
+    huella: null,
   },
   {
     ruta: "/api/seo/audit",
@@ -401,6 +591,7 @@ const ABIERTAS_HOY: Array<{
     statusMedido: 200,
     porque: "requireInternalSecret(route.ts:5) es un no-op sin la variable.",
     queLaCierra: "Que requireInternalSecret falle cerrado, y la variable en .env.example.",
+    huella: { archivo: "src/app/api/seo/audit/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/agents/run-all",
@@ -408,6 +599,7 @@ const ABIERTAS_HOY: Array<{
     statusMedido: 200,
     porque: "requireInternalSecret(route.ts:13) es un no-op sin la variable.",
     queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
+    huella: { archivo: "src/app/api/agents/run-all/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/agents/run",
@@ -415,6 +607,7 @@ const ABIERTAS_HOY: Array<{
     statusMedido: 200,
     porque: "requireInternalSecret(route.ts:15) es un no-op sin la variable.",
     queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
+    huella: { archivo: "src/app/api/agents/run/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/content/generate",
@@ -425,6 +618,7 @@ const ABIERTAS_HOY: Array<{
       "Ídem. El espía queda en 0 sólo porque la rama live de " +
       "src/lib/integrations/openai.ts:32-39 es todavía un placeholder sin fetch: es la puerta por " +
       "donde entra el gasto el día que se implemente, no un guardia.",
+    huella: { archivo: "src/app/api/content/generate/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/integrations/gbp/profile",
@@ -432,6 +626,7 @@ const ABIERTAS_HOY: Array<{
     statusMedido: 200,
     porque: "requireInternalSecret(route.ts:6) es un no-op sin la variable.",
     queLaCierra: "Ídem. Mientras tanto expone el snapshot de un negocio a cualquiera.",
+    huella: { archivo: "src/app/api/integrations/gbp/profile/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/integrations/images/generate",
@@ -441,6 +636,7 @@ const ABIERTAS_HOY: Array<{
       "requireInternalSecret(route.ts:34) es un no-op sin la variable, y el chequeo de businessId " +
       "(route.ts:41) corre ANTES de cualquier decisión de identidad.",
     queLaCierra: "Ídem, y mover el guardia arriba del 404 de negocio.",
+    huella: { archivo: "src/app/api/integrations/images/generate/route.ts", texto: "requireInternalSecret(req)" },
   },
   {
     ruta: "/api/integrations/places/search",
@@ -451,6 +647,7 @@ const ABIERTAS_HOY: Array<{
       "Ídem. El espía queda en 0 porque esta ruta está cableada al cliente FALSO de Places " +
       "(src/lib/integrations/googlePlaces.ts:19, un placeholder sin fetch). El fetch real vive en " +
       "src/lib/integrations/google/places.ts:66 y se alcanza sin sesión por /api/reports/generate.",
+    huella: { archivo: "src/app/api/integrations/places/search/route.ts", texto: "requireInternalSecret(req)" },
   },
 ];
 
@@ -495,13 +692,31 @@ function destinoDe(salida: string): string {
  */
 const NO_INVOCABLES: Array<{ ruta: string; verbo: string; porque: string }> = [];
 
-/** Todo `route.ts` bajo `src/app/api`, leído del disco. */
+/** Todo `route.<ext>` bajo `src/app`, leído del disco. */
 function rutasEnDisco(directorio: string): string[] {
   const salida: string[] = [];
   for (const entrada of readdirSync(directorio)) {
     const completo = path.join(directorio, entrada);
     if (statSync(completo).isDirectory()) salida.push(...rutasEnDisco(completo));
-    else if (entrada === "route.ts" || entrada === "route.tsx") salida.push(completo);
+    else if (ARCHIVO_DE_RUTA.test(entrada)) salida.push(completo);
+  }
+  return salida;
+}
+
+/**
+ * Todo archivo que se LLAME `route.algo`, aceptado o no.
+ *
+ * Sirve para una sola cosa, y es la que faltaba: que el día que alguien escriba
+ * `route.mjs` —o cualquier extensión que `ARCHIVO_DE_RUTA` no contemple— el
+ * barrido FALLE en vez de ignorarlo en silencio. El agujero no era la lista
+ * corta; era que una lista corta se lee igual que un barrido completo.
+ */
+function nombradosRuta(directorio: string): string[] {
+  const salida: string[] = [];
+  for (const entrada of readdirSync(directorio)) {
+    const completo = path.join(directorio, entrada);
+    if (statSync(completo).isDirectory()) salida.push(...nombradosRuta(completo));
+    else if (/^route\.[^.]+$/.test(entrada)) salida.push(completo);
   }
   return salida;
 }
@@ -509,7 +724,7 @@ function rutasEnDisco(directorio: string): string[] {
 /** `/Users/.../src/app/api/agents/run/route.ts` -> `/api/agents/run`. */
 function rutaUrl(archivo: string): string {
   const rel = path.relative(path.join(RAIZ, "src", "app"), archivo).replace(/\\/g, "/");
-  return "/" + rel.replace(/\/route\.tsx?$/, "");
+  return "/" + rel.replace(/\/route\.(tsx|ts|jsx|js)$/, "");
 }
 
 interface Medicion {
@@ -522,15 +737,23 @@ interface Medicion {
   tiro: string | null;
   /** Las URLs que el handler intentó llamar, en orden. */
   fetchSalientes: string[];
+  /** Cuántas veces preguntó quién llama antes de contestar. */
+  consultasIdentidad: number;
 }
 
-const archivos = rutasEnDisco(DIRECTORIO_API).sort();
+const archivos = rutasEnDisco(DIRECTORIO_RUTAS).sort();
 const mediciones: Medicion[] = [];
 /** Rutas cuyo módulo no exporta ningún verbo reconocible. */
 const sinHandlers: string[] = [];
 let handlersDescubiertos = 0;
 
 const fetchOriginal = globalThis.fetch;
+const requerir = createRequire(import.meta.url);
+const nativosOriginales: Array<{
+  nativo: Record<string, unknown>;
+  metodo: string;
+  original: unknown;
+}> = [];
 
 beforeAll(async () => {
   // Ver el encabezado: estas cuatro líneas son la diferencia entre una medición
@@ -554,10 +777,42 @@ beforeAll(async () => {
           : (entrada as Request).url;
     const metodo = init?.method ?? (entrada as Request)?.method ?? "GET";
     arnes.salientes.push(`${metodo} ${url}`);
+    arnes.todasLasSalientes.push(`${metodo} ${url}`);
     return Promise.reject(
       new Error(`[espia] llamada saliente sin sesion, rechazada: ${metodo} ${url}`)
     );
   }) as typeof fetch;
+
+  // Y los transportes que NO pasan por `fetch`.
+  //
+  // El espía instrumentaba sólo `globalThis.fetch`, y un refutador lo midió con
+  // un servidor local: una petición hecha con `node:https`.request salió de
+  // verdad y el registro quedó en cero, o sea que el barrido informaba «cero
+  // llamadas» sobre una llamada que había salido. Hoy `grep` sobre `src` no
+  // encuentra ningún uso de estos módulos ni de axios —hay un trinquete más
+  // abajo que falla si aparece uno—, así que esto no cambia ninguna medición:
+  // cubre el día en que alguien agregue un cliente que no use fetch, que es
+  // justo el día en que nadie se acordaría de venir a extender el espía.
+  for (const modulo of ["node:http", "node:https"]) {
+    const nativo = requerir(modulo) as Record<string, unknown>;
+    for (const metodo of ["request", "get"]) {
+      const original = nativo[metodo];
+      nativosOriginales.push({ nativo, metodo, original });
+      nativo[metodo] = (...args: unknown[]) => {
+        const primero = args[0];
+        const donde =
+          typeof primero === "string"
+            ? primero
+            : primero instanceof URL
+              ? primero.toString()
+              : JSON.stringify(primero);
+        const registro = `${modulo}.${metodo} ${donde}`;
+        arnes.salientes.push(registro);
+        arnes.todasLasSalientes.push(registro);
+        throw new Error(`[espia] llamada saliente sin sesion, rechazada: ${registro}`);
+      };
+    }
+  }
 
   for (const archivo of archivos) {
     const ruta = rutaUrl(archivo);
@@ -579,6 +834,7 @@ beforeAll(async () => {
         arnes.cookies.set(nombre, valor);
       }
       arnes.salientes.length = 0;
+      arnes.consultasIdentidad = 0;
 
       const url = new URL(ORIGEN + ruta);
       for (const [clave, valor] of Object.entries(forma.query ?? {})) {
@@ -611,6 +867,14 @@ beforeAll(async () => {
         tiro = error instanceof Error ? error.message : String(error);
       }
 
+      // Cerrar la ventana. El handler ya contestó, pero una llamada diferida
+      // por `setTimeout(..., 0)` o por un `void async` sin `await` todavía no
+      // salió: sin este drenaje la foto se saca antes de la fuga y el barrido
+      // informa cero. Medido por un refutador, verde, con la llamada
+      // disparándose de verdad.
+      await new Promise((listo) => setTimeout(listo, 0));
+      await new Promise((listo) => setImmediate(listo));
+
       mediciones.push({
         ruta,
         archivo: path.relative(RAIZ, archivo).replace(/\\/g, "/"),
@@ -618,6 +882,7 @@ beforeAll(async () => {
         status,
         tiro,
         fetchSalientes: [...arnes.salientes],
+        consultasIdentidad: arnes.consultasIdentidad,
       });
     }
   }
@@ -625,6 +890,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   globalThis.fetch = fetchOriginal;
+  for (const { nativo, metodo, original } of nativosOriginales) nativo[metodo] = original;
 });
 
 /** Lo medido, en una línea legible para el mensaje de una falla. */
@@ -659,6 +925,22 @@ describe("la precondición global se mide llamando, no leyendo", () => {
         enTabla.filter((r) => !enDisco.includes(r)),
         "Estas rutas están en FORMA_DE_LLAMADA y ya no están en el disco. Una forma de llamada " +
           "para una ruta que no existe no mide nada y esconde la siguiente."
+      ).toEqual([]);
+    });
+
+    it("no hay en el disco un route.algo con una extensión que el barrido no acepte", () => {
+      const aceptados = new Set(archivos);
+      const ignorados = nombradosRuta(DIRECTORIO_RUTAS)
+        .filter((a) => !aceptados.has(a))
+        .map((a) => path.relative(RAIZ, a));
+
+      expect(
+        ignorados,
+        "Estos archivos se llaman `route.algo` y el barrido NO los está llamando, porque su " +
+          "extensión no está en ARCHIVO_DE_RUTA. Si Next los sirve, son rutas sin medir —el " +
+          "refutador plantó un route.tsx abierto y la suite entera quedó verde—. Si no los " +
+          "sirve, hay que decir acá por qué. Lo que no puede pasar es que la diferencia entre " +
+          "«no existe» y «no lo miramos» sea invisible."
       ).toEqual([]);
     });
 
@@ -773,6 +1055,109 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       ).toEqual([]);
     });
 
+    it("el que niega, negó porque preguntó quién llama", () => {
+      const exentas = new Set(EXENCIONES.map((e) => e.ruta));
+      const negaronSinPreguntar = mediciones
+        .filter((m) => !exentas.has(m.ruta))
+        .filter((m) => m.status === 401 || m.status === 403)
+        .filter((m) => m.consultasIdentidad === 0)
+        .map((m) => `${linea(m)} — 0 consultas de identidad`);
+
+      expect(
+        negaronSinPreguntar,
+        "Estos handlers contestaron 401 o 403 SIN preguntar nunca quién llama. El status pasa la " +
+          "propiedad 2 y no significa nada: la negación viene de otra parte —un esquema, la RLS, " +
+          "una fila que no existe— o de un dato que el propio llamador manda. Es el control " +
+          "positivo: sin él, medido por un refutador, una autenticación falsa basada en un " +
+          "header `x-user-id` pasaba por guardia legítimo, y 40 de 58 handlers del repositorio " +
+          "vecino seguían dando 401 con el guardia borrado."
+      ).toEqual([]);
+    });
+
+    it("las rutas exentas también dicen si preguntaron, y ninguna miente", () => {
+      // Una exención declara que ALGO reemplaza a la sesión, no que no haya
+      // identidad: el callback de Google además pide membresía de agencia, o sea
+      // que sí pregunta. Esto pone ese hecho en el registro, para que el día que
+      // una exención deje de preguntar alguien tenga que venir a decir por qué.
+      const registro = EXENCIONES.map((e) => {
+        const m = mediciones.find((x) => x.ruta === e.ruta);
+        return `${e.ruta}: ${m ? m.consultasIdentidad : "no medida"} consultas`;
+      }).sort();
+
+      expect(
+        registro,
+        "Las dos que preguntan una vez son las de Google, y preguntan porque su mecanismo no es " +
+          "sólo la cookie: además exigen membresía de la agencia. Las dos que preguntan cero son " +
+          "las que no pueden —un webhook de un tercero y el aterrizaje de un magic link— y ahí " +
+          "el cero es la exención misma, no un descuido. Si un número se mueve, el mecanismo de " +
+          "esa exención cambió y hay que releerla antes de actualizar la lista."
+      ).toEqual([
+        "/api/auth/google/callback: 1 consultas",
+        "/api/auth/google/start: 1 consultas",
+        "/api/webhooks/lead-won: 0 consultas",
+        "/auth/callback: 0 consultas",
+      ]);
+    });
+
+    it("cada entrada abierta conserva el mecanismo que su motivo nombra", () => {
+      const perdidas: string[] = [];
+      for (const a of ABIERTAS_HOY) {
+        if (!a.huella) continue;
+        let fuente: string;
+        try {
+          fuente = readFileSync(path.join(RAIZ, a.huella.archivo), "utf8");
+        } catch {
+          perdidas.push(`${a.verbo} ${a.ruta}: su huella apunta a un archivo que ya no existe`);
+          continue;
+        }
+        if (!codigoQueLlama(fuente, a.huella.texto).includes(a.huella.texto)) {
+          perdidas.push(
+            `${a.verbo} ${a.ruta}: su motivo dice que el mecanismo es \`${a.huella.texto}\` y ` +
+              `eso ya no está en ${a.huella.archivo}. La entrada quedó describiendo algo que no ` +
+              `existe: o el motivo cambió, o la ruta ahora está abierta por otra razón.`
+          );
+        }
+      }
+
+      expect(perdidas, "una entrada abierta caduca con el mecanismo que dice tener").toEqual([]);
+    });
+
+    it("la que está abierta pregunta una vez, y esa pregunta no es un guardia", () => {
+      /**
+       * PREGUNTAR NO ES GATEAR, Y ACÁ SE VE LA DIFERENCIA MEDIDA.
+       *
+       * Esta entrada es la única con `huella: null`, porque su motivo es que NO
+       * hay mecanismo. Escribí este test esperando cero consultas de identidad y
+       * midió UNA: `src/lib/reports/orchestrator.ts:70-71` llama a `getUser()`.
+       *
+       * El número contradijo mi suposición y la corrección va acá porque es el
+       * hallazgo: ese `getUser()` no decide PERMISO, decide FUENTE DE DATOS —el
+       * `if (user)` de :73 elige entre los datos del usuario y una rama
+       * sembrada—. La ruta pregunta quién llama, escucha «nadie», y sigue
+       * adelante igual, generando el reporte y gastando en Places y PageSpeed.
+       *
+       * Y eso marca el límite del control positivo de arriba, que hay que decir
+       * en vez de esconder: el contador atrapa «negó sin preguntar», que es el
+       * caso que un refutador explotó con un header `x-user-id`. NO atrapa
+       * «preguntó y no le importó la respuesta». Para eso está el status: acá es
+       * 200, y por eso esta ruta es la primera de la lista de trabajo.
+       */
+      const m = mediciones.find((x) => x.ruta === "/api/reports/generate" && x.verbo === "POST");
+
+      expect(m, "la ruta del reporte ya no está en el barrido").toBeDefined();
+      expect(
+        m!.consultasIdentidad,
+        "POST /api/reports/generate preguntaba UNA vez quién llama, en el orquestador, para " +
+          "elegir la fuente de datos y no para negar. Si este número se movió, esa pregunta " +
+          "cambió de lugar o de propósito, y hay que releer la entrada antes de tocar el número."
+      ).toBe(1);
+      expect(
+        m!.status,
+        "y el 200 es lo que dice que la pregunta no era un guardia: preguntó, le dijeron nadie, " +
+          "y contestó igual."
+      ).toBe(200);
+    });
+
     it("cada exención contesta exactamente el status que declaró", () => {
       const desviadas = EXENCIONES.flatMap((e) =>
         mediciones
@@ -787,7 +1172,7 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       ).toEqual([]);
     });
 
-    it("cada exención sigue teniendo en el archivo el mecanismo que la justifica", () => {
+    it("cada exención sigue teniendo el mecanismo que la justifica, en el archivo donde vive", () => {
       const perdidas: string[] = [];
       for (const e of EXENCIONES) {
         const archivo = archivos.find((a) => rutaUrl(a) === e.ruta);
@@ -795,10 +1180,21 @@ describe("la precondición global se mide llamando, no leyendo", () => {
           perdidas.push(`${e.ruta}: exenta y la ruta ya no existe en el disco`);
           continue;
         }
-        const fuente = readFileSync(archivo, "utf8");
         for (const huella of e.huellas) {
-          if (!fuente.includes(huella)) {
-            perdidas.push(`${e.ruta}: perdió la huella \`${huella}\` de su mecanismo`);
+          let fuente: string;
+          try {
+            fuente = readFileSync(path.join(RAIZ, huella.archivo), "utf8");
+          } catch {
+            perdidas.push(
+              `${e.ruta}: su huella apunta a ${huella.archivo} y ese archivo ya no existe`
+            );
+            continue;
+          }
+          if (!codigoQueLlama(fuente, huella.texto).includes(huella.texto)) {
+            perdidas.push(
+              `${e.ruta}: perdió la huella \`${huella.texto}\` en ${huella.archivo} ` +
+                `(no aparece en posición de llamada, con los comentarios tapados)`
+            );
           }
         }
       }
@@ -820,6 +1216,37 @@ describe("la precondición global se mide llamando, no leyendo", () => {
     });
   });
 
+  describe("los mecanismos que reemplazan a la sesión, ejercitados de los dos lados", () => {
+    it("el callback de magic link no deja pasar un code inválido", async () => {
+      const archivo = archivos.find((a) => rutaUrl(a) === "/auth/callback");
+      expect(archivo, "la ruta del callback ya no está en el disco").toBeDefined();
+      const modulo: Record<string, unknown> = await import(pathToFileURL(archivo!).href);
+      const handler = modulo.GET as (req: Request) => Promise<Response>;
+
+      const respuesta = await handler(
+        new Request(`${ORIGEN}/auth/callback?code=un-code-que-no-existe&next=/app`)
+      );
+
+      // El status solo no alcanza para distinguir: un 307 al destino y un 307 al
+      // login son el mismo número. Lo que separa negar de dejar pasar es ADÓNDE
+      // manda, y eso es lo que se afirma — es el mismo defecto que un refutador
+      // midió en /api/auth/google/start, donde el 307 de éxito y el de negación
+      // eran indistinguibles para el barrido.
+      const destino = respuesta.headers.get("location") ?? "";
+      expect(respuesta.status, "un code inválido tiene que terminar en una redirección").toBe(307);
+      expect(
+        destino.includes("/login"),
+        `Un code inválido mandó el navegador a ${destino}. Si eso no es el login, el canje falló ` +
+          `y la ruta siguió adelante igual, que es la única forma en que esta exención se vuelve ` +
+          `una puerta: el 307 seguiría siendo 307 y el barrido no se enteraría.`
+      ).toBe(true);
+      expect(
+        destino.includes("/app"),
+        `Un code inválido no puede terminar en el destino post-login (${destino}).`
+      ).toBe(false);
+    });
+  });
+
   describe("propiedad 3: el espía de fetch en cero", () => {
     it("ningún handler sale a la red sin sesión, salvo la fuga ya medida", () => {
       const conocidas = new Map(FUGAS_HOY.map((f) => [`${f.verbo} ${f.ruta}`, f.destinos]));
@@ -833,8 +1260,14 @@ describe("la precondición global se mide llamando, no leyendo", () => {
           fugas.push(`${clave(m)} [${m.archivo}] -> ${medidos.join(" | ")}`);
           continue;
         }
-        const sobran = medidos.filter((d, i) => esperados[i] !== d || medidos.length !== esperados.length);
-        if (sobran.length > 0) {
+        // Como MULTICONJUNTO, no por índice. Un refutador puso este test rojo
+        // metiendo sesenta `await Promise.resolve()` delante de la MISMA
+        // llamada: mismos destinos, misma cantidad, sólo otro orden de
+        // planificación. Comparar por índice medía el planificador de
+        // promesas, no la fuga.
+        const ordenados = [...medidos].sort().join(" | ");
+        const declarados = [...esperados].sort().join(" | ");
+        if (ordenados !== declarados) {
           fugas.push(
             `${clave(m)} [${m.archivo}] -> salió a ${medidos.join(" | ")} y su entrada en ` +
               `FUGAS_HOY declara ${esperados.join(" | ")}`
@@ -848,6 +1281,37 @@ describe("la precondición global se mide llamando, no leyendo", () => {
           "2026-09-10. Eso es gasto que un anónimo puede provocar —Places y PageSpeed cobran por " +
           "request— y superficie: la clave de PageSpeed viaja en la query string de su propia " +
           "URL. El espía las rechaza, así que la suite no gasta nada; en producción no hay espía."
+      ).toEqual([]);
+    });
+
+    it("no salió nada a la red fuera de la foto de ningún handler", () => {
+      const declaradas = FUGAS_HOY.flatMap((f) => f.destinos).sort();
+      const todas = arnes.todasLasSalientes.map(destinoDe).sort();
+
+      expect(
+        todas,
+        "El total de salidas registradas en TODO el archivo no coincide con lo declarado en " +
+          "FUGAS_HOY. Esta cuenta existe aparte de la de cada handler porque una llamada " +
+          "diferida —un setTimeout, un `void async` sin await— sale DESPUÉS de que el handler " +
+          "contestó, y el registro por handler no la ve. Una fuga sin dueño sigue siendo una fuga."
+      ).toEqual(declaradas);
+    });
+
+    it("no hay en el repositorio un transporte HTTP que el espía no vigile", () => {
+      const NO_VIGILADOS = ["axios", "node-fetch", "got", "superagent", "undici", "request"];
+      const paquete = JSON.parse(readFileSync(path.join(RAIZ, "package.json"), "utf8")) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const declarados = Object.keys({ ...paquete.dependencies, ...paquete.devDependencies });
+
+      expect(
+        declarados.filter((d) => NO_VIGILADOS.includes(d)),
+        "Este paquete entró como dependencia y NO pasa por ninguno de los dos puntos que el " +
+          "espía instrumenta (globalThis.fetch, y request/get de node:http y node:https). " +
+          "Medido por un refutador contra un servidor local: axios —con su propio httpsAgent— y " +
+          "node-fetch SALIERON y el espía registró cero. O se instrumenta acá, o el cero de la " +
+          "propiedad 3 deja de significar algo."
       ).toEqual([]);
     });
 
