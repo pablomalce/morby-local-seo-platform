@@ -2596,6 +2596,51 @@ SELECT 72, 'an organization is created with no session',
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 73 a 76. Las auditorías de legibilidad por IA
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que la tabla que guarda la historia no se pueda leer ni escribir
+-- desde la organización de al lado, y que la sesión de navegador no pueda
+-- DECLARAR que un sitio está bien.
+--
+-- La última es la que importa y no es obvia: escribir una auditoría es
+-- consecuencia de peticiones que hizo el servidor. Una sesión que pudiera
+-- insertar podría afirmar «los rastreadores entran» sin haber mirado nada, y esa
+-- fila se vería igual que una medida de verdad.
+
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 73, 'a session can write an AI-readability audit',
+       has_table_privilege('authenticated', 'public.aeo_audits', 'INSERT'),
+       'una sesión podría declarar que un sitio está bien sin haberlo mirado';
+
+INSERT INTO defect_report
+SELECT 74, 'anon can read the audits',
+       has_table_privilege('anon', 'public.aeo_audits', 'SELECT'),
+       'las auditorías de los clientes, legibles sin sesión';
+
+INSERT INTO defect_report
+SELECT 75, 'the audits table has no RLS',
+       NOT (SELECT c.relrowsecurity AND c.relforcerowsecurity
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relname = 'aeo_audits'),
+       'sin RLS forzada, un miembro ve las auditorías de otra organización';
+
+-- Y la historia: si alguien agregara un índice único por organización —copiando
+-- la 0022 sin leer por qué NO se copia— cada corrida pisaría a la anterior y
+-- «qué cambió» dejaría de poder contestarse.
+INSERT INTO defect_report
+SELECT 76, 'the audits keep only one row per organization',
+       EXISTS (SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'aeo_audits' AND i.indisunique
+                 AND i.indrelid::regclass::text <> 'aeo_audits_pkey'
+                 AND (SELECT count(*) FROM unnest(i.indkey) k WHERE k <> 0) > 0
+                 AND i.indexrelid::regclass::text LIKE '%organization%'),
+       'con un único por organización, cada corrida pisa a la anterior y se pierde la historia';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Anti-vacuity: sixty-eight checks were written, so sixty-eight rows must be present.
@@ -2608,8 +2653,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 72 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 72 checks recorded a result.', checks;
+    IF checks <> 76 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 76 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -2620,11 +2665,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 72 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 76 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 72 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 76 checks green: the schema prevents every one of them.';
 END
 $$;
 
