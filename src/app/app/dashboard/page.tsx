@@ -3,6 +3,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { HudLabel } from "@/components/ui";
 import { ProductoResumen, type NegocioResumen } from "./client";
 import { SelectorDeOrganizacion } from "@/components/SelectorDeOrganizacion";
+import { AvisosDeEscala } from "@/components/AvisosDeEscala";
 import { organizacionActiva } from "@/lib/org/servidor";
 import type { EstadoDelProducto } from "@/lib/product/proximoPaso";
 
@@ -116,6 +117,12 @@ export default async function ProductDashboardPage() {
       <HudLabel>00 / PRODUCT</HudLabel>
       <h1 className="mt-3 display-h text-3xl">{organizacion.name}</h1>
       <SelectorDeOrganizacion actual={organizacion.id} disponibles={organizacion.disponibles} />
+      {/*
+        La cantidad de CLIENTES sale de las organizaciones que el usuario puede
+        elegir, que es lo mismo que cuenta el selector. Un segundo conteo
+        divergiría del primero en cuanto uno de los dos cambie de criterio.
+      */}
+      <AvisosDeEscala clientes={organizacion.disponibles.length} />
       <ProductoResumen organizacion={organizacion.name} negocios={negocios} estado={estado} />
     </div>
   );
