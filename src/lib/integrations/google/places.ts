@@ -54,7 +54,29 @@ const FIELD_MASK = [
   "currentOpeningHours.openNow",
 ].join(",");
 
-export async function lookupPlace(input: PlacesLookupInput): Promise<PlacesLookup> {
+/**
+ * The one call to the Places endpoint, shared by the single lookup and the
+ * list search below.
+ *
+ * WHY THERE IS ONE PATH AND NOT TWO
+ *
+ * Until 2026-09-16 this repository had two Places clients. This one, which
+ * calls Google, was wired to the report orchestrator. The other one,
+ * `src/lib/integrations/googlePlaces.ts`, was wired to the only Places ROUTE
+ * of the application — and returned rows from the demo dataset, and kept
+ * returning them with the key set. Gate H2-GO-0 of the spine says it plainly:
+ * auditing with a client that returns mock data is worse than not auditing.
+ * The route now comes through here, the other file is gone, and a test fails
+ * if anything imports it again.
+ */
+async function buscarEnPlaces(
+  textQuery: string,
+  maxResultCount: number
+): Promise<
+  | { status: "missing-key" }
+  | { status: "error"; errorMessage: string }
+  | { status: "live"; places: GooglePlacesResult[] }
+> {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return { status: "missing-key" };
 
@@ -66,10 +88,7 @@ export async function lookupPlace(input: PlacesLookupInput): Promise<PlacesLooku
         "X-Goog-Api-Key": apiKey,
         "X-Goog-FieldMask": `places.${FIELD_MASK.split(",").join(",places.")}`,
       },
-      body: JSON.stringify({
-        textQuery: input.query,
-        maxResultCount: 1,
-      }),
+      body: JSON.stringify({ textQuery, maxResultCount }),
       // Aggressive cache — Place details rarely change in a day.
       next: { revalidate: 86400 },
     });
@@ -82,30 +101,61 @@ export async function lookupPlace(input: PlacesLookupInput): Promise<PlacesLooku
     }
 
     const payload = (await response.json()) as { places?: GooglePlacesResult[] };
-    const place = payload.places?.[0];
-    if (!place) return { status: "no-match" };
-
-    return {
-      status: "live",
-      placeId: place.id,
-      displayName: place.displayName?.text,
-      formattedAddress: place.formattedAddress,
-      rating: place.rating,
-      userRatingCount: place.userRatingCount,
-      types: place.types,
-      location:
-        place.location?.latitude !== undefined && place.location?.longitude !== undefined
-          ? { lat: place.location.latitude, lng: place.location.longitude }
-          : undefined,
-      website: place.websiteUri,
-      openNow: place.currentOpeningHours?.openNow,
-    };
+    return { status: "live", places: payload.places ?? [] };
   } catch (err) {
     return {
       status: "error",
       errorMessage: err instanceof Error ? err.message : "Unknown Places error",
     };
   }
+}
+
+function aLookup(place: GooglePlacesResult): PlacesLookup {
+  return {
+    status: "live",
+    placeId: place.id,
+    displayName: place.displayName?.text,
+    formattedAddress: place.formattedAddress,
+    rating: place.rating,
+    userRatingCount: place.userRatingCount,
+    types: place.types,
+    location:
+      place.location?.latitude !== undefined && place.location?.longitude !== undefined
+        ? { lat: place.location.latitude, lng: place.location.longitude }
+        : undefined,
+    website: place.websiteUri,
+    openNow: place.currentOpeningHours?.openNow,
+  };
+}
+
+export async function lookupPlace(input: PlacesLookupInput): Promise<PlacesLookup> {
+  const resultado = await buscarEnPlaces(input.query, 1);
+  if (resultado.status !== "live") return resultado;
+  const place = resultado.places[0];
+  if (!place) return { status: "no-match" };
+  return aLookup(place);
+}
+
+export interface PlacesSearch {
+  /** `missing-key` and `error` carry no places on purpose: no data is not demo data. */
+  status: "live" | "missing-key" | "error";
+  places: PlacesLookup[];
+  errorMessage?: string;
+}
+
+/**
+ * Text search returning several places. Same endpoint, same key, same
+ * failure modes as `lookupPlace` — and, deliberately, no fallback: without a
+ * key the answer is `missing-key` with an empty list, never rows that look
+ * like businesses.
+ */
+export async function searchPlaces(query: string, maxResultCount = 5): Promise<PlacesSearch> {
+  const resultado = await buscarEnPlaces(query, maxResultCount);
+  if (resultado.status === "missing-key") return { status: "missing-key", places: [] };
+  if (resultado.status === "error") {
+    return { status: "error", places: [], errorMessage: resultado.errorMessage };
+  }
+  return { status: "live", places: resultado.places.map(aLookup) };
 }
 
 interface GooglePlacesResult {
