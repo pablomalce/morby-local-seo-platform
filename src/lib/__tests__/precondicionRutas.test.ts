@@ -347,6 +347,12 @@ const FORMA_DE_LLAMADA: Record<
   // Sin header `x-vulkan-signature`: es el pedido de un desconocido, que es el
   // caso que la firma existe para rechazar.
   "/api/webhooks/lead-won": { cuerpo: { event: "lead.won" } },
+  // Las dos que entraron con #90 y #91 el 2026-09-16. El barrido se puso rojo
+  // en main por diseño: dos rutas nuevas sin forma de llamada, contestando 400
+  // en zod antes de llegar al guardia. Medidas con cuerpo válido antes de
+  // mergear, en un worktree con los seis PR juntos: 401 las dos, espía en cero.
+  "/api/aeo/audit": { cuerpo: { businessId: "99999999-9999-4999-8999-999999999999" } },
+  "/api/organizations": { cuerpo: { name: "Cliente de prueba del barrido" } },
   // Sin `code`, que es el caso del que entra a mano a la URL. El caso CON code
   // —el mecanismo ejercitado del otro lado— tiene su propio test más abajo.
   "/auth/callback": {},
