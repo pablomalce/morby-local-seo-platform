@@ -491,6 +491,146 @@ const EXENCIONES: Array<{
     statusEsperado: [307],
   },
   {
+    ruta: "/api/seo/audit",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/seo/audit/route.ts:5, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/seo/audit/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/agents/run-all",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/agents/run-all/route.ts:13, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/agents/run-all/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/agents/run",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/agents/run/route.ts:15, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/agents/run/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/content/generate",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/content/generate/route.ts:15, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/content/generate/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/integrations/gbp/profile",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/integrations/gbp/profile/route.ts:6, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/integrations/gbp/profile/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/integrations/images/generate",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/integrations/images/generate/route.ts:34, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/integrations/images/generate/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/integrations/places/search",
+    publicaAProposito: false,
+    porque:
+      "Ruta interna, servidor a servidor: su identidad no es una sesión de navegador sino un " +
+      "secreto compartido en el header x-internal-secret. Contesta 401, así que cumple la " +
+      "propiedad 2; está acá porque niega SIN preguntar quién llama —0 consultas de identidad— " +
+      "y el control positivo lo exige declarado. Hasta el 2026-09-10 estaba en ABIERTAS_HOY: el " +
+      "guardia era opt-in y sin la variable dejaba pasar a cualquiera.",
+    mecanismo:
+      "requireInternalSecret(req) en src/app/api/integrations/places/search/route.ts:13, que falla CERRADO: sin " +
+      "INTERNAL_API_SECRET configurado contesta 401 a todos (src/lib/api/internal-guard.ts). " +
+      "Nadie en la aplicación la llama hoy — medido: ningún fetch, ningún cron, nadie manda el " +
+      "header.",
+    huellas: [
+      { archivo: "src/app/api/integrations/places/search/route.ts", texto: "requireInternalSecret(req)" },
+      { archivo: "src/lib/api/internal-guard.ts", texto: "if (!secret)" },
+    ],
+    statusEsperado: [401],
+  },
+  {
     ruta: "/api/auth/google/start",
     publicaAProposito: false,
     porque:
@@ -540,13 +680,20 @@ const EXENCIONES: Array<{
  * abajo sin que alguien la edite a propósito, y este comentario es lo que va a
  * leer cuando lo haga.
  *
- * BAJARLA ES EL TRABAJO. Siete de estas ocho se cierran con una sola línea:
- * `requireInternalSecret` (src/lib/api/internal-guard.ts:14-15) contesta `null`
- * —o sea «pasá»— cuando `INTERNAL_API_SECRET` no está en el entorno, y esa
- * variable no figura en `.env.example`. O sea que el estado por defecto del
- * repositorio es ABIERTO, y el status de siete rutas lo decide una variable de
- * Vercel en vez del código. La octava, `/api/reports/generate`, no tiene
- * guardia de ninguna clase y es la que además gasta.
+ * BAJARLA ES EL TRABAJO, Y YA BAJÓ DE OCHO A UNA. El 2026-09-10 eran ocho.
+ * Siete se cerraron con una sola línea: `requireInternalSecret`
+ * (src/lib/api/internal-guard.ts) contestaba `null` —o sea «pasá»— cuando
+ * `INTERNAL_API_SECRET` no estaba en el entorno, y esa variable no figuraba en
+ * `.env.example`; ahora falla cerrado, y las siete viven en `EXENCIONES` como
+ * lo que son: rutas cuya identidad no es una sesión sino un secreto compartido,
+ * igual que el webhook de lead-won. Este trinquete exigió el borrado de las
+ * siete entradas cuando cambió el guardia — que es exactamente para lo que
+ * existe la igualdad en las dos direcciones.
+ *
+ * La que queda, `/api/reports/generate`, no tiene guardia de ninguna clase y
+ * es la que además gasta. La llama `src/app/reports/page.tsx`, una página de
+ * cliente fuera de `/app` y por lo tanto fuera del middleware: cerrarla es una
+ * decisión de producto, no una línea.
  */
 const ABIERTAS_HOY: Array<{
   ruta: string;
@@ -584,70 +731,6 @@ const ABIERTAS_HOY: Array<{
       "Un guardia propio antes del trabajo. Es la única de las ocho que sigue en 200 incluso con " +
       "INTERNAL_API_SECRET puesta, y la única que además sale a la red: va primera.",
     huella: null,
-  },
-  {
-    ruta: "/api/seo/audit",
-    verbo: "POST",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:5) es un no-op sin la variable.",
-    queLaCierra: "Que requireInternalSecret falle cerrado, y la variable en .env.example.",
-    huella: { archivo: "src/app/api/seo/audit/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/agents/run-all",
-    verbo: "POST",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:13) es un no-op sin la variable.",
-    queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
-    huella: { archivo: "src/app/api/agents/run-all/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/agents/run",
-    verbo: "POST",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:15) es un no-op sin la variable.",
-    queLaCierra: "Ídem. Con la variable puesta, medido: 401.",
-    huella: { archivo: "src/app/api/agents/run/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/content/generate",
-    verbo: "POST",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:15) es un no-op sin la variable.",
-    queLaCierra:
-      "Ídem. El espía queda en 0 sólo porque la rama live de " +
-      "src/lib/integrations/openai.ts:32-39 es todavía un placeholder sin fetch: es la puerta por " +
-      "donde entra el gasto el día que se implemente, no un guardia.",
-    huella: { archivo: "src/app/api/content/generate/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/integrations/gbp/profile",
-    verbo: "GET",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:6) es un no-op sin la variable.",
-    queLaCierra: "Ídem. Mientras tanto expone el snapshot de un negocio a cualquiera.",
-    huella: { archivo: "src/app/api/integrations/gbp/profile/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/integrations/images/generate",
-    verbo: "POST",
-    statusMedido: 200,
-    porque:
-      "requireInternalSecret(route.ts:34) es un no-op sin la variable, y el chequeo de businessId " +
-      "(route.ts:41) corre ANTES de cualquier decisión de identidad.",
-    queLaCierra: "Ídem, y mover el guardia arriba del 404 de negocio.",
-    huella: { archivo: "src/app/api/integrations/images/generate/route.ts", texto: "requireInternalSecret(req)" },
-  },
-  {
-    ruta: "/api/integrations/places/search",
-    verbo: "POST",
-    statusMedido: 200,
-    porque: "requireInternalSecret(route.ts:13) es un no-op sin la variable.",
-    queLaCierra:
-      "Ídem. El espía queda en 0 porque esta ruta está cableada al cliente FALSO de Places " +
-      "(src/lib/integrations/googlePlaces.ts:19, un placeholder sin fetch). El fetch real vive en " +
-      "src/lib/integrations/google/places.ts:66 y se alcanza sin sesión por /api/reports/generate.",
-    huella: { archivo: "src/app/api/integrations/places/search/route.ts", texto: "requireInternalSecret(req)" },
   },
 ];
 
@@ -1127,8 +1210,15 @@ describe("la precondición global se mide llamando, no leyendo", () => {
           "el cero es la exención misma, no un descuido. Si un número se mueve, el mecanismo de " +
           "esa exención cambió y hay que releerla antes de actualizar la lista."
       ).toEqual([
+        "/api/agents/run-all: 0 consultas",
+        "/api/agents/run: 0 consultas",
         "/api/auth/google/callback: 1 consultas",
         "/api/auth/google/start: 1 consultas",
+        "/api/content/generate: 0 consultas",
+        "/api/integrations/gbp/profile: 0 consultas",
+        "/api/integrations/images/generate: 0 consultas",
+        "/api/integrations/places/search: 0 consultas",
+        "/api/seo/audit: 0 consultas",
         "/api/webhooks/lead-won: 0 consultas",
         "/auth/callback: 0 consultas",
       ]);
