@@ -9,25 +9,36 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const NEGOCIO = "7d703707-4f9d-43bf-9305-6bc22eddf45f";
 
 let usuario: { id: string } | null = { id: "u1" };
-let negocio: { id: string; website: string | null } | null = null;
+let negocio: { id: string; organization_id: string; website: string | null } | null = null;
 let errorLectura: { message: string } | null = null;
 let pedidos: string[] = [];
 /** Qué contesta cada URL. `null` = falla la petición. */
 let respuestas: Record<string, string | null> = {};
 
+// Lo que la ruta escribió en `aeo_audits`, para afirmar que la tabla que el
+// #93 creó tiene por fin quien la escriba, y con qué.
+let guardadas: Array<Record<string, unknown>> = [];
+let errorGuardado: { message: string } | null = null;
+
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
     auth: { getUser: async () => ({ data: { user: usuario } }) },
-    from: () => ({
+    from: (tabla: string) => ({
       select: () => ({
         eq: () => ({ maybeSingle: async () => ({ data: negocio, error: errorLectura }) }),
       }),
+      insert: async (fila: Record<string, unknown>) => {
+        if (tabla === "aeo_audits") guardadas.push(fila);
+        return { error: errorGuardado };
+      },
     }),
   }),
 }));
 
 const { POST } = await import("../route");
 
+let porAgente: string[] = [];
+let statusParaAgente: (ua: string) => number = () => 200;
 let n = 0;
 function pedido(cuerpo: unknown): Request {
   n += 1;
@@ -39,21 +50,37 @@ function pedido(cuerpo: unknown): Request {
 }
 
 const HTML_SANO = `<html><body><p>${"contenido real ".repeat(80)}</p>
-  <script type="application/ld+json">{"@type":"Organization"}</script>
-  <script type="application/ld+json">{"@type":"LocalBusiness"}</script>
-  <script type="application/ld+json">{"@type":"FAQPage"}</script></body></html>`;
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization"}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"LocalBusiness"}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage"}</script></body></html>`;
+// Los tres bloques llevan @context desde que existe el validador: sin él no
+// son JSON-LD sino JSON, y el «sitio sano» de este fixture no lo era. El
+// validador nuevo lo dijo antes que nadie — que es para lo que está.
 
 beforeEach(() => {
   usuario = { id: "u1" };
-  negocio = { id: NEGOCIO, website: "https://ejemplo.com" };
+  negocio = { id: NEGOCIO, organization_id: "org-1", website: "https://ejemplo.com" };
   errorLectura = null;
+  guardadas = [];
+  errorGuardado = null;
   pedidos = [];
+  porAgente = [];
+  statusParaAgente = () => 200;
   respuestas = {
     "https://ejemplo.com/robots.txt": "User-agent: *\nDisallow:",
     "https://ejemplo.com/": HTML_SANO,
     "https://ejemplo.com/llms.txt": "# llms",
   };
-  vi.stubGlobal("fetch", async (url: string) => {
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    const ua = init ? new Headers(init.headers).get("user-agent") : null;
+    // Las peticiones por agente se registran aparte: no son «archivos que
+    // pide», son «cómo lo tratan», y un test de abajo las cuenta. Se
+    // distinguen por el user-agent: el propio de la auditoría pide archivos;
+    // cualquier otro es la ruta preguntando «¿y a éste cómo lo tratás?».
+    if (ua && !ua.startsWith("VulkanGrowthOS/")) {
+      porAgente.push(ua);
+      return { ok: true, status: statusParaAgente(ua), text: async () => "" } as Response;
+    }
     pedidos.push(url);
     const cuerpo = respuestas[url];
     if (cuerpo === null || cuerpo === undefined) {
@@ -114,7 +141,7 @@ describe("cuándo NO audita, y qué dice", () => {
   });
 
   it("un negocio sin sitio no es un sitio con problemas", async () => {
-    negocio = { id: NEGOCIO, website: "" };
+    negocio = { id: NEGOCIO, organization_id: "org-1", website: "" };
     const res = await POST(pedido({ businessId: NEGOCIO }));
     expect(res.status).toBe(409);
     expect((await res.json()).motivo).toBe("sin-sitio");
@@ -136,8 +163,58 @@ describe("cuándo NO audita, y qué dice", () => {
   });
 
   it("un sitio sin esquema se completa con https en vez de fallar", async () => {
-    negocio = { id: NEGOCIO, website: "ejemplo.com" };
+    negocio = { id: NEGOCIO, organization_id: "org-1", website: "ejemplo.com" };
     await POST(pedido({ businessId: NEGOCIO }));
     expect(pedidos.every((u) => u.startsWith("https://ejemplo.com"))).toBe(true);
+  });
+});
+
+describe("lo que la puerta H2-GO-1 exige de la ruta", () => {
+  it("hace una petición real por cada agente, con su user-agent, y devuelve el código", async () => {
+    statusParaAgente = (ua) => (ua.includes("GPTBot") ? 403 : 200);
+
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    const cuerpo = (await res.json()) as {
+      lectura: { statusPorAgente: Record<string, number | null> };
+      hallazgos: Array<{ gravedad: string; donde: string }>;
+    };
+
+    expect(porAgente.length, "una petición por agente declarado").toBe(5);
+    expect(cuerpo.lectura.statusPorAgente.gptbot).toBe(403);
+    expect(cuerpo.lectura.statusPorAgente.claudebot).toBe(200);
+    // Robots abierto + 403 al user-agent = bloqueante, y apunta al CDN. Es el
+    // caso que leer el robots no ve nunca.
+    expect(cuerpo.hallazgos.some((h) => h.gravedad === "bloqueante" && /CDN/.test(h.donde))).toBe(true);
+  });
+
+  it("guarda una fila en aeo_audits por corrida, con los datos crudos", async () => {
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    const cuerpo = (await res.json()) as { guardada: boolean };
+
+    expect(cuerpo.guardada).toBe(true);
+    expect(guardadas).toHaveLength(1);
+    const fila = guardadas[0];
+    expect(fila.organization_id).toBe("org-1");
+    expect(fila.business_id).toBe(NEGOCIO);
+    expect(fila.url).toBe("https://ejemplo.com/");
+    expect(fila.robots_leido).toBe(true);
+    expect((fila.acceso as { http: Record<string, number> }).http.gptbot).toBe(200);
+    expect(typeof fila.caracteres_sin_js).toBe("number");
+    expect((fila.schema_encontrado as { tipos: string[] }).tipos).toEqual([
+      "FAQPage",
+      "LocalBusiness",
+      "Organization",
+    ]);
+  });
+
+  it("si guardar falla, la auditoría igual se devuelve y lo dice", async () => {
+    errorGuardado = { message: "rls" };
+
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    const cuerpo = (await res.json()) as { ok: boolean; guardada: boolean };
+
+    expect(res.status).toBe(200);
+    expect(cuerpo.ok).toBe(true);
+    expect(cuerpo.guardada).toBe(false);
   });
 });

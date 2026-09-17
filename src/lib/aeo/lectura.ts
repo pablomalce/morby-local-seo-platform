@@ -182,6 +182,57 @@ function recolectar(nodo: unknown, tipos: Set<string>): void {
  * vacía. Se devuelve el número, y quien lo muestra decide con el umbral escrito
  * en un solo lugar.
  */
+/**
+ * Lo que está MAL en el JSON-LD, no sólo lo que hay.
+ *
+ * `tiposDeSchema` ignora un bloque que no parsea, y eso era correcto para su
+ * pregunta —«¿qué tipos declara?»— y un agujero para la puerta H2-GO-1: un
+ * JSON-LD roto salía igual que uno ausente, y «no tiene schema» y «tiene un
+ * schema que ningún motor puede leer» son hallazgos distintos con arreglos
+ * distintos. La puerta lo dice: *si el JSON-LD sólo se comprueba por presencia,
+ * el schema inválido sale verde*.
+ *
+ * Tres errores, cada uno con el bloque en el que está, para que el hallazgo
+ * apunte a algo que se pueda abrir y corregir:
+ *   - no parsea (con el mensaje del parser);
+ *   - parsea pero no declara `@context`, sin lo cual no es JSON-LD sino JSON;
+ *   - parsea pero algún nodo no declara `@type`, o sea que no dice qué es.
+ */
+export function erroresDeSchema(html: string): string[] {
+  const errores: string[] = [];
+  const bloques = [
+    ...html.matchAll(
+      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+    ),
+  ];
+  bloques.forEach((bloque, i) => {
+    const n = i + 1;
+    let datos: unknown;
+    try {
+      datos = JSON.parse(bloque[1].trim());
+    } catch (e) {
+      errores.push(`bloque ${n}: no parsea (${(e as Error).message})`);
+      return;
+    }
+    const raices = Array.isArray(datos) ? datos : [datos];
+    for (const raiz of raices) {
+      if (!raiz || typeof raiz !== "object") {
+        errores.push(`bloque ${n}: la raíz no es un objeto`);
+        continue;
+      }
+      const objeto = raiz as Record<string, unknown>;
+      if (!("@context" in objeto)) errores.push(`bloque ${n}: sin @context`);
+      const nodos = Array.isArray(objeto["@graph"]) ? objeto["@graph"] : [objeto];
+      for (const nodo of nodos) {
+        if (nodo && typeof nodo === "object" && !("@type" in (nodo as object))) {
+          errores.push(`bloque ${n}: un nodo sin @type`);
+        }
+      }
+    }
+  });
+  return errores;
+}
+
 export function textoSinJavaScript(html: string): number {
   const limpio = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
