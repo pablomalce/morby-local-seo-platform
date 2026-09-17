@@ -17,10 +17,14 @@ export async function middleware(request: NextRequest) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  // If Supabase isn't configured yet, skip auth-related logic entirely. The site stays up in
-  // demo mode and /app/* simply renders without a session (frontend gracefully handles this).
+  // If Supabase isn't configured yet, the public site stays up in demo mode — but /app/* is the
+  // gated area, and a gate that opens when its lock is missing is not a gate. Measured
+  // 2026-09-16 by an adversarial review of the route sweep: with the variables absent (or with
+  // Supabase down, below) every page under /app rendered for anyone. Public routes fall
+  // through; the gated ones fail CLOSED, to the login, which is the only honest answer when
+  // nobody can say who is asking.
   if (!supabaseUrl || !supabaseAnonKey) {
-    return NextResponse.next();
+    return alLoginSiEsPrivada(request, "supabase-sin-configurar");
   }
 
   let response = NextResponse.next({ request });
@@ -65,11 +69,31 @@ export async function middleware(request: NextRequest) {
 
     return response;
   } catch (err) {
-    // Last-resort safety: never let a misconfigured Supabase setup take the whole site down.
-    // Log to Vercel runtime logs and let the request through.
-    console.error("[middleware] supabase failed, falling through:", err);
+    // Last-resort safety: never let a misconfigured Supabase setup take the PUBLIC site down.
+    // The gated area is different: if the session cannot be checked, nobody gets in.
+    console.error("[middleware] supabase failed:", err);
+    return alLoginSiEsPrivada(request, "supabase-fallo");
+  }
+}
+
+/**
+ * Fail closed where there is a gate, fall through where there is none.
+ *
+ * Public routes (overview, dashboard, demo) never needed a session, so an auth
+ * outage must not take them down. `/app/*` did need one, and "we could not
+ * check" is not "checked and fine": it goes to the login with the reason in
+ * the query, so the operator can tell a real logout from a broken backend.
+ */
+function alLoginSiEsPrivada(request: NextRequest, motivo: string): NextResponse {
+  if (!request.nextUrl.pathname.startsWith("/app")) {
     return NextResponse.next();
   }
+  const url = request.nextUrl.clone();
+  url.pathname = "/login";
+  url.search = "";
+  url.searchParams.set("redirectTo", request.nextUrl.pathname);
+  url.searchParams.set("motivo", motivo);
+  return NextResponse.redirect(url);
 }
 
 export const config = {
