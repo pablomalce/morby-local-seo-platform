@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Página de control AEO — rota a propósito</title>
+  <!--
+    ESTA PÁGINA TIENE QUE SALIR EN ROJO. Es la página de control de la puerta
+    H2-GO-1 de la espina de Vulkan: si la auditoría AEO la marca verde en
+    cualquiera de los tres ejes, la auditoría no mide ese eje.
+
+      1. Contenido sólo tras ejecutar JavaScript: el HTML servido no tiene texto.
+      2. JSON-LD inválido: un bloque que no parsea y otro sin @context ni @type.
+      3. Bloqueada en robots.txt para GPTBot y ClaudeBot (ver /robots.txt).
+
+    No la arregles. Está alojada en el mismo despliegue de Growth OS para que
+    exista en una URL pública sin acto humano aparte.
+  -->
+  <script type="application/ld+json">
+    { "@context": "https://schema.org", "@type": "LocalBusiness", "name": "Control", 
+  </script>
+  <script type="application/ld+json">
+    { "name": "Sin contexto ni tipo" }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    document.getElementById("app").innerHTML =
+      "<h1>Contenido visible sólo con JavaScript</h1>" +
+      "<p>" + "Este texto no existe en el HTML servido. ".repeat(40) + "</p>";
+  </script>
+</body>
+</html>

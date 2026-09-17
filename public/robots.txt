@@ -1,0 +1,11 @@
+# Growth OS. Todo abierto, salvo la página de control de la auditoría AEO,
+# que está bloqueada A PROPÓSITO para dos rastreadores de IA: es la puerta
+# H2-GO-1 y tiene que salir en rojo. No la abras.
+User-agent: GPTBot
+Disallow: /aeo-control/
+
+User-agent: ClaudeBot
+Disallow: /aeo-control/
+
+User-agent: *
+Disallow:

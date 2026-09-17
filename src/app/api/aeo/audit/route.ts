@@ -3,7 +3,13 @@ import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { accesoDeLasIA, textoSinJavaScript, tiposDeSchema } from "@/lib/aeo/lectura";
+import {
+  accesoDeLasIA,
+  erroresDeSchema,
+  textoSinJavaScript,
+  tiposDeSchema,
+} from "@/lib/aeo/lectura";
+import { statusPorAgente } from "@/lib/aeo/peticion";
 import { hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 
 export const dynamic = "force-dynamic";
@@ -80,7 +86,7 @@ export async function POST(req: Request) {
 
     const { data: negocio, error } = await supabase
       .from("businesses")
-      .select("id, website")
+      .select("id, organization_id, website")
       .eq("id", businessId)
       .maybeSingle();
 
@@ -121,12 +127,34 @@ export async function POST(req: Request) {
     // que nadie confunda «permite» con «no se pudo mirar».
     const textoRobots = robots.ok ? robots.texto : "";
 
+    // La petición REAL con cada user-agent. No reemplaza la lectura del
+    // robots: la complementa con lo que el servidor hace de verdad, que es lo
+    // que la puerta H2-GO-1 exige y lo único que un CDN no puede fingir.
+    const statusAgentes = await statusPorAgente(base.toString());
     const lectura: LecturaDelSitio = {
       acceso: accesoDeLasIA(textoRobots),
+      statusPorAgente: statusAgentes,
       caracteresSinJs: textoSinJavaScript(portada.texto),
       schema: tiposDeSchema(portada.texto),
+      erroresDeSchema: erroresDeSchema(portada.texto),
       tieneLlmsTxt: llms.ok,
     };
+
+    // Una fila por corrida: la historia es el producto (encabezado de la 0025).
+    // Hasta hoy la tabla existía y nadie la escribía — la forma «módulo sin
+    // llamadores» del #95, en versión tabla. Si la escritura falla, la
+    // auditoría igual se devuelve: guardarla es valioso, perderla no puede
+    // costar la respuesta.
+    const { error: errorGuardado } = await supabase.from("aeo_audits").insert({
+      organization_id: negocio.organization_id,
+      business_id: negocio.id,
+      url: base.toString(),
+      robots_leido: robots.ok,
+      acceso: { robots: lectura.acceso, http: statusAgentes },
+      caracteres_sin_js: lectura.caracteresSinJs,
+      schema_encontrado: { tipos: lectura.schema, errores: lectura.erroresDeSchema },
+      llms_txt: llms.ok,
+    });
 
     return NextResponse.json(
       {
@@ -134,6 +162,7 @@ export async function POST(req: Request) {
         url: base.toString(),
         robotsLeido: robots.ok,
         motivoRobots: robots.ok ? null : robots.motivo,
+        guardada: !errorGuardado,
         lectura,
         hallazgos: hallazgos(lectura),
       },

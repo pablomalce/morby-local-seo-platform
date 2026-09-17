@@ -21,10 +21,26 @@ import { AGENTES_IA, MINIMO_DE_TEXTO, type AgenteIA } from "./lectura";
  */
 
 export interface LecturaDelSitio {
+  /** Lo que `robots.txt` DECLARA por agente. */
   acceso: Record<AgenteIA, boolean>;
+  /**
+   * Lo que el sitio HACE por agente: el código HTTP de una petición real con
+   * ese user-agent, o `null` si no contestó. Es la mitad que faltaba: un CDN
+   * puede devolver 403 a GPTBot con un `robots.txt` que lo permite, y leer sólo
+   * el robots dejaba esa página en verde. Opcional para que las lecturas viejas
+   * sigan valiendo; cuando está, manda sobre `acceso`.
+   */
+  statusPorAgente?: Record<AgenteIA, number | null>;
   caracteresSinJs: number;
   schema: string[];
+  /** Lo que el validador encontró mal en el JSON-LD. Vacío es «no hay errores». */
+  erroresDeSchema?: string[];
   tieneLlmsTxt: boolean;
+}
+
+/** Códigos con los que un sitio le dice a un rastreador «vos no». */
+function bloqueadoPorHttp(status: number | null | undefined): boolean {
+  return status === 401 || status === 403 || status === 429 || status === 451;
 }
 
 export type Gravedad = "bloqueante" | "importante" | "informativo";
@@ -43,7 +59,24 @@ const SCHEMA_QUE_IMPORTA = ["Organization", "LocalBusiness", "FAQPage"] as const
 export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
   const salida: Hallazgo[] = [];
 
-  const bloqueados = AGENTES_IA.filter((a) => !lectura.acceso[a]);
+  // Bloqueado es: lo prohíbe el robots, O el servidor le contestó «no» a la
+  // petición real con su user-agent. La segunda condición es la que la puerta
+  // H2-GO-1 exige, y la que ninguna lista escrita a mano puede satisfacer.
+  const bloqueados = AGENTES_IA.filter(
+    (a) => !lectura.acceso[a] || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+  );
+  const bloqueadosSoloPorHttp = AGENTES_IA.filter(
+    (a) => lectura.acceso[a] && bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+  );
+  if (bloqueadosSoloPorHttp.length > 0) {
+    salida.push({
+      gravedad: "bloqueante",
+      quePasa: `El robots.txt permite a ${bloqueadosSoloPorHttp.join(", ")}, pero el servidor les contesta ${bloqueadosSoloPorHttp.map((a) => lectura.statusPorAgente?.[a]).join("/")} cuando llegan con su user-agent.`,
+      queHacer:
+        "El bloqueo no está en el robots: está en el CDN, el WAF o una regla de bots del hosting. Es el caso que una auditoría que sólo lee robots.txt no ve nunca.",
+      donde: "el panel del CDN o del WAF (reglas de bots), no el robots.txt",
+    });
+  }
 
   if (bloqueados.length === AGENTES_IA.length) {
     salida.push({
@@ -73,6 +106,15 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
     });
   }
 
+  if (lectura.erroresDeSchema && lectura.erroresDeSchema.length > 0) {
+    salida.push({
+      gravedad: "bloqueante",
+      quePasa: `El JSON-LD tiene ${lectura.erroresDeSchema.length} error(es) que un motor no va a perdonar: ${lectura.erroresDeSchema.join("; ")}.`,
+      queHacer:
+        "Un schema roto vale menos que ninguno: el motor lo descarta entero y además lo cuenta como señal de descuido. Arreglar primero los bloques que no parsean, después @context y @type.",
+      donde: "la plantilla que emite los <script type=\"application/ld+json\">",
+    });
+  }
   const faltantes = SCHEMA_QUE_IMPORTA.filter((t) => !lectura.schema.includes(t));
   if (faltantes.length > 0) {
     salida.push({
