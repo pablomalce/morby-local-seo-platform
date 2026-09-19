@@ -47,7 +47,8 @@ const nav: NavItem[] = [
   { href: "/studio/images", labelKey: "nav.images", icon: ImageIcon, index: "05", section: "PRODUCE" },
   { href: "/reviews", labelKey: "nav.reviews", icon: MessageSquareText, index: "06", section: "PRODUCE" },
   { href: "/planner", labelKey: "nav.planner", icon: CalendarCheck, index: "07", section: "PRODUCE" },
-  { href: "/reports", labelKey: "nav.reports", icon: FileText, index: "08", section: "PRODUCE" },
+  // Bajo /app desde el 2026-09-19: el reporte gasta (Places + PageSpeed) y pide sesión.
+  { href: "/app/reports", labelKey: "nav.reports", icon: FileText, index: "08", section: "PRODUCE" },
   { href: "/agents", labelKey: "nav.agents", icon: Bot, index: "09", section: "AGENTS" },
   { href: "/settings", labelKey: "nav.settings", icon: Settings, index: "10", section: "ADMIN" },
 ];

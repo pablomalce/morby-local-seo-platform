@@ -696,10 +696,15 @@ const EXENCIONES: Array<{
  * siete entradas cuando cambió el guardia — que es exactamente para lo que
  * existe la igualdad en las dos direcciones.
  *
- * La que queda, `/api/reports/generate`, no tiene guardia de ninguna clase y
- * es la que además gasta. La llama `src/app/reports/page.tsx`, una página de
- * cliente fuera de `/app` y por lo tanto fuera del middleware: cerrarla es una
- * decisión de producto, no una línea.
+ * Y DE UNA A CERO, EL 2026-09-19. La que quedaba, `/api/reports/generate`, no
+ * tenía guardia de ninguna clase y era la que además gastaba: la llamaba
+ * `src/app/reports/page.tsx`, una página de cliente fuera de `/app` y por lo
+ * tanto fuera del middleware. Cerrarla era una decisión de producto —una demo
+ * pública que gasta, o una pantalla con sesión— y Pablo dijo «cerrala». La
+ * ruta pide sesión antes del rate limit y de zod (401 sin ella, cero fetch), y
+ * la página vive en `/app/reports`. La lista queda vacía a propósito, no se
+ * borra: un handler nuevo que nazca abierto tiene que venir a escribirse acá,
+ * con motivo, y este comentario es lo que va a leer.
  */
 const ABIERTAS_HOY: Array<{
   ruta: string;
@@ -723,43 +728,24 @@ const ABIERTAS_HOY: Array<{
    * comprueba lo medido —cero consultas de identidad— en su propio test.
    */
   huella: Huella | null;
-}> = [
-  {
-    ruta: "/api/reports/generate",
-    verbo: "POST",
-    statusMedido: 200,
-    porque:
-      "No hay NINGUNA línea de identidad en el handler (route.ts:70-89): sólo rateLimit y zod. " +
-      "El getUser() de src/lib/reports/orchestrator.ts:70-73 no decide permiso, decide FUENTE de " +
-      "datos, y sin sesión cae a la rama sembrada. Su propio comentario admite que es pública y " +
-      "que dispara llamadas facturables.",
-    queLaCierra:
-      "Un guardia propio antes del trabajo. Es la única de las ocho que sigue en 200 incluso con " +
-      "INTERNAL_API_SECRET puesta, y la única que además sale a la red: va primera.",
-    huella: null,
-  },
-];
+}> = [];
 
 /**
- * La única fuga de red medida sin sesión, con trinquete por destino.
+ * Las fugas de red medidas sin sesión, con trinquete por destino.
  *
  * Se compara por PREFIJO de la URL —host y path, sin la query— porque la clave
  * de PageSpeed viaja en la query string y no tiene por qué entrar en un archivo
  * de tests. El prefijo alcanza para lo que la lista tiene que impedir: que
- * aparezca un destino nuevo, o que aparezca un segundo handler que salga a la
- * red sin sesión.
+ * aparezca un destino nuevo, o que aparezca un handler que salga a la red sin
+ * sesión.
+ *
+ * VACÍA DESDE EL 2026-09-19. Hasta entonces tenía una entrada, la de
+ * `POST /api/reports/generate`: un Places y dos PageSpeed por cada anónimo.
+ * Con el guardia de sesión delante del trabajo, el espía mide cero salidas en
+ * todo el barrido — y el `afterAll` de abajo lo exige con igualdad exacta, así
+ * que la fuga no puede volver sin que alguien la escriba acá con nombre.
  */
-const FUGAS_HOY: Array<{ ruta: string; verbo: string; destinos: string[] }> = [
-  {
-    ruta: "/api/reports/generate",
-    verbo: "POST",
-    destinos: [
-      "POST https://places.googleapis.com/v1/places:searchText",
-      "GET https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-      "GET https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-    ],
-  },
-];
+const FUGAS_HOY: Array<{ ruta: string; verbo: string; destinos: string[] }> = [];
 
 /** La clave con la que un handler medido se busca en las listas de arriba. */
 function clave(m: Medicion): string {
@@ -1253,40 +1239,43 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       expect(perdidas, "una entrada abierta caduca con el mecanismo que dice tener").toEqual([]);
     });
 
-    it("la que está abierta pregunta una vez, y esa pregunta no es un guardia", () => {
+    it("la ruta del reporte, que era la abierta, ahora niega — y niega porque preguntó", () => {
       /**
-       * PREGUNTAR NO ES GATEAR, Y ACÁ SE VE LA DIFERENCIA MEDIDA.
+       * PREGUNTAR NO ES GATEAR, Y ACÁ SE VE LA DIFERENCIA MEDIDA — dos veces.
        *
-       * Esta entrada es la única con `huella: null`, porque su motivo es que NO
-       * hay mecanismo. Escribí este test esperando cero consultas de identidad y
-       * midió UNA: `src/lib/reports/orchestrator.ts:70-71` llama a `getUser()`.
+       * Hasta el 2026-09-19 esta ruta era la única entrada de ABIERTAS_HOY.
+       * Preguntaba UNA vez quién llama —`src/lib/reports/orchestrator.ts:70-71`,
+       * `getUser()`— y esa pregunta no decidía PERMISO sino FUENTE DE DATOS: el
+       * `if (user)` de :73 elegía entre los datos del usuario y una rama
+       * sembrada. Escuchaba «nadie» y seguía adelante, generando el reporte y
+       * gastando en Places y PageSpeed. Eso marcaba el límite del control
+       * positivo: atrapa «negó sin preguntar», no «preguntó y no le importó».
        *
-       * El número contradijo mi suposición y la corrección va acá porque es el
-       * hallazgo: ese `getUser()` no decide PERMISO, decide FUENTE DE DATOS —el
-       * `if (user)` de :73 elige entre los datos del usuario y una rama
-       * sembrada—. La ruta pregunta quién llama, escucha «nadie», y sigue
-       * adelante igual, generando el reporte y gastando en Places y PageSpeed.
-       *
-       * Y eso marca el límite del control positivo de arriba, que hay que decir
-       * en vez de esconder: el contador atrapa «negó sin preguntar», que es el
-       * caso que un refutador explotó con un header `x-user-id`. NO atrapa
-       * «preguntó y no le importó la respuesta». Para eso está el status: acá es
-       * 200, y por eso esta ruta es la primera de la lista de trabajo.
+       * Ahora el handler pregunta primero, por su cuenta, y niega. Este test
+       * fija las dos cosas juntas, porque cada una sola vale poco: un 401 sin
+       * pregunta es el stub negando de casualidad (medido: 40 de 58 handlers lo
+       * hacían con el guardia borrado), y una pregunta sin 401 es el estado
+       * anterior. La pregunta del orquestador ya no ocurre sin sesión: el
+       * guardia corta antes de llegar a él, así que el contador vuelve a 1 y
+       * esa única pregunta es la del guardia.
        */
       const m = mediciones.find((x) => x.ruta === "/api/reports/generate" && x.verbo === "POST");
 
       expect(m, "la ruta del reporte ya no está en el barrido").toBeDefined();
       expect(
+        m!.status,
+        "POST /api/reports/generate sin sesión tiene que ser 401: el guardia va antes del rate " +
+          "limit, de zod y del orquestador. Un 200 acá es la puerta abierta otra vez, y gasta."
+      ).toBe(401);
+      expect(
         m!.consultasIdentidad,
-        "POST /api/reports/generate preguntaba UNA vez quién llama, en el orquestador, para " +
-          "elegir la fuente de datos y no para negar. Si este número se movió, esa pregunta " +
-          "cambió de lugar o de propósito, y hay que releer la entrada antes de tocar el número."
+        "y tiene que haber preguntado exactamente una vez: la del guardia. Cero es el stub " +
+          "negando solo; dos es que el orquestador corrió igual y preguntó él también."
       ).toBe(1);
       expect(
-        m!.status,
-        "y el 200 es lo que dice que la pregunta no era un guardia: preguntó, le dijeron nadie, " +
-          "y contestó igual."
-      ).toBe(200);
+        m!.fetchSalientes,
+        "sin sesión no sale nada a la red: ni Places ni PageSpeed."
+      ).toEqual([]);
     });
 
     it("cada exención contesta exactamente el status que declaró", () => {
