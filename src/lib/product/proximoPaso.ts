@@ -89,7 +89,7 @@ export function proximoPaso(estado: EstadoDelProducto): ProximoPaso | null {
   if (estado.reportes === 0) {
     return {
       que: "Generar el primer reporte con datos reales",
-      donde: "/reports",
+      donde: "/app/reports",
       porque: "Es lo que convierte las integraciones conectadas en algo que un cliente puede leer.",
     };
   }

@@ -140,7 +140,7 @@ export default function ReportsPage() {
       {error && (
         <Card className="mb-6 border-red-900/60 bg-red-950/30">
           <p className="font-mono text-[11px] uppercase tracking-hud text-red-300">
-            <span className="text-red-400">//</span> {error}
+            <span className="text-red-400">{"//"}</span> {error}
           </p>
         </Card>
       )}

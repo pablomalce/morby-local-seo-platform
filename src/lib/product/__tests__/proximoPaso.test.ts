@@ -39,7 +39,7 @@ describe("el próximo paso sale de lo que hay", () => {
   });
 
   it("con todo conectado y sin reportes, el paso es generar el primero", () => {
-    expect(proximoPaso({ ...COMPLETA, reportes: 0 })?.donde).toBe("/reports");
+    expect(proximoPaso({ ...COMPLETA, reportes: 0 })?.donde).toBe("/app/reports");
   });
 
   it("con reporte y sin contenido aprobado, el paso es aprobar", () => {
