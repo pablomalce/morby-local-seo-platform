@@ -11,6 +11,11 @@ import { businesses } from "@/lib/mock/universal";
 // enough budget so the lookup isn't killed before its own 45s timeout. Vercel Hobby caps this at 60s.
 export const maxDuration = 60;
 
+// Como las otras siete rutas que leen la sesión: la cookie se lee en cada
+// petición, así que esto no se cachea ni corre en el edge.
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
 const businessSchema = z.object({
   id: z.string(),
   organizationId: z.string(),
