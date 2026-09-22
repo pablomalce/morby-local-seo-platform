@@ -83,10 +83,23 @@ const schema = z.object({
  * 401 sin sesión y cero fetch.
  */
 export async function POST(req: Request) {
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  // El guardia lleva su propio try, y no es decoración. En "modo demo" —sin
+  // las envs de Supabase, un estado que el middleware documenta y soporta—
+  // `createSupabaseServerClient()` las pasa como `undefined!` y `getUser()`
+  // TIRA. Sin este catch, un anónimo recibía un 500: exactamente lo que el
+  // barrido prohíbe ("un 500 sin sesión significa una de dos cosas, y las dos
+  // son el defecto"), y encima escondiendo la razón.
+  //
+  // Falla CERRADO, como `requireInternalSecret` cuando le falta el secreto: si
+  // no hay proveedor de identidad no hay nadie autenticado, y eso es un 401.
+  let user: { id: string } | null = null;
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data } = await supabase.auth.getUser();
+    user = data.user;
+  } catch {
+    user = null;
+  }
   if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
 
   // Still rate-limited per IP: a report takes 20–40s and costs two PageSpeed
