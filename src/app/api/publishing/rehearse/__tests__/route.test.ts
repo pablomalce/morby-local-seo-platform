@@ -53,9 +53,13 @@ vi.mock("@/lib/supabase/server", () => ({
 let llamadas: unknown[][] = [];
 let respuesta: unknown = { ok: true, estado: "ensayado", publicationId: "pub-1" };
 
+/** Cuando está puesto, `publicar()` TIRA: una excepción del servidor, no del pedido. */
+let explota: Error | null = null;
+
 vi.mock("@/lib/publishing/transport", () => ({
   publicar: async (...args: unknown[]) => {
     llamadas.push(args);
+    if (explota) throw explota;
     return respuesta;
   },
 }));
@@ -163,6 +167,45 @@ describe("lo que contesta cuando el transporte dice que no", () => {
     respuesta = { ok: false, motivo: "ledger-ilegible", detalle: "sin conexión" };
     const res = await POST(pedido({ assetId: ASSET }));
     expect(res.status).toBe(502);
+  });
+
+  it("y el `detalle` NO sale al navegador: sólo el motivo (defecto medido el 2026-09-26 — el detalle del transporte es el mensaje crudo de Postgres, con nombre de constraint adentro, y llegaba al cliente)", async () => {
+    respuesta = {
+      ok: false,
+      motivo: "ledger-ilegible",
+      detalle: 'duplicate key value violates unique constraint "publications_asset_id_destination_key"',
+    };
+
+    const res = await POST(pedido({ assetId: ASSET }));
+
+    expect(res.status).toBe(502);
+    // El cuerpo entero, no `toMatchObject`: una clave de más es exactamente el
+    // defecto, así que no puede colarse por debajo de la aserción.
+    expect(await res.json()).toEqual({ ok: false, motivo: "ledger-ilegible" });
+  });
+
+  it("una excepción del servidor es 500, no 400 (defecto medido el 2026-09-26: el catch-all mandaba 400 a todo, y la pantalla lo leía como «el id no es un uuid» — o sea se culpaba a sí misma por algo que se rompió del otro lado)", async () => {
+    explota = new Error("boom");
+    try {
+      const res = await POST(pedido({ assetId: ASSET }));
+      expect(res.status).toBe(500);
+    } finally {
+      explota = null;
+    }
+  });
+
+  it("y un pedido que de verdad está mal sigue siendo 400 (cerrar de más también es un defecto: si todo fuera 500, la pantalla no sabría cuándo el error es suyo)", async () => {
+    const res = await POST(pedido({ assetId: "no-es-un-uuid" }));
+    expect(res.status).toBe(400);
+  });
+
+  it("tampoco en los otros motivos: el 500 y el 409 del transporte mandan sólo el motivo", async () => {
+    for (const [motivo, status] of [["sin-transporte", 500], ["no-aprobado", 409]] as const) {
+      respuesta = { ok: false, motivo, detalle: "no mires esto" };
+      const res = await POST(pedido({ assetId: ASSET }));
+      expect(res.status, motivo).toBe(status);
+      expect(await res.json(), motivo).toEqual({ ok: false, motivo });
+    }
   });
 
   it("un motivo que acá no debería pasar tampoco se lee como éxito", async () => {
