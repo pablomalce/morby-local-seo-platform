@@ -214,10 +214,21 @@ BEGIN;
 -- el guard congela. En orden de glob siempre va después, pero aplicada a mano
 -- después de un `.down`, se podía aplicar sola —medido—, y entonces cada reporte
 -- con cita moría con 42703 al guardarse. Se niega.
+--
+-- Y mira el ESQUEMA, no sólo el registro. La sexta ronda de la revisión midió
+-- que un rollback fuera de orden (el .down de la `0026` con la `0027` todavía
+-- puesta) deja la fila de la `0027` en `schema_migrations` sin nada de la
+-- `0027` en las tablas, y la guarda que sólo leía el registro dejaba pasar.
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
-                    WHERE version = '0027_profile_immutability') THEN
-        RAISE EXCEPTION 'la 0028 no se aplica sin la 0027: aplicar primero la 0027';
+                    WHERE version = '0027_profile_immutability')
+       OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = 'public' AND table_name = 'company_profiles'
+                         AND column_name = 'superseded_at')
+       OR NOT EXISTS (SELECT 1 FROM pg_trigger
+                       WHERE tgname = 'trg_company_profiles_immutable'
+                         AND tgrelid = 'public.company_profiles'::regclass) THEN
+        RAISE EXCEPTION 'la 0028 no se aplica sin la 0027 en el esquema (registro, superseded_at y el guard): aplicar primero la 0027';
     END IF;
 END $$;
 

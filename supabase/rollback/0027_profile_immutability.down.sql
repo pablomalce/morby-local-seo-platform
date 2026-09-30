@@ -31,6 +31,16 @@
 -- El paso 3 empieza por la columna porque sin ella no hay dónde poner las
 -- fechas: este archivo la borra, y la `0027` al negarse deshace la suya.
 --
+-- Y dos cosas del paso 3 que el export no resuelve, medidas por la sexta ronda:
+-- una versión que alguien SUPERE mientras la `0027` está revertida no tiene
+-- fecha en ningún lado —ni en la base ni en el export—, así que la fecha la
+-- decide una persona, y conviene anotar en algún lado que es decidida y no
+-- medida; y si además la escribió sin `published_at`/`published_by` —la `0026`
+-- sola lo acepta—, la re-aplicación muere en el CHECK de la decisión 13 hasta
+-- que alguien complete esos dos datos. `published_by` tampoco se inventa.
+--
+-- El permiso vale para UNA corrida: este archivo lo consume al terminar.
+--
 -- Si la `0028` está aplicada, se revierte PRIMERO: su trigger de la cita confía
 -- en que una versión no borrador está congelada, y sin la `0027` esa confianza
 -- queda sin sostén aunque el trigger siga ahí.
@@ -42,9 +52,38 @@
 -- es la clase de instrucción que un día se lleva algo que nadie nombró. La
 -- constraint antes que la columna que mira, por la misma razón.
 
+-- LAS NEGATIVAS, Y POR QUÉ ESTE ARCHIVO SE PROTEGE SOLO. La sexta ronda de la
+-- revisión adversarial midió que la primera versión fallaba ABIERTA con un
+-- `psql -f` a secas: sin transacción y sin `ON_ERROR_STOP`, psql imprimía la
+-- negativa y seguía con los DROP, que se confirmaban uno por uno. Por eso, como
+-- el .down de la `0026`: `ON_ERROR_STOP` propio y una transacción que envuelve
+-- todo. Y el lock va antes de las comprobaciones, para que nadie publique ni
+-- supere una versión entre que se miró y que se borró.
+\set ON_ERROR_STOP on
+
+BEGIN;
+
+LOCK TABLE public.company_profiles IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM public.company_profiles WHERE status = 'superseded')
+    -- La `0028` primero: su trigger de la cita lee `superseded_at`, y sin esta
+    -- columna cada reporte con cita muere con 42703. La guarda de la `0028` lo
+    -- impide al aplicarla; esto lo impide al revertir esta.
+    IF EXISTS (SELECT 1 FROM public.schema_migrations
+                WHERE version = '0028_report_cites_profile_version')
+       OR EXISTS (SELECT 1 FROM pg_trigger
+                   WHERE tgname = 'trg_reports_cite_frozen_version'
+                     AND tgrelid = 'public.reports'::regclass) THEN
+        RAISE EXCEPTION 'la 0028 esta aplicada: revertirla primero (su trigger lee superseded_at)';
+    END IF;
+
+    -- Las fechas. Sólo si la columna todavía existe: una segunda corrida de
+    -- este archivo no tiene nada que perder y no tiene por qué negarse.
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'company_profiles'
+                  AND column_name = 'superseded_at')
+       AND EXISTS (SELECT 1 FROM public.company_profiles WHERE status = 'superseded')
        AND coalesce(current_setting('vulkan.perder_fechas_de_superacion', true), '') <> 'si' THEN
         RAISE EXCEPTION 'hay versiones superadas: este .down borra su superseded_at y la 0027 no la vuelve a inventar. Exportar id y superseded_at primero; para seguir igual: SET vulkan.perder_fechas_de_superacion = ''si'';';
     END IF;
@@ -74,3 +113,12 @@ ALTER TABLE public.company_profiles
     DROP COLUMN IF EXISTS superseded_at;
 
 DELETE FROM public.schema_migrations WHERE version = '0027_profile_immutability';
+
+-- El permiso se consume: vale para UNA corrida. Sin esto, el `SET` de sesión
+-- seguía vivo, y una segunda corrida en la misma sesión —o en una conexión
+-- reutilizada— borraba fechas restauradas sin que nadie lo pidiera otra vez.
+-- Lo encontró la sexta ronda. Dentro de la transacción: si algo de arriba
+-- falla, el permiso queda para reintentar.
+RESET vulkan.perder_fechas_de_superacion;
+
+COMMIT;

@@ -318,7 +318,7 @@ BEGIN
      WHERE status = 'superseded' AND superseded_at IS NULL;
     IF n > 0 THEN
         RAISE EXCEPTION
-            'la 0027 no se aplica: % versiones superadas no tienen fecha de superacion (la borro el .down de la 0027) y esta migracion no la inventa. Fuera de esta migracion: ALTER TABLE public.company_profiles ADD COLUMN superseded_at timestamptz; ponerles la fecha desde el export previo al .down; y volver a aplicar. Filas: %',
+            'la 0027 no se aplica: % versiones superadas no tienen fecha de superacion (la borro el .down de la 0027, o se superaron mientras la 0027 no estaba aplicada) y esta migracion no la inventa. Fuera de esta migracion: ALTER TABLE public.company_profiles ADD COLUMN superseded_at timestamptz; ponerles la fecha desde el export previo al .down, o la que decida una persona para las que no estan en el export; y volver a aplicar. Filas: %',
             n, ids;
     END IF;
 END $$;

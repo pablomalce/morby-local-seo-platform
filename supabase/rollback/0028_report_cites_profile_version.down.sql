@@ -25,6 +25,13 @@
 -- CASCADE, por la razón de siempre: si algo que esta migración no creó quedó
 -- colgado de la columna, el rollback falla nombrándolo.
 
+-- En una transacción y con `ON_ERROR_STOP` propio, como el .down de la `0026`:
+-- a medias, este archivo dejaría los triggers sin su columna o la columna sin su
+-- FK, y un `psql -f` a secas sigue de largo después de un error.
+\set ON_ERROR_STOP on
+
+BEGIN;
+
 DROP TRIGGER IF EXISTS trg_reports_cite_frozen_version ON public.reports;
 DROP TRIGGER IF EXISTS trg_reports_citation_is_fixed ON public.reports;
 DROP FUNCTION IF EXISTS public.reports_cite_frozen_version();
@@ -42,3 +49,5 @@ ALTER TABLE public.company_profiles
     DROP CONSTRAINT IF EXISTS company_profiles_org_business_id_key;
 
 DELETE FROM public.schema_migrations WHERE version = '0028_report_cites_profile_version';
+
+COMMIT;
