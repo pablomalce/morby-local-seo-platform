@@ -4747,9 +4747,13 @@ SELECT 108, 'el trigger de la cita rechaza también una versión superada, que e
 -- LO QUE ESTE BLOQUE NO MIDE, dicho porque la primera versión decía que sí: la
 -- elección entre `NO ACTION` y `RESTRICT` en la FK de la cita. Decía «con
 -- RESTRICT, este bloque es el que se pondría rojo», y es falso: medido con la FK
--- en RESTRICT, las 117 aserciones quedan verdes (decisión 3 de la `0028`). Lo
--- que sí lo pondría rojo es una FK en CASCADE que borrara reportes al borrar una
--- versión, o un guard que confundiera esta baja con un borrado directo.
+-- en RESTRICT, las 117 aserciones quedan verdes (decisión 3 de la `0028`). Y
+-- tampoco una FK en CASCADE, que la versión siguiente de este comentario daba
+-- por detectada: una versión citada sólo puede desaparecer por esta misma baja
+-- —el guard rechaza el borrado directo, no se cita un borrador, y una congelada
+-- no vuelve a borrador—, así que la acción de la FK no se observa nunca. Medido
+-- por la tercera ronda de la revisión. Lo que SÍ lo pone rojo, medido, es un
+-- guard que confunda esta baja con un borrado directo.
 --
 -- «Alice Publicada» tiene ahora dos versiones y tres reportes, dos de ellos con
 -- cita. Corre de verdad y cuenta después, en otra sentencia: la lección del 101.
@@ -4763,7 +4767,7 @@ SELECT 109, 'un reporte que cita la ficha impide dar de baja a la empresa',
        CASE WHEN b.estado IS NULL AND q.reportes = 0 AND q.versiones = 0
             THEN 'la baja entró y se llevó los reportes con cita y las dos versiones que citaban'
             WHEN b.estado IS NOT NULL THEN 'la baja murió con ' || b.estado ||
-                 ': el orden de los cascades importa, y no tendría que importar'
+                 ': algún guard confundió la baja de la empresa con un borrado directo'
             ELSE 'la baja pasó pero quedaron ' || q.reportes || ' reportes y ' || q.versiones || ' versiones' END
   FROM h12_baja_citada b
  CROSS JOIN (SELECT (SELECT count(*) FROM reports          WHERE business_id = 'd0270000-0027-4027-8027-000000000001') AS reportes,
@@ -5059,8 +5063,17 @@ SELECT 114, 'un reporte puede citar la ficha de otra empresa de su organización
 -- septiembre, y la FK resolvía a una estrategia que el reporte nunca vio.
 --
 -- La superada del fixture estuvo vigente de hace diez días a hace cinco. Tres
--- formas de citarla fuera de eso, y la cuarta es el control positivo (la 108 es
+-- formas de citarla fuera de eso, y la última es el control positivo (la 108 es
 -- el otro).
+--
+-- Y EL BORDE, que la tercera ronda de la revisión encontró sin fijar: la
+-- ventana es semiabierta —`published_at <= created_at < superseded_at`—, y en el
+-- instante exacto del relevo la saliente ya no rige y la entrante sí. Sin estos
+-- dos casos, cambiar `>=` por `>` dejaba citar LAS DOS en ese instante, y `<` por
+-- `<=` ninguna. Dentro de una transacción `now()` no avanza, así que publicar y
+-- generar el reporte en la misma transacción cae exactamente ahí. La saliente es
+-- la superada del fixture (superada hace cinco días); la entrante, la versión 2
+-- de la misma empresa que armó el 107 (publicada hace cinco días).
 INSERT INTO reports (id, organization_id, business_id, title, created_at)
 SELECT 'd0280000-0028-4028-8028-000000000302', org_alice,
        'd0270000-0027-4027-8027-000000000002', 'Reporte viejo, de antes de la ficha',
@@ -5083,6 +5096,16 @@ SELECT * FROM (VALUES
     ('mover la fecha de un reporte citado fuera de la vigencia de su versión',
      $s$UPDATE reports SET created_at = now() WHERE id = 'd0280000-0028-4028-8028-000000000300'$s$,
      '45004'),
+    ('un reporte escrito en el instante exacto del relevo citando la versión saliente',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la saliente',
+               'd0270000-0027-4027-8027-000000000020', now() - interval '5 days' FROM t$s$,
+     '45004'),
+    ('un reporte escrito en el instante exacto del relevo citando la versión entrante',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la entrante',
+               'd0280000-0028-4028-8028-000000000022', now() - interval '5 days' FROM t$s$,
+     NULL::text),
     ('completar un reporte de hace siete días con la versión vigente entonces',
      $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0280000-0028-4028-8028-000000000303'$s$,
      NULL::text)
@@ -5095,7 +5118,7 @@ INSERT INTO defect_report
 SELECT 115, 'un reporte puede citar una versión que no estaba vigente cuando se escribió',
        EXISTS (SELECT 1 FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado),
        CASE WHEN NOT EXISTS (SELECT 1 FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado)
-            THEN 'las tres citas fuera de la vigencia murieron con 45004; completar con la versión vigente entró'
+            THEN 'las tres citas fuera de la vigencia y la de la saliente en el relevo murieron con 45004; la entrante en el relevo y completar con la versión vigente entraron'
             ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
                                                    ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
                                    FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado) END;

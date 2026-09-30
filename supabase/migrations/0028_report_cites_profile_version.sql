@@ -50,6 +50,8 @@
 --   el trigger de la cita, entero, pero BEFORE  . . rojo 116
 --   el trigger pasa a SECURITY INVOKER  . . . . . . rojo 117
 --   sin la regla de vigencia  . . . . . . . . . . . rojo 115
+--   el borde de salida cerrado (>= pasa a >)  . . . rojo 115
+--   el borde de entrada abierto (< pasa a <=) . . . rojo 115
 --   sin la rama «es un borrador»  . . . . . . . . . rojo 105
 --   la cita fija deja re-apuntar (sólo no quitar) . rojo 107
 --   sin el RETURN NEW temprano de la cita fija  . . rojo 107
@@ -62,7 +64,9 @@
 -- tenía la regla de vigencia, y el 115 caía por eso. Con el trigger entero y
 -- sólo movido a BEFORE —medido acá—, el único que lo ve es el 116, que es el que
 -- existe para eso. Las filas de la rama de borrador, la re-cita y el re-juicio
--- son de la segunda ronda: con la suite de la primera, las tres sobrevivían.
+-- son de la segunda ronda: con la suite de la primera, las tres sobrevivían. Las
+-- dos de los bordes son de la tercera: la ventana es semiabierta y ningún caso
+-- citaba en el instante exacto del relevo, así que las dos sobrevivían.
 --
 -- Y dos arreglos que no viven en la suite, medidos a mano en la réplica:
 -- re-aplicar esta migración sobre la FK de dos columnas de su primera versión

@@ -83,6 +83,16 @@
 -- La primera sobrevivía a la suite de la segunda ronda: el 112 sólo sacaba hijas
 -- de una versión congelada, nunca las metía.
 --
+-- CUARTA RONDA, después de la tercera revisión: el guard que no distingue la
+-- baja de la empresa de un borrado directo cae en 101 y 109 (y el 109 ahora lo
+-- dice con esas palabras; antes culpaba al orden de los cascades). Y el backfill
+-- de la decisión 15, medido a mano con los dos escenarios de la tercera ronda
+-- —un borrador que carga la fecha de publicación de una versión vieja, y
+-- versiones publicadas fuera del orden numérico—: después de los dos `.down` y
+-- la re-aplicación, las cuatro superadas recuperan su fecha exacta. Con la
+-- versión anterior del backfill, una abortaba en el CHECK de la decisión 16 y
+-- otra volvía a solapar ventanas.
+--
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +248,8 @@
 --    filas en `superseded`, así que volver a aplicar esto moría en el CHECK de
 --    la decisión 4 sobre cualquier base que alguna vez superó una versión.
 --    Ahora, antes del CHECK, las superadas sin fecha la recuperan: el
---    `published_at` de la versión que las sucedió. Es la fecha real en el flujo
+--    `published_at` de la versión que las sucedió — la próxima PUBLICADA en el
+--    tiempo, no el próximo número y no un borrador (ver el UPDATE). Es la fecha real en el flujo
 --    del producto —publicar la 3 es pasar la 2 a `superseded` y la 3 a
 --    `published` en una transacción (decisión 16 de la `0026`)—, y sólo si no
 --    hay sucesora publicada cae a `now()`, que NO es la real. La primera versión
@@ -286,14 +297,23 @@ ALTER TABLE public.company_profiles
 -- Decisión 15. Sólo encuentra filas después del `.down`; en una aplicación
 -- normal la tabla no tiene superadas sin fecha y esto no toca nada. Corre ANTES
 -- de crear los triggers de la sección 3, así que el guard no lo ve.
+-- La sucesora es la PRÓXIMA PUBLICACIÓN en el tiempo, no el próximo número de
+-- versión, y nunca un borrador. La tercera ronda de la revisión adversarial
+-- midió las dos cosas: un borrador puede llevar `published_at` —el esquema no lo
+-- prohíbe, el bloque 105 lo usa— y tomarlo como publicación devolvía una fecha
+-- anterior a la real (o anterior a la propia publicación, y el CHECK de la
+-- decisión 16 abortaba la re-aplicación); y nada ata el número de versión al
+-- orden de publicación, así que buscar por `version >` devolvía la sucesora
+-- equivocada o ninguna, y con `now()` volvía el solape.
 UPDATE public.company_profiles p
    SET superseded_at = coalesce(
            (SELECT min(n.published_at)
               FROM public.company_profiles n
              WHERE n.organization_id = p.organization_id
                AND n.business_id = p.business_id
-               AND n.version > p.version
-               AND n.published_at IS NOT NULL),
+               AND n.id <> p.id
+               AND n.status <> 'draft'
+               AND n.published_at > p.published_at),
            now())
  WHERE p.status = 'superseded'
    AND p.superseded_at IS NULL;
