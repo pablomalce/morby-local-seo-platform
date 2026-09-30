@@ -163,7 +163,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
 -- `SECURITY DEFINER` y contesta el estado de la ficha de cualquier organización).
 -- El rol que hace de aplicación en esta suite no puede tener más que los roles
 -- reales, o las aserciones que corren como él miden un esquema más laxo que el
--- de producción. El bloque 110 mide los cinco.
+-- de producción. El bloque 110 mide los seis.
 --
 -- Guardado con `to_regprocedure` por el motivo de los de arriba: `rollback.sh`
 -- aplica este archivo sobre el esquema de ANTES de la migración que prueba.
@@ -176,7 +176,8 @@ BEGIN
         'public.company_profiles_immutable()',
         'public.profile_child_freeze_state(text, jsonb)',
         'public.profile_child_immutable()',
-        'public.reports_cite_frozen_version()'
+        'public.reports_cite_frozen_version()',
+        'public.reports_citation_is_fixed()'
     ] LOOP
         IF to_regprocedure(f) IS NOT NULL THEN
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM growthos_app', f);

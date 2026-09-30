@@ -19,7 +19,8 @@
 --
 -- CÓMO FALLA
 --
--- Rojo en los bloques 95 a 103 de `supabase/qa/defects_test.sql`. Los tres que
+-- Rojo en los bloques 95 a 103 y 110 a 113 de `supabase/qa/defects_test.sql`
+-- (los 104 a 109 y 114 a 117 son de la `0028`). Los tres que
 -- son la puerta:
 --
 --   * el 96 hace UPDATE del contenido de una versión `published` —y de una
@@ -59,6 +60,20 @@
 -- llegar a la aserción que dice medirla no la midió.
 --
 -- Y con todo restaurado, las 103 vuelven a verde.
+--
+-- SEGUNDA RONDA, DESPUÉS DE LA REVISIÓN ADVERSARIAL (2026-09-30), contra las 117
+-- aserciones y con la `0027` y la `0028` re-aplicadas para restaurar. Las nueve
+-- de arriba siguen cayendo, y las cinco nuevas de este archivo también:
+--
+--   sin el chequeo de la versión de origen  . . . . rojo 112
+--   sin la excepción del SET NULL del catálogo  . . rojo 113
+--   la excepción sin mirar si el servicio sigue . . rojo 113
+--   sin el CHECK «una superada estuvo publicada» .  rojo 99
+--   la transición con lista de columnas a mano  . . rojo 103
+--
+-- La última es la que la revisión encontró viva: el bloque 103 escribía la
+-- columna nueva sin pasar por la transición, y moría en el `RAISE` final sea
+-- cual fuera la comparación.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
@@ -170,25 +185,86 @@
 --    100 (`service_role` reescribiendo una publicada) sigue muriendo con 45001,
 --    y el 111 pone el control positivo con sesión. El 110 mide el privilegio.
 --
+-- LO QUE ENCONTRÓ LA REVISIÓN ADVERSARIAL DEL 2026-09-30, Y CÓMO QUEDÓ
+--
+-- Cinco lentes independientes y un escéptico por lente, cada hallazgo
+-- reproducido en la réplica antes de aceptarlo. De este archivo salieron
+-- cuatro, y cambiaron el código:
+--
+-- 12. EL `SET NULL` DEL CATÁLOGO PASA. La primera versión de este guard hacía
+--    IMBORRABLE cualquier servicio de `business_services` que una oferta
+--    publicada o superada citara: la FK `profile_offers_service_fkey` de la
+--    `0026` es `ON DELETE SET NULL (service_id)`, ese SET NULL es un UPDATE
+--    sobre `profile_offers`, y el guard lo rechazaba con 45002. O sea, congelaba
+--    el catálogo — exactamente lo que el «QUÉ NO HACE» de abajo decía que no
+--    hacía, y lo que el comentario de esa FK en la `0026` dice que no puede
+--    pasar («que alguien borre un servicio del catálogo no puede bloquear el
+--    borrado por una decisión estratégica vieja»). Ahora pasa ESE UPDATE y sólo
+--    ése: en `profile_offers`, `service_id` de algo a NULL, nada más cambió, y el
+--    servicio YA NO EXISTE. La última condición es la que distingue el SET NULL
+--    de la FK —el servicio se está borrando— de alguien que desengancha a mano
+--    la oferta de una versión publicada, que sigue muriendo con 45002. Es la
+--    misma técnica que distingue el cascade del borrado directo (decisión 1).
+--    Lo miden los bloques 113 (el borrado del servicio entra y la oferta queda
+--    con NULL) y su contracara (el desenganche a mano no).
+--
+-- 13. UNA SUPERADA ESTUVO PUBLICADA, Y LO DICE UN CHECK. La transición
+--    `draft -> superseded` se rechaza con 45003, pero eso es un trigger de
+--    UPDATE: un INSERT directo con `status = 'superseded'` y sin
+--    `published_at`/`published_by` entraba, y la `0028` lo aceptaba como versión
+--    congelada citable. `company_profiles_superseded_was_published` exige fecha
+--    y persona de publicación también para `superseded`. La transición
+--    `published -> superseded` las conserva —el jsonb del punto 3 prohíbe
+--    tocarlas—, así que ninguna superada legítima pierde nada.
+--
+-- 14. EL CHEQUEO DE ORIGEN TIENE BLOQUE. Mover una hija de una versión
+--    congelada a un borrador le SACA contenido a la congelada, y el guard lo
+--    rechaza mirando la versión de origen (la segunda mitad de
+--    `profile_child_immutable`). Ningún bloque lo ejercitaba: las veintidós
+--    plantillas del 96 reescriben texto, no cambian `profile_id`. Borrar esa
+--    mitad del guard dejaba todo verde. El bloque 112 lo mide ahora, en las
+--    dos columnas por las que una hija cambia de versión (`profile_id` y, en la
+--    evidencia, `objective_id`), con su control positivo entre dos borradores.
+--
+-- 15. RE-APLICAR DESPUÉS DEL .down. El `.down` borra `superseded_at` y deja las
+--    filas en `superseded`, así que volver a aplicar esto moría en el CHECK de
+--    la decisión 4 sobre cualquier base que alguna vez superó una versión.
+--    Ahora, antes del CHECK, las superadas sin fecha reciben `now()`. NO es la
+--    fecha real —ésa la perdió el `.down`, y su encabezado lo dice—: es la de
+--    re-aplicación, y es el único caso en que la columna no significa lo que
+--    dice. Y el archivo entero va en una transacción, como la `0026`: sin ella,
+--    un fallo a la mitad dejaba la columna puesta y sin guard.
+--
 -- QUÉ NO HACE
 --
 -- * No congela `business_services`. `profile_offers.service_id` apunta al
 --   catálogo operativo, y si alguien renombra un servicio, la línea de oferta
---   de una versión publicada resuelve a otro nombre. Congelar el catálogo
---   porque una versión vieja lo cita haría inusable el producto. El límite es
---   real y queda dicho: una versión congela SUS filas, no aquello a lo que
---   apunta. Lo mismo con `competitors.profile_competitor_id`, que es el puntero
+--   de una versión publicada resuelve a otro nombre; si lo borra, la oferta
+--   queda sin servicio (decisión 12 — la primera versión de este archivo decía
+--   esto mismo y lo contradecía). Congelar el catálogo porque una versión vieja
+--   lo cita haría inusable el producto. El límite es real y queda dicho: una
+--   versión congela SUS filas, no aquello a lo que apunta. Lo mismo con `competitors.profile_competitor_id`, que es el puntero
 --   del scrape hacia la lista curada: cambiarlo no cambia la lista.
 -- * No hace que el reporte cite el `version_id`. Eso es la otra mitad de H1.2 y
 --   vive en `src/lib/reports/`, no en el esquema.
 -- * No aplica nada a hosted, igual que la `0026`. Nada en este repositorio
 --   aplica migraciones a `tpqiltnskfeycnybczgz`.
 
+BEGIN;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1. La fecha de la superada
 -- ─────────────────────────────────────────────────────────────────────────────
 ALTER TABLE public.company_profiles
     ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
+
+-- Decisión 15. Sólo encuentra filas después del `.down`; en una aplicación
+-- normal la tabla no tiene superadas sin fecha y esto no toca nada. Corre ANTES
+-- de crear los triggers de la sección 3, así que el guard no lo ve.
+UPDATE public.company_profiles
+   SET superseded_at = now()
+ WHERE status = 'superseded'
+   AND superseded_at IS NULL;
 
 COMMENT ON COLUMN public.company_profiles.superseded_at IS
     'Cuándo esta versión dejó de estar vigente. Dato SOBRE la versión, no contenido de la versión: es la única columna que el guard de inmutabilidad deja cambiar, y sólo junto con status -> superseded. Ver decisión 4 de la 0027.';
@@ -202,6 +278,21 @@ DO $$ BEGIN
         ALTER TABLE public.company_profiles
             ADD CONSTRAINT company_profiles_superseded_is_dated
             CHECK ((status = 'superseded') = (superseded_at IS NOT NULL));
+    END IF;
+END $$;
+
+-- Decisión 13: `published_is_complete` de la `0026` lo exige para `published`;
+-- esto, para lo que alguna vez lo fue.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'company_profiles_superseded_was_published'
+          AND conrelid = 'public.company_profiles'::regclass
+    ) THEN
+        ALTER TABLE public.company_profiles
+            ADD CONSTRAINT company_profiles_superseded_was_published
+            CHECK (status <> 'superseded'
+                   OR (published_at IS NOT NULL AND published_by IS NOT NULL));
     END IF;
 END $$;
 
@@ -415,6 +506,23 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- Decisión 12: el `ON DELETE SET NULL (service_id)` de la `0026`, y sólo él.
+    -- Lo que lo distingue de un desenganche a mano es que el servicio ya no
+    -- está: la acción de la FK corre después de borrarlo.
+    IF v_state = 'frozen'
+       AND TG_OP = 'UPDATE'
+       AND TG_TABLE_NAME = 'profile_offers'
+       AND (v_old->>'service_id') IS NOT NULL
+       AND (v_new->>'service_id') IS NULL
+       AND (v_new - 'service_id') IS NOT DISTINCT FROM (v_old - 'service_id')
+       AND NOT EXISTS (
+           SELECT 1 FROM public.business_services
+            WHERE organization_id = (v_old->>'organization_id')::uuid
+              AND id = (v_old->>'service_id')::uuid)
+    THEN
+        RETURN NEW;
+    END IF;
+
     IF v_state = 'frozen' THEN
         RAISE EXCEPTION
             '% de una version publicada o superada: el contenido de la version no se edita',
@@ -470,3 +578,5 @@ END $$;
 
 INSERT INTO public.schema_migrations (version) VALUES ('0027_profile_immutability')
 ON CONFLICT (version) DO NOTHING;
+
+COMMIT;

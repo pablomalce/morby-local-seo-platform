@@ -27,6 +27,30 @@
  * 7. El INSERT falla y el reporte vuelve como si se hubiera guardado — que era
  *    el comportamiento hasta H1.2, y que desde H1.2 significa que la cita no
  *    existe y nadie se entera.
+ *
+ * MEDIDO ROMPIENDO EL CÓDIGO, CON `scripts/mutar.sh` (2026-09-30). Cada
+ * mutación, sola, contra el árbol entero (731 tests); todas CAYERON y todas en
+ * este archivo. La revisión adversarial señaló que la primera ronda —catorce—
+ * no estaba escrita en ningún lado; ésta es la lista.
+ *
+ *   orchestrator.ts                                         cae
+ *   ─────────────────────────────────────────────────────── ────────
+ *   la columna viaja como null en vez del id                 1, 3
+ *   la consulta sin `.eq("organization_id", …)`              2
+ *   `.eq("status", "draft")` en vez de `published`           2
+ *   `.single()` en vez de `.maybeSingle()`                   2, 5
+ *   un error de lectura se devuelve como `none`              5
+ *   `reason` lleva el error entero (con el mensaje)          5
+ *   sin cita, la columna viaja como `null`                   4, 5
+ *   el INSERT fallido no se levanta                          7
+ *   la excepción lleva el mensaje en vez del código          7
+ *   la rama de semillas cita `none` en vez de `demo`         6
+ *   `buildReport` no recibe la cita                          1, 3, 4, 5
+ *   el `select` pide `business_id` en vez de `id`            1, 2, 3
+ *   la rama `clientSnapshot` cita `none` en vez de `demo`    6b
+ *
+ * La del `select` sin `id` es la que la revisión encontró viva: el doble
+ * devolvía la fila entera y el test comparaba la proyección por substring.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -70,6 +94,21 @@ let consultasALaFicha: { filtros: [string, unknown][]; columnas?: string; termin
 /** Cada fila que se intentó insertar en `reports`. */
 let insertados: Record<string, unknown>[] = [];
 
+/** Las columnas de un `select("a, b, c")`, como tokens y no como texto. */
+function columnasDe(proyeccion: string | undefined): string[] {
+  return (proyeccion ?? "*")
+    .split(",")
+    .map((c) => c.trim())
+    .filter(Boolean);
+}
+
+function proyectar(fila: Fila | null, proyeccion: string | undefined): Record<string, unknown> | null {
+  if (!fila) return null;
+  const columnas = columnasDe(proyeccion);
+  if (columnas.includes("*")) return { ...fila };
+  return Object.fromEntries(columnas.filter((c) => c in fila).map((c) => [c, fila[c as keyof Fila]]));
+}
+
 const createSupabaseServerClient = vi.fn(async () => ({
   auth: {
     getUser: async () => ({ data: { user: haySesion ? { id: "u" } : null } }),
@@ -104,7 +143,13 @@ const createSupabaseServerClient = vi.fn(async () => ({
       maybeSingle: async () => {
         consulta.terminal = "maybeSingle";
         if (tabla === "company_profiles") {
-          return errorDeFicha ? { data: null, error: errorDeFicha } : { data: publicada, error: null };
+          if (errorDeFicha) return { data: null, error: errorDeFicha };
+          // El doble devuelve SÓLO las columnas que la consulta pidió, como
+          // PostgREST. La primera versión devolvía la fila entera fuera cual
+          // fuera la proyección, así que un `select("business_id, version,
+          // published_at")` —sin `id`— dejaba los siete tests verdes y en
+          // producción citaba `undefined`. Lo encontró la revisión adversarial.
+          return { data: proyectar(publicada, consulta.columnas), error: null };
         }
         return { data: null, error: null };
       },
@@ -199,9 +244,9 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
     // cambia qué fila se cita.
     expect(consulta.filtros).toHaveLength(3);
     expect(consulta.terminal).toBe("maybeSingle");
-    expect(consulta.columnas).toContain("id");
-    expect(consulta.columnas).toContain("version");
-    expect(consulta.columnas).toContain("published_at");
+    // Por TOKENS y no por substring: la primera versión hacía
+    // `toContain("id")` sobre el texto, y "business_id" lo satisfacía.
+    expect(columnasDe(consulta.columnas).sort()).toEqual(["id", "published_at", "version"]);
   });
 
   it("3. cambiar la ficha y regenerar el MISMO reporte cita un id distinto (la mitad c)", async () => {
@@ -257,6 +302,28 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
     const report = await generar(businesses[0].id);
 
     expect(report).not.toBeNull();
+    expect(report?.profileCitation).toEqual({ status: "demo" });
+    expect(consultasALaFicha).toHaveLength(0);
+    expect(insertados).toHaveLength(0);
+  });
+
+  it("6b. un reporte del tenant que vive sólo en el navegador (clientSnapshot) tampoco", async () => {
+    // La tercera rama de `loadSnapshot`: sin sesión, con el negocio que el
+    // navegador manda. La revisión adversarial encontró que ningún test pasaba
+    // por acá, así que mutar su cita a `none` quedaba verde.
+    haySesion = false;
+    const { businesses } = await import("@/lib/mock/universal");
+    const local = { ...businesses[0], id: "local-solo-en-el-navegador" };
+    const { generateReport } = await import("@/lib/reports/orchestrator");
+
+    const report = await generateReport({
+      businessId: local.id,
+      clientSnapshot: { business: local, locations: [], services: [] },
+      locale: "es",
+    });
+
+    expect(report).not.toBeNull();
+    expect(report?.businessId).toBe(local.id);
     expect(report?.profileCitation).toEqual({ status: "demo" });
     expect(consultasALaFicha).toHaveLength(0);
     expect(insertados).toHaveLength(0);

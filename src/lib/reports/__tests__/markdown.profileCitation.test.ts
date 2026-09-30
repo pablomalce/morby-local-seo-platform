@@ -13,6 +13,13 @@
  *
  * Y que el motor, sin que nadie le pase la cita, invente una. Sin la opción dice
  * `demo`, igual que de Places y PageSpeed.
+ *
+ * Y que un reporte guardado antes de H1.2 haga reventar el export.
+ *
+ * MEDIDO CON `scripts/mutar.sh` (2026-09-30), cada una sola; todas cayeron acá:
+ * el motor dice `none` sin cita; la frase de `error` es la de `none`; el id va
+ * recortado a ocho caracteres; y sin la guarda de `undefined`, el export de un
+ * reporte viejo tira un TypeError.
  */
 import { describe, expect, it } from "vitest";
 
@@ -64,6 +71,18 @@ describe("la cita a la ficha en el reporte que el cliente se lleva", () => {
     expect(none).not.toContain("could not be read");
     expect(none).toContain("No strategic profile has been published");
     expect(error).not.toContain("No strategic profile has been published");
+  });
+
+  it("un reporte guardado ANTES de H1.2 —sin `profileCitation`— se exporta y dice que es viejo", () => {
+    // Es lo que devuelve el historial de `localStorage` para todo reporte
+    // generado antes de este cambio: el tipo dice que el campo existe, el JSON
+    // guardado no lo tiene. La primera versión reventaba acá con un TypeError.
+    const viejo = { ...reporte() } as Partial<ReturnType<typeof reporte>>;
+    delete viejo.profileCitation;
+
+    const md = reportToMarkdown(viejo as ReturnType<typeof reporte>);
+
+    expect(seccion(md)).toContain("generated before reports cited a strategic profile");
   });
 
   it("sin cita que pasarle, el motor dice `demo` y no inventa una", () => {
