@@ -75,6 +75,14 @@
 -- columna nueva sin pasar por la transición, y moría en el `RAISE` final sea
 -- cual fuera la comparación.
 --
+-- TERCERA RONDA, después de la segunda revisión, otras dos que cayeron:
+--
+--   la comprobación de destino mira el origen . . . rojo 112
+--   sin el CHECK de la ventana invertida  . . . . . rojo 99
+--
+-- La primera sobrevivía a la suite de la segunda ronda: el 112 sólo sacaba hijas
+-- de una versión congelada, nunca las metía.
+--
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -229,11 +237,28 @@
 -- 15. RE-APLICAR DESPUÉS DEL .down. El `.down` borra `superseded_at` y deja las
 --    filas en `superseded`, así que volver a aplicar esto moría en el CHECK de
 --    la decisión 4 sobre cualquier base que alguna vez superó una versión.
---    Ahora, antes del CHECK, las superadas sin fecha reciben `now()`. NO es la
---    fecha real —ésa la perdió el `.down`, y su encabezado lo dice—: es la de
---    re-aplicación, y es el único caso en que la columna no significa lo que
---    dice. Y el archivo entero va en una transacción, como la `0026`: sin ella,
---    un fallo a la mitad dejaba la columna puesta y sin guard.
+--    Ahora, antes del CHECK, las superadas sin fecha la recuperan: el
+--    `published_at` de la versión que las sucedió. Es la fecha real en el flujo
+--    del producto —publicar la 3 es pasar la 2 a `superseded` y la 3 a
+--    `published` en una transacción (decisión 16 de la `0026`)—, y sólo si no
+--    hay sucesora publicada cae a `now()`, que NO es la real. La primera versión
+--    de este arreglo ponía `now()` siempre, y la segunda ronda de la revisión
+--    adversarial midió qué costaba: la ventana de la superada se estiraba hasta
+--    la re-aplicación y se solapaba con la de su sucesora, y la decisión 8 de la
+--    `0028` —que la versión citada estuviera vigente— dejaba citar las dos. Y el
+--    archivo entero va en una transacción, como la `0026`: sin ella, un fallo a
+--    la mitad dejaba la columna puesta y sin guard.
+--
+-- 16. UNA VERSIÓN NO SE SUPERA ANTES DE PUBLICARSE, Y LO DICE UN CHECK:
+--    `superseded_at >= published_at`. Desde la `0028` esas dos fechas deciden
+--    qué reporte puede citar qué versión, y una ventana invertida dejaba una
+--    versión incitable y rompía las citas que ya la tenían. Lo midió la segunda
+--    ronda. Lo que el CHECK NO impide, y queda dicho: un `superseded_at`
+--    retroactivo —anterior a un reporte que ya la cita— deja esa cita fuera de su
+--    ventana. Desde la segunda ronda eso ya no rompe nada: el trigger de la
+--    `0028` no vuelve a comprobar una cita que no cambió. Pero la decisión 8 de
+--    la `0028` se garantiza al CITAR, no para siempre. Las dos fechas las
+--    escribe quien publica, y hoy ningún código publica.
 --
 -- QUÉ NO HACE
 --
@@ -261,10 +286,17 @@ ALTER TABLE public.company_profiles
 -- Decisión 15. Sólo encuentra filas después del `.down`; en una aplicación
 -- normal la tabla no tiene superadas sin fecha y esto no toca nada. Corre ANTES
 -- de crear los triggers de la sección 3, así que el guard no lo ve.
-UPDATE public.company_profiles
-   SET superseded_at = now()
- WHERE status = 'superseded'
-   AND superseded_at IS NULL;
+UPDATE public.company_profiles p
+   SET superseded_at = coalesce(
+           (SELECT min(n.published_at)
+              FROM public.company_profiles n
+             WHERE n.organization_id = p.organization_id
+               AND n.business_id = p.business_id
+               AND n.version > p.version
+               AND n.published_at IS NOT NULL),
+           now())
+ WHERE p.status = 'superseded'
+   AND p.superseded_at IS NULL;
 
 COMMENT ON COLUMN public.company_profiles.superseded_at IS
     'Cuándo esta versión dejó de estar vigente. Dato SOBRE la versión, no contenido de la versión: es la única columna que el guard de inmutabilidad deja cambiar, y sólo junto con status -> superseded. Ver decisión 4 de la 0027.';
@@ -293,6 +325,20 @@ DO $$ BEGIN
             ADD CONSTRAINT company_profiles_superseded_was_published
             CHECK (status <> 'superseded'
                    OR (published_at IS NOT NULL AND published_by IS NOT NULL));
+    END IF;
+END $$;
+
+-- Decisión 16.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'company_profiles_superseded_after_published'
+          AND conrelid = 'public.company_profiles'::regclass
+    ) THEN
+        ALTER TABLE public.company_profiles
+            ADD CONSTRAINT company_profiles_superseded_after_published
+            CHECK (superseded_at IS NULL OR published_at IS NULL
+                   OR superseded_at >= published_at);
     END IF;
 END $$;
 

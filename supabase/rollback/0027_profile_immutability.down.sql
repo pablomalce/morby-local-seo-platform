@@ -12,11 +12,16 @@
 -- dato que la `0027` agregó; todo lo demás son funciones y triggers, que no
 -- guardan nada.
 --
--- Volver a aplicar la `0027` después de esto FUNCIONA, pero no devuelve las
--- fechas: la `0027` les pone `now()` a las superadas que encuentra sin fecha
--- (su decisión 15), porque su CHECK exige una. Hasta el 2026-09-30 no lo hacía,
--- y re-aplicarla moría en ese CHECK sobre cualquier base que alguna vez había
--- superado una versión; lo encontró la revisión adversarial.
+-- Volver a aplicar la `0027` después de esto funciona, con dos condiciones que
+-- conviene saber. Las fechas perdidas se recuperan del `published_at` de la
+-- versión sucesora, que es la fecha real en el flujo del producto; sin sucesora
+-- publicada, la fecha es la de re-aplicación (decisión 15). Y si MIENTRAS la
+-- `0027` estuvo revertida alguien escribió una fila `superseded` sin fecha ni
+-- persona de publicación —la `0026` sola lo acepta—, la re-aplicación se niega
+-- en el CHECK de la decisión 13, entera y sin dejar nada a medias. Es lo
+-- correcto: `published_by` no se puede inventar. Hay que corregir esa fila a
+-- mano. La primera versión de este encabezado decía «funciona» sin condiciones;
+-- la segunda ronda de la revisión adversarial midió la segunda.
 --
 -- Si la `0028` está aplicada, se revierte PRIMERO: su trigger de la cita confía
 -- en que una versión no borrador está congelada, y sin la `0027` esa confianza
@@ -43,6 +48,8 @@ DROP FUNCTION IF EXISTS public.profile_child_freeze_state(text, jsonb);
 DROP FUNCTION IF EXISTS public.company_profiles_immutable();
 DROP FUNCTION IF EXISTS public.company_profile_freeze_state(uuid, uuid);
 
+ALTER TABLE public.company_profiles
+    DROP CONSTRAINT IF EXISTS company_profiles_superseded_after_published;
 ALTER TABLE public.company_profiles
     DROP CONSTRAINT IF EXISTS company_profiles_superseded_was_published;
 ALTER TABLE public.company_profiles

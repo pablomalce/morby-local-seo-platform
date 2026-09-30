@@ -47,12 +47,28 @@
 -- aserciones, re-aplicando la `0027` y esta para restaurar. Ninguna sobrevivió:
 --
 --   la FK vuelve a dos columnas, sin la empresa . . rojo 114
---   el trigger de la cita vuelve a BEFORE . . . . . rojo 115, 116
+--   el trigger de la cita, entero, pero BEFORE  . . rojo 116
 --   el trigger pasa a SECURITY INVOKER  . . . . . . rojo 117
 --   sin la regla de vigencia  . . . . . . . . . . . rojo 115
+--   sin la rama «es un borrador»  . . . . . . . . . rojo 105
+--   la cita fija deja re-apuntar (sólo no quitar) . rojo 107
 --   sin el RETURN NEW temprano de la cita fija  . . rojo 107
+--   el AFTER re-juzga una cita que no cambió  . . . rojo 107
 --   el ICP de una versión citada se reescribe . . . rojo 96, 106
 --   sin el trigger de la cita congelada . . . . . . rojo 105, 106, 111, 115, 117
+--
+-- La fila del BEFORE decía «rojo 115, 116» en la primera tabla, y la segunda
+-- ronda de la revisión mostró por qué: aquel mutante, además de ser BEFORE, no
+-- tenía la regla de vigencia, y el 115 caía por eso. Con el trigger entero y
+-- sólo movido a BEFORE —medido acá—, el único que lo ve es el 116, que es el que
+-- existe para eso. Las filas de la rama de borrador, la re-cita y el re-juicio
+-- son de la segunda ronda: con la suite de la primera, las tres sobrevivían.
+--
+-- Y dos arreglos que no viven en la suite, medidos a mano en la réplica:
+-- re-aplicar esta migración sobre la FK de dos columnas de su primera versión
+-- la deja de tres y borra el índice viejo; y el ida y vuelta de los dos `.down`
+-- con una versión superada ya no estira su ventana (decisión 15 de la `0027`):
+-- la cita fuera de vigencia se sigue rechazando después.
 --
 -- Y la que la primera versión de este archivo decía cuidar y no cuidaba: con
 -- `ON DELETE RESTRICT` en vez de `NO ACTION`, NADA se pone rojo, porque no hay
@@ -91,11 +107,13 @@
 --    diferencia NO se ve acá, y la primera versión de este archivo afirmaba lo
 --    contrario: decía que `RESTRICT` «podría rechazar la baja si la ficha cae
 --    antes que el reporte». Medido por la revisión y re-medido acá con la FK en
---    `RESTRICT` contra las 117 aserciones —todas verdes—, es falso: en PostgreSQL las
---    dos son chequeos AFTER encolados, los borrados de un cascade no disparan los
---    suyos hasta que la sentencia de afuera vacía su cola, y para entonces el
---    otro cascade ya se llevó los reportes. Con `RESTRICT` la baja también entra,
---    en los dos órdenes. `NO ACTION` queda por ser el default y porque es
+--    `RESTRICT` contra las 117 aserciones —todas verdes—, es falso PARA ESTE
+--    CASO: los dos cascades salen del mismo `businesses`, a la misma
+--    profundidad, y los chequeos que encolan sus borrados corren después de los
+--    dos. No es una regla general del motor —la segunda ronda encontró un caso
+--    donde el orden SÍ importa, con cascades a profundidades distintas: la FK
+--    `published_by` de la `0026` impide borrar una organización con ficha
+--    publicada, y eso es del #105, no de este archivo—. `NO ACTION` queda por ser el default y porque es
 --    diferible si algún día hace falta; el bloque 109 mide que la baja entra, NO
 --    la elección entre las dos, que acá no es observable.
 --
@@ -146,6 +164,26 @@
 --    el INSERT muere con 45004 y el reporte falla una vez. Es correcto: ese
 --    reporte iba a citar una versión que ya no estaba vigente.
 --
+--    Y TRES LÍMITES DE ESTA REGLA, medidos por la segunda ronda de la revisión:
+--    * La carrera al revés NO se detecta: si la publicación empieza antes que el
+--      INSERT del reporte y confirma después, el reporte queda guardado con un
+--      `created_at` posterior al `superseded_at` de la versión que cita. Las dos
+--      fechas son `now()`, que es el comienzo de cada transacción y no el orden
+--      en que confirman, y leer la versión no la bloquea contra un cambio de
+--      `status` (no es columna de clave). El reporte se escribió con el
+--      contenido de esa versión, así que la cita dice la verdad; lo que queda
+--      desalineado es la fecha.
+--    * Las fechas las escribe quien publica, y nada las ata al reloj: un
+--      `published_at` en el futuro hace que todo reporte de esa empresa muera
+--      con 45004 hasta que el reloj lo alcance. Hoy ningún código publica; el
+--      que lo haga tiene que usar el reloj de la base.
+--    * Por las dos cosas de arriba, la regla se garantiza al CITAR, no para
+--      siempre. Una cita guardada que queda fuera de su ventana —por la carrera
+--      o por un `superseded_at` retroactivo— NO se vuelve a juzgar mientras no
+--      cambie: el trigger sale temprano si ni la cita ni la fecha cambiaron. La
+--      primera versión la re-juzgaba en cada reenvío de la fila, y ese reporte
+--      quedaba sin poder recibir un PATCH nunca más.
+--
 -- QUÉ NO HACE
 --
 -- * No aplica nada a hosted. Y HAY UN ORDEN QUE IMPORTA, EN LAS DOS
@@ -185,7 +223,21 @@ DO $$ BEGIN
     END IF;
 END $$;
 
+-- Si la FK existe con DOS columnas —la forma de la primera versión de este
+-- archivo, que alguna base de desarrollo pudo haber recibido—, se rehace. Sin
+-- esto, re-aplicar la versión arreglada sobre la vieja dejaba la FK vieja en su
+-- lugar, porque la guarda sólo miraba el nombre y el nombre no cambió; lo midió
+-- la segunda ronda de la revisión adversarial. Lo mismo con el índice viejo.
+DROP INDEX IF EXISTS public.reports_org_profile_version_idx;
 DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'reports_profile_version_fkey'
+          AND conrelid = 'public.reports'::regclass
+          AND array_length(conkey, 1) <> 3
+    ) THEN
+        ALTER TABLE public.reports DROP CONSTRAINT reports_profile_version_fkey;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'reports_profile_version_fkey'
@@ -237,6 +289,18 @@ DECLARE
     v_superseded_at timestamptz;
 BEGIN
     IF NEW.profile_version_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Una cita que no cambió no se vuelve a juzgar. La regla de vigencia se
+    -- comprueba al CITAR (o al mover la fecha del reporte), no cada vez que
+    -- alguien reenvía la fila entera. Sin esto, un reporte cuya versión se superó
+    -- DESPUÉS con fecha retroactiva, o en carrera con su propio INSERT, quedaba
+    -- sin poder recibir un PATCH de fila entera nunca más; lo midió la segunda
+    -- ronda de la revisión adversarial.
+    IF TG_OP = 'UPDATE'
+       AND NEW.profile_version_id IS NOT DISTINCT FROM OLD.profile_version_id
+       AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at THEN
         RETURN NULL;
     END IF;
 

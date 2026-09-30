@@ -4244,8 +4244,11 @@ SELECT 98, 'una versión publicada se puede borrar y la cita deja de resolver',
 -- `published`; si eso no se pudiera, la inmutabilidad habría comprado el
 -- congelamiento al precio de no poder versionar, que es el defecto de al lado.
 --
--- Seis casos, y el primero es el control positivo de los otros cinco. El sexto
--- no es una transición: es la puerta de al lado. `45003` es un trigger de
+-- Siete casos, y el primero es el control positivo de los otros seis. El
+-- sexto es la ventana invertida —superada antes de publicada—, que desde la
+-- decisión 16 de la `0027` rechaza un CHECK (23514); lo encontró la segunda
+-- ronda de la revisión. El séptimo no es una transición: es la puerta de al
+-- lado. `45003` es un trigger de
 -- UPDATE, así que un INSERT directo como `superseded` lo esquivaba, sin fecha ni
 -- persona de publicación, y la `0028` lo aceptaba como versión citable. Lo
 -- encontró la revisión adversarial del 2026-09-30; lo cierra el CHECK de la
@@ -4267,6 +4270,9 @@ SELECT * FROM (VALUES
     ('superada -> publicada, o sea resucitar',
      $s$UPDATE company_profiles SET status = 'published', superseded_at = NULL WHERE id = 'd0270000-0027-4027-8027-000000000020'$s$,
      '45001'),
+    ('superar una versión con fecha anterior a su publicación',
+     $s$UPDATE company_profiles SET status = 'superseded', superseded_at = published_at - interval '1 day' WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$,
+     '23514'),
     ('insertar directo una superada que nunca se publicó',
      $s$INSERT INTO company_profiles (organization_id, business_id, version, status, superseded_at)
         SELECT organization_id, id, 2, 'superseded', now() FROM businesses
@@ -4281,7 +4287,7 @@ INSERT INTO defect_report
 SELECT 99, 'la transición de estado de una versión no está acotada a la que el versionado necesita',
        EXISTS (SELECT 1 FROM h12_transicion_r WHERE estado IS DISTINCT FROM esperado),
        CASE WHEN NOT EXISTS (SELECT 1 FROM h12_transicion_r WHERE estado IS DISTINCT FROM esperado)
-            THEN 'la única transición sancionada entró y los otros cinco casos murieron con su código: ' ||
+            THEN 'la única transición sancionada entró y los otros seis casos murieron con su código: ' ||
                  (SELECT count(*) FROM h12_transicion_r) || ' casos'
             ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
                                                    ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
@@ -4466,7 +4472,7 @@ SELECT 104, 'un reporte puede citar la ficha de otra organización',
        estado IS DISTINCT FROM '23503',
        CASE WHEN estado IS NULL
             THEN 'ACEPTADO: el reporte de bob cita la versión publicada de alice'
-            WHEN estado = '23503' THEN 'rechazado por la FK compuesta contra el par de la versión, 23503'
+            WHEN estado = '23503' THEN 'rechazado por la FK compuesta contra la terna (organización, empresa, versión), 23503'
             ELSE 'rechazado con ' || estado || ', que no es la FK compuesta' END
   FROM (SELECT pg_temp.sqlstate_sin_huella(format($s$
             INSERT INTO reports (organization_id, business_id, title, profile_version_id)
@@ -4478,18 +4484,46 @@ SELECT 104, 'un reporte puede citar la ficha de otra organización',
 -- QUÉ CUIDA: que un reporte no cite un BORRADOR. La FK resolvería —la fila
 -- existe—, pero a una fila que se puede reescribir después, que es el modo de
 -- fallo de H1.2 con otras palabras. Exige 45004, el código de la `0028`.
+--
+-- DOS CASOS, Y EL SEGUNDO ES EL QUE MIDE LA RAMA. Un borrador sin fecha de
+-- publicación lo frenan dos cosas a la vez: la rama «es un borrador» y la regla
+-- de vigencia (`published_at` NULL). La segunda ronda de la revisión adversarial
+-- mostró que todos los borradores citados en la suite eran de ésos, así que
+-- borrar la rama de borrador dejaba todo verde. El esquema permite un borrador
+-- CON `published_at` y `published_by` —los CHECK los exigen para `published` y
+-- `superseded`, no los prohíben para `draft`—, y para ése la rama de borrador es
+-- lo único que frena la cita. El segundo caso le pone fecha de publicación al
+-- borrador y lo cita, dentro de una subtransacción que se deshace.
+CREATE TEMP TABLE h12_cita_borrador ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('citar un borrador sin fecha de publicación',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000003', 'Reporte del borrador',
+               'd0270000-0027-4027-8027-000000000030' FROM t$s$,
+     '45004'),
+    ('citar un borrador que tiene fecha y persona de publicación',
+     $s$DO $x$ BEGIN
+            UPDATE company_profiles
+               SET published_at = now() - interval '1 day', published_by = '11111111-1111-4111-8111-111111111111'
+             WHERE id = 'd0270000-0027-4027-8027-000000000030';
+            INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+            SELECT org_alice, 'd0270000-0027-4027-8027-000000000003', 'Reporte del borrador fechado',
+                   'd0270000-0027-4027-8027-000000000030' FROM t;
+        END $x$$s$,
+     '45004')
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_cita_borrador_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_cita_borrador;
+
 INSERT INTO defect_report
 SELECT 105, 'un reporte puede citar un borrador, que después se reescribe',
-       estado IS DISTINCT FROM '45004',
-       CASE WHEN estado IS NULL
-            THEN 'ACEPTADO: el reporte cita un borrador y la cita resuelve a un texto que puede cambiar'
-            WHEN estado = '45004' THEN 'rechazado por el trigger de la cita, 45004'
-            ELSE 'rechazado con ' || estado || ', que no es el trigger de la cita' END
-  FROM (SELECT pg_temp.sqlstate_sin_huella(format($s$
-            INSERT INTO reports (organization_id, business_id, title, profile_version_id)
-            VALUES (%L, 'd0270000-0027-4027-8027-000000000003', 'Reporte del borrador',
-                    'd0270000-0027-4027-8027-000000000030')
-        $s$, (SELECT org_alice FROM t))) AS estado) x;
+       EXISTS (SELECT 1 FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'citar un borrador murió con 45004, con y sin fecha de publicación'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || esperado || ')', '; ' ORDER BY caso)
+                                   FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado) END;
 
 -- ── 106 ──────────────────────────────────────────────────────────────────────
 -- LA MITAD (b) DE LA PUERTA H1.2, EN SQL: «un reporte generado cita un
@@ -4615,6 +4649,39 @@ $$;
 -- temprano cuando la cita no cambia—, y que sacar cualquiera de los dos dejaba el
 -- bloque verde. El reenvío de la misma cita sí dispara el trigger, así que sólo
 -- el `RETURN NEW` temprano lo deja pasar: ése es el que ahora lo mide.
+-- LOS DOS ÚLTIMOS CASOS, Y POR QUÉ LLEGARON EN LA SEGUNDA RONDA. El primero
+-- («cambiar la cita») muere también por la regla de vigencia: el reporte A es de
+-- «ahora» y la versión 2 se publicó un segundo después. Así que un guard que
+-- dejara RE-APUNTAR una cita (y sólo prohibiera quitarla) quedaba verde. El
+-- penúltimo re-apunta a una versión que SÍ estuvo vigente en la fecha nueva del
+-- reporte: la vigencia lo deja pasar, y lo único que lo frena es la cita fija.
+--
+-- El último es el control positivo del arreglo de la segunda ronda: una versión
+-- que se superó DESPUÉS de citada, con fecha retroactiva, deja la cita fuera de
+-- su ventana, y reenviar esa misma cita en un PATCH de fila entera tiene que
+-- seguir entrando. Antes el trigger la re-juzgaba en cada reenvío.
+--
+-- Fixture: «Alice Superada» gana su versión 2, publicada hace cinco días —la
+-- sucesora real de la superada—, con un reporte de hace dos que la cita, y
+-- después la versión 2 se supera con fecha retroactiva, hace tres días.
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0280000-0028-4028-8028-000000000022', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 2, 'draft' FROM t;
+UPDATE company_profiles
+   SET status = 'published', published_at = now() - interval '5 days', published_by = '11111111-1111-4111-8111-111111111111'
+ WHERE id = 'd0280000-0028-4028-8028-000000000022';
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-00000000000c', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte contra la superada',
+       'd0270000-0027-4027-8027-000000000020', now() - interval '7 days' FROM t;
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-00000000000d', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte contra la versión 2',
+       'd0280000-0028-4028-8028-000000000022', now() - interval '2 days' FROM t;
+UPDATE company_profiles
+   SET status = 'superseded', superseded_at = now() - interval '3 days'
+ WHERE id = 'd0280000-0028-4028-8028-000000000022';
+
 CREATE TEMP TABLE h12_cita_fija ON COMMIT DROP AS
 SELECT * FROM (VALUES
     ('cambiar la cita de un reporte guardado',
@@ -4631,6 +4698,12 @@ SELECT * FROM (VALUES
      NULL::text),
     ('poner la cita por primera vez en un reporte que no la tenía, con la versión vigente en su fecha',
      $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000010' WHERE id = 'd0280000-0028-4028-8028-000000000000'$s$,
+     NULL::text),
+    ('re-apuntar la cita a otra versión, moviendo la fecha a su vigencia',
+     $s$UPDATE reports SET profile_version_id = 'd0280000-0028-4028-8028-000000000022', created_at = now() - interval '4 days' WHERE id = 'd0280000-0028-4028-8028-00000000000c'$s$,
+     '45004'),
+    ('reenviar la cita de un reporte cuya versión se superó después, con fecha retroactiva',
+     $s$UPDATE reports SET title = 'Reporte contra la versión 2, otra vez', profile_version_id = 'd0280000-0028-4028-8028-000000000022' WHERE id = 'd0280000-0028-4028-8028-00000000000d'$s$,
      NULL::text)
 ) AS c(caso, sql, esperado);
 
@@ -4641,7 +4714,7 @@ INSERT INTO defect_report
 SELECT 107, 'la cita de un reporte guardado se puede cambiar o quitar',
        EXISTS (SELECT 1 FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado),
        CASE WHEN NOT EXISTS (SELECT 1 FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado)
-            THEN 'cambiar y quitar la cita murieron con 45004; retitular, reenviar la misma cita y completar un reporte sin cita entraron'
+            THEN 'cambiar, re-apuntar y quitar la cita murieron con 45004; retitular, reenviar la misma cita (también después de una superación retroactiva) y completar un reporte sin cita entraron'
             ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
                                                    ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
                                    FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado) END;
@@ -4669,9 +4742,14 @@ SELECT 108, 'el trigger de la cita rechaza también una versión superada, que e
 -- EL CONTROL POSITIVO DE LA DECISIÓN 3 de la `0028`: dar de baja una empresa
 -- cuyos reportes citan su ficha tiene que ENTRAR. La baja borra en una sentencia
 -- los reportes (cascade desde `businesses`) y la ficha (otro cascade desde
--- `businesses`), y la FK del reporte a la ficha es NO ACTION justamente para que
--- el orden de esos dos cascades no importe. Con RESTRICT, este bloque es el que
--- se pondría rojo.
+-- `businesses`), y tiene que entrar.
+--
+-- LO QUE ESTE BLOQUE NO MIDE, dicho porque la primera versión decía que sí: la
+-- elección entre `NO ACTION` y `RESTRICT` en la FK de la cita. Decía «con
+-- RESTRICT, este bloque es el que se pondría rojo», y es falso: medido con la FK
+-- en RESTRICT, las 117 aserciones quedan verdes (decisión 3 de la `0028`). Lo
+-- que sí lo pondría rojo es una FK en CASCADE que borrara reportes al borrar una
+-- versión, o un guard que confundiera esta baja con un borrado directo.
 --
 -- «Alice Publicada» tiene ahora dos versiones y tres reportes, dos de ellos con
 -- cita. Corre de verdad y cuenta después, en otra sentencia: la lección del 101.
@@ -4834,8 +4912,12 @@ RESET ROLE;
 -- reescriben texto y nunca cambian `profile_id`, así que borrar esa mitad del
 -- guard dejaba todo verde.
 --
--- Los dos últimos casos son el control positivo: entre dos borradores, mover
--- está permitido.
+-- El cuarto caso es la dirección contraria —meter una hija de un borrador EN la
+-- versión congelada—, que frena la comprobación del DESTINO. La primera versión
+-- de este bloque sólo sacaba, y la segunda ronda de la revisión mostró que
+-- cambiar el destino por el origen en esa comprobación dejaba todo verde. Los
+-- dos últimos casos son el control positivo: entre dos borradores, mover está
+-- permitido.
 INSERT INTO businesses (id, organization_id, name)
 SELECT 'd0280000-0028-4028-8028-000000000100', org_alice, 'Alice Borrador Dos' FROM t;
 INSERT INTO company_profiles (id, organization_id, business_id, version, status)
@@ -4856,6 +4938,9 @@ SELECT * FROM (VALUES
     ('sacar la evidencia de la superada hacia el objetivo de un borrador',
      $s$UPDATE profile_evidence SET objective_id = 'd0270000-0027-4027-8027-000000000036' WHERE id = 'd0270000-0027-4027-8027-000000000027'$s$,
      '45002'),
+    ('meter una oferta de un borrador en la superada',
+     $s$UPDATE profile_offers SET profile_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0270000-0027-4027-8027-000000000031'$s$,
+     '45002'),
     ('mover una oferta entre dos borradores',
      $s$UPDATE profile_offers SET profile_id = 'd0280000-0028-4028-8028-000000000110' WHERE id = 'd0270000-0027-4027-8027-000000000031'$s$,
      NULL::text),
@@ -4871,7 +4956,7 @@ INSERT INTO defect_report
 SELECT 112, 'una hija se puede sacar de una versión congelada moviéndola a un borrador',
        EXISTS (SELECT 1 FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado),
        CASE WHEN NOT EXISTS (SELECT 1 FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado)
-            THEN 'sacar oferta, objetivo y evidencia de la superada murió con 45002; mover entre borradores entró'
+            THEN 'sacar oferta, objetivo y evidencia de la superada, y meter una oferta en ella, murieron con 45002; mover entre borradores entró'
             ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
                                                    ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
                                    FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado) END;
