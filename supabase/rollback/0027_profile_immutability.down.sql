@@ -12,16 +12,24 @@
 -- dato que la `0027` agregó; todo lo demás son funciones y triggers, que no
 -- guardan nada.
 --
--- Volver a aplicar la `0027` después de esto funciona, con dos condiciones que
--- conviene saber. Las fechas perdidas se recuperan del `published_at` de la
--- versión sucesora, que es la fecha real en el flujo del producto; sin sucesora
--- publicada, la fecha es la de re-aplicación (decisión 15). Y si MIENTRAS la
--- `0027` estuvo revertida alguien escribió una fila `superseded` sin fecha ni
--- persona de publicación —la `0026` sola lo acepta—, la re-aplicación se niega
--- en el CHECK de la decisión 13, entera y sin dejar nada a medias. Es lo
--- correcto: `published_by` no se puede inventar. Hay que corregir esa fila a
--- mano. La primera versión de este encabezado decía «funciona» sin condiciones;
--- la segunda ronda de la revisión adversarial midió la segunda.
+-- Y POR ESO SE NIEGA A CORRER si hay versiones superadas, salvo que quien lo
+-- corre lo pida con todas las letras:
+--
+--     SET vulkan.perder_fechas_de_superacion = 'si';
+--
+-- La `0027` no reconstruye esas fechas al volver a aplicarse —se niega y nombra
+-- las filas (su decisión 15)—, porque tres rondas de la revisión adversarial
+-- mostraron que ninguna regla lo hace sin adivinar, y desde la `0028` una fecha
+-- adivinada decide qué reporte puede citar qué versión. Así que el camino es:
+--
+--   1. exportar `id, superseded_at` de las superadas;
+--   2. correr esto con el SET de arriba;
+--   3. para volver: `ALTER TABLE public.company_profiles ADD COLUMN
+--      superseded_at timestamptz`, poner las fechas del export, y re-aplicar la
+--      `0027`, que encuentra la columna con fechas y sigue.
+--
+-- El paso 3 empieza por la columna porque sin ella no hay dónde poner las
+-- fechas: este archivo la borra, y la `0027` al negarse deshace la suya.
 --
 -- Si la `0028` está aplicada, se revierte PRIMERO: su trigger de la cita confía
 -- en que una versión no borrador está congelada, y sin la `0027` esa confianza
@@ -33,6 +41,14 @@
 -- falla si un trigger todavía la usa, y ése es el punto — un CASCADE en un .down
 -- es la clase de instrucción que un día se lleva algo que nadie nombró. La
 -- constraint antes que la columna que mira, por la misma razón.
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.company_profiles WHERE status = 'superseded')
+       AND coalesce(current_setting('vulkan.perder_fechas_de_superacion', true), '') <> 'si' THEN
+        RAISE EXCEPTION 'hay versiones superadas: este .down borra su superseded_at y la 0027 no la vuelve a inventar. Exportar id y superseded_at primero; para seguir igual: SET vulkan.perder_fechas_de_superacion = ''si'';';
+    END IF;
+END $$;
 
 DROP TRIGGER IF EXISTS trg_company_profiles_immutable ON public.company_profiles;
 DROP TRIGGER IF EXISTS trg_profile_offers_immutable ON public.profile_offers;

@@ -68,11 +68,12 @@
 -- dos de los bordes son de la tercera: la ventana es semiabierta y ningún caso
 -- citaba en el instante exacto del relevo, así que las dos sobrevivían.
 --
--- Y dos arreglos que no viven en la suite, medidos a mano en la réplica:
--- re-aplicar esta migración sobre la FK de dos columnas de su primera versión
--- la deja de tres y borra el índice viejo; y el ida y vuelta de los dos `.down`
--- con una versión superada ya no estira su ventana (decisión 15 de la `0027`):
--- la cita fuera de vigencia se sigue rechazando después.
+-- Y un arreglo que no vive en la suite, medido a mano en la réplica: re-aplicar
+-- esta migración sobre la FK de dos columnas de su primera versión la deja de
+-- tres y borra el índice viejo. Las fechas de las superadas después de un
+-- `.down` ya no se reconstruyen en ningún lado —la `0027` se niega a aplicarse
+-- sin ellas (su decisión 15)—, así que la regla de vigencia nunca trabaja sobre
+-- una fecha adivinada.
 --
 -- Y la que la primera versión de este archivo decía cuidar y no cuidaba: con
 -- `ON DELETE RESTRICT` en vez de `NO ACTION`, NADA se pone rojo, porque no hay
@@ -207,6 +208,18 @@
 --   `/app/reports` en el #103, sin mergear, y tocarla acá es un conflicto seguro.
 
 BEGIN;
+
+-- Esta migración confía en la `0027`: el trigger de la cita lee `superseded_at`,
+-- que agrega ella, y la regla de vigencia sólo tiene sentido sobre versiones que
+-- el guard congela. En orden de glob siempre va después, pero aplicada a mano
+-- después de un `.down`, se podía aplicar sola —medido—, y entonces cada reporte
+-- con cita moría con 42703 al guardarse. Se niega.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
+                    WHERE version = '0027_profile_immutability') THEN
+        RAISE EXCEPTION 'la 0028 no se aplica sin la 0027: aplicar primero la 0027';
+    END IF;
+END $$;
 
 ALTER TABLE public.reports
     ADD COLUMN IF NOT EXISTS profile_version_id uuid;

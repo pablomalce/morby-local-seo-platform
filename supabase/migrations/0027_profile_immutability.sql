@@ -85,21 +85,14 @@
 --
 -- CUARTA RONDA, después de la tercera revisión: el guard que no distingue la
 -- baja de la empresa de un borrado directo cae en 101 y 109 (y el 109 ahora lo
--- dice con esas palabras; antes culpaba al orden de los cascades). Y el backfill
--- de la decisión 15, medido a mano con los dos escenarios de la tercera ronda
--- —un borrador que carga la fecha de publicación de una versión vieja, y
--- versiones publicadas fuera del orden numérico—: después de los dos `.down` y
--- la re-aplicación, las cuatro superadas recuperan su fecha exacta. Con la
--- versión anterior del backfill, una abortaba en el CHECK de la decisión 16 y
--- otra volvía a solapar ventanas.
+-- dice con esas palabras; antes culpaba al orden de los cascades).
 --
--- QUINTA RONDA: la cuarta revisión encontró que el arreglo de la tercera
--- —`published_at >` estricto— rompía los EMPATES, que el propio producto
--- produce al publicar y superar en una transacción. Con el orden
--- `(published_at, version)`, medido a mano sobre cuatro empresas —empate por el
--- camino del guard, dos publicaciones en el mismo instante, borrador fechado,
--- números fuera de orden—, las siete superadas recuperan su fecha idéntica
--- después de los dos `.down` y la re-aplicación.
+-- Y UNA COSA QUE SE DEJÓ DE HACER. Entre la segunda y la quinta ronda, la
+-- re-aplicación después del `.down` reconstruía `superseded_at` con una regla
+-- que cada ronda encontró equivocada de una manera nueva (decisión 15). No se
+-- arregló por quinta vez: se sacó. Medido a mano: con superadas sin fecha la
+-- re-aplicación se niega y nombra las filas; con las fechas puestas a mano,
+-- entra; y el `.down` se niega a borrarlas salvo que se lo pidan.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
@@ -252,21 +245,30 @@
 --    dos columnas por las que una hija cambia de versión (`profile_id` y, en la
 --    evidencia, `objective_id`), con su control positivo entre dos borradores.
 --
--- 15. RE-APLICAR DESPUÉS DEL .down. El `.down` borra `superseded_at` y deja las
---    filas en `superseded`, así que volver a aplicar esto moría en el CHECK de
---    la decisión 4 sobre cualquier base que alguna vez superó una versión.
---    Ahora, antes del CHECK, las superadas sin fecha la recuperan: el
---    `published_at` de la versión que las sucedió — la próxima PUBLICADA en el
---    tiempo, no el próximo número y no un borrador (ver el UPDATE). Es la fecha real en el flujo
---    del producto —publicar la 3 es pasar la 2 a `superseded` y la 3 a
---    `published` en una transacción (decisión 16 de la `0026`)—, y sólo si no
---    hay sucesora publicada cae a `now()`, que NO es la real. La primera versión
---    de este arreglo ponía `now()` siempre, y la segunda ronda de la revisión
---    adversarial midió qué costaba: la ventana de la superada se estiraba hasta
---    la re-aplicación y se solapaba con la de su sucesora, y la decisión 8 de la
---    `0028` —que la versión citada estuviera vigente— dejaba citar las dos. Y el
---    archivo entero va en una transacción, como la `0026`: sin ella, un fallo a
---    la mitad dejaba la columna puesta y sin guard.
+-- 15. RE-APLICAR DESPUÉS DEL .down: SE NIEGA SI HAY SUPERADAS SIN FECHA. El
+--    `.down` borra `superseded_at` y deja las filas en `superseded`. La
+--    información se pierde ahí, y ninguna regla la reconstruye sin adivinar: tres
+--    rondas seguidas de la revisión adversarial encontraron tres maneras en que
+--    la reconstrucción adivinaba mal —`now()` estiraba la ventana sobre la de la
+--    sucesora; un borrador con fecha o un número de versión fuera de orden daban
+--    la sucesora equivocada; y el orden DENTRO de un empate en el mismo instante
+--    es irrecuperable—, y cada arreglo del predicado abría la esquina siguiente.
+--    Hay una cuarta que nadie probó y que ningún predicado arregla: el guard deja
+--    superar una versión sin publicar otra en el mismo momento, y entonces ni la
+--    fecha de la sucesora es la real. Una fecha adivinada acá no es un dato menor:
+--    desde la `0028` decide qué reporte puede citar qué versión.
+--
+--    Así que esta migración NO reconstruye nada. Si encuentra versiones
+--    superadas sin fecha, se niega a aplicarse, nombra las filas, y dice el
+--    procedimiento: agregar la columna a mano, ponerles la fecha desde el export
+--    que el `.down` exige antes de correrse, y volver a aplicar. La columna hay
+--    que agregarla a mano porque la negativa deshace la transacción entera,
+--    columna incluida; la primera versión del mensaje pedía «ponerles la fecha»
+--    sin decirlo, y medido, era imposible de seguir. Y el `.down`, del otro lado, se niega a borrar fechas de superadas
+--    salvo que quien lo corre lo pida con todas las letras. Las dos puntas fallan
+--    cerradas; ninguna inventa. Y el archivo entero va en una transacción, como
+--    la `0026`: sin ella, un fallo a la mitad dejaba la columna puesta y sin
+--    guard.
 --
 -- 16. UNA VERSIÓN NO SE SUPERA ANTES DE PUBLICARSE, Y LO DICE UN CHECK:
 --    `superseded_at >= published_at`. Desde la `0028` esas dos fechas deciden
@@ -302,37 +304,24 @@ BEGIN;
 ALTER TABLE public.company_profiles
     ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
 
--- Decisión 15. Sólo encuentra filas después del `.down`; en una aplicación
--- normal la tabla no tiene superadas sin fecha y esto no toca nada. Corre ANTES
--- de crear los triggers de la sección 3, así que el guard no lo ve.
--- La sucesora es la PRÓXIMA PUBLICACIÓN en el tiempo, no el próximo número de
--- versión, y nunca un borrador. La tercera ronda de la revisión adversarial
--- midió las dos cosas: un borrador puede llevar `published_at` —el esquema no lo
--- prohíbe, el bloque 105 lo usa— y tomarlo como publicación devolvía una fecha
--- anterior a la real (o anterior a la propia publicación, y el CHECK de la
--- decisión 16 abortaba la re-aplicación); y nada ata el número de versión al
--- orden de publicación, así que buscar por `version >` devolvía la sucesora
--- equivocada o ninguna, y con `now()` volvía el solape.
---
--- Y el orden es `(published_at, version)` y no `published_at` solo: dentro de
--- una transacción `now()` no avanza, así que publicar la 2 y superar la 1 en la
--- misma transacción deja a las dos con el mismo instante. Con `published_at >`
--- estricto, la 2 no era sucesora de la 1 y la 1 caía a `now()`, que es el solape
--- otra vez. Lo midió la cuarta ronda, sobre el arreglo de la tercera: la
--- regresión era mía. El desempate por número de versión sólo decide entre
--- publicaciones del MISMO instante.
-UPDATE public.company_profiles p
-   SET superseded_at = coalesce(
-           (SELECT min(n.published_at)
-              FROM public.company_profiles n
-             WHERE n.organization_id = p.organization_id
-               AND n.business_id = p.business_id
-               AND n.id <> p.id
-               AND n.status <> 'draft'
-               AND (n.published_at, n.version) > (p.published_at, p.version)),
-           now())
- WHERE p.status = 'superseded'
-   AND p.superseded_at IS NULL;
+-- Decisión 15: nada se reconstruye. Sólo encuentra filas después del `.down`
+-- (o si alguien superó versiones con la `0026` sola); en una aplicación normal
+-- no hay superadas sin fecha y esto no hace nada.
+DO $$
+DECLARE
+    n   int;
+    ids text;
+BEGIN
+    SELECT count(*), string_agg(id::text, ', ' ORDER BY id)
+      INTO n, ids
+      FROM public.company_profiles
+     WHERE status = 'superseded' AND superseded_at IS NULL;
+    IF n > 0 THEN
+        RAISE EXCEPTION
+            'la 0027 no se aplica: % versiones superadas no tienen fecha de superacion (la borro el .down de la 0027) y esta migracion no la inventa. Fuera de esta migracion: ALTER TABLE public.company_profiles ADD COLUMN superseded_at timestamptz; ponerles la fecha desde el export previo al .down; y volver a aplicar. Filas: %',
+            n, ids;
+    END IF;
+END $$;
 
 COMMENT ON COLUMN public.company_profiles.superseded_at IS
     'Cuándo esta versión dejó de estar vigente. Dato SOBRE la versión, no contenido de la versión: es la única columna que el guard de inmutabilidad deja cambiar, y sólo junto con status -> superseded. Ver decisión 4 de la 0027.';
