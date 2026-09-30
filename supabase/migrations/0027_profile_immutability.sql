@@ -156,6 +156,20 @@
 --    hija nueva sin `profile_id` rompe las escrituras a la cara, que es la
 --    dirección correcta del error.
 --
+-- 11. NADIE EJECUTA ESTAS FUNCIONES A MANO: `REVOKE ... FROM PUBLIC, anon,
+--    authenticated, service_role`, que es la forma de la `0021`. La primera
+--    versión revocaba sólo `FROM PUBLIC`, como la `0015`, y MEDIDO en la réplica
+--    eso no alcanza: los default privileges de Supabase dan EXECUTE por nombre a
+--    los tres roles, así que `anon` podía llamar
+--    `company_profile_freeze_state` por RPC. Es `SECURITY DEFINER`: saltea RLS,
+--    contesta el estado de la ficha de CUALQUIER organización dado su id, y de
+--    paso le toma un `FOR SHARE`. Un oráculo entre tenants y un lock ajeno, a un
+--    POST de distancia. Los triggers siguen disparando sin ese privilegio
+--    —PostgreSQL no pide EXECUTE sobre la función de un trigger al dispararlo, y
+--    lo que ellas llaman adentro corre como su dueño—, y está medido: el bloque
+--    100 (`service_role` reescribiendo una publicada) sigue muriendo con 45001,
+--    y el 111 pone el control positivo con sesión. El 110 mide el privilegio.
+--
 -- QUÉ NO HACE
 --
 -- * No congela `business_services`. `profile_offers.service_id` apunta al
@@ -228,7 +242,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION public.company_profile_freeze_state(uuid, uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.company_profile_freeze_state(uuid, uuid)
+    FROM PUBLIC, anon, authenticated, service_role;
 
 COMMENT ON FUNCTION public.company_profile_freeze_state(uuid, uuid) IS
     'Estado de congelamiento de una versión de la ficha, para los guards de las hijas: gone (el padre se borra, es el cascade) / draft (libre) / frozen (rechazar). SECURITY DEFINER a propósito: ver decisión 5 de la 0027.';
@@ -298,7 +313,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION public.company_profiles_immutable() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.company_profiles_immutable()
+    FROM PUBLIC, anon, authenticated, service_role;
 
 DROP TRIGGER IF EXISTS trg_company_profiles_immutable ON public.company_profiles;
 CREATE TRIGGER trg_company_profiles_immutable
@@ -358,7 +374,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION public.profile_child_freeze_state(text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.profile_child_freeze_state(text, jsonb)
+    FROM PUBLIC, anon, authenticated, service_role;
 
 CREATE OR REPLACE FUNCTION public.profile_child_immutable()
 RETURNS trigger
@@ -426,7 +443,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION public.profile_child_immutable() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.profile_child_immutable()
+    FROM PUBLIC, anon, authenticated, service_role;
 
 DO $$
 DECLARE

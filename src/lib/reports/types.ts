@@ -104,6 +104,31 @@ export interface DataSourceHealth {
   note: string;
 }
 
+/**
+ * Contra qué versión de la ficha de empresa (`company_profiles`) se escribió el
+ * reporte. Es la mitad (b) de la puerta H1.2: «un reporte generado cita un
+ * version_id que resuelve a esa fila exacta».
+ *
+ * CUATRO ESTADOS Y NO UN `string | null`, porque un null no distingue las dos
+ * cosas que más importan distinguir: «esta empresa no tiene ficha publicada» y
+ * «no se pudo leer la ficha». La primera es un hecho sobre el cliente; la
+ * segunda es un fallo nuestro, y leerla como la primera sería presentar un
+ * error como un dato — el mismo defecto que `dataSourceHealth.note` tuvo con las
+ * fuentes en `error`.
+ *
+ * - `cited`: había una versión publicada y ésta es. `versionId` es el que la
+ *   base guarda en `reports.profile_version_id`, con FK compuesta (la `0028`).
+ * - `none`: con sesión, la lectura anduvo, y no hay versión publicada.
+ * - `demo`: reporte de demostración, sin organización: no hay nada que citar.
+ * - `error`: con sesión, la lectura falló. `reason` es el código, nunca el
+ *   mensaje de Postgres, que puede nombrar tablas y constraints.
+ */
+export type ProfileCitation =
+  | { status: "cited"; versionId: string; version: number; publishedAt: string }
+  | { status: "none" }
+  | { status: "demo" }
+  | { status: "error"; reason: string };
+
 export interface Report {
   id: string;
   businessId: string;
@@ -126,4 +151,6 @@ export interface Report {
   dataSourceHealth: DataSourceHealth;
   /** What engine generated this — heuristic, claude, openai, hybrid. */
   generator: "heuristic" | "claude" | "openai" | "hybrid";
+  /** Contra qué versión de la ficha se escribió. Ver `ProfileCitation`. */
+  profileCitation: ProfileCitation;
 }

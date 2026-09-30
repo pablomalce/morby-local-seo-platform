@@ -34,7 +34,7 @@ import type {
   ContentAsset,
   Review,
 } from "@/lib/types/core";
-import type { DataSourceHealth, Report } from "./types";
+import type { DataSourceHealth, ProfileCitation, Report } from "./types";
 
 /**
  * Client-side snapshot passed from the browser when the tenant lives only in localStorage
@@ -63,6 +63,34 @@ interface SnapshotResult {
   snapshot: BusinessSnapshot;
   /** True when the snapshot came from authenticated Supabase data. */
   authenticated: boolean;
+  /** Contra qué versión de la ficha se va a escribir el reporte. */
+  profileCitation: ProfileCitation;
+}
+
+/**
+ * La versión publicada de la ficha de ESTA empresa, o por qué no hay cita.
+ *
+ * Un error de lectura es `error` y NO `none`: «no tiene ficha publicada» es un
+ * hecho sobre el cliente y «no se pudo leer» es un fallo nuestro. Hoy, además,
+ * es el caso normal en hosted —la `0026` no está aplicada y `company_profiles`
+ * no existe, medido el 2026-09-30—, así que esta rama no es teórica: es la que
+ * corre hasta que alguien aplique las tres migraciones de la ficha.
+ *
+ * `reason` es el código de PostgREST o de Postgres y nunca el mensaje, que
+ * puede nombrar tablas y constraints; la lección del ensayo de publicación
+ * (#104). Y `maybeSingle` y no `single`: cero filas es `none`, no un error. Dos
+ * filas SÍ son un error —PGRST116—, y está bien que lo sean: el único parcial de
+ * la decisión 16 de la `0026` dice que no pueden existir, y si existieran
+ * elegir una sería citar al azar.
+ */
+function citationFrom(resp: {
+  data: unknown;
+  error: { code?: string } | null;
+}): ProfileCitation {
+  if (resp.error) return { status: "error", reason: resp.error.code || "sin-codigo" };
+  const row = resp.data as { id: string; version: number; published_at: string } | null;
+  if (!row) return { status: "none" };
+  return { status: "cited", versionId: row.id, version: row.version, publishedAt: row.published_at };
 }
 
 async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput): Promise<SnapshotResult | null> {
@@ -77,13 +105,22 @@ async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput)
       .eq("id", businessId)
       .single();
     if (biz) {
-      const [locsResp, svcsResp, cmpResp, revResp, contentResp, plansResp] = await Promise.all([
+      const [locsResp, svcsResp, cmpResp, revResp, contentResp, plansResp, profileResp] = await Promise.all([
         supabase.from("business_locations").select("*").eq("business_id", businessId),
         supabase.from("business_services").select("*").eq("business_id", businessId),
         supabase.from("competitors").select("*").eq("business_id", businessId),
         supabase.from("reviews").select("*").eq("business_id", businessId),
         supabase.from("content_assets").select("*").eq("business_id", businessId),
         supabase.from("platform_tasks").select("*").eq("business_id", businessId),
+        // H1.2: la versión PUBLICADA de la ficha de esta empresa, con el tenant
+        // en el filtro como toda consulta desde la `0004`. Ver `citationFrom`.
+        supabase
+          .from("company_profiles")
+          .select("id, version, published_at")
+          .eq("organization_id", biz.organization_id)
+          .eq("business_id", businessId)
+          .eq("status", "published")
+          .maybeSingle(),
       ]);
 
       const business = {
@@ -113,7 +150,7 @@ async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput)
         snap.plan = (plansResp.data ?? []).map(mapPlan);
       }
 
-      return { snapshot: snap, authenticated: true };
+      return { snapshot: snap, authenticated: true, profileCitation: citationFrom(profileResp) };
     }
   }
 
@@ -122,7 +159,11 @@ async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput)
   if (seed) {
     const locs = locations.filter((l) => l.businessId === seed.id);
     const svcs = services.filter((s) => s.businessId === seed.id);
-    return { snapshot: buildBusinessSnapshot(seed, locs, svcs), authenticated: false };
+    return {
+      snapshot: buildBusinessSnapshot(seed, locs, svcs),
+      authenticated: false,
+      profileCitation: { status: "demo" },
+    };
   }
 
   // Final fallback: tenant lives only in the client's localStorage (created via onboarding
@@ -136,7 +177,7 @@ async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput)
     if (clientSnapshot.content?.length) snap.content = clientSnapshot.content;
     if (clientSnapshot.competitors?.length) snap.competitors = clientSnapshot.competitors;
     if (clientSnapshot.reviews?.length) snap.reviews = clientSnapshot.reviews;
-    return { snapshot: snap, authenticated: false };
+    return { snapshot: snap, authenticated: false, profileCitation: { status: "demo" } };
   }
 
   return null;
@@ -363,12 +404,13 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
       ga4: google.ga4,
     },
     localeOverride: input.locale,
+    profileCitation: result.profileCitation,
   });
 
   // Persist to DB if authenticated.
   if (result.authenticated) {
     const supabase = await createSupabaseServerClient();
-    await supabase.from("reports").insert({
+    const { error: persistError } = await supabase.from("reports").insert({
       // Explicit. The snapshot already carries the tenant — it was read from
       // the same `businesses` row this report is about — so the trigger that
       // used to supply it was supplying a value that had been in scope all
@@ -381,7 +423,33 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
       locale: report.locale,
       summary: report.summary,
       content: JSON.stringify(report),
+      // La cita, para la base: FK compuesta a la versión (la `0028`). Sale de la
+      // MISMA variable que la cita del JSON de arriba, así que las dos no pueden
+      // decir cosas distintas.
+      //
+      // Y la clave va SÓLO cuando hay algo que citar, no como `null`. Es a
+      // propósito y es por el orden de despliegue: en una base sin la `0028` la
+      // columna no existe, y un `profile_version_id: null` rompería con 42703
+      // TODOS los reportes; así sólo rompe el de una empresa con versión
+      // publicada, que sin la `0026` no puede existir. Ver la `0028`, «QUÉ NO
+      // HACE».
+      ...(report.profileCitation.status === "cited"
+        ? { profile_version_id: report.profileCitation.versionId }
+        : {}),
     });
+
+    // Antes este error se tragaba: el reporte volvía a la pantalla y nadie se
+    // enteraba de que no se había guardado. Desde H1.2 eso es peor que antes,
+    // porque la puerta dice que el reporte generado CITA una versión que
+    // resuelve — y un reporte que no se guardó no cita nada, en silencio. Así
+    // que se levanta, con el código y no con el mensaje (que puede nombrar
+    // tablas), y la ruta lo convierte en su respuesta genérica.
+    //
+    // No rompe nada que ande: medido en hosted el 2026-09-30, `reports` tiene
+    // 5 filas, la última del 2026-09-05. El INSERT funciona hoy.
+    if (persistError) {
+      throw new Error(`reports: el reporte no se guardó (${persistError.code ?? "sin código"})`);
+    }
   }
 
   return report;
