@@ -5074,6 +5074,13 @@ SELECT 114, 'un reporte puede citar la ficha de otra empresa de su organización
 -- generar el reporte en la misma transacción cae exactamente ahí. La saliente es
 -- la superada del fixture (superada hace cinco días); la entrante, la versión 2
 -- de la misma empresa que armó el 107 (publicada hace cinco días).
+--
+-- Las dos fechas de los casos se LEEN de las filas y no se escriben: la cuarta
+-- ronda de la revisión mostró que, escritas como literales, los casos quedaban
+-- en el borde sólo porque tres `'5 days'` de tres lugares distintos
+-- coincidían, y mover cualquiera a `'6 days'` dejaba el borde sin medir y todo
+-- verde. Y la anti-vacuidad de abajo exige que la salida de una y la entrada de
+-- la otra sean el MISMO instante; si no, no es un relevo.
 INSERT INTO reports (id, organization_id, business_id, title, created_at)
 SELECT 'd0280000-0028-4028-8028-000000000302', org_alice,
        'd0270000-0027-4027-8027-000000000002', 'Reporte viejo, de antes de la ficha',
@@ -5099,17 +5106,32 @@ SELECT * FROM (VALUES
     ('un reporte escrito en el instante exacto del relevo citando la versión saliente',
      $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
         SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la saliente',
-               'd0270000-0027-4027-8027-000000000020', now() - interval '5 days' FROM t$s$,
+               'd0270000-0027-4027-8027-000000000020',
+               (SELECT superseded_at FROM company_profiles WHERE id = 'd0270000-0027-4027-8027-000000000020')
+          FROM t$s$,
      '45004'),
     ('un reporte escrito en el instante exacto del relevo citando la versión entrante',
      $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
         SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la entrante',
-               'd0280000-0028-4028-8028-000000000022', now() - interval '5 days' FROM t$s$,
+               'd0280000-0028-4028-8028-000000000022',
+               (SELECT published_at FROM company_profiles WHERE id = 'd0280000-0028-4028-8028-000000000022')
+          FROM t$s$,
      NULL::text),
     ('completar un reporte de hace siete días con la versión vigente entonces',
      $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0280000-0028-4028-8028-000000000303'$s$,
      NULL::text)
 ) AS c(caso, sql, esperado);
+
+DO $$
+DECLARE
+    sale timestamptz := (SELECT superseded_at FROM company_profiles WHERE id = 'd0270000-0027-4027-8027-000000000020');
+    entra timestamptz := (SELECT published_at FROM company_profiles WHERE id = 'd0280000-0028-4028-8028-000000000022');
+BEGIN
+    IF sale IS NULL OR entra IS NULL OR sale <> entra THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 115: la saliente sale el % y la entrante entra el %: no es un relevo.', sale, entra;
+    END IF;
+END
+$$;
 
 CREATE TEMP TABLE h12_vigencia_r ON COMMIT DROP AS
 SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_vigencia;

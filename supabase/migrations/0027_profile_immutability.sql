@@ -93,6 +93,14 @@
 -- versión anterior del backfill, una abortaba en el CHECK de la decisión 16 y
 -- otra volvía a solapar ventanas.
 --
+-- QUINTA RONDA: la cuarta revisión encontró que el arreglo de la tercera
+-- —`published_at >` estricto— rompía los EMPATES, que el propio producto
+-- produce al publicar y superar en una transacción. Con el orden
+-- `(published_at, version)`, medido a mano sobre cuatro empresas —empate por el
+-- camino del guard, dos publicaciones en el mismo instante, borrador fechado,
+-- números fuera de orden—, las siete superadas recuperan su fecha idéntica
+-- después de los dos `.down` y la re-aplicación.
+--
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +313,14 @@ ALTER TABLE public.company_profiles
 -- decisión 16 abortaba la re-aplicación); y nada ata el número de versión al
 -- orden de publicación, así que buscar por `version >` devolvía la sucesora
 -- equivocada o ninguna, y con `now()` volvía el solape.
+--
+-- Y el orden es `(published_at, version)` y no `published_at` solo: dentro de
+-- una transacción `now()` no avanza, así que publicar la 2 y superar la 1 en la
+-- misma transacción deja a las dos con el mismo instante. Con `published_at >`
+-- estricto, la 2 no era sucesora de la 1 y la 1 caía a `now()`, que es el solape
+-- otra vez. Lo midió la cuarta ronda, sobre el arreglo de la tercera: la
+-- regresión era mía. El desempate por número de versión sólo decide entre
+-- publicaciones del MISMO instante.
 UPDATE public.company_profiles p
    SET superseded_at = coalesce(
            (SELECT min(n.published_at)
@@ -313,7 +329,7 @@ UPDATE public.company_profiles p
                AND n.business_id = p.business_id
                AND n.id <> p.id
                AND n.status <> 'draft'
-               AND n.published_at > p.published_at),
+               AND (n.published_at, n.version) > (p.published_at, p.version)),
            now())
  WHERE p.status = 'superseded'
    AND p.superseded_at IS NULL;
