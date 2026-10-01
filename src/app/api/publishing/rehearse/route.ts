@@ -114,8 +114,21 @@ export async function POST(req: Request) {
       resultado.motivo === "no-aprobado" ? 409
       : resultado.motivo === "ledger-ilegible" ? 502
       : 500;
-    return NextResponse.json(resultado, { status: codigo });
+    // Sólo el motivo, no el `detalle`: el del transporte trae el mensaje crudo
+    // de Postgres, con nombre de constraint adentro. Medido por un escéptico el
+    // 2026-09-26 — llegaba al navegador. Se registra del lado del servidor,
+    // como hace `apiError`, y la pantalla no lo necesita para decir qué pasó.
+    if (resultado.motivo === "ledger-ilegible" && "detalle" in resultado) {
+      // eslint-disable-next-line no-console
+      console.error("[rehearse] ledger ilegible:", resultado.detalle);
+    }
+    return NextResponse.json({ ok: false, motivo: resultado.motivo }, { status: codigo });
   } catch (error) {
-    return apiError(error);
+    // El ZodError es lo único que un 400 describe bien: «lo que mandaste no
+    // sirve». Cualquier otra excepción es del servidor, y contestarla con 400
+    // hacía que la pantalla se culpara a sí misma —«el id no es un uuid»—
+    // cuando el que se rompió fue el servidor. Medido por un escéptico.
+    if (error instanceof z.ZodError) return apiError(error, 400);
+    return apiError(error, 500);
   }
 }
