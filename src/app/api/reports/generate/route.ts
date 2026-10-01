@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import type { ClientSnapshotInput } from "@/lib/reports/orchestrator";
@@ -9,6 +10,11 @@ import { businesses } from "@/lib/mock/universal";
 // PageSpeed Insights can take 15–40s for slow sites; give the serverless function
 // enough budget so the lookup isn't killed before its own 45s timeout. Vercel Hobby caps this at 60s.
 export const maxDuration = 60;
+
+// Como las otras siete rutas que leen la sesión: la cookie se lee en cada
+// petición, así que esto no se cachea ni corre en el edge.
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 const businessSchema = z.object({
   id: z.string(),
@@ -66,10 +72,43 @@ const schema = z.object({
  * Generate a structured executive report for a tenant.
  * Always runs the deterministic heuristic engine. Hydrates with Google Places data
  * when GOOGLE_PLACES_API_KEY is configured.
+ *
+ * QUÉ CIERRA ESTE GUARDIA (H0.8, decidido por Pablo el 2026-09-19: "cerrala")
+ *
+ * Hasta hoy esta ruta era la única de la aplicación sin ninguna línea de
+ * identidad, y la única que además sale a la red: cada llamada anónima gastaba
+ * Places y dos PageSpeed. El rate limit por IP la frenaba a diez por minuto,
+ * que es un tope para humanos y no para un bucle. La página que la llama ya
+ * no vive en `/reports` (fuera del middleware) sino en `/app/reports`, donde
+ * el middleware exige sesión; y la ruta exige la suya propia acá, ANTES del
+ * rate limit y de zod, para que un llamador sin sesión nunca llegue al
+ * trabajo. El `getUser()` del orquestador sigue decidiendo la FUENTE de datos
+ * (Supabase con sesión, semilla sin ella); éste decide si hay permiso, que es
+ * otra pregunta. El barrido (`precondicionRutas.test.ts`) mide las dos cosas:
+ * 401 sin sesión y cero fetch.
  */
 export async function POST(req: Request) {
-  // Public route that triggers real (billable) PageSpeed calls — rate-limit per IP.
-  // A report takes 20–40s, so 10/min is generous for humans but stops hammering.
+  // El guardia lleva su propio try, y no es decoración. En "modo demo" —sin
+  // las envs de Supabase, un estado que el middleware documenta y soporta—
+  // `createSupabaseServerClient()` las pasa como `undefined!` y `getUser()`
+  // TIRA. Sin este catch, un anónimo recibía un 500: exactamente lo que el
+  // barrido prohíbe ("un 500 sin sesión significa una de dos cosas, y las dos
+  // son el defecto"), y encima escondiendo la razón.
+  //
+  // Falla CERRADO, como `requireInternalSecret` cuando le falta el secreto: si
+  // no hay proveedor de identidad no hay nadie autenticado, y eso es un 401.
+  let user: { id: string } | null = null;
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data } = await supabase.auth.getUser();
+    user = data.user;
+  } catch {
+    user = null;
+  }
+  if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+
+  // Still rate-limited per IP: a report takes 20–40s and costs two PageSpeed
+  // calls, so 10/min is generous for a person and a brake for a loop.
   const limited = rateLimit(req, { limit: 10, windowMs: 60_000, key: "reports-generate" });
   if (limited) return limited;
 
