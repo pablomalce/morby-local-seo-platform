@@ -52,6 +52,22 @@ export async function exportMyData(): Promise<{ ok: boolean; data?: string; mess
 /**
  * GDPR right to erasure ("right to be forgotten").
  * Deletes everything tied to the user. Triggered ON DELETE CASCADE will clear all child rows.
+ *
+ * QUÉ IMPIDE: que le conteste «listo» a alguien a quien no se le borró nada.
+ * Hasta el 2026-10-01 ningún paso miraba su `error` y la función terminaba en
+ * `redirect("/")` pasara lo que pasara; medido en la réplica, con una versión
+ * publicada de la ficha los tres borrados morían con 23503 y la pantalla se
+ * leía como éxito. Ahora cada paso corta la cadena y vuelve `ok: false`.
+ *
+ * Un rechazo que SIGUE siendo correcto, y por eso tiene que llegar: si la
+ * persona publicó o verificó una versión de la ficha en una organización que
+ * NO es suya, sacarle esa membresía se rechaza al COMMIT (decisiones 4 y 18 de
+ * la `0026`). Quién publicó es parte de la versión; esa organización decide
+ * primero qué pasa con ella.
+ *
+ * Lo que este cambio no hace: deshacer un paso que ya pasó. Si las
+ * organizaciones propias se borraron y el paso 2 falla, ya no están, y el
+ * mensaje lo dice en vez de prometer que no se borró nada.
  */
 export async function deleteMyAccount(): Promise<{ ok: boolean; message?: string }> {
   const supabase = await createSupabaseServerClient();
@@ -60,23 +76,42 @@ export async function deleteMyAccount(): Promise<{ ok: boolean; message?: string
 
   const admin = createSupabaseAdminClient();
 
+  // El detalle de la base va al log y no a la pantalla: el DETAIL de un 23503
+  // nombra el uuid de otra organización.
+  const fallo = (paso: string, error: { code?: string; message: string }, yaBorrado: string) => {
+    console.error(`[deleteMyAccount] ${paso}: ${error.code ?? "?"} ${error.message}`);
+    return {
+      ok: false,
+      message: `Your account was not deleted: we could not ${paso}.${yaBorrado ? ` ${yaBorrado}` : ""}`,
+    };
+  };
+
   // 1. Delete all orgs where this user is the owner (cascades into businesses + children).
-  const { data: ownedMembers } = await admin
+  // Si no se puede leer cuáles son, no se sigue: con `data` en null el paso se
+  // salteaba en silencio y los pasos 2 y 3 dejaban las organizaciones sin dueño.
+  const { data: ownedMembers, error: ownedErr } = await admin
     .from("org_members")
     .select("organization_id")
     .eq("user_id", user.id)
     .eq("role", "owner");
+  if (ownedErr) return fallo("look up the organizations you own", ownedErr, "Nothing was deleted.");
 
-  if (ownedMembers && ownedMembers.length > 0) {
-    const orgIds = ownedMembers.map((m) => m.organization_id);
-    await admin.from("organizations").delete().in("id", orgIds);
+  const orgIds = (ownedMembers ?? []).map((m) => m.organization_id);
+  if (orgIds.length > 0) {
+    const { error: orgsErr } = await admin.from("organizations").delete().in("id", orgIds);
+    if (orgsErr) return fallo("delete the organizations you own", orgsErr, "Nothing was deleted.");
   }
+  const yaBorrado = orgIds.length > 0 ? "The organizations you owned were deleted." : "";
 
   // 2. Remove any remaining org_members rows referencing this user.
-  await admin.from("org_members").delete().eq("user_id", user.id);
+  const { error: membersErr } = await admin.from("org_members").delete().eq("user_id", user.id);
+  if (membersErr) {
+    return fallo("remove your memberships in other organizations", membersErr, yaBorrado);
+  }
 
   // 3. Delete the Supabase Auth user itself.
-  await admin.auth.admin.deleteUser(user.id);
+  const { error: userErr } = await admin.auth.admin.deleteUser(user.id);
+  if (userErr) return fallo("delete your login", userErr, yaBorrado);
 
   // 4. Bounce to the public homepage.
   redirect("/");
