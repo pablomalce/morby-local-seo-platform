@@ -39,7 +39,13 @@
 -- sola lo acepta—, la re-aplicación muere en el CHECK de la decisión 13 hasta
 -- que alguien complete esos dos datos. `published_by` tampoco se inventa.
 --
--- El permiso vale para UNA corrida: este archivo lo consume al terminar.
+-- El permiso vale para UNA corrida: este archivo lo consume al terminar. Y se
+-- niega si el permiso viene de un lugar donde el `RESET` no llega —`PGOPTIONS`,
+-- `ALTER ROLE ... SET`, `ALTER DATABASE ... SET`—, porque ése sobrevive al
+-- `RESET` y valdría para todas las corridas que vengan. Es la comprobación que
+-- el #107 le puso al `.down` de la `0026`, que lo midió el 2026-10-01: con
+-- `PGOPTIONS="-c vulkan.perder_la_ficha=si"`, después del `RESET` el valor sigue
+-- siendo `si`. Este archivo tenía el mismo hueco.
 --
 -- Si la `0028` está aplicada, se revierte PRIMERO: su trigger de la cita confía
 -- en que una versión no borrador está congelada, y sin la `0027` esa confianza
@@ -66,6 +72,9 @@ BEGIN;
 LOCK TABLE public.company_profiles IN ACCESS EXCLUSIVE MODE;
 
 DO $$
+DECLARE
+    v_permiso  text := coalesce(current_setting('vulkan.perder_fechas_de_superacion', true), '');
+    v_de_fondo text;
 BEGIN
     -- La `0028` primero: su trigger de la cita lee `superseded_at`, y sin esta
     -- columna cada reporte con cita muere con 42703. La guarda de la `0028` lo
@@ -83,9 +92,22 @@ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = 'public' AND table_name = 'company_profiles'
                   AND column_name = 'superseded_at')
-       AND EXISTS (SELECT 1 FROM public.company_profiles WHERE status = 'superseded')
-       AND coalesce(current_setting('vulkan.perder_fechas_de_superacion', true), '') <> 'si' THEN
-        RAISE EXCEPTION 'hay versiones superadas: este .down borra su superseded_at y la 0027 no la vuelve a inventar. Exportar id y superseded_at primero; para seguir igual: SET vulkan.perder_fechas_de_superacion = ''si'';';
+       AND EXISTS (SELECT 1 FROM public.company_profiles WHERE status = 'superseded') THEN
+        IF v_permiso <> 'si' THEN
+            RAISE EXCEPTION 'hay versiones superadas: este .down borra su superseded_at y la 0027 no la vuelve a inventar. Exportar id y superseded_at primero; para seguir igual: SET vulkan.perder_fechas_de_superacion = ''si'';';
+        END IF;
+
+        -- De dónde viene el permiso, igual que en el `.down` de la `0026`.
+        -- `RESET` lleva el valor al que tendría la sesión sin ningún SET: si ése
+        -- ya es 'si', el permiso vino de PGOPTIONS o de un ALTER ROLE/DATABASE
+        -- SET, el RESET del final no lo consume y valdría para siempre. Se lee y
+        -- se devuelve el valor como estaba.
+        RESET vulkan.perder_fechas_de_superacion;
+        v_de_fondo := coalesce(current_setting('vulkan.perder_fechas_de_superacion', true), '');
+        PERFORM set_config('vulkan.perder_fechas_de_superacion', v_permiso, false);
+        IF v_de_fondo = 'si' THEN
+            RAISE EXCEPTION 'el permiso vulkan.perder_fechas_de_superacion viene de PGOPTIONS o de un ALTER ROLE/DATABASE SET: sobrevive al RESET y valdria para todas las corridas. Sacarlo de ahi y darlo con SET en esta sesion.';
+        END IF;
     END IF;
 END $$;
 

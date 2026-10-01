@@ -36,8 +36,8 @@
 -- `ALTER ROLE ... SET`, `ALTER DATABASE ... SET`—, porque ése sobrevive al
 -- `RESET` y valdría para todas las corridas que vengan. Medido el 2026-10-01: con
 -- `PGOPTIONS="-c vulkan.perder_la_ficha=si"`, después del `RESET` el valor
--- sigue siendo `si`. El `.down` de la `0027` consume su permiso igual y tiene
--- ese mismo hueco; es otro frente.
+-- sigue siendo `si`. El `.down` de la `0027` tenía ese mismo hueco; desde el
+-- #106 hace esta misma comprobación.
 --
 -- LAS NEGATIVAS SE PROTEGEN SOLAS, igual que en el `.down` de la `0027`: el
 -- `ON_ERROR_STOP` es del archivo y no de quien lo invoca, así que con un
