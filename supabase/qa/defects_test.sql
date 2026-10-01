@@ -1,4 +1,4 @@
--- A hundred and seventeen isolation checks against the Growth OS schema — executable.
+-- A hundred and twenty isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -3775,12 +3775,22 @@ SELECT 91, 'una versión superada no puede convivir con la publicada',
 -- Y se publica sobre el negocio de BOB, no el de alice, porque el negocio de alice
 -- ya tiene su versión 5 publicada: el único parcial de la decisión 16 se dispararía
 -- primero y este bloque informaría 23505 en vez del 23503 que dice medir.
+--
+-- EL `SET CONSTRAINTS` ES LO QUE HACE EL COMMIT, y desde la decisión 18 de la
+-- `0026` hace falta: la FK es `DEFERRABLE INITIALLY DEFERRED`, así que el INSERT
+-- solo PASA y la negativa llega al COMMIT. Este archivo termina en ROLLBACK y
+-- nunca llega a uno, así que sin esta línea el bloque informaría «aceptado» sobre
+-- un esquema que rechaza. `SET CONSTRAINTS ... IMMEDIATE` dispara en ese momento
+-- las comprobaciones pendientes, que es exactamente lo que el COMMIT hace. Y
+-- `sqlstate_sin_huella` lo deshace con todo lo demás: el modo vuelve a diferido
+-- cuando la subtransacción se revierte.
 CREATE TEMP TABLE h1_publica_ajeno ON COMMIT DROP AS
 SELECT pg_temp.sqlstate_sin_huella(format($sql$
     INSERT INTO company_profiles (id, organization_id, business_id, version, status,
                                   published_at, published_by)
     VALUES ('d0260000-0026-4026-8026-0000000000d4', %L,
-            'd0260000-0026-4026-8026-0000000000b1', 8, 'published', now(), %L)
+            'd0260000-0026-4026-8026-0000000000b1', 8, 'published', now(), %L);
+    SET CONSTRAINTS ALL IMMEDIATE
 $sql$, (SELECT org_bob FROM t), 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee')) AS estado;
 
 INSERT INTO defect_report
@@ -4415,10 +4425,23 @@ SELECT 102, 'la excepción de H1.4 deja editable la evidencia de una versión pu
 -- publicada era reescribible y en verde. Se llama a la función directamente
 -- porque el defecto no es alcanzable desde una tabla que hoy existe: es la tabla
 -- de mañana.
+--
+-- EL `SET CONSTRAINTS` ANTES DEL `ALTER` ES EL PRECIO (d) DE LA DECISIÓN 18 DE LA
+-- `0026`. Desde que `published_by` se comprueba al COMMIT, cada versión que este
+-- archivo escribió arriba deja en cola su comprobación, y un `ALTER TABLE` sobre
+-- una tabla con eventos pendientes muere: medido el 2026-10-01, al traer el #107,
+-- este caso dio 55006 —`cannot ALTER TABLE ... because it has pending trigger
+-- events`— en vez del 45001. Dispararlas es lo que haría el
+-- COMMIT, igual que en el bloque 92. Va ADENTRO de la sentencia que se mide, y
+-- no suelto en el archivo: `sqlstate_sin_huella` revierte la subtransacción y
+-- con ella el modo, así que cada constraint vuelve a SU modo para los bloques de
+-- después. Devolverlo a mano con `SET CONSTRAINTS ALL DEFERRED` taparía una FK
+-- que una mutación volviera `INITIALLY IMMEDIATE` —el #107 lo midió—.
 CREATE TEMP TABLE h12_forma ON COMMIT DROP AS
 SELECT * FROM (VALUES
     ('una columna nueva nace congelada',
      $s$DO $x$ BEGIN
+            SET CONSTRAINTS ALL IMMEDIATE;
             ALTER TABLE public.company_profiles ADD COLUMN qa_columna_nueva text;
             UPDATE public.company_profiles
                SET status = 'superseded', superseded_at = now(),
@@ -5228,10 +5251,302 @@ SELECT 117, 'el trigger de la cita depende de lo que ve quien escribe: un rol ci
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 118 a 120. La baja de una organización con su ficha publicada — CERRADO por
+-- la decisión 18 de la 0026
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que dar de baja a un cliente sea posible aunque haya publicado su
+-- ficha, sin que deje de valer que una versión no puede quedar firmada por alguien
+-- que no es miembro.
+--
+-- Medido el 2026-09-30 y el 2026-10-01, revisando H1.2: con una versión publicada,
+-- `DELETE FROM organizations` moría con 23503 en
+-- `company_profiles_published_by_member_fkey` y, con esa FK sacada, en
+-- `profile_evidence_verified_by_member_fkey`. Ningún bloque borraba nunca una
+-- organización, así que los 94 estaban en verde con la baja imposible. Y
+-- `deleteMyAccount` se tragaba el error: la persona veía éxito.
+--
+-- FIXTURES PROPIAS: olga (dueña, por el alta real de `handle_new_user`), víctor
+-- (editor, verifica la evidencia) e inés (lectora, no firma nada), los tres en la
+-- MISMA organización. Ningún otro bloque las toca, y los tres bloques deshacen lo
+-- que hacen: la organización sigue entera para el siguiente.
+--
+-- LA FICHA SE PUBLICA DESPUÉS DE CARGAR LAS HIJAS, no al revés: es el orden en que
+-- una ficha se publica de verdad, y el único que sigue valiendo con el guard de
+-- inmutabilidad de H1.2 (#106), que rechaza hijas nuevas en una versión publicada.
+--
+-- CORREN COMO `service_role`, que es el rol con el que `deleteMyAccount` borra
+-- (`createSupabaseAdminClient`): la vía real (R9). La única excepción es el borrado
+-- desde `auth.users` del 119, dicha ahí.
+--
+-- Y CADA UNO DISPARA LO QUE COMPROBARÍA EL COMMIT, por lo que dice el bloque 92:
+-- este archivo termina en ROLLBACK, y sin `SET CONSTRAINTS ALL IMMEDIATE` las
+-- comprobaciones diferidas no correrían nunca —el 118 pasaría sin haber mirado y
+-- el 119 no vería ninguna negativa—.
+
+INSERT INTO auth.users (id, email) VALUES
+    ('d0260000-0026-4026-8026-000000000a01', 'olga@example.test'),
+    ('d0260000-0026-4026-8026-000000000a02', 'victor@example.test'),
+    ('d0260000-0026-4026-8026-000000000a03', 'ines@example.test');
+
+CREATE TEMP TABLE baja AS
+SELECT organization_id AS org
+  FROM org_members
+ WHERE user_id = 'd0260000-0026-4026-8026-000000000a01' AND role = 'owner';
+
+INSERT INTO org_members (organization_id, user_id, role)
+SELECT org, 'd0260000-0026-4026-8026-000000000a02'::uuid, 'editor' FROM baja
+UNION ALL
+SELECT org, 'd0260000-0026-4026-8026-000000000a03'::uuid, 'viewer' FROM baja;
+
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0260000-0026-4026-8026-000000000a10', org, 'Baja Olga Co' FROM baja;
+INSERT INTO business_services (id, organization_id, business_id, slug, name)
+SELECT 'd0260000-0026-4026-8026-000000000a11', org,
+       'd0260000-0026-4026-8026-000000000a10', 'olga-servicio', 'Servicio de Olga' FROM baja;
+
+-- La ficha ENTERA: la versión y sus siete hijas, el ICP apuntando a su segmento,
+-- la oferta a su servicio, la evidencia `manual` verificada por víctor y una fila
+-- de scrape de `competitors` colgada del rival curado. Cada FK del subárbol tiene
+-- algo que comprobar cuando la cascada pasa.
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0260000-0026-4026-8026-000000000a20', org,
+       'd0260000-0026-4026-8026-000000000a10', 1, 'draft' FROM baja;
+INSERT INTO profile_offers (organization_id, profile_id, service_id, name)
+SELECT org, 'd0260000-0026-4026-8026-000000000a20',
+       'd0260000-0026-4026-8026-000000000a11', 'Oferta de Olga' FROM baja;
+INSERT INTO profile_markets (organization_id, profile_id, country)
+SELECT org, 'd0260000-0026-4026-8026-000000000a20', 'SE' FROM baja;
+INSERT INTO profile_segments (id, organization_id, profile_id, name)
+SELECT 'd0260000-0026-4026-8026-000000000a21', org,
+       'd0260000-0026-4026-8026-000000000a20', 'Segmento de Olga' FROM baja;
+INSERT INTO profile_competitors (id, organization_id, profile_id, name)
+SELECT 'd0260000-0026-4026-8026-000000000a22', org,
+       'd0260000-0026-4026-8026-000000000a20', 'Rival de Olga' FROM baja;
+INSERT INTO profile_icp (organization_id, profile_id, definition, primary_segment_id)
+SELECT org, 'd0260000-0026-4026-8026-000000000a20', 'ICP de Olga',
+       'd0260000-0026-4026-8026-000000000a21' FROM baja;
+INSERT INTO profile_objectives (id, organization_id, profile_id, statement, kind)
+SELECT 'd0260000-0026-4026-8026-000000000a23', org,
+       'd0260000-0026-4026-8026-000000000a20', 'Somos los mas rapidos', 'claim' FROM baja;
+INSERT INTO profile_evidence (organization_id, objective_id, kind, url, verified_at, verified_by)
+SELECT org, 'd0260000-0026-4026-8026-000000000a23', 'manual', 'https://example.org/olga',
+       now(), 'd0260000-0026-4026-8026-000000000a02' FROM baja;
+INSERT INTO competitors (organization_id, business_id, name, profile_competitor_id)
+SELECT org, 'd0260000-0026-4026-8026-000000000a10', 'Rival scrapeado',
+       'd0260000-0026-4026-8026-000000000a22' FROM baja;
+
+UPDATE company_profiles
+   SET status = 'published', published_at = now(),
+       published_by = 'd0260000-0026-4026-8026-000000000a01'
+ WHERE id = 'd0260000-0026-4026-8026-000000000a20';
+
+-- Anti-vacuidad: «no quedó nada» sobre una organización que no tenía nada no
+-- mide una baja. Cada tabla que la fixture dice poblar tiene que tener su fila,
+-- la versión tiene que estar PUBLICADA por olga y la evidencia VERIFICADA por
+-- víctor —sin eso el 119 pediría una negativa a una FK que no tiene qué
+-- comprobar—. Y se dispara lo que el COMMIT comprobaría: una fixture que violara
+-- una FK diferida corta la corrida acá, y no aparece como un rojo del 118.
+--
+-- EN UNA SUBTRANSACCIÓN, Y NO CON UN `SET CONSTRAINTS ALL DEFERRED` DESPUÉS. La
+-- primera versión de este bloque hacía eso, y una mutación lo midió: `ALL
+-- DEFERRED` difiere TODA constraint diferible por el resto de la transacción,
+-- incluida una `DEFERRABLE INITIALLY IMMEDIATE`, así que la mutación que le
+-- devolvía a la FK su comprobación inmediata —la que traba la baja— sobrevivía
+-- con los 97 checks de entonces en verde. Revertir la subtransacción devuelve a
+-- cada constraint SU modo, no el que alguien eligió para todas.
+DO $$
+BEGIN
+    BEGIN
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION 'qa: devolver el modo de las constraints' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        NULL;
+    END;
+END
+$$;
+
+DO $$
+DECLARE
+    o      uuid := (SELECT org FROM baja);
+    vacias text;
+BEGIN
+    SELECT string_agg(tabla, ', ' ORDER BY tabla) INTO vacias
+      FROM (VALUES
+            ('org_members',         (SELECT count(*) FROM org_members WHERE organization_id = o) = 3),
+            ('businesses',          (SELECT count(*) FROM businesses WHERE organization_id = o) = 1),
+            ('business_services',   (SELECT count(*) FROM business_services WHERE organization_id = o) = 1),
+            ('competitors',         (SELECT count(*) FROM competitors WHERE organization_id = o
+                                                                       AND profile_competitor_id IS NOT NULL) = 1),
+            ('company_profiles',    (SELECT count(*) FROM company_profiles WHERE organization_id = o
+                                                                            AND status = 'published'
+                                                                            AND published_by = 'd0260000-0026-4026-8026-000000000a01') = 1),
+            ('profile_offers',      (SELECT count(*) FROM profile_offers WHERE organization_id = o) = 1),
+            ('profile_markets',     (SELECT count(*) FROM profile_markets WHERE organization_id = o) = 1),
+            ('profile_segments',    (SELECT count(*) FROM profile_segments WHERE organization_id = o) = 1),
+            ('profile_competitors', (SELECT count(*) FROM profile_competitors WHERE organization_id = o) = 1),
+            ('profile_icp',         (SELECT count(*) FROM profile_icp WHERE organization_id = o
+                                                                       AND primary_segment_id IS NOT NULL) = 1),
+            ('profile_objectives',  (SELECT count(*) FROM profile_objectives WHERE organization_id = o) = 1),
+            ('profile_evidence',    (SELECT count(*) FROM profile_evidence WHERE organization_id = o
+                                                                            AND verified_by = 'd0260000-0026-4026-8026-000000000a02') = 1)
+           ) AS f(tabla, ok)
+     WHERE NOT ok;
+    IF vacias IS NOT NULL THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 118 a 120 no pobló: %', vacias;
+    END IF;
+END
+$$;
+
+-- Corre una sentencia con un rol, dispara lo que el COMMIT comprobaría, y la
+-- DESHACE, para que el bloque siguiente encuentre la organización entera.
+-- Devuelve `SQLSTATE | mensaje` si murió. Si pasó, devuelve 'paso' y, con
+-- `p_org`, cuántas tablas miró y cuáles de esas todavía tienen filas de la
+-- organización.
+--
+-- EL DENOMINADOR DE «NO QUEDÓ NADA» SALE DEL CATÁLOGO, no de una lista: toda
+-- tabla de `public` con `organization_id`, más la organización misma. Una tabla
+-- que la baja dejara colgada aparece acá aunque nadie la haya nombrado (R14). Y
+-- se cuenta como `postgres` —después del `RESET ROLE`— porque la pregunta es qué
+-- quedó en la base, no qué alcanza a ver el rol que borró.
+--
+-- Cómo deshace: como `sqlstate_sin_huella()`, con una excepción propia que sólo
+-- atrapa el handler de adentro. El rol, el modo de las constraints y las filas
+-- vuelven con la subtransacción.
+CREATE OR REPLACE FUNCTION pg_temp.al_commit(p_sql text, p_rol text, p_org uuid DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    r       record;
+    n       bigint;
+    miradas int  := 0;
+    restos  text := '';
+    salida  text;
+BEGIN
+    BEGIN
+        EXECUTE format('SET LOCAL ROLE %I', p_rol);
+        EXECUTE p_sql;
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RESET ROLE;
+
+        IF p_org IS NULL THEN
+            salida := 'paso';
+        ELSE
+            FOR r IN
+                SELECT c.relname
+                  FROM pg_class c
+                  JOIN pg_namespace s ON s.oid = c.relnamespace AND s.nspname = 'public'
+                  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'organization_id'
+                                     AND NOT a.attisdropped
+                 WHERE c.relkind IN ('r', 'p')
+                 ORDER BY c.relname
+            LOOP
+                EXECUTE format('SELECT count(*) FROM public.%I WHERE organization_id = $1', r.relname)
+                   INTO n USING p_org;
+                miradas := miradas + 1;
+                IF n > 0 THEN restos := restos || r.relname || '=' || n || ' '; END IF;
+            END LOOP;
+            SELECT count(*) INTO n FROM public.organizations WHERE id = p_org;
+            IF n > 0 THEN restos := restos || 'organizations=' || n || ' '; END IF;
+            salida := format('paso; %s tablas; quedaron: [%s]', miradas, trim(restos));
+        END IF;
+
+        RAISE EXCEPTION 'qa: deshacer la baja' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN salida;
+    END;
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' | ' || SQLERRM;
+END
+$$;
+
+-- ── 118 ──────────────────────────────────────────────────────────────────────
+-- La baja de la organización entera. Lo que la persona pide con «borrar mi
+-- cuenta» es exactamente esto: el primer paso de `deleteMyAccount`.
+--
+-- Exige DOS cosas y las dos hacen falta: que pase —el defecto medido— y que no
+-- quede ni una fila de la organización en ninguna tabla con `organization_id`. Un
+-- arreglo que sacara la FK de la ficha de la cascada, o que dejara la ficha
+-- huérfana para que el borrado pase, estaría en verde en la primera mitad.
+--
+-- Y el número de tablas miradas tiene piso: con cero —un catálogo que no
+-- encontró nada— «no quedó nada» es cero sobre cero. Doce son las que la fixture
+-- puebla; el catálogo tiene más, y alcanza con que no tenga menos.
+SELECT set_config('qa.b118', pg_temp.al_commit(
+           format('DELETE FROM organizations WHERE id = %L', (SELECT org FROM baja)),
+           'service_role', (SELECT org FROM baja)), true);
+
+INSERT INTO defect_report
+SELECT 118, 'una organización con la ficha publicada no se puede dar de baja, o la baja deja filas',
+       NOT (resultado ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
+            AND substring(resultado FROM '^paso; ([0-9]+) tablas')::int >= 12),
+       CASE WHEN resultado ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
+                 AND substring(resultado FROM '^paso; ([0-9]+) tablas')::int >= 12
+            THEN 'la baja pasó al COMMIT como service_role: organización, tres membresías, negocio, ' ||
+                 'ficha publicada y sus siete hijas; ' || resultado
+            ELSE 'la baja devolvió: ' || resultado END
+  FROM (SELECT current_setting('qa.b118') AS resultado) x;
+
+-- ── 119 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL DE QUE LA DECISIÓN 4 SIGUE VALIENDO PARA UNA PERSONA. Sin este
+-- bloque, sacar las dos FK pondría el 118 en verde: la baja pasaría, y una versión
+-- quedaría firmada por alguien que ya no es miembro.
+--
+-- Tres bajas sueltas, con la organización y la versión en pie, y las tres tienen
+-- que morir con 23503 NOMBRANDO SU FK —un 23503 de otra FK, o un 23514 de un
+-- `SET NULL` que choca con el CHECK, no es la negativa que se mide—:
+--
+--   a. la membresía de olga, que publicó (el paso 2 de `deleteMyAccount`);
+--   b. la de víctor, que verificó la evidencia;
+--   c. olga desde `auth.users`, que cae por cascada en su membresía. Éste corre
+--      como `postgres` y no como `service_role`: en hosted lo borra GoTrue con
+--      `supabase_auth_admin`, que en esta réplica `postgres` no puede asumir, y
+--      `service_role` no tiene DELETE sobre `auth.users`. Lo que se mide es la
+--      cascada a la membresía, que es la misma la dispare quien la dispare.
+SELECT set_config('qa.b119a', pg_temp.al_commit(format(
+           'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+           (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a01'), 'service_role'), true);
+SELECT set_config('qa.b119b', pg_temp.al_commit(format(
+           'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+           (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a02'), 'service_role'), true);
+SELECT set_config('qa.b119c', pg_temp.al_commit(
+           'DELETE FROM auth.users WHERE id = ''d0260000-0026-4026-8026-000000000a01''',
+           'postgres'), true);
+
+INSERT INTO defect_report
+SELECT 119, 'se puede borrar a UN miembro que publicó o verificó mientras su versión sigue en pie',
+       NOT (a LIKE '23503 |%"company_profiles_published_by_member_fkey"%'
+            AND b LIKE '23503 |%"profile_evidence_verified_by_member_fkey"%'
+            AND c LIKE '23503 |%"company_profiles_published_by_member_fkey"%'),
+       CASE WHEN a LIKE '23503 |%"company_profiles_published_by_member_fkey"%'
+                 AND b LIKE '23503 |%"profile_evidence_verified_by_member_fkey"%'
+                 AND c LIKE '23503 |%"company_profiles_published_by_member_fkey"%'
+            THEN 'las tres bajas sueltas mueren al COMMIT con 23503 nombrando su FK: ' ||
+                 'olga (published_by), víctor (verified_by) y olga desde auth.users'
+            ELSE 'olga: ' || a || ' / víctor: ' || b || ' / olga desde auth.users: ' || c END
+  FROM (SELECT current_setting('qa.b119a') AS a, current_setting('qa.b119b') AS b,
+               current_setting('qa.b119c') AS c) x;
+
+-- ── 120 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 119: inés no publicó ni verificó nada, y su baja PASA.
+-- Sin este bloque, un esquema que rechazara toda baja de miembro —un trigger que
+-- la prohíba, una FK nueva que la trabe— pondría el 119 en verde por el motivo
+-- equivocado.
+SELECT set_config('qa.b120', pg_temp.al_commit(format(
+           'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+           (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a03'), 'service_role'), true);
+
+INSERT INTO defect_report
+SELECT 120, 'el esquema también rechaza la baja de un miembro que no firmó nada',
+       current_setting('qa.b120') <> 'paso',
+       CASE WHEN current_setting('qa.b120') = 'paso'
+            THEN 'la baja de inés pasó al COMMIT: el 119 rechaza a quien firmó, no a cualquiera'
+            ELSE 'la baja de inés murió: ' || current_setting('qa.b120') END;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and seventeen checks were written, so a hundred and
--- seventeen rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and twenty checks were written, so a hundred and
+-- twenty rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -5247,8 +5562,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 117 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 117 checks recorded a result.', checks;
+    IF checks <> 120 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 120 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -5259,11 +5574,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 117 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 120 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 117 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 120 checks green: the schema prevents every one of them.';
 END
 $$;
 

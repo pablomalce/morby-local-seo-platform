@@ -44,8 +44,9 @@
 --
 -- CÓMO FALLA
 --
--- Rojo en los bloques 77 a 93 de `supabase/qa/defects_test.sql`. Los dos que
--- son la puerta de H1.1:
+-- Rojo en los bloques 77 a 94 y 118 a 120 de `supabase/qa/defects_test.sql`
+-- (del 95 al 117 son de la `0027` y la `0028`). Los dos que son la puerta de
+-- H1.1:
 --
 --   * el 79 intenta el INSERT cruzado en LAS DIEZ relaciones del subárbol —las
 --     siete hijas, el puntero de `competitors`, la FK de tres columnas del ICP y
@@ -85,6 +86,21 @@
 --     UPDATE de una fila que la policy esconde no falla, afecta cero filas y
 --     devuelve éxito. Ver decisión 17 para lo que este bloque NO cierra.
 --
+-- Y los tres de la BAJA, que llegaron después de que la revisión de H1.2 midiera
+-- que dar de baja a un cliente con la ficha publicada era imposible (decisión
+-- 18):
+--
+--   * el 118 borra, como `service_role` —el rol de `deleteMyAccount`—, una
+--     organización con la ficha ENTERA poblada y publicada, dispara lo que el
+--     COMMIT comprueba, y exige que pase y que no quede ni una fila de esa
+--     organización en ninguna tabla que tenga `organization_id`;
+--   * el 119 exige 23503, nombrando la FK, a borrar UNA membresía que publicó, UNA
+--     que verificó, y a la persona que publicó desde `auth.users`, con la versión
+--     en pie: la decisión 4 sigue valiendo para una persona;
+--   * el 120 es su control positivo: borrar a un miembro que no publicó ni
+--     verificó nada pasa. Sin él, un esquema que rechazara toda baja de miembro
+--     pondría el 119 en verde.
+--
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES DE PRODUCTO
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +130,11 @@
 --    `company_profiles_published_is_complete` exige fecha y persona. Precedente
 --    exacto: `publications_published_is_complete` de la `0016`.
 --
--- 4. `published_by` VA CON `ON DELETE RESTRICT`, Y ACÁ SE SEPARA DE LA `0015`.
+-- 4. `published_by` SE NIEGA AL BORRADO EN VEZ DE ANULARSE, Y ACÁ SE SEPARA DE LA
+--    `0015`. Empezó como `ON DELETE RESTRICT`; la decisión 18 la pasó a
+--    `NO ACTION DEFERRABLE INITIALLY DEFERRED`, porque RESTRICT también trababa
+--    la baja de la organización ENTERA. Lo que esta decisión elige —negarse, no
+--    `SET NULL`— no cambió: cambió cuándo se comprueba.
 --    La `0015` eligió `ON DELETE SET NULL` para `approved_by` con el motivo
 --    escrito: «que una persona se vaya no puede borrar el asset». Es el
 --    precedente y no se sigue, porque está MEDIDO que en presencia de un CHECK
@@ -122,9 +142,9 @@
 --    `auth.users` dispara el SET NULL, el SET NULL viola el CHECK, y el borrado
 --    muere con `23514 | new row for relation "c3" violates check constraint`.
 --    O sea que el SET NULL no entrega lo que promete: no deja ir a la persona,
---    deja un error confuso en su lugar. `RESTRICT` bloquea el mismo borrado
---    diciendo POR QUÉ, y además es lo correcto para un registro citable: quién
---    publicó una versión es parte de la versión.
+--    deja un error confuso en su lugar. Negarse —`23503`, nombrando la fila—
+--    bloquea el mismo borrado diciendo POR QUÉ, y además es lo correcto para un
+--    registro citable: quién publicó una versión es parte de la versión.
 --    Consecuencia honesta, porque es el precio: borrar a una persona que
 --    publicó exige primero decidir qué pasa con lo que publicó. Eso es una
 --    decisión, no un efecto secundario.
@@ -307,10 +327,11 @@
 --     superconjunto estricto —implica que la persona existe Y que es miembro de
 --     esa organización— y «dos FK donde una es subconjunto estricto de la otra
 --     son dos cosas que mantener en paso sin ganancia» es la §6 de la `0004`.
---     El `ON DELETE RESTRICT` de la decisión 4 sobrevive con el mismo efecto por
---     un camino más largo: `org_members.user_id` cae con `ON DELETE CASCADE`, así
---     que borrar la persona intenta borrar la membresía y ESA es la que queda
---     bloqueada, nombrando la fila. Y la baja de un miembro ARCHIVA desde la
+--     La negativa de la decisión 4 sobrevive con el mismo efecto por un camino
+--     más largo: `org_members.user_id` cae con `ON DELETE CASCADE`, así que
+--     borrar la persona intenta borrar la membresía y ESA es la que queda
+--     bloqueada —al COMMIT, ver decisión 18—, nombrando la fila. Lo mismo vale
+--     para `verified_by`. Y la baja de un miembro ARCHIVA desde la
 --     `0013`, no borra, así que la fila que sostiene esta FK no se va cuando
 --     alguien deja el equipo: quién publicó una versión sigue siendo parte de la
 --     versión.
@@ -363,6 +384,102 @@
 --     LEE) y el bloque guarda el MENSAJE, no sólo el SQLSTATE, para que el día
 --     que la migración de escritura otorgue UPDATE se vea si lo que lo frena pasó
 --     a ser el `WITH CHECK` de la policy restrictiva o nada.
+--
+-- 18. LA BAJA DE UNA ORGANIZACIÓN ENTERA SE LLEVA SU FICHA; LA DE UN MIEMBRO QUE
+--     PUBLICÓ O VERIFICÓ, NO. Y POR ESO LAS DOS FK CONTRA `org_members` SE
+--     COMPRUEBAN AL COMMIT.
+--     Medido en la réplica el 2026-09-30 y el 2026-10-01, revisando H1.2: con una
+--     versión publicada, `DELETE FROM organizations` muere con
+--
+--         23503 | update or delete on table "org_members" violates foreign key
+--                 constraint "company_profiles_published_by_member_fkey"
+--
+--     y, con esa FK sacada, muere en la siguiente,
+--     `profile_evidence_verified_by_member_fkey`, si hay una evidencia `manual`
+--     verificada. O sea que dar de baja a un cliente que alguna vez publicó su
+--     ficha era imposible, y `deleteMyAccount` —el camino del derecho al olvido,
+--     `src/lib/auth/account-actions.ts`— se tragaba el error y contestaba éxito.
+--
+--     POR QUÉ PASA, porque el arreglo depende de eso: la cascada no corre en
+--     profundidad. El RI ejecuta cada acción con `SPI_execute_snapshot(...,
+--     fire_triggers = false)`, así que los triggers de la consulta interna no
+--     disparan al terminarla: se ENCOLAN al final de la cola de la sentencia de
+--     afuera. Borrar la organización encola sus acciones en orden de nombre de
+--     trigger —para el RI, el OID—: `org_members` va antes que `businesses`. La
+--     de `org_members` borra las membresías y encola SU comprobación; la de
+--     `businesses` borra el negocio y encola la cascada a `company_profiles`
+--     DETRÁS de esa comprobación. Cuando la comprobación corre, la versión
+--     publicada sigue ahí. `RESTRICT` falla así, y `NO ACTION` inmediata también
+--     (medido): las dos miran antes de que termine la sentencia, y la sentencia
+--     es la que borra la organización.
+--
+--     LA DECISIÓN: las dos FK pasan a `NO ACTION DEFERRABLE INITIALLY DEFERRED`
+--     —`RESTRICT` no se puede diferir; por eso `NO ACTION`—. Se comprueban al
+--     COMMIT, cuando todas las cascadas terminaron. Medido:
+--
+--       * la organización se va entera —membresías, negocio, ficha y sus siete
+--         hijas— y no queda una sola fila suya (bloque 118);
+--       * borrar UNA membresía que publicó, UNA que verificó, o a quien publicó
+--         desde `auth.users` —que cae por cascada en la misma membresía— con la
+--         versión en pie, sigue muriendo con 23503 y nombrando la fila (bloque
+--         119); y borrar a quien no publicó ni verificó pasa (bloque 120).
+--
+--     La invariante de la decisión 15 es IDÉNTICA en todo estado confirmado: no
+--     hay COMMIT después del cual una versión diga que la publicó, o una fuente
+--     que la verificó, alguien que no es miembro de esa organización. Cambia
+--     CUÁNDO se mira, no QUÉ.
+--
+--     EL PRECIO, dicho:
+--       (a) el error llega en el COMMIT y no en la sentencia. Por PostgREST cada
+--           pedido es una transacción, así que quien llama lo ve en la misma
+--           respuesta; en una transacción más larga, la sentencia «pasa» y el
+--           COMMIT no. El bloque 92 lo mide con `SET CONSTRAINTS ALL IMMEDIATE`,
+--           que es lo que hace el COMMIT;
+--       (b) dentro de UNA transacción puede existir, hasta el COMMIT, una versión
+--           publicada por alguien que no es miembro. Nadie más la ve —MVCC— y el
+--           COMMIT la rechaza;
+--       (c) una sesión que corra `SET CONSTRAINTS ALL IMMEDIATE` vuelve a tener
+--           el defecto en ESA transacción. Falla cerrada: la baja se niega, no
+--           borra de más;
+--       (d) una transacción que escribe en `company_profiles`, en
+--           `profile_evidence` o en `org_members` y DESPUÉS hace `ALTER TABLE`
+--           sobre esa tabla muere con `55006 | cannot ALTER TABLE ... because it
+--           has pending trigger events`: la comprobación diferida queda en cola
+--           hasta el COMMIT. Medido el 2026-10-01 con el bloque 103 del
+--           `defects_test.sql` del #106, que agrega una columna a la ficha
+--           dentro de su transacción; el 103 ahora dispara las comprobaciones
+--           con `SET CONSTRAINTS ALL IMMEDIATE` justo antes del `ALTER`, dentro
+--           de la subtransacción que mide y que se revierte. Una migración que
+--           haga backfill y después cambie la forma de una de esas tres tablas
+--           tiene que disparar antes las comprobaciones —`SET CONSTRAINTS
+--           company_profiles_published_by_member_fkey,
+--           profile_evidence_verified_by_member_fkey IMMEDIATE`— o separar los
+--           dos pasos.
+--
+--     LO QUE SE DESCARTÓ, Y POR QUÉ:
+--       * un trigger en `org_members` que deje pasar el borrado cuando la
+--         organización ya no está —la técnica con la que la `0027` distingue la
+--         cascada del borrado directo—. No convive con la FK: la comprobación de
+--         la FK corre igual, diga lo que diga el trigger. Pide sacar la FK y
+--         reescribir a mano lo que ella hace —el lado del INSERT, el del DELETE,
+--         el UPDATE de las columnas de la llave, y el `FOR KEY SHARE` que impide
+--         que un borrado concurrente deje una versión huérfana—. Un RI escrito a
+--         mano es lo que la §7 de la `0004` reemplazó por FK;
+--       * un `BEFORE DELETE` en `organizations` que borre primero sus negocios
+--         para reordenar la cascada. Anda, y deja el error en la sentencia, pero
+--         es una cascada a mano que tiene que saber qué subárboles cuelgan de
+--         `org_members`: la próxima tabla que referencie el par repite el
+--         defecto sin que nada lo diga;
+--       * `SET NULL` y `CASCADE`. La decisión 4 midió que SET NULL choca con el
+--         CHECK de `published`; CASCADE haría que borrar a una persona borre las
+--         versiones que publicó.
+--
+--     LA REGLA QUE QUEDA, para la próxima migración: una FK por el par contra
+--     `org_members` desde algo que cuelgue de `businesses` tiene que ser
+--     `DEFERRABLE INITIALLY DEFERRED`, o la baja de la organización se traba
+--     otra vez. El bloque 118 lo ve sólo si su fixture puebla esa tabla nueva:
+--     su anti-vacuidad exige una fila en cada una de las que hoy nombra, y una
+--     tabla que se agregue hay que sumarla ahí.
 
 \set ON_ERROR_STOP on
 
@@ -461,7 +578,7 @@ CREATE TABLE IF NOT EXISTS public.company_profiles (
     summary         text,
 
     published_at    timestamptz,
-    -- Decisión 4 (RESTRICT y no SET NULL) y decisión 15: la FK no va contra
+    -- Decisión 4 (negarse y no SET NULL), 15 y 18 (al COMMIT): la FK no va contra
     -- `auth.users` sino contra el PAR de `org_members`, más abajo. Sin columna
     -- REFERENCES acá para no tener dos FK donde una es subconjunto de la otra.
     published_by    uuid,
@@ -500,16 +617,22 @@ CREATE TABLE IF NOT EXISTS public.company_profiles (
     -- auth.users(id)`, bob publicaba una versión de la organización de alice sin
     -- un solo error. MATCH SIMPLE deja pasar el borrador, que tiene la columna en
     -- NULL.
+    --
+    -- Y al COMMIT, no en la sentencia (decisión 18): con RESTRICT la baja de la
+    -- organización entera moría acá, porque la comprobación de `org_members`
+    -- corre antes de que la cascada llegue a esta fila. Borrar UNA membresía que
+    -- publicó sigue muriendo con 23503.
     CONSTRAINT company_profiles_published_by_member_fkey
         FOREIGN KEY (organization_id, published_by)
-        REFERENCES public.org_members (organization_id, user_id) ON DELETE RESTRICT
+        REFERENCES public.org_members (organization_id, user_id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
 );
 
 COMMENT ON TABLE public.company_profiles IS
     'Una fila por VERSIÓN del perfil estratégico de una empresa, no una por empresa. Las siete hijas cuelgan de la fila-versión: ver el encabezado de la 0026.';
 
 COMMENT ON COLUMN public.company_profiles.published_by IS
-    'Quién publicó, y tiene que ser MIEMBRO de la organización de la ficha: la FK va contra el par de org_members, no contra auth.users. ON DELETE RESTRICT y no SET NULL. Ver decisiones 4 y 15 de la 0026.';
+    'Quién publicó, y tiene que ser MIEMBRO de la organización de la ficha: la FK va contra el par de org_members, no contra auth.users. Se niega al borrado de esa membresía en vez de anularse, y lo comprueba al COMMIT para que la baja de la organización entera pase. Ver decisiones 4, 15 y 18 de la 0026.';
 
 -- Como máximo un borrador abierto por empresa (decisión 2). Parcial: las
 -- versiones publicadas y las superadas no compiten entre sí.
@@ -820,9 +943,14 @@ CREATE TABLE IF NOT EXISTS public.profile_evidence (
     -- Decisión 15, la mitad de la evidencia: quien verifica a mano tiene que ser
     -- miembro de la organización de la ficha. MATCH SIMPLE deja pasar la fuente
     -- 'http' sin verificar, que tiene la columna en NULL.
+    --
+    -- Al COMMIT por lo mismo que `published_by` (decisión 18). Medido: con
+    -- `published_by` arreglada y ésta en RESTRICT, la baja de la organización
+    -- moría en ESTA FK.
     CONSTRAINT profile_evidence_verified_by_member_fkey
         FOREIGN KEY (organization_id, verified_by)
-        REFERENCES public.org_members (organization_id, user_id) ON DELETE RESTRICT
+        REFERENCES public.org_members (organization_id, user_id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
 );
 
 COMMENT ON TABLE public.profile_evidence IS
@@ -848,7 +976,7 @@ COMMENT ON TABLE public.profile_evidence IS
 -- dominio propio no se puede resolver, en vez de contar esa fuente como buena.
 -- Queda escrito para que no lo descubra solo, igual que el `www.` de la §1.
 COMMENT ON COLUMN public.profile_evidence.verified_by IS
-    'Quién verificó a mano, y tiene que ser miembro de la organización de la ficha: la FK va contra el par de org_members. Ver decisión 15 de la 0026.';
+    'Quién verificó a mano, y tiene que ser miembro de la organización de la ficha: la FK va contra el par de org_members y se comprueba al COMMIT. Ver decisiones 15 y 18 de la 0026.';
 
 COMMENT ON COLUMN public.profile_evidence.source_host IS
     'Generada con public.url_host(url). La regla de origen distinto de H1.4 compara columnas, no cadenas reparseadas.';
