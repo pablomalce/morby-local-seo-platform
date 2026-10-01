@@ -20,7 +20,7 @@
  * cualquier paso corta la cadena y vuelve como `ok: false`, sin redirigir.
  *
  * El cliente de Supabase es un doble, y lo que el doble NO prueba está dicho:
- * que el `DELETE` real pase o falle es asunto de los bloques 95 a 97 de
+ * que el `DELETE` real pase o falle es asunto de los bloques 118 a 120 de
  * `supabase/qa/defects_test.sql`, que corren contra la réplica. Acá se mide
  * sólo qué hace la función con lo que la base le contesta.
  */

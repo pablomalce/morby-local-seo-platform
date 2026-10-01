@@ -1,4 +1,4 @@
--- Ninety-seven isolation checks against the Growth OS schema — executable.
+-- A hundred and twenty isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -2808,9 +2808,34 @@ SELECT 'd0260000-0026-4026-8026-0000000000b2', org_bob,
 -- Una segunda versión de la MISMA empresa, para el bloque 87. `superseded` y no
 -- `draft`: el parcial de un solo borrador abierto es justo lo que el bloque 83
 -- mide, y usarlo acá lo pondría en verde por agotamiento.
-INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+--
+-- `superseded_at` llegó con la `0027`: el CHECK
+-- `company_profiles_superseded_is_dated` es una equivalencia, así que una
+-- superada sin fecha ya no entra. Esta línea cambió por eso y por nada más; lo
+-- que el fixture existe para sostener —que `superseded` no compite con
+-- `published` en el índice parcial— no se toca.
+--
+-- Y desde la decisión 13 de la `0027` lleva también fecha y persona de
+-- publicación: una superada ESTUVO publicada, y un CHECK lo exige.
+INSERT INTO company_profiles (id, organization_id, business_id, version, status,
+                              published_at, published_by, superseded_at)
 SELECT 'd0260000-0026-4026-8026-0000000000a9', org_alice,
-       'd0260000-0026-4026-8026-0000000000a1', 2, 'superseded' FROM t;
+       'd0260000-0026-4026-8026-0000000000a1', 2, 'superseded',
+       now() - interval '20 days', '11111111-1111-4111-8111-111111111111', now() FROM t;
+
+-- Y una SEGUNDA empresa de alice con su propio borrador, que existe para el
+-- bloque 87 y llegó con la `0027`. Antes, el 87 metía el ICP en la versión 2
+-- —`superseded`— y desde la `0027` eso lo rechaza el guard de inmutabilidad con
+-- 45002 ANTES de que la FK compuesta opine: un rechazo por el motivo
+-- equivocado, que es exactamente lo que ese bloque detecta. La otra fila-versión
+-- que el 87 necesita tiene que ser ESCRIBIBLE, o sea un borrador, y un borrador
+-- más de la MISMA empresa no puede existir (el único parcial del bloque 83). De
+-- otra empresa de la misma organización, sí.
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0260000-0026-4026-8026-0000000000a7', org_alice, 'Ficha Alice Dos' FROM t;
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0260000-0026-4026-8026-0000000000a8', org_alice,
+       'd0260000-0026-4026-8026-0000000000a7', 1, 'draft' FROM t;
 
 -- Un segmento, un objetivo y un competidor curado de CADA organización. Son los
 -- destinos legítimos y los cruzados del bucle de los bloques 79 y 80: sin una
@@ -3250,7 +3275,14 @@ DECLARE
         -- La novena, y no es de la ficha: la tabla MUTABLE de scrape que la
         -- `0026` hace apuntar a la lista curada. Entra por el cierre, no por
         -- decisión de este archivo.
-        'competitors'
+        'competitors',
+        -- La décima, desde la `0028`: el reporte CITA una versión de la ficha
+        -- con `reports_profile_version_fkey`, así que el cierre la trae con sus
+        -- dos FK —la compuesta a `businesses` y la de la cita—, las dos con el
+        -- tenant. La primera corrida con la `0028` puesta se cayó acá con
+        -- «Sobran: reports», que es exactamente para lo que este bloque cuenta
+        -- en vez de confiar.
+        'reports'
     ];
 BEGIN
     SELECT count(*) INTO n_tablas FROM h1_subarbol;
@@ -3270,13 +3302,13 @@ BEGIN
             coalesce(faltan, 'ninguna'), coalesce(sobran, 'ninguna');
     END IF;
 
-    IF n_tablas <> 9 THEN
-        RAISE EXCEPTION 'Corrida vacua del bloque 81: el subárbol tiene % tablas y se declararon 9.', n_tablas;
+    IF n_tablas <> 10 THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 81: el subárbol tiene % tablas y se declararon 10.', n_tablas;
     END IF;
 
-    IF n_fks <> 15 THEN
+    IF n_fks <> 17 THEN
         RAISE EXCEPTION
-            'Corrida vacua del bloque 81: se examinaron % FK con padre con tenant y se declararon 15. Una tabla nueva en el subárbol cambia este número, y cambiarlo es mirar qué entró.',
+            'Corrida vacua del bloque 81: se examinaron % FK con padre con tenant y se declararon 17. Una tabla nueva en el subárbol cambia este número, y cambiarlo es mirar qué entró.',
             n_fks;
     END IF;
 
@@ -3294,7 +3326,7 @@ BEGIN
             inutil;
     END IF;
 
-    RAISE NOTICE 'Bloque 81: 9 tablas en el subárbol, 15 FK con padre con tenant examinadas, 1 excepción nombrada y viva.';
+    RAISE NOTICE 'Bloque 81: 10 tablas en el subárbol, 17 FK con padre con tenant examinadas, 1 excepción nombrada y viva.';
 END
 $$;
 
@@ -3449,11 +3481,22 @@ SELECT 86, 'el origen de la evidencia no lo calcula la base',
 -- Mismo tenant en las dos filas, a propósito: acá no se está midiendo
 -- aislamiento entre clientes sino la llave más ajustada de la §6 de la `0004`. El
 -- caso 9 del bucle de arriba cruza la MISMA FK por tenant; ésta es la otra mitad.
+--
+-- QUÉ FILAS USA, Y POR QUÉ CAMBIARON CON LA `0027`. El ICP se escribe en el
+-- borrador de la segunda empresa de alice y apunta al segmento de la versión 1
+-- de la PRIMERA: dos fila-versión distintas de la misma organización, que es lo
+-- que la FK de tres columnas tiene que rechazar. Antes se escribía sobre la
+-- versión 2 —`superseded`— y desde la `0027` el guard de inmutabilidad la
+-- rechaza con 45002 antes que la FK. No es que el defecto volviera: es que el
+-- rechazo llegaba por otro motivo, y este bloque exige el 23503 EXACTO
+-- justamente para no aceptar eso. Y no puede escribirse en la versión 1 de
+-- alice, que ya tiene su ICP desde el bloque 82: sería 23505, otro motivo
+-- equivocado.
 CREATE TEMP TABLE h1_icp_otra_version ON COMMIT DROP AS
 SELECT pg_temp.sqlstate_of(format($sql$
     INSERT INTO profile_icp (id, organization_id, profile_id, definition, primary_segment_id)
     VALUES ('d0260000-0026-4026-8026-0000000000ac', %L,
-            'd0260000-0026-4026-8026-0000000000a9', 'ICP de la v2',
+            'd0260000-0026-4026-8026-0000000000a8', 'ICP de otra fila-version',
             'd0260000-0026-4026-8026-0000000000a3')
 $sql$, (SELECT org_alice FROM t))) AS estado;
 
@@ -3461,7 +3504,7 @@ INSERT INTO defect_report
 SELECT 87, 'el ICP de una versión puede apuntar a un segmento de otra versión',
        estado IS DISTINCT FROM '23503',
        CASE WHEN estado IS NULL
-            THEN 'ACEPTADO: el ICP de la v2 describe un segmento de la v1'
+            THEN 'ACEPTADO: el ICP de una fila-version describe un segmento de otra'
             WHEN estado = '23503' THEN 'rechazado por la FK compuesta contra el par de la versión, 23503'
             ELSE 'rechazado con ' || estado || ', que no es la FK compuesta' END
   FROM h1_icp_otra_version;
@@ -3697,9 +3740,11 @@ SELECT 90, 'una empresa puede tener dos versiones publicadas a la vez',
 -- `superseded` compitiera, eso sería imposible.
 CREATE TEMP TABLE h1_superseded_conviven ON COMMIT DROP AS
 SELECT pg_temp.sqlstate_sin_huella(format($sql$
-    INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+    INSERT INTO company_profiles (id, organization_id, business_id, version, status,
+                                  published_at, published_by, superseded_at)
     VALUES ('d0260000-0026-4026-8026-0000000000d3', %L,
-            'd0260000-0026-4026-8026-0000000000a1', 7, 'superseded')
+            'd0260000-0026-4026-8026-0000000000a1', 7, 'superseded',
+            now() - interval '20 days', '11111111-1111-4111-8111-111111111111', now())
 $sql$, (SELECT org_alice FROM t))) AS estado;
 
 INSERT INTO defect_report
@@ -3924,8 +3969,1290 @@ $$;
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 95 a 97. La baja de una organización con su ficha publicada — CERRADO por la
--- decisión 18 de la 0026
+-- Fixture de H1.2 — tres versiones IDÉNTICAS en forma y distintas en estado
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Cuatro empresas más de alice, cada una con UNA versión de siete hijas. Las
+-- cuatro se escriben igual y se separan en la última línea: una queda
+-- `published`, una `superseded`, una `draft` y la cuarta `published` para que el
+-- bloque 101 la dé de baja de verdad. Que las tres primeras sean idénticas salvo
+-- el estado es lo que hace comparables los bloques 96 y 97: si el 96 rechaza y
+-- el 97 acepta las MISMAS veintidós escrituras, lo único que puede explicarlo es
+-- el estado de la versión.
+--
+-- Y nacen BORRADOR las cuatro, con el contenido escrito antes de publicar. No es
+-- una comodidad del fixture: es el único orden posible desde la `0027`, y es el
+-- orden real del producto. La versión 5 de alice de más arriba está publicada y
+-- vacía, y ya no se le puede agregar una hija — que es exactamente lo que estos
+-- bloques miden.
+--
+-- Empresas de alice y no una de bob: acá no se mide aislamiento entre clientes
+-- —eso son los bloques 79 y 88— sino el congelamiento dentro de un cliente. Una
+-- empresa por versión porque los dos únicos parciales de la `0026` sólo dejan un
+-- borrador y una publicada por empresa.
+RESET ROLE;
+
+DO $fx$
+DECLARE
+    v_org   uuid := (SELECT org_alice FROM t);
+    v_alice uuid := '11111111-1111-4111-8111-111111111111';
+    v_caso  record;
+    v_biz   uuid;
+    v_prof  uuid;
+    v_obj   uuid;
+    b       int;
+    id_de   text := 'd0270000-0027-4027-8027-';
+BEGIN
+    FOR v_caso IN
+        SELECT * FROM (VALUES
+            (1, 'published',  'Alice Publicada'),
+            (2, 'superseded', 'Alice Superada'),
+            (3, 'draft',      'Alice Borrador'),
+            (4, 'published',  'Alice Publicada Dos')
+        ) AS c(idx, estado, nombre)
+    LOOP
+        b      := v_caso.idx * 10;
+        v_biz  := (id_de || lpad(v_caso.idx::text, 12, '0'))::uuid;
+        v_prof := (id_de || lpad(b::text, 12, '0'))::uuid;
+        v_obj  := (id_de || lpad((b + 6)::text, 12, '0'))::uuid;
+
+        INSERT INTO businesses (id, organization_id, name)
+            VALUES (v_biz, v_org, v_caso.nombre);
+        INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+            VALUES (v_prof, v_org, v_biz, 1, 'draft');
+
+        INSERT INTO profile_offers (id, organization_id, profile_id, name)
+            VALUES ((id_de || lpad((b+1)::text, 12, '0'))::uuid, v_org, v_prof, 'Oferta de la version');
+        INSERT INTO profile_markets (id, organization_id, profile_id, country, region)
+            VALUES ((id_de || lpad((b+2)::text, 12, '0'))::uuid, v_org, v_prof, 'SE', 'Stockholm');
+        INSERT INTO profile_segments (id, organization_id, profile_id, name)
+            VALUES ((id_de || lpad((b+3)::text, 12, '0'))::uuid, v_org, v_prof, 'Segmento de la version');
+        INSERT INTO profile_competitors (id, organization_id, profile_id, name)
+            VALUES ((id_de || lpad((b+4)::text, 12, '0'))::uuid, v_org, v_prof, 'Rival curado');
+        INSERT INTO profile_icp (id, organization_id, profile_id, definition, primary_segment_id)
+            VALUES ((id_de || lpad((b+5)::text, 12, '0'))::uuid, v_org, v_prof, 'ICP de la version',
+                    (id_de || lpad((b+3)::text, 12, '0'))::uuid);
+        INSERT INTO profile_objectives (id, organization_id, profile_id, statement, kind)
+            VALUES (v_obj, v_org, v_prof, 'Afirmacion de la version', 'claim');
+        INSERT INTO profile_evidence (id, organization_id, objective_id, kind, url)
+            VALUES ((id_de || lpad((b+7)::text, 12, '0'))::uuid, v_org, v_obj, 'http',
+                    'https://fuente.example/v' || v_caso.idx);
+
+        -- Fechas en el pasado y escalonadas, a propósito: dentro de una
+        -- transacción `now()` no avanza, y la decisión 8 de la `0028` pide que
+        -- la versión que un reporte cita estuviera vigente cuando el reporte se
+        -- escribió. Publicada hace diez días; la superada, superada hace cinco.
+        -- Con las dos en `now()` la vigencia de la superada sería un intervalo
+        -- vacío y nadie podría citarla nunca.
+        IF v_caso.estado <> 'draft' THEN
+            UPDATE company_profiles
+               SET status = 'published', published_at = now() - interval '10 days',
+                   published_by = v_alice
+             WHERE id = v_prof;
+        END IF;
+        IF v_caso.estado = 'superseded' THEN
+            UPDATE company_profiles
+               SET status = 'superseded', superseded_at = now() - interval '5 days'
+             WHERE id = v_prof;
+        END IF;
+    END LOOP;
+END
+$fx$;
+
+-- Qué fila es cuál. Se calcula con la misma aritmética que el fixture: una tabla
+-- de ids escrita a mano al lado de un fixture que los calcula son dos listas que
+-- se separan.
+CREATE TEMP TABLE h12_filas ON COMMIT DROP AS
+SELECT c.idx,
+       c.estado                                                                    AS estado_version,
+       (SELECT org_alice FROM t)                                                   AS org,
+       ('d0270000-0027-4027-8027-' || lpad((c.idx*10)::text, 12, '0'))::uuid       AS profile_id,
+       ('d0270000-0027-4027-8027-' || lpad((c.idx*10+6)::text, 12, '0'))::uuid     AS objective_id,
+       r.relacion,
+       ('d0270000-0027-4027-8027-' || lpad((c.idx*10+r.off)::text, 12, '0'))::uuid AS child_id
+  FROM (VALUES (1,'published'), (2,'superseded'), (3,'draft'), (4,'published')) AS c(idx, estado)
+ CROSS JOIN (VALUES ('company_profiles',0), ('profile_offers',1), ('profile_markets',2),
+                    ('profile_segments',3), ('profile_competitors',4), ('profile_icp',5),
+                    ('profile_objectives',6), ('profile_evidence',7)) AS r(relacion, off);
+
+-- Las veintidós escrituras. Una sola lista, usada por el bloque que exige que
+-- sean rechazadas y por el que exige que sean aceptadas: dos listas paralelas se
+-- separan, y el día que se separen el control positivo dejaría de controlar el
+-- caso negativo.
+--
+-- `%1$L` = la organización, `%2$L` = la versión, `%3$L` = la fila hija,
+-- `%4$L` = el objetivo (la evidencia cuelga de ahí, no de la ficha).
+CREATE TEMP TABLE h12_plantillas (relacion text, operacion text, plantilla text, esperado text) ON COMMIT DROP;
+INSERT INTO h12_plantillas VALUES
+ ('company_profiles',   'UPDATE', $p$UPDATE company_profiles SET summary = 'reescrito' WHERE id = %2$L$p$, '45001'),
+
+ ('profile_offers',     'INSERT', $p$INSERT INTO profile_offers (organization_id, profile_id, name) VALUES (%1$L, %2$L, 'agregada')$p$, '45002'),
+ ('profile_offers',     'UPDATE', $p$UPDATE profile_offers SET name = 'reescrita' WHERE id = %3$L$p$, '45002'),
+ ('profile_offers',     'DELETE', $p$DELETE FROM profile_offers WHERE id = %3$L$p$, '45002'),
+
+ ('profile_markets',    'INSERT', $p$INSERT INTO profile_markets (organization_id, profile_id, country) VALUES (%1$L, %2$L, 'NO')$p$, '45002'),
+ ('profile_markets',    'UPDATE', $p$UPDATE profile_markets SET region = 'Malmo' WHERE id = %3$L$p$, '45002'),
+ ('profile_markets',    'DELETE', $p$DELETE FROM profile_markets WHERE id = %3$L$p$, '45002'),
+
+ ('profile_segments',   'INSERT', $p$INSERT INTO profile_segments (organization_id, profile_id, name) VALUES (%1$L, %2$L, 'agregado')$p$, '45002'),
+ ('profile_segments',   'UPDATE', $p$UPDATE profile_segments SET name = 'reescrito' WHERE id = %3$L$p$, '45002'),
+ ('profile_segments',   'DELETE', $p$DELETE FROM profile_segments WHERE id = %3$L$p$, '45002'),
+
+ ('profile_competitors','INSERT', $p$INSERT INTO profile_competitors (organization_id, profile_id, name) VALUES (%1$L, %2$L, 'agregado')$p$, '45002'),
+ ('profile_competitors','UPDATE', $p$UPDATE profile_competitors SET name = 'reescrito' WHERE id = %3$L$p$, '45002'),
+ ('profile_competitors','DELETE', $p$DELETE FROM profile_competitors WHERE id = %3$L$p$, '45002'),
+
+ -- El INSERT del ICP tiene además el único de una fila por versión, que daría
+ -- 23505. Da 45002 porque un trigger BEFORE corre ANTES de las restricciones; si
+ -- algún día diera 23505, el bloque lo informaría como desvío.
+ ('profile_icp',        'INSERT', $p$INSERT INTO profile_icp (organization_id, profile_id, definition) VALUES (%1$L, %2$L, 'otro ICP')$p$, '45002'),
+ ('profile_icp',        'UPDATE', $p$UPDATE profile_icp SET definition = 'reescrito' WHERE id = %3$L$p$, '45002'),
+ ('profile_icp',        'DELETE', $p$DELETE FROM profile_icp WHERE id = %3$L$p$, '45002'),
+
+ ('profile_objectives', 'INSERT', $p$INSERT INTO profile_objectives (organization_id, profile_id, statement, kind) VALUES (%1$L, %2$L, 'agregada', 'claim')$p$, '45002'),
+ ('profile_objectives', 'UPDATE', $p$UPDATE profile_objectives SET statement = 'reescrita' WHERE id = %3$L$p$, '45002'),
+ ('profile_objectives', 'DELETE', $p$DELETE FROM profile_objectives WHERE id = %3$L$p$, '45002'),
+
+ ('profile_evidence',   'INSERT', $p$INSERT INTO profile_evidence (organization_id, objective_id, kind, url) VALUES (%1$L, %4$L, 'http', 'https://agregada.example/x')$p$, '45002'),
+ ('profile_evidence',   'UPDATE', $p$UPDATE profile_evidence SET url = 'https://reescrita.example/x' WHERE id = %3$L$p$, '45002'),
+ ('profile_evidence',   'DELETE', $p$DELETE FROM profile_evidence WHERE id = %3$L$p$, '45002');
+
+-- ── 95 ───────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: la frase literal de la puerta H1.2 —«un UPDATE del contenido de una
+-- versión PUBLICADA es rechazado por la base»— sobre la única columna de
+-- contenido que vive en la fila-versión. El resto del contenido está en las
+-- hijas y lo mide el 96.
+--
+-- `sqlstate_sin_huella` y no `sqlstate_of`: si el guard no estuviera, el UPDATE
+-- pasaría y el `summary` quedaría reescrito para todos los bloques de abajo.
+INSERT INTO defect_report
+SELECT 95, 'el resumen de una versión publicada se puede reescribir',
+       estado IS DISTINCT FROM '45001',
+       CASE WHEN estado IS NULL
+            THEN 'ACEPTADO: el UPDATE entró y la cita resuelve a un texto que cambió después'
+            WHEN estado = '45001' THEN 'rechazado por el guard de la fila-versión, 45001'
+            ELSE 'rechazado con ' || estado || ', que no es el guard de inmutabilidad' END
+  FROM (SELECT pg_temp.sqlstate_sin_huella(
+                   format($s$UPDATE company_profiles SET summary = 'reescrito' WHERE id = %L$s$,
+                          'd0270000-0027-4027-8027-000000000010')) AS estado) x;
+
+-- ── 96 ───────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que «no se edita» cubra el CONTENIDO y no la fila-versión. El
+-- contenido de una versión son las siete hijas; congelar sólo `company_profiles`
+-- dejaría el `version_id` citado resolviendo a un ICP que alguien reescribió
+-- después, que es el modo de fallo que la puerta nombra.
+--
+-- Veintidós escrituras por versión —un UPDATE en la ficha, e INSERT, UPDATE y
+-- DELETE en cada una de las siete hijas— por las DOS versiones no borrador.
+-- Cuarenta y cuatro casos, y cada uno exige su SQLSTATE EXACTO: 45001 la ficha,
+-- 45002 las hijas. Un 42501 de una policy no cuenta —el rechazo tiene que venir
+-- del guard—, y tampoco cuenta un 23505 o un 23503, que son el esquema
+-- rechazando por su forma y no por el estado de la versión.
+CREATE TEMP TABLE h12_congelado ON COMMIT DROP AS
+SELECT f.estado_version, p.relacion, p.operacion, p.esperado,
+       pg_temp.sqlstate_sin_huella(
+           format(p.plantilla, f.org, f.profile_id, f.child_id, f.objective_id)) AS estado
+  FROM h12_plantillas p
+  JOIN h12_filas f ON f.relacion = p.relacion
+ WHERE f.idx IN (1, 2);
+
+INSERT INTO defect_report
+SELECT 96, 'el contenido de una versión publicada o superada se puede editar en sus hijas',
+       EXISTS (SELECT 1 FROM h12_congelado WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_congelado WHERE estado IS DISTINCT FROM esperado)
+            THEN 'las ' || (SELECT count(*) FROM h12_congelado) ||
+                 ' escrituras sobre las 8 relaciones de una versión publicada y de una superada murieron con su código exacto'
+            ELSE 'desvíos: ' || (SELECT string_agg(estado_version || '/' || relacion || '/' || operacion ||
+                                                   ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || esperado || ')', '; ' ORDER BY estado_version, relacion, operacion)
+                                   FROM h12_congelado WHERE estado IS DISTINCT FROM esperado) END;
+
+-- Anti-vacuidad del 96: cuarenta y cuatro casos o el bloque no midió lo que dice.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM h12_congelado;
+    IF n <> 44 THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 96: % casos en vez de 44.', n;
+    END IF;
+END
+$$;
+
+-- ── 97 ───────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 96, y sin él el 96 pasa con la ficha inservible. Las
+-- MISMAS veintidós escrituras sobre una versión `draft` tienen que ENTRAR las
+-- veintidós. Un guard que congela también el borrador cierra de más: la ficha no
+-- se podría escribir nunca, el 96 seguiría verde, y H1.1 —que dice que la ficha
+-- EXISTE— quedaría desmentida por la puerta siguiente.
+CREATE TEMP TABLE h12_borrador ON COMMIT DROP AS
+SELECT p.relacion, p.operacion,
+       pg_temp.sqlstate_sin_huella(
+           format(p.plantilla, f.org, f.profile_id, f.child_id, f.objective_id)) AS estado
+  FROM h12_plantillas p
+  JOIN h12_filas f ON f.relacion = p.relacion
+ WHERE f.idx = 3;
+
+-- QUÉ PIDE, EXACTAMENTE, Y POR QUÉ NO ES «LAS 22 ENTRAN». Dos de las veintidós
+-- las rechaza el ESQUEMA por su forma, no el guard, y está bien que lo haga:
+-- el INSERT del ICP da 23505 porque el borrador ya tiene el suyo —el único de
+-- una fila por versión, bloque 82—, y el DELETE del segmento da 23503 porque el
+-- ICP lo señala con la FK de tres columnas en RESTRICT, que es el bloque 87.
+-- Medido en la réplica al escribir este bloque.
+--
+-- Así que la afirmación es doble y las dos mitades hacen falta: NINGUNA de las
+-- veintidós puede morir con un código del guard (45001/45002/45003), y
+-- EXACTAMENTE 20 tienen que entrar. Sin la segunda mitad, un esquema que
+-- rechazara las veintidós por otros motivos pasaría este control diciendo «el
+-- guard no fue»; sin la primera, un guard que congelara el borrador con un
+-- código nuevo pasaría inadvertido. El 20 se edita a mano y con el motivo al
+-- lado, como todo número de este repositorio.
+INSERT INTO defect_report
+SELECT 97, 'el guard congela también el borrador y la ficha no se puede escribir',
+       EXISTS (SELECT 1 FROM h12_borrador WHERE estado IN ('45001', '45002', '45003'))
+         OR (SELECT count(*) FROM h12_borrador WHERE estado IS NULL) <> 20,
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_borrador WHERE estado IN ('45001', '45002', '45003'))
+             AND (SELECT count(*) FROM h12_borrador WHERE estado IS NULL) = 20
+            THEN '20 de las ' || (SELECT count(*) FROM h12_borrador) ||
+                 ' escrituras entraron sobre el borrador y ninguna murió con un código del guard; ' ||
+                 'las otras dos las rechazó la forma del esquema: ' ||
+                 (SELECT string_agg(relacion || '/' || operacion || ' ' || estado, ', ' ORDER BY relacion, operacion)
+                    FROM h12_borrador WHERE estado IS NOT NULL)
+            ELSE 'el guard apareció sobre un borrador en [' ||
+                 coalesce((SELECT string_agg(relacion || '/' || operacion || ' ' || estado, '; ' ORDER BY relacion, operacion)
+                             FROM h12_borrador WHERE estado IN ('45001', '45002', '45003')), '') ||
+                 '], y entraron ' || (SELECT count(*) FROM h12_borrador WHERE estado IS NULL) ||
+                 ' de 22 (se esperan 20). Rechazos: ' ||
+                 coalesce((SELECT string_agg(relacion || '/' || operacion || ' ' || estado, '; ' ORDER BY relacion, operacion)
+                             FROM h12_borrador WHERE estado IS NOT NULL), 'ninguno') END;
+
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM h12_borrador;
+    IF n <> 22 THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 97: % casos en vez de 22.', n;
+    END IF;
+END
+$$;
+
+-- ── 98 ───────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la fila que un reporte cita no se pueda BORRAR. Es la forma más
+-- corta de que la cita deje de resolver, y «no se edita» no la cubre.
+INSERT INTO defect_report
+SELECT 98, 'una versión publicada se puede borrar y la cita deja de resolver',
+       estado IS DISTINCT FROM '45001',
+       CASE WHEN estado IS NULL
+            THEN 'ACEPTADO: el borrado directo de la versión publicada entró'
+            WHEN estado = '45001' THEN 'rechazado por el guard, 45001'
+            ELSE 'rechazado con ' || estado || ', que no es el guard de inmutabilidad' END
+  FROM (SELECT pg_temp.sqlstate_sin_huella(
+                   format($s$DELETE FROM company_profiles WHERE id = %L$s$,
+                          'd0270000-0027-4027-8027-000000000010')) AS estado) x;
+
+-- ── 99 ───────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la única transición sancionada sea posible y que no venga con
+-- nada colgado. Publicar la versión 3 es pasar la 2 a `superseded` y la 3 a
+-- `published`; si eso no se pudiera, la inmutabilidad habría comprado el
+-- congelamiento al precio de no poder versionar, que es el defecto de al lado.
+--
+-- Siete casos, y el primero es el control positivo de los otros seis. El
+-- sexto es la ventana invertida —superada antes de publicada—, que desde la
+-- decisión 16 de la `0027` rechaza un CHECK (23514); lo encontró la segunda
+-- ronda de la revisión. El séptimo no es una transición: es la puerta de al
+-- lado. `45003` es un trigger de
+-- UPDATE, así que un INSERT directo como `superseded` lo esquivaba, sin fecha ni
+-- persona de publicación, y la `0028` lo aceptaba como versión citable. Lo
+-- encontró la revisión adversarial del 2026-09-30; lo cierra el CHECK de la
+-- decisión 13 de la `0027`, con 23514.
+CREATE TEMP TABLE h12_transicion ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('publicada -> superada, sola',
+     $s$UPDATE company_profiles SET status = 'superseded', superseded_at = now() WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$,
+     NULL::text),
+    ('publicada -> superada, con el resumen de regalo',
+     $s$UPDATE company_profiles SET status = 'superseded', superseded_at = now(), summary = 'de paso' WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$,
+     '45001'),
+    ('borrador -> superada, sin haber estado publicada',
+     $s$UPDATE company_profiles SET status = 'superseded', superseded_at = now() WHERE id = 'd0270000-0027-4027-8027-000000000030'$s$,
+     '45003'),
+    ('publicada -> borrador, o sea despublicar',
+     $s$UPDATE company_profiles SET status = 'draft', published_at = NULL, published_by = NULL WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$,
+     '45001'),
+    ('superada -> publicada, o sea resucitar',
+     $s$UPDATE company_profiles SET status = 'published', superseded_at = NULL WHERE id = 'd0270000-0027-4027-8027-000000000020'$s$,
+     '45001'),
+    ('superar una versión con fecha anterior a su publicación',
+     $s$UPDATE company_profiles SET status = 'superseded', superseded_at = published_at - interval '1 day' WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$,
+     '23514'),
+    ('insertar directo una superada que nunca se publicó',
+     $s$INSERT INTO company_profiles (organization_id, business_id, version, status, superseded_at)
+        SELECT organization_id, id, 2, 'superseded', now() FROM businesses
+         WHERE id = 'd0270000-0027-4027-8027-000000000003'$s$,
+     '23514')
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_transicion_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_transicion;
+
+INSERT INTO defect_report
+SELECT 99, 'la transición de estado de una versión no está acotada a la que el versionado necesita',
+       EXISTS (SELECT 1 FROM h12_transicion_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_transicion_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'la única transición sancionada entró y los otros seis casos murieron con su código: ' ||
+                 (SELECT count(*) FROM h12_transicion_r) || ' casos'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_transicion_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 100 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el guard valga para el rol con el que el producto escribe de
+-- verdad. `service_role` tiene BYPASSRLS de fábrica —lo dice el encabezado de
+-- `replica.sh`, y es el rol de la service key—, así que las dieciséis policies
+-- de la `0026` no lo tocan. Un trigger sí. Es la diferencia entre una garantía
+-- que la clave de servicio saltea y una que no.
+SET LOCAL ROLE service_role;
+SELECT set_config('qa.b100',
+       coalesce(pg_temp.sqlstate_sin_huella(
+           $s$UPDATE company_profiles SET summary = 'reescrito por la clave de servicio' WHERE id = 'd0270000-0027-4027-8027-000000000010'$s$),
+       'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 100, 'la clave de servicio, que saltea RLS, también saltea la inmutabilidad',
+       current_setting('qa.b100') <> '45001',
+       CASE WHEN current_setting('qa.b100') = '45001'
+            THEN 'service_role, con BYPASSRLS, murió con 45001: el guard no es una policy'
+            WHEN current_setting('qa.b100') = 'ACEPTADO'
+            THEN 'ACEPTADO: service_role reescribió el contenido de una versión publicada'
+            ELSE 'service_role murió con ' || current_setting('qa.b100') ||
+                 ', que no es el guard: un rechazo por privilegio no prueba la inmutabilidad' END;
+
+-- ── 101 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 98, y es la decisión 1 de la `0027` ejecutada: dar de
+-- baja a la EMPRESA tiene que seguir funcionando, aunque su versión publicada no
+-- se pueda borrar sola. Sin este bloque, el 98 pasaría con un producto en el que
+-- no se puede dar de baja a un cliente.
+--
+-- Corre de verdad y no con `sin_huella`: lo que se mide es que el cascade se
+-- LLEVE las hijas, y eso hay que contarlo después. Por eso el fixture tiene una
+-- cuarta empresa —la «Publicada Dos»— que existe sólo para esto, y por eso este
+-- bloque va al final: ningún bloque de arriba la mira.
+-- EN DOS SENTENCIAS, Y NO POR ESTILO. La primera versión de este bloque hacía
+-- la baja y los tres conteos en un solo SELECT, y los tres contaban 1: en una
+-- sentencia todas las subconsultas ven el MISMO snapshot, tomado antes de
+-- ejecutarla, así que el bloque informaba «la baja pasó pero quedaron filas»
+-- sobre un cascade que había funcionado. Medido en la réplica. Contar en la
+-- misma sentencia que borra es contar el pasado.
+CREATE TEMP TABLE h12_baja ON COMMIT DROP AS
+SELECT pg_temp.sqlstate_of(
+           $s$DELETE FROM businesses WHERE id = 'd0270000-0027-4027-8027-000000000004'$s$) AS estado;
+
+CREATE TEMP TABLE h12_cascade ON COMMIT DROP AS
+SELECT (SELECT estado FROM h12_baja) AS estado,
+       (SELECT count(*) FROM company_profiles WHERE business_id  = 'd0270000-0027-4027-8027-000000000004') AS quedan_versiones,
+       (SELECT count(*) FROM profile_offers   WHERE profile_id   = 'd0270000-0027-4027-8027-000000000040') AS quedan_ofertas,
+       (SELECT count(*) FROM profile_evidence WHERE objective_id = 'd0270000-0027-4027-8027-000000000046') AS quedan_fuentes;
+
+INSERT INTO defect_report
+SELECT 101, 'el guard de inmutabilidad impide dar de baja a un cliente',
+       estado IS NOT NULL OR quedan_versiones <> 0 OR quedan_ofertas <> 0 OR quedan_fuentes <> 0,
+       CASE WHEN estado IS NULL AND quedan_versiones = 0 AND quedan_ofertas = 0 AND quedan_fuentes = 0
+            THEN 'dar de baja la empresa entró y el cascade se llevó la versión publicada, sus hijas y la evidencia'
+            WHEN estado IS NOT NULL THEN 'dar de baja la empresa murió con ' || estado ||
+                 ': el guard confundió el cascade con un borrado directo'
+            ELSE 'la baja pasó pero quedaron filas: ' || quedan_versiones || ' versiones, ' ||
+                 quedan_ofertas || ' ofertas, ' || quedan_fuentes || ' fuentes' END
+  FROM h12_cascade;
+
+-- ── 102 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la excepción de la decisión 9 sea exactamente lo que dice. El
+-- job de H1.4 escribe `last_status` y `last_checked_at` sobre la evidencia de una
+-- versión PUBLICADA —es lo único que H1.4 mide—, así que esas dos columnas
+-- tienen que poder cambiar. Y NADA más: si la excepción se leyera como «la
+-- evidencia de una publicada es editable», la URL de la fuente sería
+-- reescribible y una afirmación publicada podría cambiar de respaldo sin dejar
+-- rastro.
+--
+-- Los tres casos van juntos por eso: el primero solo diría que el job puede
+-- correr, los otros dos solos dirían que la evidencia está congelada, y la
+-- decisión 9 es la conjunción.
+CREATE TEMP TABLE h12_h14 ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('la medición del job: last_status y last_checked_at',
+     $s$UPDATE profile_evidence SET last_status = 200, last_checked_at = now() WHERE id = 'd0270000-0027-4027-8027-000000000017'$s$,
+     NULL::text),
+    ('la medición con la URL de regalo',
+     $s$UPDATE profile_evidence SET last_status = 200, url = 'https://otra.example/z' WHERE id = 'd0270000-0027-4027-8027-000000000017'$s$,
+     '45002'),
+    ('la verificación a mano, que es una afirmación y no una medición',
+     $s$UPDATE profile_evidence SET verified_at = now(), verified_by = '11111111-1111-4111-8111-111111111111' WHERE id = 'd0270000-0027-4027-8027-000000000017'$s$,
+     '45002')
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_h14_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_h14;
+
+INSERT INTO defect_report
+SELECT 102, 'la excepción de H1.4 deja editable la evidencia de una versión publicada',
+       EXISTS (SELECT 1 FROM h12_h14_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_h14_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'el job escribe su medición sobre una publicada, y la URL y la verificación a mano siguen congeladas'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_h14_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 103 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: las dos decisiones del guard que no se ven ejecutando el guard.
+--
+-- La primera es la decisión 3: el guard compara `to_jsonb(NEW)` menos dos
+-- claves, no una lista de columnas, así que una columna que alguien agregue
+-- mañana nace CONGELADA. Se mide agregando una columna de verdad dentro de una
+-- subtransacción que se deshace, y escribiéndola sobre la versión publicada
+-- JUNTO CON la transición sancionada (`published -> superseded`), que es la única
+-- rama donde esa comparación decide. Con una lista de columnas escrita a mano,
+-- ese UPDATE pasaría: la transición es legal y la columna nueva no está en la
+-- lista.
+--
+-- La primera versión de este caso escribía la columna nueva SOLA, sin tocar el
+-- estado. Ese UPDATE muere en el `RAISE` incondicional del final del guard, sea
+-- cual sea la comparación, así que el caso quedaba verde con la mutación exacta
+-- que decía atrapar. Lo midió la revisión adversarial del 2026-09-30.
+--
+-- La segunda es la decisión 10: `profile_child_freeze_state` resuelve de qué
+-- versión es una fila por tabla, y una forma que no sabe resolver levanta 45002
+-- en vez de devolver 'gone'. Importa porque 'gone' es el caso del cascade, o sea
+-- PERMISO: la primera versión de la `0027` leía `profile_id` en las siete hijas y
+-- `profile_evidence` no lo tiene, con lo cual toda la evidencia de una versión
+-- publicada era reescribible y en verde. Se llama a la función directamente
+-- porque el defecto no es alcanzable desde una tabla que hoy existe: es la tabla
+-- de mañana.
+--
+-- EL `SET CONSTRAINTS` ANTES DEL `ALTER` ES EL PRECIO (d) DE LA DECISIÓN 18 DE LA
+-- `0026`. Desde que `published_by` se comprueba al COMMIT, cada versión que este
+-- archivo escribió arriba deja en cola su comprobación, y un `ALTER TABLE` sobre
+-- una tabla con eventos pendientes muere: medido el 2026-10-01, al traer el #107,
+-- este caso dio 55006 —`cannot ALTER TABLE ... because it has pending trigger
+-- events`— en vez del 45001. Dispararlas es lo que haría el
+-- COMMIT, igual que en el bloque 92. Va ADENTRO de la sentencia que se mide, y
+-- no suelto en el archivo: `sqlstate_sin_huella` revierte la subtransacción y
+-- con ella el modo, así que cada constraint vuelve a SU modo para los bloques de
+-- después. Devolverlo a mano con `SET CONSTRAINTS ALL DEFERRED` taparía una FK
+-- que una mutación volviera `INITIALLY IMMEDIATE` —el #107 lo midió—.
+CREATE TEMP TABLE h12_forma ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('una columna nueva nace congelada',
+     $s$DO $x$ BEGIN
+            SET CONSTRAINTS ALL IMMEDIATE;
+            ALTER TABLE public.company_profiles ADD COLUMN qa_columna_nueva text;
+            UPDATE public.company_profiles
+               SET status = 'superseded', superseded_at = now(),
+                   qa_columna_nueva = 'escrita'
+             WHERE id = 'd0270000-0027-4027-8027-000000000010';
+        END $x$$s$,
+     '45001'),
+    ('una forma que el guard no sabe resolver falla cerrado',
+     $s$SELECT public.profile_child_freeze_state('tabla_de_manana', '{"organization_id": "018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1a01"}'::jsonb)$s$,
+     '45002')
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_forma_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_forma;
+
+INSERT INTO defect_report
+SELECT 103, 'el guard enumera columnas a mano, o se calla ante una forma que no conoce',
+       EXISTS (SELECT 1 FROM h12_forma_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_forma_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'una columna agregada después queda congelada, y una tabla que el guard no sabe resolver levanta 45002'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || esperado || ')', '; ' ORDER BY caso)
+                                   FROM h12_forma_r WHERE estado IS DISTINCT FROM esperado) END;
+
+RESET ROLE;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Fixture de la cita — la `0028`
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Los bloques 104 a 109 citan las versiones del fixture de H1.2: la publicada de
+-- «Alice Publicada» (…10), la superada de «Alice Superada» (…20) y el borrador
+-- de «Alice Borrador» (…30). Van DESPUÉS de los bloques 95 a 103 a propósito: el
+-- 106 publica una versión 2 de «Alice Publicada» de verdad, y con eso la …10
+-- pasa a superada; los bloques de arriba la miran publicada.
+--
+-- Un reporte sin cita de la misma empresa, para el control positivo del 107
+-- (poner la cita por primera vez sí se puede).
+RESET ROLE;
+
+INSERT INTO reports (id, organization_id, business_id, title)
+SELECT 'd0280000-0028-4028-8028-000000000000', org_alice,
+       'd0270000-0027-4027-8027-000000000001', 'Reporte sin cita' FROM t;
+
+-- ── 104 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que un reporte no pueda citar la ficha de OTRA organización. El
+-- reporte es de bob y cita la versión publicada de alice. Exige 23503 EXACTO: la
+-- FK compuesta, no el trigger —que sin fila no decide, decisión 6 de la
+-- `0028`— ni una policy.
+INSERT INTO defect_report
+SELECT 104, 'un reporte puede citar la ficha de otra organización',
+       estado IS DISTINCT FROM '23503',
+       CASE WHEN estado IS NULL
+            THEN 'ACEPTADO: el reporte de bob cita la versión publicada de alice'
+            WHEN estado = '23503' THEN 'rechazado por la FK compuesta contra la terna (organización, empresa, versión), 23503'
+            ELSE 'rechazado con ' || estado || ', que no es la FK compuesta' END
+  FROM (SELECT pg_temp.sqlstate_sin_huella(format($s$
+            INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+            VALUES (%L, 'd0260000-0026-4026-8026-0000000000b1', 'Reporte de bob',
+                    'd0270000-0027-4027-8027-000000000010')
+        $s$, (SELECT org_bob FROM t))) AS estado) x;
+
+-- ── 105 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que un reporte no cite un BORRADOR. La FK resolvería —la fila
+-- existe—, pero a una fila que se puede reescribir después, que es el modo de
+-- fallo de H1.2 con otras palabras. Exige 45004, el código de la `0028`.
+--
+-- DOS CASOS, Y EL SEGUNDO ES EL QUE MIDE LA RAMA. Un borrador sin fecha de
+-- publicación lo frenan dos cosas a la vez: la rama «es un borrador» y la regla
+-- de vigencia (`published_at` NULL). La segunda ronda de la revisión adversarial
+-- mostró que todos los borradores citados en la suite eran de ésos, así que
+-- borrar la rama de borrador dejaba todo verde. El esquema permite un borrador
+-- CON `published_at` y `published_by` —los CHECK los exigen para `published` y
+-- `superseded`, no los prohíben para `draft`—, y para ése la rama de borrador es
+-- lo único que frena la cita. El segundo caso le pone fecha de publicación al
+-- borrador y lo cita, dentro de una subtransacción que se deshace.
+CREATE TEMP TABLE h12_cita_borrador ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('citar un borrador sin fecha de publicación',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000003', 'Reporte del borrador',
+               'd0270000-0027-4027-8027-000000000030' FROM t$s$,
+     '45004'),
+    ('citar un borrador que tiene fecha y persona de publicación',
+     $s$DO $x$ BEGIN
+            UPDATE company_profiles
+               SET published_at = now() - interval '1 day', published_by = '11111111-1111-4111-8111-111111111111'
+             WHERE id = 'd0270000-0027-4027-8027-000000000030';
+            INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+            SELECT org_alice, 'd0270000-0027-4027-8027-000000000003', 'Reporte del borrador fechado',
+                   'd0270000-0027-4027-8027-000000000030' FROM t;
+        END $x$$s$,
+     '45004')
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_cita_borrador_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_cita_borrador;
+
+INSERT INTO defect_report
+SELECT 105, 'un reporte puede citar un borrador, que después se reescribe',
+       EXISTS (SELECT 1 FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'citar un borrador murió con 45004, con y sin fecha de publicación'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || esperado || ')', '; ' ORDER BY caso)
+                                   FROM h12_cita_borrador_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 106 ──────────────────────────────────────────────────────────────────────
+-- LA MITAD (b) DE LA PUERTA H1.2, EN SQL: «un reporte generado cita un
+-- version_id que resuelve a ESA FILA EXACTA». Lo que se mide acá es la parte de
+-- esa frase que depende de la base: que la fila citada no pueda decir otra cosa
+-- después de citada.
+--
+-- QUÉ NO MIDE, Y LA PRIMERA VERSIÓN DECÍA QUE SÍ. La revisión adversarial del
+-- 2026-09-30 mostró que la primera versión de este bloque quedaba verde con TODOS
+-- los mecanismos de la `0027` y la `0028` borrados: elegía las dos citas a mano y
+-- después comprobaba que estuvieran las que había escrito. Decía ser la mitad
+-- (c) —«regenerar el MISMO reporte cita un id distinto»—, y eso no lo hace la
+-- base: quien elige qué versión citar al regenerar es el orquestador, y lo mide
+-- el test 3 de `src/lib/reports/__tests__/orchestrator.profileCitation.test.ts`.
+--
+-- Lo que la base SÍ hace, y este bloque mide, son tres cosas, cada una con un
+-- mecanismo que si falta lo pone rojo:
+--   1. la versión 2 no se puede citar mientras es borrador (45004, el trigger de
+--      la `0028`): la única forma de que un reporte cite la ficha nueva es
+--      publicarla;
+--   2. después de publicar la 2, el ICP de la 1 —que el reporte A ya cita— no se
+--      puede reescribir (45002, el guard de las hijas de la `0027`);
+--   3. las dos citas resuelven, cada una a su fila, y la de A sigue diciendo lo
+--      que decía cuando se citó.
+--
+-- Las fechas van explícitas y escalonadas porque dentro de una transacción
+-- `now()` no avanza y la decisión 8 de la `0028` pide que la versión citada
+-- estuviera vigente cuando se escribió el reporte: A se escribe «ahora» contra la
+-- 1, la 2 se publica un segundo después, y B se escribe dos segundos después.
+--
+-- Corre de verdad, no con `sin_huella`: el 107 y el 109 usan lo que deja.
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id)
+SELECT 'd0280000-0028-4028-8028-00000000000a', org_alice,
+       'd0270000-0027-4027-8027-000000000001', 'Reporte A',
+       'd0270000-0027-4027-8027-000000000010' FROM t;
+
+-- Cambiar la ficha: la versión 2, con otro ICP, escrita como borrador.
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0280000-0028-4028-8028-000000000020', org_alice,
+       'd0270000-0027-4027-8027-000000000001', 2, 'draft' FROM t;
+INSERT INTO profile_icp (id, organization_id, profile_id, definition)
+SELECT 'd0280000-0028-4028-8028-000000000025', org_alice,
+       'd0280000-0028-4028-8028-000000000020', 'ICP NUEVO de la version 2' FROM t;
+
+-- 1. Citar la 2 mientras es borrador.
+SELECT set_config('qa.b106_borrador', coalesce(pg_temp.sqlstate_sin_huella(format($s$
+    INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+    VALUES (%L, 'd0270000-0027-4027-8027-000000000001', 'Reporte contra el borrador',
+            'd0280000-0028-4028-8028-000000000020')
+$s$, (SELECT org_alice FROM t))), 'ACEPTADO'), true);
+
+-- Publicarla: la 1 a superada y la 2 a publicada, un segundo después de A.
+UPDATE company_profiles
+   SET status = 'superseded', superseded_at = now() + interval '1 second'
+ WHERE id = 'd0270000-0027-4027-8027-000000000010';
+UPDATE company_profiles
+   SET status = 'published', published_at = now() + interval '1 second',
+       published_by = '11111111-1111-4111-8111-111111111111'
+ WHERE id = 'd0280000-0028-4028-8028-000000000020';
+
+-- 2. Reescribir el ICP de la 1, que A ya cita.
+SELECT set_config('qa.b106_reescribir', coalesce(pg_temp.sqlstate_sin_huella(
+    $s$UPDATE profile_icp SET definition = 'ICP reescrito despues de citado'
+        WHERE profile_id = 'd0270000-0027-4027-8027-000000000010'$s$), 'ACEPTADO'), true);
+
+-- Reporte B: la misma empresa, contra la versión vigente.
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-00000000000b', org_alice,
+       'd0270000-0027-4027-8027-000000000001', 'Reporte B',
+       'd0280000-0028-4028-8028-000000000020', now() + interval '2 seconds' FROM t;
+
+-- 3. Resolver las dos citas.
+CREATE TEMP TABLE h12_cita ON COMMIT DROP AS
+SELECT r.id AS reporte, r.profile_version_id AS cita, cp.version, cp.status, icp.definition
+  FROM reports r
+  LEFT JOIN company_profiles cp ON cp.organization_id = r.organization_id AND cp.id = r.profile_version_id
+  LEFT JOIN profile_icp icp     ON icp.organization_id = cp.organization_id AND icp.profile_id = cp.id
+ WHERE r.id IN ('d0280000-0028-4028-8028-00000000000a', 'd0280000-0028-4028-8028-00000000000b');
+
+INSERT INTO defect_report
+SELECT 106, 'la cita no resuelve a lo citado: se puede citar un borrador, o reescribir lo que ya se citó',
+       NOT coalesce(current_setting('qa.b106_borrador') = '45004'
+            AND current_setting('qa.b106_reescribir') = '45002'
+            AND a.cita IS NOT NULL AND b.cita IS NOT NULL AND a.cita <> b.cita
+            AND a.version = 1 AND a.status = 'superseded' AND a.definition = 'ICP de la version'
+            AND b.version = 2 AND b.status = 'published' AND b.definition = 'ICP NUEVO de la version 2', false),
+       'citar la v2 siendo borrador dio ' || current_setting('qa.b106_borrador') || ' (esperado 45004); ' ||
+       'reescribir el ICP de la v1 ya citada dio ' || current_setting('qa.b106_reescribir') || ' (esperado 45002); ' ||
+       'el reporte A cita v' || coalesce(a.version::text, '?') || ' (' || coalesce(a.status, 'no resuelve') ||
+       ', ICP «' || coalesce(a.definition, '—') || '»); el B cita v' || coalesce(b.version::text, '?') ||
+       ' (' || coalesce(b.status, 'no resuelve') || ', ICP «' || coalesce(b.definition, '—') || '»)'
+  FROM (SELECT * FROM h12_cita WHERE reporte = 'd0280000-0028-4028-8028-00000000000a') a
+ CROSS JOIN (SELECT * FROM h12_cita WHERE reporte = 'd0280000-0028-4028-8028-00000000000b') b;
+
+-- Anti-vacuidad del 106: si alguno de los dos reportes no quedó, el CROSS JOIN
+-- de arriba no produce fila y el bloque no se registra. Esto lo dice antes y con
+-- nombre.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM h12_cita;
+    IF n <> 2 THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 106: % de los 2 reportes quedaron.', n;
+    END IF;
+END
+$$;
+
+-- ── 107 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que una cita guardada no se cambie ni se quite (decisión 5 de la
+-- `0028`). Cambiar contra qué versión se escribió un reporte ya entregado es
+-- reescribir su historia, aunque las dos versiones existan y estén congeladas.
+--
+-- Con tres controles positivos, porque el guard podría cerrar de más en tres
+-- direcciones: un UPDATE de otra columna del reporte tiene que entrar; un UPDATE
+-- que MANDA la misma cita que ya tenía —la forma de un PATCH o un upsert de fila
+-- entera— también; y poner la cita por primera vez en un reporte que no la tenía,
+-- con una versión vigente en su fecha, también.
+--
+-- El segundo control existe porque el primero solo no medía lo que decía. La
+-- primera versión afirmaba que el retitulado probaba que el trigger es `UPDATE OF
+-- profile_version_id`; la revisión adversarial mostró que lo dejan pasar DOS
+-- mecanismos independientes —la lista de columnas del trigger y el `RETURN NEW`
+-- temprano cuando la cita no cambia—, y que sacar cualquiera de los dos dejaba el
+-- bloque verde. El reenvío de la misma cita sí dispara el trigger, así que sólo
+-- el `RETURN NEW` temprano lo deja pasar: ése es el que ahora lo mide.
+-- LOS DOS ÚLTIMOS CASOS, Y POR QUÉ LLEGARON EN LA SEGUNDA RONDA. El primero
+-- («cambiar la cita») muere también por la regla de vigencia: el reporte A es de
+-- «ahora» y la versión 2 se publicó un segundo después. Así que un guard que
+-- dejara RE-APUNTAR una cita (y sólo prohibiera quitarla) quedaba verde. El
+-- penúltimo re-apunta a una versión que SÍ estuvo vigente en la fecha nueva del
+-- reporte: la vigencia lo deja pasar, y lo único que lo frena es la cita fija.
+--
+-- El último es el control positivo del arreglo de la segunda ronda: una versión
+-- que se superó DESPUÉS de citada, con fecha retroactiva, deja la cita fuera de
+-- su ventana, y reenviar esa misma cita en un PATCH de fila entera tiene que
+-- seguir entrando. Antes el trigger la re-juzgaba en cada reenvío.
+--
+-- Fixture: «Alice Superada» gana su versión 2, publicada hace cinco días —la
+-- sucesora real de la superada—, con un reporte de hace dos que la cita, y
+-- después la versión 2 se supera con fecha retroactiva, hace tres días.
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0280000-0028-4028-8028-000000000022', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 2, 'draft' FROM t;
+UPDATE company_profiles
+   SET status = 'published', published_at = now() - interval '5 days', published_by = '11111111-1111-4111-8111-111111111111'
+ WHERE id = 'd0280000-0028-4028-8028-000000000022';
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-00000000000c', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte contra la superada',
+       'd0270000-0027-4027-8027-000000000020', now() - interval '7 days' FROM t;
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-00000000000d', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte contra la versión 2',
+       'd0280000-0028-4028-8028-000000000022', now() - interval '2 days' FROM t;
+UPDATE company_profiles
+   SET status = 'superseded', superseded_at = now() - interval '3 days'
+ WHERE id = 'd0280000-0028-4028-8028-000000000022';
+
+CREATE TEMP TABLE h12_cita_fija ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('cambiar la cita de un reporte guardado',
+     $s$UPDATE reports SET profile_version_id = 'd0280000-0028-4028-8028-000000000020' WHERE id = 'd0280000-0028-4028-8028-00000000000a'$s$,
+     '45004'),
+    ('quitar la cita de un reporte guardado',
+     $s$UPDATE reports SET profile_version_id = NULL WHERE id = 'd0280000-0028-4028-8028-00000000000a'$s$,
+     '45004'),
+    ('cambiar el título de un reporte con cita',
+     $s$UPDATE reports SET title = 'Reporte A, retitulado' WHERE id = 'd0280000-0028-4028-8028-00000000000a'$s$,
+     NULL::text),
+    ('mandar la misma cita junto con otro cambio, como un PATCH de fila entera',
+     $s$UPDATE reports SET title = 'Reporte A, otra vez', profile_version_id = 'd0270000-0027-4027-8027-000000000010' WHERE id = 'd0280000-0028-4028-8028-00000000000a'$s$,
+     NULL::text),
+    ('poner la cita por primera vez en un reporte que no la tenía, con la versión vigente en su fecha',
+     $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000010' WHERE id = 'd0280000-0028-4028-8028-000000000000'$s$,
+     NULL::text),
+    ('re-apuntar la cita a otra versión, moviendo la fecha a su vigencia',
+     $s$UPDATE reports SET profile_version_id = 'd0280000-0028-4028-8028-000000000022', created_at = now() - interval '4 days' WHERE id = 'd0280000-0028-4028-8028-00000000000c'$s$,
+     '45004'),
+    ('reenviar la cita de un reporte cuya versión se superó después, con fecha retroactiva',
+     $s$UPDATE reports SET title = 'Reporte contra la versión 2, otra vez', profile_version_id = 'd0280000-0028-4028-8028-000000000022' WHERE id = 'd0280000-0028-4028-8028-00000000000d'$s$,
+     NULL::text)
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_cita_fija_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_cita_fija;
+
+INSERT INTO defect_report
+SELECT 107, 'la cita de un reporte guardado se puede cambiar o quitar',
+       EXISTS (SELECT 1 FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'cambiar, re-apuntar y quitar la cita murieron con 45004; retitular, reenviar la misma cita (también después de una superación retroactiva) y completar un reporte sin cita entraron'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_cita_fija_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 108 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 105 Y DEL 115: una versión SUPERADA se puede citar
+-- desde un reporte escrito cuando estaba vigente. Está congelada igual que una
+-- publicada, así que la cita resuelve para siempre a lo mismo. Un trigger que
+-- exigiera `published` pasaría el 105 y dejaría sin camino a un reporte viejo que
+-- se re-guarda. La superada del fixture estuvo vigente de hace diez días a hace
+-- cinco; el reporte es de hace siete.
+INSERT INTO defect_report
+SELECT 108, 'el trigger de la cita rechaza también una versión superada, que está congelada',
+       estado IS NOT NULL,
+       CASE WHEN estado IS NULL
+            THEN 'un reporte citando una versión superada entró'
+            ELSE 'citar una versión superada murió con ' || estado || ': el trigger cierra de más' END
+  FROM (SELECT pg_temp.sqlstate_sin_huella(format($s$
+            INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+            VALUES (%L, 'd0270000-0027-4027-8027-000000000002', 'Reporte de la superada',
+                    'd0270000-0027-4027-8027-000000000020', now() - interval '7 days')
+        $s$, (SELECT org_alice FROM t))) AS estado) x;
+
+-- ── 109 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DE LA DECISIÓN 3 de la `0028`: dar de baja una empresa
+-- cuyos reportes citan su ficha tiene que ENTRAR. La baja borra en una sentencia
+-- los reportes (cascade desde `businesses`) y la ficha (otro cascade desde
+-- `businesses`), y tiene que entrar.
+--
+-- LO QUE ESTE BLOQUE NO MIDE, dicho porque la primera versión decía que sí: la
+-- elección entre `NO ACTION` y `RESTRICT` en la FK de la cita. Decía «con
+-- RESTRICT, este bloque es el que se pondría rojo», y es falso: medido con la FK
+-- en RESTRICT, las 117 aserciones quedan verdes (decisión 3 de la `0028`). Y
+-- tampoco una FK en CASCADE, que la versión siguiente de este comentario daba
+-- por detectada: una versión citada sólo puede desaparecer por esta misma baja
+-- —el guard rechaza el borrado directo, no se cita un borrador, y una congelada
+-- no vuelve a borrador—, así que la acción de la FK no se observa nunca. Medido
+-- por la tercera ronda de la revisión. Lo que SÍ lo pone rojo, medido, es un
+-- guard que confunda esta baja con un borrado directo.
+--
+-- «Alice Publicada» tiene ahora dos versiones y tres reportes, dos de ellos con
+-- cita. Corre de verdad y cuenta después, en otra sentencia: la lección del 101.
+CREATE TEMP TABLE h12_baja_citada ON COMMIT DROP AS
+SELECT pg_temp.sqlstate_of(
+           $s$DELETE FROM businesses WHERE id = 'd0270000-0027-4027-8027-000000000001'$s$) AS estado;
+
+INSERT INTO defect_report
+SELECT 109, 'un reporte que cita la ficha impide dar de baja a la empresa',
+       b.estado IS NOT NULL OR q.reportes <> 0 OR q.versiones <> 0,
+       CASE WHEN b.estado IS NULL AND q.reportes = 0 AND q.versiones = 0
+            THEN 'la baja entró y se llevó los reportes con cita y las dos versiones que citaban'
+            WHEN b.estado IS NOT NULL THEN 'la baja murió con ' || b.estado ||
+                 ': algún guard confundió la baja de la empresa con un borrado directo'
+            ELSE 'la baja pasó pero quedaron ' || q.reportes || ' reportes y ' || q.versiones || ' versiones' END
+  FROM h12_baja_citada b
+ CROSS JOIN (SELECT (SELECT count(*) FROM reports          WHERE business_id = 'd0270000-0027-4027-8027-000000000001') AS reportes,
+                    (SELECT count(*) FROM company_profiles WHERE business_id = 'd0270000-0027-4027-8027-000000000001') AS versiones) q;
+
+RESET ROLE;
+
+
+-- ── 110 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que ningún rol pueda llamar A MANO a las seis funciones de la
+-- `0027` y la `0028`. Medido antes del arreglo: con el `REVOKE ... FROM PUBLIC`
+-- solo —la forma de la `0015`—, `anon` tenía EXECUTE sobre
+-- `company_profile_freeze_state`, porque los default privileges de Supabase lo
+-- dan POR NOMBRE a los tres roles. Esa función es `SECURITY DEFINER`, saltea RLS
+-- y contesta el estado de la ficha de cualquier organización dado su id, tomando
+-- un `FOR SHARE` de paso: un oráculo entre tenants a un POST de distancia.
+--
+-- Dos mitades. Por catálogo, las seis funciones por los cuatro roles:
+-- veinticuatro pares, y ninguno puede tener EXECUTE. Y ejecutado, porque el catálogo dice qué
+-- privilegio hay, no qué pasa: `anon` llama a la función y tiene que morir con
+-- 42501.
+CREATE TEMP TABLE h12_privilegios ON COMMIT DROP AS
+SELECT f.firma, r.rol,
+       to_regprocedure(f.firma) IS NOT NULL AS existe,
+       CASE WHEN to_regprocedure(f.firma) IS NULL THEN NULL
+            ELSE has_function_privilege(r.rol, to_regprocedure(f.firma), 'EXECUTE') END AS ejecuta
+  FROM (VALUES ('public.company_profile_freeze_state(uuid, uuid)'),
+               ('public.company_profiles_immutable()'),
+               ('public.profile_child_freeze_state(text, jsonb)'),
+               ('public.profile_child_immutable()'),
+               ('public.reports_cite_frozen_version()'),
+               ('public.reports_citation_is_fixed()')) AS f(firma)
+ CROSS JOIN (VALUES ('anon'), ('authenticated'), ('service_role'), ('growthos_app')) AS r(rol);
+
+SET LOCAL ROLE anon;
+SELECT set_config('qa.b110',
+       coalesce(pg_temp.sqlstate_of(
+           $s$SELECT public.company_profile_freeze_state('018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1a01', 'd0270000-0027-4027-8027-000000000020')$s$),
+       'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 110, 'un rol de la API puede llamar a mano a las funciones SECURITY DEFINER de la ficha',
+       EXISTS (SELECT 1 FROM h12_privilegios WHERE ejecuta IS DISTINCT FROM false)
+         OR current_setting('qa.b110') <> '42501',
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_privilegios WHERE ejecuta IS DISTINCT FROM false)
+             AND current_setting('qa.b110') = '42501'
+            THEN (SELECT count(*) FROM h12_privilegios) || ' pares función/rol sin EXECUTE, y anon llamando a la función murió con 42501'
+            ELSE 'con EXECUTE: [' ||
+                 coalesce((SELECT string_agg(rol || ' sobre ' || firma, '; ' ORDER BY firma, rol)
+                             FROM h12_privilegios WHERE ejecuta), '') ||
+                 ']; sin la función: [' ||
+                 coalesce((SELECT string_agg(firma, '; ') FROM h12_privilegios WHERE NOT existe), '') ||
+                 ']; anon llamándola dio ' || current_setting('qa.b110') END;
+
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM h12_privilegios WHERE existe;
+    IF n <> 24 THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 110: % de los 24 pares función/rol tienen la función.', n;
+    END IF;
+END
+$$;
+
+-- ── 111 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 110, y es la pregunta que el 110 abre: ¿los triggers
+-- siguen disparando si nadie tiene EXECUTE sobre sus funciones? PostgreSQL no lo
+-- pide al disparar, y lo que ellas llaman adentro corre como su dueño. Pero eso
+-- es una afirmación sobre el motor, y acá se mide con los dos roles que escriben
+-- de verdad.
+--
+-- Con sesión (`authenticated`, alice): no puede escribir la ficha —la `0026` le
+-- da sólo lectura, medido—, pero SÍ inserta reportes, que es lo que hace el
+-- orquestador. Así que: citar una versión superada de su organización ENTRA, y
+-- citar un borrador muere con 45004 — o sea que el trigger de la cita disparó
+-- para ella, en las dos direcciones.
+--
+-- Con `service_role`, que es quien escribe la ficha: una hija de un borrador se
+-- edita, y una de una superada muere con 45002. El bloque 100 ya lo mide sobre
+-- la fila-versión; esto lo mide en una hija, que pasa por las DOS funciones
+-- auxiliares.
+--
+-- El SQL se arma como `postgres` y viaja por un GUC, igual que en los bloques 88
+-- y 89: `org_alice` sale de `org_members`, no es un literal. La primera versión
+-- de este bloque escribió a mano el UUID de la organización de alice, y los dos
+-- INSERT murieron con 42501 —la policy de `reports` rechazando una organización
+-- de la que alice no es miembro—: el bloque se puso rojo por un rechazo por el
+-- motivo equivocado, que es lo que tiene que hacer, pero el defecto era suyo.
+SELECT set_config('qa.sql111a', format($s$
+           INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+           VALUES (%L, 'd0270000-0027-4027-8027-000000000002', 'Reporte con sesion',
+                   'd0270000-0027-4027-8027-000000000020', now() - interval '7 days')
+       $s$, (SELECT org_alice FROM t)), true);
+SELECT set_config('qa.sql111b', format($s$
+           INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+           VALUES (%L, 'd0270000-0027-4027-8027-000000000003', 'Reporte con sesion, borrador',
+                   'd0270000-0027-4027-8027-000000000030')
+       $s$, (SELECT org_alice FROM t)), true);
+
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b111a',
+       coalesce(pg_temp.sqlstate_sin_huella(current_setting('qa.sql111a')), 'ACEPTADO'), true);
+SELECT set_config('qa.b111b',
+       coalesce(pg_temp.sqlstate_sin_huella(current_setting('qa.sql111b')), 'ACEPTADO'), true);
+RESET ROLE;
+
+SET LOCAL ROLE service_role;
+SELECT set_config('qa.b111c',
+       coalesce(pg_temp.sqlstate_sin_huella(
+           $s$UPDATE profile_offers SET name = 'editada por la clave de servicio' WHERE id = 'd0270000-0027-4027-8027-000000000031'$s$),
+       'ACEPTADO'), true);
+SELECT set_config('qa.b111d',
+       coalesce(pg_temp.sqlstate_sin_huella(
+           $s$UPDATE profile_offers SET name = 'editada por la clave de servicio' WHERE id = 'd0270000-0027-4027-8027-000000000021'$s$),
+       'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 111, 'sin EXECUTE, los triggers de la ficha y de la cita dejan de disparar o de dejar pasar',
+       NOT (current_setting('qa.b111a') = 'ACEPTADO' AND current_setting('qa.b111b') = '45004'
+            AND current_setting('qa.b111c') = 'ACEPTADO' AND current_setting('qa.b111d') = '45002'),
+       'con sesión: citar una superada dio ' || current_setting('qa.b111a') ||
+       ' (esperado ACEPTADO), citar un borrador dio ' || current_setting('qa.b111b') ||
+       ' (esperado 45004); con service_role: editar la hija de un borrador dio ' || current_setting('qa.b111c') ||
+       ' (esperado ACEPTADO), la de una superada dio ' || current_setting('qa.b111d') || ' (esperado 45002)';
+
+RESET ROLE;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Lo que encontró la revisión adversarial del 2026-09-30
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Seis bloques, uno por defecto confirmado que ningún bloque de arriba podía
+-- ver. Cada escenario lo reprodujo primero un revisor contra el esquema viejo,
+-- en la réplica, y lo vio pasar.
+RESET ROLE;
+
+-- ── 112 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que una hija no se pueda SACAR de una versión congelada hacia un
+-- borrador (decisión 14 de la `0027`). Mover una línea de oferta, un objetivo o
+-- una fuente de la versión superada a un borrador le quita contenido a la
+-- superada, y el destino del UPDATE es un borrador: la única comprobación que lo
+-- frena es la que mira la versión de ORIGEN. Las veintidós plantillas del 96
+-- reescriben texto y nunca cambian `profile_id`, así que borrar esa mitad del
+-- guard dejaba todo verde.
+--
+-- El cuarto caso es la dirección contraria —meter una hija de un borrador EN la
+-- versión congelada—, que frena la comprobación del DESTINO. La primera versión
+-- de este bloque sólo sacaba, y la segunda ronda de la revisión mostró que
+-- cambiar el destino por el origen en esa comprobación dejaba todo verde. Los
+-- dos últimos casos son el control positivo: entre dos borradores, mover está
+-- permitido.
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0280000-0028-4028-8028-000000000100', org_alice, 'Alice Borrador Dos' FROM t;
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0280000-0028-4028-8028-000000000110', org_alice,
+       'd0280000-0028-4028-8028-000000000100', 1, 'draft' FROM t;
+INSERT INTO profile_objectives (id, organization_id, profile_id, statement, kind)
+SELECT 'd0280000-0028-4028-8028-000000000116', org_alice,
+       'd0280000-0028-4028-8028-000000000110', 'Objetivo del borrador dos', 'claim' FROM t;
+
+CREATE TEMP TABLE h12_mudanza ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('sacar una oferta de la superada hacia un borrador',
+     $s$UPDATE profile_offers SET profile_id = 'd0270000-0027-4027-8027-000000000030' WHERE id = 'd0270000-0027-4027-8027-000000000021'$s$,
+     '45002'),
+    ('sacar un objetivo de la superada hacia un borrador',
+     $s$UPDATE profile_objectives SET profile_id = 'd0270000-0027-4027-8027-000000000030' WHERE id = 'd0270000-0027-4027-8027-000000000026'$s$,
+     '45002'),
+    ('sacar la evidencia de la superada hacia el objetivo de un borrador',
+     $s$UPDATE profile_evidence SET objective_id = 'd0270000-0027-4027-8027-000000000036' WHERE id = 'd0270000-0027-4027-8027-000000000027'$s$,
+     '45002'),
+    ('meter una oferta de un borrador en la superada',
+     $s$UPDATE profile_offers SET profile_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0270000-0027-4027-8027-000000000031'$s$,
+     '45002'),
+    ('mover una oferta entre dos borradores',
+     $s$UPDATE profile_offers SET profile_id = 'd0280000-0028-4028-8028-000000000110' WHERE id = 'd0270000-0027-4027-8027-000000000031'$s$,
+     NULL::text),
+    ('mover la evidencia entre objetivos de dos borradores',
+     $s$UPDATE profile_evidence SET objective_id = 'd0280000-0028-4028-8028-000000000116' WHERE id = 'd0270000-0027-4027-8027-000000000037'$s$,
+     NULL::text)
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_mudanza_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_mudanza;
+
+INSERT INTO defect_report
+SELECT 112, 'una hija se puede sacar de una versión congelada moviéndola a un borrador',
+       EXISTS (SELECT 1 FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'sacar oferta, objetivo y evidencia de la superada, y meter una oferta en ella, murieron con 45002; mover entre borradores entró'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_mudanza_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 113 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la ficha NO congele el catálogo (decisión 12 de la `0027`).
+-- `profile_offers.service_id` es `ON DELETE SET NULL (service_id)` desde la
+-- `0026`, y ese SET NULL es un UPDATE sobre la oferta. Medido por la revisión: el
+-- guard lo rechazaba con 45002 y el servicio quedaba imposible de borrar para
+-- siempre si alguna versión publicada o superada lo citaba — lo contrario de lo
+-- que la `0026` y la `0027` dicen.
+--
+-- Tres cosas, y las tres hacen falta: desenganchar la oferta A MANO sigue
+-- muriendo con 45002 (la excepción no es «service_id se puede anular»); borrar
+-- el servicio ENTRA; y después la oferta sigue ahí, sin servicio, que es lo que
+-- la `0026` decidió.
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0280000-0028-4028-8028-000000000200', org_alice, 'Alice Catalogo' FROM t;
+INSERT INTO business_services (id, organization_id, business_id, slug, name)
+SELECT 'd0280000-0028-4028-8028-000000000201', org_alice,
+       'd0280000-0028-4028-8028-000000000200', 'catalogo-servicio', 'Servicio del catalogo' FROM t;
+INSERT INTO company_profiles (id, organization_id, business_id, version, status)
+SELECT 'd0280000-0028-4028-8028-000000000210', org_alice,
+       'd0280000-0028-4028-8028-000000000200', 1, 'draft' FROM t;
+INSERT INTO profile_offers (id, organization_id, profile_id, name, service_id)
+SELECT 'd0280000-0028-4028-8028-000000000211', org_alice,
+       'd0280000-0028-4028-8028-000000000210', 'Oferta con servicio',
+       'd0280000-0028-4028-8028-000000000201' FROM t;
+UPDATE company_profiles
+   SET status = 'published', published_at = now() - interval '1 day', published_by = '11111111-1111-4111-8111-111111111111'
+ WHERE id = 'd0280000-0028-4028-8028-000000000210';
+
+SELECT set_config('qa.b113_mano', coalesce(pg_temp.sqlstate_sin_huella(
+    $s$UPDATE profile_offers SET service_id = NULL WHERE id = 'd0280000-0028-4028-8028-000000000211'$s$),
+    'ACEPTADO'), true);
+
+CREATE TEMP TABLE h12_catalogo ON COMMIT DROP AS
+SELECT pg_temp.sqlstate_of(
+           $s$DELETE FROM business_services WHERE id = 'd0280000-0028-4028-8028-000000000201'$s$) AS estado;
+
+INSERT INTO defect_report
+SELECT 113, 'la ficha congela el catálogo: un servicio citado por una oferta publicada no se puede borrar',
+       current_setting('qa.b113_mano') <> '45002' OR c.estado IS NOT NULL OR o.n <> 1 OR o.con_servicio <> 0,
+       'desenganchar a mano dio ' || current_setting('qa.b113_mano') || ' (esperado 45002); ' ||
+       'borrar el servicio dio ' || coalesce(c.estado, 'ACEPTADO') || ' (esperado ACEPTADO); ' ||
+       'quedan ' || o.n || ' ofertas, ' || o.con_servicio || ' con servicio (esperado 1 y 0)'
+  FROM h12_catalogo c
+ CROSS JOIN (SELECT count(*) AS n, count(service_id) AS con_servicio
+               FROM profile_offers WHERE id = 'd0280000-0028-4028-8028-000000000211') o;
+
+-- ── 114 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que un reporte no pueda citar la ficha de OTRA EMPRESA de su misma
+-- organización (decisión 2 de la `0028`). Medido por la revisión contra la FK de
+-- dos columnas: el INSERT entraba, y también MOVER un reporte citado con un
+-- UPDATE de `business_id`, que ni disparaba el trigger — y con eso la otra
+-- empresa quedaba imposible de dar de baja. Exige 23503 exacto: la FK de tres
+-- columnas.
+--
+-- El tercer caso es el control positivo: mover un reporte SIN cita entre
+-- empresas sigue permitido; lo que la FK mira es la cita.
+INSERT INTO reports (id, organization_id, business_id, title, profile_version_id, created_at)
+SELECT 'd0280000-0028-4028-8028-000000000300', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte de la superada, guardado',
+       'd0270000-0027-4027-8027-000000000020', now() - interval '7 days' FROM t;
+INSERT INTO reports (id, organization_id, business_id, title)
+SELECT 'd0280000-0028-4028-8028-000000000301', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte sin cita, para mover' FROM t;
+
+CREATE TEMP TABLE h12_otra_empresa ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('citar la ficha de otra empresa de la misma organización',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000003', 'Reporte de otra empresa',
+               'd0270000-0027-4027-8027-000000000020', now() - interval '7 days' FROM t$s$,
+     '23503'),
+    ('mover a otra empresa un reporte que cita la ficha de la suya',
+     $s$UPDATE reports SET business_id = 'd0270000-0027-4027-8027-000000000003' WHERE id = 'd0280000-0028-4028-8028-000000000300'$s$,
+     '23503'),
+    ('mover a otra empresa un reporte sin cita',
+     $s$UPDATE reports SET business_id = 'd0270000-0027-4027-8027-000000000003' WHERE id = 'd0280000-0028-4028-8028-000000000301'$s$,
+     NULL::text)
+) AS c(caso, sql, esperado);
+
+CREATE TEMP TABLE h12_otra_empresa_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_otra_empresa;
+
+INSERT INTO defect_report
+SELECT 114, 'un reporte puede citar la ficha de otra empresa de su organización',
+       EXISTS (SELECT 1 FROM h12_otra_empresa_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_otra_empresa_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'citar o mover hacia otra empresa murió con 23503; mover un reporte sin cita entró'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_otra_empresa_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 115 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que la versión citada estuviera VIGENTE cuando se escribió el
+-- reporte (decisión 8 de la `0028`). Medido por la revisión: «poner la cita por
+-- primera vez» dejaba completar un reporte de enero con una versión publicada en
+-- septiembre, y la FK resolvía a una estrategia que el reporte nunca vio.
+--
+-- La superada del fixture estuvo vigente de hace diez días a hace cinco. Tres
+-- formas de citarla fuera de eso, y la última es el control positivo (la 108 es
+-- el otro).
+--
+-- Y EL BORDE, que la tercera ronda de la revisión encontró sin fijar: la
+-- ventana es semiabierta —`published_at <= created_at < superseded_at`—, y en el
+-- instante exacto del relevo la saliente ya no rige y la entrante sí. Sin estos
+-- dos casos, cambiar `>=` por `>` dejaba citar LAS DOS en ese instante, y `<` por
+-- `<=` ninguna. Dentro de una transacción `now()` no avanza, así que publicar y
+-- generar el reporte en la misma transacción cae exactamente ahí. La saliente es
+-- la superada del fixture (superada hace cinco días); la entrante, la versión 2
+-- de la misma empresa que armó el 107 (publicada hace cinco días).
+--
+-- Las dos fechas de los casos se LEEN de las filas y no se escriben: la cuarta
+-- ronda de la revisión mostró que, escritas como literales, los casos quedaban
+-- en el borde sólo porque tres `'5 days'` de tres lugares distintos
+-- coincidían, y mover cualquiera a `'6 days'` dejaba el borde sin medir y todo
+-- verde. Y la anti-vacuidad de abajo exige que la salida de una y la entrada de
+-- la otra sean el MISMO instante; si no, no es un relevo.
+INSERT INTO reports (id, organization_id, business_id, title, created_at)
+SELECT 'd0280000-0028-4028-8028-000000000302', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte viejo, de antes de la ficha',
+       now() - interval '30 days' FROM t;
+INSERT INTO reports (id, organization_id, business_id, title, created_at)
+SELECT 'd0280000-0028-4028-8028-000000000303', org_alice,
+       'd0270000-0027-4027-8027-000000000002', 'Reporte de cuando la superada estaba vigente',
+       now() - interval '7 days' FROM t;
+
+CREATE TEMP TABLE h12_vigencia ON COMMIT DROP AS
+SELECT * FROM (VALUES
+    ('un reporte de hoy citando una versión superada hace cinco días',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte de hoy',
+               'd0270000-0027-4027-8027-000000000020' FROM t$s$,
+     '45004'),
+    ('completar un reporte de hace treinta días con una versión publicada hace diez',
+     $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0280000-0028-4028-8028-000000000302'$s$,
+     '45004'),
+    ('mover la fecha de un reporte citado fuera de la vigencia de su versión',
+     $s$UPDATE reports SET created_at = now() WHERE id = 'd0280000-0028-4028-8028-000000000300'$s$,
+     '45004'),
+    ('un reporte escrito en el instante exacto del relevo citando la versión saliente',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la saliente',
+               'd0270000-0027-4027-8027-000000000020',
+               (SELECT superseded_at FROM company_profiles WHERE id = 'd0270000-0027-4027-8027-000000000020')
+          FROM t$s$,
+     '45004'),
+    ('un reporte escrito en el instante exacto del relevo citando la versión entrante',
+     $s$INSERT INTO reports (organization_id, business_id, title, profile_version_id, created_at)
+        SELECT org_alice, 'd0270000-0027-4027-8027-000000000002', 'Reporte del relevo, contra la entrante',
+               'd0280000-0028-4028-8028-000000000022',
+               (SELECT published_at FROM company_profiles WHERE id = 'd0280000-0028-4028-8028-000000000022')
+          FROM t$s$,
+     NULL::text),
+    ('completar un reporte de hace siete días con la versión vigente entonces',
+     $s$UPDATE reports SET profile_version_id = 'd0270000-0027-4027-8027-000000000020' WHERE id = 'd0280000-0028-4028-8028-000000000303'$s$,
+     NULL::text)
+) AS c(caso, sql, esperado);
+
+DO $$
+DECLARE
+    sale timestamptz := (SELECT superseded_at FROM company_profiles WHERE id = 'd0270000-0027-4027-8027-000000000020');
+    entra timestamptz := (SELECT published_at FROM company_profiles WHERE id = 'd0280000-0028-4028-8028-000000000022');
+BEGIN
+    IF sale IS NULL OR entra IS NULL OR sale <> entra THEN
+        RAISE EXCEPTION 'Corrida vacua del bloque 115: la saliente sale el % y la entrante entra el %: no es un relevo.', sale, entra;
+    END IF;
+END
+$$;
+
+CREATE TEMP TABLE h12_vigencia_r ON COMMIT DROP AS
+SELECT caso, esperado, pg_temp.sqlstate_sin_huella(sql) AS estado FROM h12_vigencia;
+
+INSERT INTO defect_report
+SELECT 115, 'un reporte puede citar una versión que no estaba vigente cuando se escribió',
+       EXISTS (SELECT 1 FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado),
+       CASE WHEN NOT EXISTS (SELECT 1 FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado)
+            THEN 'las tres citas fuera de la vigencia y la de la saliente en el relevo murieron con 45004; la entrante en el relevo y completar con la versión vigente entraron'
+            ELSE 'desvíos: ' || (SELECT string_agg(caso || ' dio ' || coalesce(estado, 'ACEPTADO') ||
+                                                   ' (esperado ' || coalesce(esperado, 'ACEPTADO') || ')', '; ' ORDER BY caso)
+                                   FROM h12_vigencia_r WHERE estado IS DISTINCT FROM esperado) END;
+
+-- ── 116 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el trigger de la cita no le diga a otra organización si una
+-- versión suya es un borrador (decisión 6 de la `0028`). Medido por la revisión
+-- contra el trigger `BEFORE`: un miembro de la organización A escribiendo un
+-- reporte con el `organization_id` de la B recibía 45004 si la versión de B era
+-- un borrador y 42501 si no — el oráculo entre tenants que la decisión 11 de la
+-- `0027` había cerrado, reabierto por otra puerta. Con el trigger `AFTER`, RLS
+-- contesta primero y la respuesta es 42501 siempre.
+--
+-- BOB SONDEA A ALICE, Y NO AL REVÉS. La primera versión de este bloque ponía a
+-- alice sondeando a bob, y daba 45004 con el arreglo puesto: alice ES miembro de
+-- la organización de bob desde el bloque 5 (lo dice el 92), así que RLS la deja
+-- pasar y saber que es un borrador es su derecho. Bob no es miembro de la de
+-- alice —el 89 lo mide—, que es lo que hace falta para que esto sea un sondeo.
+--
+-- La versión de alice TIENE que ser un borrador para que el caso mida algo: si no
+-- lo fuera, el 42501 saldría igual con el trigger viejo. El predicado lo afirma.
+SELECT set_config('qa.sql116', format($s$
+    INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+    VALUES (%L, 'd0270000-0027-4027-8027-000000000003', 'Sondeo de bob',
+            'd0270000-0027-4027-8027-000000000030')
+$s$, (SELECT org_alice FROM t)), true);
+SELECT set_config('qa.b116_estado',
+       coalesce((SELECT status FROM company_profiles WHERE id = 'd0270000-0027-4027-8027-000000000030'), 'no existe'),
+       true);
+
+SELECT pg_temp.be('22222222-2222-4222-8222-222222222222');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b116',
+       coalesce(pg_temp.sqlstate_sin_huella(current_setting('qa.sql116')), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 116, 'el trigger de la cita le dice a otra organización si una versión suya es un borrador',
+       current_setting('qa.b116') <> '42501' OR current_setting('qa.b116_estado') <> 'draft',
+       'bob citando el borrador de alice con el tenant de alice dio ' || current_setting('qa.b116') ||
+       ' (esperado 42501, la policy antes que el trigger); la versión de alice es ' ||
+       current_setting('qa.b116_estado') || ' (tiene que ser draft para que esto mida)';
+
+-- ── 117 ──────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDA: que el trigger de la cita no dependa de lo que ve quien escribe
+-- (decisión 6 de la `0028`: `SECURITY DEFINER`). Medido por la revisión: ningún
+-- bloque usaba un rol que pudiera insertar reportes y NO viera
+-- `company_profiles`, así que pasar la función a `SECURITY INVOKER` dejaba todo
+-- verde — y con eso un rol ciego a la ficha citaba un borrador: su SELECT no
+-- encontraba la fila, y «sin fila» es dejar pasar.
+--
+-- `growthos_app` es ese rol: la policy de `reports` lo alcanza, y las de la
+-- ficha son `TO authenticated`. Las dos primeras mediciones son la
+-- anti-vacuidad: que de verdad no vea la ficha, y que de verdad pueda escribir
+-- reportes. Si cualquiera de las dos fallara, el 45004 no probaría nada.
+SELECT set_config('qa.sql117a', format($s$
+    INSERT INTO reports (organization_id, business_id, title)
+    VALUES (%L, 'd0270000-0027-4027-8027-000000000003', 'Reporte sin cita, como growthos_app')
+$s$, (SELECT org_alice FROM t)), true);
+SELECT set_config('qa.sql117b', format($s$
+    INSERT INTO reports (organization_id, business_id, title, profile_version_id)
+    VALUES (%L, 'd0270000-0027-4027-8027-000000000003', 'Reporte contra el borrador, como growthos_app',
+            'd0270000-0027-4027-8027-000000000030')
+$s$, (SELECT org_alice FROM t)), true);
+
+SELECT pg_temp.be('11111111-1111-4111-8111-111111111111');
+SET LOCAL ROLE growthos_app;
+SELECT set_config('qa.b117_ve',
+       pg_temp.escalar($s$SELECT count(*)::text FROM company_profiles$s$), true);
+SELECT set_config('qa.b117_sin_cita',
+       coalesce(pg_temp.sqlstate_sin_huella(current_setting('qa.sql117a')), 'ACEPTADO'), true);
+SELECT set_config('qa.b117_borrador',
+       coalesce(pg_temp.sqlstate_sin_huella(current_setting('qa.sql117b')), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 117, 'el trigger de la cita depende de lo que ve quien escribe: un rol ciego a la ficha cita un borrador',
+       NOT (current_setting('qa.b117_ve') = '0'
+            AND current_setting('qa.b117_sin_cita') = 'ACEPTADO'
+            AND current_setting('qa.b117_borrador') = '45004'),
+       'growthos_app ve ' || current_setting('qa.b117_ve') || ' filas de la ficha (esperado 0); ' ||
+       'insertar un reporte sin cita dio ' || current_setting('qa.b117_sin_cita') || ' (esperado ACEPTADO); ' ||
+       'citar un borrador dio ' || current_setting('qa.b117_borrador') || ' (esperado 45004)';
+
+RESET ROLE;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 118 a 120. La baja de una organización con su ficha publicada — CERRADO por
+-- la decisión 18 de la 0026
 -- ─────────────────────────────────────────────────────────────────────────────
 -- QUÉ CUIDAN: que dar de baja a un cliente sea posible aunque haya publicado su
 -- ficha, sin que deje de valer que una versión no puede quedar firmada por alguien
@@ -3949,12 +5276,12 @@ RESET ROLE;
 --
 -- CORREN COMO `service_role`, que es el rol con el que `deleteMyAccount` borra
 -- (`createSupabaseAdminClient`): la vía real (R9). La única excepción es el borrado
--- desde `auth.users` del 96, dicha ahí.
+-- desde `auth.users` del 119, dicha ahí.
 --
 -- Y CADA UNO DISPARA LO QUE COMPROBARÍA EL COMMIT, por lo que dice el bloque 92:
 -- este archivo termina en ROLLBACK, y sin `SET CONSTRAINTS ALL IMMEDIATE` las
--- comprobaciones diferidas no correrían nunca —el 95 pasaría sin haber mirado y
--- el 96 no vería ninguna negativa—.
+-- comprobaciones diferidas no correrían nunca —el 118 pasaría sin haber mirado y
+-- el 119 no vería ninguna negativa—.
 
 INSERT INTO auth.users (id, email) VALUES
     ('d0260000-0026-4026-8026-000000000a01', 'olga@example.test'),
@@ -4016,17 +5343,17 @@ UPDATE company_profiles
 -- Anti-vacuidad: «no quedó nada» sobre una organización que no tenía nada no
 -- mide una baja. Cada tabla que la fixture dice poblar tiene que tener su fila,
 -- la versión tiene que estar PUBLICADA por olga y la evidencia VERIFICADA por
--- víctor —sin eso el 96 pediría una negativa a una FK que no tiene qué
+-- víctor —sin eso el 119 pediría una negativa a una FK que no tiene qué
 -- comprobar—. Y se dispara lo que el COMMIT comprobaría: una fixture que violara
--- una FK diferida corta la corrida acá, y no aparece como un rojo del 95.
+-- una FK diferida corta la corrida acá, y no aparece como un rojo del 118.
 --
 -- EN UNA SUBTRANSACCIÓN, Y NO CON UN `SET CONSTRAINTS ALL DEFERRED` DESPUÉS. La
 -- primera versión de este bloque hacía eso, y una mutación lo midió: `ALL
 -- DEFERRED` difiere TODA constraint diferible por el resto de la transacción,
 -- incluida una `DEFERRABLE INITIALLY IMMEDIATE`, así que la mutación que le
 -- devolvía a la FK su comprobación inmediata —la que traba la baja— sobrevivía
--- con los 97 en verde. Revertir la subtransacción devuelve a cada constraint SU
--- modo, no el que alguien eligió para todas.
+-- con los 97 checks de entonces en verde. Revertir la subtransacción devuelve a
+-- cada constraint SU modo, no el que alguien eligió para todas.
 DO $$
 BEGIN
     BEGIN
@@ -4065,7 +5392,7 @@ BEGIN
            ) AS f(tabla, ok)
      WHERE NOT ok;
     IF vacias IS NOT NULL THEN
-        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 95 a 97 no pobló: %', vacias;
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 118 a 120 no pobló: %', vacias;
     END IF;
 END
 $$;
@@ -4132,7 +5459,7 @@ EXCEPTION WHEN OTHERS THEN
 END
 $$;
 
--- ── 95 ───────────────────────────────────────────────────────────────────────
+-- ── 118 ──────────────────────────────────────────────────────────────────────
 -- La baja de la organización entera. Lo que la persona pide con «borrar mi
 -- cuenta» es exactamente esto: el primer paso de `deleteMyAccount`.
 --
@@ -4144,12 +5471,12 @@ $$;
 -- Y el número de tablas miradas tiene piso: con cero —un catálogo que no
 -- encontró nada— «no quedó nada» es cero sobre cero. Doce son las que la fixture
 -- puebla; el catálogo tiene más, y alcanza con que no tenga menos.
-SELECT set_config('qa.b95', pg_temp.al_commit(
+SELECT set_config('qa.b118', pg_temp.al_commit(
            format('DELETE FROM organizations WHERE id = %L', (SELECT org FROM baja)),
            'service_role', (SELECT org FROM baja)), true);
 
 INSERT INTO defect_report
-SELECT 95, 'una organización con la ficha publicada no se puede dar de baja, o la baja deja filas',
+SELECT 118, 'una organización con la ficha publicada no se puede dar de baja, o la baja deja filas',
        NOT (resultado ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
             AND substring(resultado FROM '^paso; ([0-9]+) tablas')::int >= 12),
        CASE WHEN resultado ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
@@ -4157,11 +5484,11 @@ SELECT 95, 'una organización con la ficha publicada no se puede dar de baja, o 
             THEN 'la baja pasó al COMMIT como service_role: organización, tres membresías, negocio, ' ||
                  'ficha publicada y sus siete hijas; ' || resultado
             ELSE 'la baja devolvió: ' || resultado END
-  FROM (SELECT current_setting('qa.b95') AS resultado) x;
+  FROM (SELECT current_setting('qa.b118') AS resultado) x;
 
--- ── 96 ───────────────────────────────────────────────────────────────────────
+-- ── 119 ──────────────────────────────────────────────────────────────────────
 -- EL CONTROL DE QUE LA DECISIÓN 4 SIGUE VALIENDO PARA UNA PERSONA. Sin este
--- bloque, sacar las dos FK pondría el 95 en verde: la baja pasaría, y una versión
+-- bloque, sacar las dos FK pondría el 118 en verde: la baja pasaría, y una versión
 -- quedaría firmada por alguien que ya no es miembro.
 --
 -- Tres bajas sueltas, con la organización y la versión en pie, y las tres tienen
@@ -4175,18 +5502,18 @@ SELECT 95, 'una organización con la ficha publicada no se puede dar de baja, o 
 --      `supabase_auth_admin`, que en esta réplica `postgres` no puede asumir, y
 --      `service_role` no tiene DELETE sobre `auth.users`. Lo que se mide es la
 --      cascada a la membresía, que es la misma la dispare quien la dispare.
-SELECT set_config('qa.b96a', pg_temp.al_commit(format(
+SELECT set_config('qa.b119a', pg_temp.al_commit(format(
            'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
            (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a01'), 'service_role'), true);
-SELECT set_config('qa.b96b', pg_temp.al_commit(format(
+SELECT set_config('qa.b119b', pg_temp.al_commit(format(
            'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
            (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a02'), 'service_role'), true);
-SELECT set_config('qa.b96c', pg_temp.al_commit(
+SELECT set_config('qa.b119c', pg_temp.al_commit(
            'DELETE FROM auth.users WHERE id = ''d0260000-0026-4026-8026-000000000a01''',
            'postgres'), true);
 
 INSERT INTO defect_report
-SELECT 96, 'se puede borrar a UN miembro que publicó o verificó mientras su versión sigue en pie',
+SELECT 119, 'se puede borrar a UN miembro que publicó o verificó mientras su versión sigue en pie',
        NOT (a LIKE '23503 |%"company_profiles_published_by_member_fkey"%'
             AND b LIKE '23503 |%"profile_evidence_verified_by_member_fkey"%'
             AND c LIKE '23503 |%"company_profiles_published_by_member_fkey"%'),
@@ -4196,30 +5523,30 @@ SELECT 96, 'se puede borrar a UN miembro que publicó o verificó mientras su ve
             THEN 'las tres bajas sueltas mueren al COMMIT con 23503 nombrando su FK: ' ||
                  'olga (published_by), víctor (verified_by) y olga desde auth.users'
             ELSE 'olga: ' || a || ' / víctor: ' || b || ' / olga desde auth.users: ' || c END
-  FROM (SELECT current_setting('qa.b96a') AS a, current_setting('qa.b96b') AS b,
-               current_setting('qa.b96c') AS c) x;
+  FROM (SELECT current_setting('qa.b119a') AS a, current_setting('qa.b119b') AS b,
+               current_setting('qa.b119c') AS c) x;
 
--- ── 97 ───────────────────────────────────────────────────────────────────────
--- EL CONTROL POSITIVO DEL 96: inés no publicó ni verificó nada, y su baja PASA.
+-- ── 120 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 119: inés no publicó ni verificó nada, y su baja PASA.
 -- Sin este bloque, un esquema que rechazara toda baja de miembro —un trigger que
--- la prohíba, una FK nueva que la trabe— pondría el 96 en verde por el motivo
+-- la prohíba, una FK nueva que la trabe— pondría el 119 en verde por el motivo
 -- equivocado.
-SELECT set_config('qa.b97', pg_temp.al_commit(format(
+SELECT set_config('qa.b120', pg_temp.al_commit(format(
            'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
            (SELECT org FROM baja), 'd0260000-0026-4026-8026-000000000a03'), 'service_role'), true);
 
 INSERT INTO defect_report
-SELECT 97, 'el esquema también rechaza la baja de un miembro que no firmó nada',
-       current_setting('qa.b97') <> 'paso',
-       CASE WHEN current_setting('qa.b97') = 'paso'
-            THEN 'la baja de inés pasó al COMMIT: el 96 rechaza a quien firmó, no a cualquiera'
-            ELSE 'la baja de inés murió: ' || current_setting('qa.b97') END;
+SELECT 120, 'el esquema también rechaza la baja de un miembro que no firmó nada',
+       current_setting('qa.b120') <> 'paso',
+       CASE WHEN current_setting('qa.b120') = 'paso'
+            THEN 'la baja de inés pasó al COMMIT: el 119 rechaza a quien firmó, no a cualquiera'
+            ELSE 'la baja de inés murió: ' || current_setting('qa.b120') END;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: ninety-seven checks were written, so ninety-seven rows must be
--- present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and twenty checks were written, so a hundred and
+-- twenty rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -4235,8 +5562,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 97 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 97 checks recorded a result.', checks;
+    IF checks <> 120 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 120 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -4247,11 +5574,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 97 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 120 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 97 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 120 checks green: the schema prevents every one of them.';
 END
 $$;
 

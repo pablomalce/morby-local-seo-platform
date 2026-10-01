@@ -10,7 +10,41 @@
  */
 
 import { DATA_SOURCE_KEYS, DATA_SOURCE_LABELS } from "./dataSources";
-import type { Report } from "./types";
+import type { ProfileCitation, Report } from "./types";
+
+/**
+ * La línea que dice contra qué versión de la ficha se escribió el reporte.
+ *
+ * Cuatro frases para cuatro estados, y la de `error` NO se parece a la de
+ * `none`: el cliente que lee «no strategic profile has been published» y el que
+ * lee «the strategic profile could not be read» tienen que hacer cosas
+ * distintas. El id va entero y no recortado: es lo que alguien pega en un
+ * `select ... where id = ...` para resolver la cita, que es la mitad (b) de la
+ * puerta H1.2.
+ *
+ * Y acepta `undefined` aunque el tipo diga que el campo es obligatorio, porque
+ * el tipo no gobierna lo que ya está guardado. La pantalla de reportes guarda el
+ * historial en `localStorage` (`lg.reports.cache.v1`) y lo relee con un
+ * `JSON.parse` sin validar: todo reporte generado antes de H1.2 vuelve SIN
+ * `profileCitation`, y exportarlo reventaba con un TypeError al leer `.status`.
+ * Lo encontró la revisión adversarial del 2026-09-30. Un reporte viejo dice que
+ * es viejo; no finge una cita que nunca tuvo.
+ */
+function citationLine(c: ProfileCitation | undefined): string {
+  if (!c) {
+    return "This report was generated before reports cited a strategic profile, so it cites none.";
+  }
+  switch (c.status) {
+    case "cited":
+      return `Written against strategic profile **version ${c.version}**, published ${new Date(c.publishedAt).toLocaleDateString()} — version id \`${c.versionId}\`.`;
+    case "none":
+      return "No strategic profile has been published for this business yet, so this report cites none.";
+    case "demo":
+      return "Demo report: there is no organisation behind it, so there is no strategic profile to cite.";
+    case "error":
+      return `The strategic profile could not be read (${c.reason}), so this report cites none. This is a failure on our side, not a missing profile.`;
+  }
+}
 
 export function reportToMarkdown(r: Report): string {
   const issues = r.issues
@@ -74,6 +108,10 @@ ${actions}
 | KPI | Current | Target | Cadence |
 |-----|---------|--------|---------|
 ${kpis}
+
+## Strategic Profile
+
+${citationLine(r.profileCitation)}
 
 ## Data Source Health
 

@@ -17,6 +17,7 @@ import type {
   ActionOwner,
   DataSourceHealth,
   KpiSnapshot,
+  ProfileCitation,
   Report,
   ReportAction,
   ReportIssue,
@@ -32,6 +33,13 @@ interface EngineOptions {
    * picked in the top-right language switcher.
    */
   localeOverride?: "en" | "es" | "sv";
+  /**
+   * La versión de la ficha contra la que se escribe. El motor no la lee —es puro,
+   * y lo exige `engine.purity.test.ts`—: la trae el orquestador. Sin ella, el
+   * motor dice `demo`, igual que dice `demo` de Places y PageSpeed cuando nadie le
+   * pasa su estado.
+   */
+  profileCitation?: ProfileCitation;
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,5 +1037,6 @@ export function buildReport(
     kpis: trackingKpis,
     dataSourceHealth,
     generator: "heuristic",
+    profileCitation: options.profileCitation ?? { status: "demo" },
   };
 }
