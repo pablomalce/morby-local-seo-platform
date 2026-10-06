@@ -44,8 +44,9 @@
 --
 -- CÓMO FALLA
 --
--- Rojo en los bloques 77 a 97 de `supabase/qa/defects_test.sql`. Los dos que
--- son la puerta de H1.1:
+-- Rojo en los bloques 77 a 94 y 118 a 120 de `supabase/qa/defects_test.sql`
+-- (del 95 al 117 son de la `0027` y la `0028`). Los dos que son la puerta de
+-- H1.1:
 --
 --   * el 79 intenta el INSERT cruzado en LAS DIEZ relaciones del subárbol —las
 --     siete hijas, el puntero de `competitors`, la FK de tres columnas del ICP y
@@ -89,16 +90,16 @@
 -- que dar de baja a un cliente con la ficha publicada era imposible (decisión
 -- 18):
 --
---   * el 95 borra, como `service_role` —el rol de `deleteMyAccount`—, una
+--   * el 118 borra, como `service_role` —el rol de `deleteMyAccount`—, una
 --     organización con la ficha ENTERA poblada y publicada, dispara lo que el
 --     COMMIT comprueba, y exige que pase y que no quede ni una fila de esa
 --     organización en ninguna tabla que tenga `organization_id`;
---   * el 96 exige 23503, nombrando la FK, a borrar UNA membresía que publicó, UNA
+--   * el 119 exige 23503, nombrando la FK, a borrar UNA membresía que publicó, UNA
 --     que verificó, y a la persona que publicó desde `auth.users`, con la versión
 --     en pie: la decisión 4 sigue valiendo para una persona;
---   * el 97 es su control positivo: borrar a un miembro que no publicó ni
+--   * el 120 es su control positivo: borrar a un miembro que no publicó ni
 --     verificó nada pasa. Sin él, un esquema que rechazara toda baja de miembro
---     pondría el 96 en verde.
+--     pondría el 119 en verde.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES DE PRODUCTO
@@ -417,11 +418,11 @@
 --     COMMIT, cuando todas las cascadas terminaron. Medido:
 --
 --       * la organización se va entera —membresías, negocio, ficha y sus siete
---         hijas— y no queda una sola fila suya (bloque 95);
+--         hijas— y no queda una sola fila suya (bloque 118);
 --       * borrar UNA membresía que publicó, UNA que verificó, o a quien publicó
 --         desde `auth.users` —que cae por cascada en la misma membresía— con la
 --         versión en pie, sigue muriendo con 23503 y nombrando la fila (bloque
---         96); y borrar a quien no publicó ni verificó pasa (bloque 97).
+--         119); y borrar a quien no publicó ni verificó pasa (bloque 120).
 --
 --     La invariante de la decisión 15 es IDÉNTICA en todo estado confirmado: no
 --     hay COMMIT después del cual una versión diga que la publicó, o una fuente
@@ -446,9 +447,11 @@
 --           has pending trigger events`: la comprobación diferida queda en cola
 --           hasta el COMMIT. Medido el 2026-10-01 con el bloque 103 del
 --           `defects_test.sql` del #106, que agrega una columna a la ficha
---           dentro de su transacción. Una migración que haga backfill y después
---           cambie la forma de una de esas tres tablas tiene que disparar antes
---           las comprobaciones —`SET CONSTRAINTS
+--           dentro de su transacción; el 103 ahora dispara las comprobaciones
+--           con `SET CONSTRAINTS ALL IMMEDIATE` justo antes del `ALTER`, dentro
+--           de la subtransacción que mide y que se revierte. Una migración que
+--           haga backfill y después cambie la forma de una de esas tres tablas
+--           tiene que disparar antes las comprobaciones —`SET CONSTRAINTS
 --           company_profiles_published_by_member_fkey,
 --           profile_evidence_verified_by_member_fkey IMMEDIATE`— o separar los
 --           dos pasos.
@@ -474,7 +477,7 @@
 --     LA REGLA QUE QUEDA, para la próxima migración: una FK por el par contra
 --     `org_members` desde algo que cuelgue de `businesses` tiene que ser
 --     `DEFERRABLE INITIALLY DEFERRED`, o la baja de la organización se traba
---     otra vez. El bloque 95 lo ve sólo si su fixture puebla esa tabla nueva:
+--     otra vez. El bloque 118 lo ve sólo si su fixture puebla esa tabla nueva:
 --     su anti-vacuidad exige una fila en cada una de las que hoy nombra, y una
 --     tabla que se agregue hay que sumarla ahí.
 

@@ -155,6 +155,38 @@ GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Y NO las funciones de la inmutabilidad de la ficha ni la de la cita, que el
+-- GRANT de arriba le acaba de dar.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- La `0027` y la `0028` se las revocan a `anon`, `authenticated` y
+-- `service_role` (decisión 11 de la `0027`: `company_profile_freeze_state` es
+-- `SECURITY DEFINER` y contesta el estado de la ficha de cualquier organización).
+-- El rol que hace de aplicación en esta suite no puede tener más que los roles
+-- reales, o las aserciones que corren como él miden un esquema más laxo que el
+-- de producción. El bloque 110 mide los seis.
+--
+-- Guardado con `to_regprocedure` por el motivo de los de arriba: `rollback.sh`
+-- aplica este archivo sobre el esquema de ANTES de la migración que prueba.
+DO $$
+DECLARE
+    f text;
+BEGIN
+    FOREACH f IN ARRAY ARRAY[
+        'public.company_profile_freeze_state(uuid, uuid)',
+        'public.company_profiles_immutable()',
+        'public.profile_child_freeze_state(text, jsonb)',
+        'public.profile_child_immutable()',
+        'public.reports_cite_frozen_version()',
+        'public.reports_citation_is_fixed()'
+    ] LOOP
+        IF to_regprocedure(f) IS NOT NULL THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM growthos_app', f);
+        END IF;
+    END LOOP;
+END
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Y NO la función de ingesta, que el GRANT de arriba le acaba de dar.
 -- ─────────────────────────────────────────────────────────────────────────────
 -- `ingest_lead_won` es `SECURITY DEFINER`: corre como su dueño y escribe en cinco
