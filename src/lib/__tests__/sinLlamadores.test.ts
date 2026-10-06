@@ -44,8 +44,14 @@ import { describe, expect, it } from "vitest";
 const ROOT = process.cwd();
 const SRC = path.join(ROOT, "src");
 
-/** Los dos directorios donde un módulo sin llamadores miente sobre el producto. */
-const VIGILADOS = ["src/lib/publishing", "src/lib/integrations"];
+/**
+ * Los directorios donde un módulo sin llamadores miente sobre el producto.
+ *
+ * `src/lib/profile` entró con H1.4: el chequeo de evidencia sale a la red por
+ * cada fuente de la ficha, y un chequeo con tests que ninguna ruta corre es
+ * exactamente «la puerta está hecha» sin que nadie pueda cruzarla.
+ */
+const VIGILADOS = ["src/lib/publishing", "src/lib/integrations", "src/lib/profile"];
 
 /**
  * Lo que se acepta que no tenga llamadores de producción, con su razón.

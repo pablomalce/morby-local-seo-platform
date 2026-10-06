@@ -353,6 +353,10 @@ const FORMA_DE_LLAMADA: Record<
   // mergear, en un worktree con los seis PR juntos: 401 las dos, espía en cero.
   "/api/aeo/audit": { cuerpo: { businessId: "99999999-9999-4999-8999-999999999999" } },
   "/api/organizations": { cuerpo: { name: "Cliente de prueba del barrido" } },
+  // H1.4: sale a la red una vez por fuente que cargó un usuario. Un uuid válido
+  // para que zod no conteste antes del guardia; medido sin sesión: 401 y espía
+  // en cero, también en `node:http`/`node:https`, que es por donde sale.
+  "/api/profile/evidence-check": { cuerpo: { businessId: "66666666-6666-4666-8666-666666666666" } },
   // Sin `code`, que es el caso del que entra a mano a la URL. El caso CON code
   // —el mecanismo ejercitado del otro lado— tiene su propio test más abajo.
   "/auth/callback": {},
