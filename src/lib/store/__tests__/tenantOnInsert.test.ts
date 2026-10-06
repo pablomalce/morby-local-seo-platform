@@ -42,8 +42,8 @@ const SRC = path.join(process.cwd(), "src");
  *
  * `businesses` is not here: it is the parent, and its `organization_id` is the
  * one every row below is compared against. `pagespeed_cache` is not here
- * either — it is keyed by URL and holds nothing tenant-scoped, which is why
- * check 10 exempts its public read.
+ * either — it is keyed by URL and has no tenant column, and since 0030 only
+ * the server reads or writes it (checks 136 to 141).
  */
 const TENANT_SCOPED = [
   "business_locations",

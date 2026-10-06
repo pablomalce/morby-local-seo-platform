@@ -15,6 +15,7 @@
 
 import "server-only";
 import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mock/universal";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
@@ -216,6 +217,79 @@ async function hydrateWithPlaces(snap: BusinessSnapshot): Promise<DataSourceHeal
 /** How long a cached PageSpeed result stays fresh. */
 const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
 
+type WebVitals = NonNullable<BusinessSnapshot["webVitals"]>;
+
+/**
+ * LA CACHÉ DE PAGESPEED LA LEE Y LA ESCRIBE SÓLO EL SERVIDOR (0030)
+ *
+ * Con `service_role` —`createSupabaseAdminClient`— y NUNCA con la sesión. Medido
+ * en producción el 2026-10-06: con la sesión de por medio, la tabla tenía que
+ * estar abierta a quien la sesión representa, y eso era `anon` para leer —la
+ * lista de URLs de los clientes, con la clave del bundle— y `authenticated` para
+ * escribir, con el alta de cuentas abierta: cualquiera con un correo
+ * upserteaba un resultado inventado para la URL de un cliente y este archivo lo
+ * servía 24 h en su reporte. La `0030` le saca la tabla a los dos; con la sesión,
+ * estas dos funciones sólo verían 42501.
+ *
+ * `service_role` saltea la RLS, y acá eso no ensancha nada: la tabla no tiene
+ * tenant que filtrar, y lo que se escribe es lo que Google le contestó a ESTE
+ * servidor en ESTE reporte (`hydrateWithPageSpeed`), nunca algo que vino en el
+ * pedido.
+ *
+ * SIGUE SIENDO BEST-EFFORT, PERO NO EN SILENCIO
+ *
+ * Un fallo de caché no tumba el reporte: una lectura que falla es «no hay
+ * caché» y la consulta va a Google; una escritura que falla deja el reporte
+ * como estaba. Lo que cambia es que ya no se traga: hasta la `0030`, el error de
+ * PostgREST se descartaba sin mirarlo, y un permiso denegado —el estado en que
+ * deja la `0030` al código viejo— se veía igual que una caché vacía, con cada
+ * reporte gastando cuota de Google sin que nada lo dijera. Ahora queda en el log
+ * con el CÓDIGO y no con el mensaje, que puede nombrar tablas (la lección de
+ * #104, la misma que sigue el INSERT de `reports` más abajo).
+ *
+ * Y el cliente de servicio TIRA si le faltan sus variables —modo demo, o
+ * `SUPABASE_SERVICE_ROLE_KEY` sin cargar en un deploy—, por eso el `try`: es lo
+ * mismo que hace `guardarSonda`, y por el mismo motivo.
+ */
+function avisarCache(paso: "lectura" | "escritura", motivo: string): void {
+  console.warn(`[pagespeed-cache] ${paso}: ${motivo}`);
+}
+
+async function leerPageSpeedCacheado(
+  url: string,
+  strategy: string
+): Promise<{ result: WebVitals; fetched_at: string } | null> {
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data, error } = await admin
+      .from("pagespeed_cache")
+      .select("result, fetched_at")
+      .eq("url", url)
+      .eq("strategy", strategy)
+      .maybeSingle();
+    if (error) {
+      avisarCache("lectura", error.code || "sin código");
+      return null;
+    }
+    return (data as { result: WebVitals; fetched_at: string } | null) ?? null;
+  } catch {
+    avisarCache("lectura", "el cliente de servicio no se pudo crear o tiró");
+    return null;
+  }
+}
+
+async function guardarPageSpeedEnCache(url: string, strategy: string, webVitals: WebVitals): Promise<void> {
+  try {
+    const admin = createSupabaseAdminClient();
+    const { error } = await admin
+      .from("pagespeed_cache")
+      .upsert({ url, strategy, result: webVitals, fetched_at: webVitals.fetchedAt });
+    if (error) avisarCache("escritura", error.code || "sin código");
+  } catch {
+    avisarCache("escritura", "el cliente de servicio no se pudo crear o tiró");
+  }
+}
+
 /**
  * Hydrate the snapshot with real Core Web Vitals from Google PageSpeed Insights.
  * Returns the resulting DataSourceHealth status so the report shows provenance.
@@ -223,7 +297,8 @@ const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
  * Caching strategy: PageSpeed is slow (15–40s) and flaky on slow sites, so we cache only
  * SUCCESSFUL results in the `pagespeed_cache` table (keyed by url+strategy, 24h TTL). A fresh hit
  * is served instantly and survives redeploys; failures are never cached. All cache access is
- * best-effort — if the table/RLS isn't present yet, we transparently fall back to a live call.
+ * best-effort and server-only — see `leerPageSpeedCacheado` above for why, and why its
+ * failures are logged instead of swallowed.
  *
  * POR QUÉ ADEMÁS ANOTA UNA SONDA
  *
@@ -248,17 +323,10 @@ async function hydrateWithPageSpeed(
   if (!website) return "missing";
   const strategy = "mobile";
 
-  const supabase = await createSupabaseServerClient();
-
   // 1. Serve a fresh cached good result if we have one.
-  const { data: cached } = await supabase
-    .from("pagespeed_cache")
-    .select("result, fetched_at")
-    .eq("url", website)
-    .eq("strategy", strategy)
-    .maybeSingle();
+  const cached = await leerPageSpeedCacheado(website, strategy);
   if (cached && Date.now() - new Date(cached.fetched_at).getTime() < PAGESPEED_TTL_MS) {
-    snap.webVitals = cached.result as BusinessSnapshot["webVitals"];
+    snap.webVitals = cached.result;
     return "live";
   }
 
@@ -287,9 +355,9 @@ async function hydrateWithPageSpeed(
     };
     snap.webVitals = webVitals;
     // 3. Cache the good result (best-effort — never block the report on a cache write).
-    await supabase
-      .from("pagespeed_cache")
-      .upsert({ url: website, strategy, result: webVitals, fetched_at: webVitals.fetchedAt });
+    // `webVitals` sale de `result`, o sea de la respuesta de Google a este
+    // servidor; nada del pedido llega a esta fila salvo la URL que se midió.
+    await guardarPageSpeedEnCache(website, strategy, webVitals);
     return "live";
   }
   if (result.status === "missing-key") return "missing";
