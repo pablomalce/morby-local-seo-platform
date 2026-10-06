@@ -34,8 +34,14 @@
 -- de crear: es irrepresentable, y lo dice PostgreSQL con un 23503 que nombra la
 -- FK. Y ninguna persona se guarda sin ese par: el sub de Keycloak ES un uuid,
 -- igual que el de Supabase, así que no se distingue por forma; lo único que lo
--- vuelve imposible es que no exista columna de identidad sin la FK, y eso lo
--- afirma el CATÁLOGO, no una lista (bloque 128).
+-- vuelve imposible es que ningún identificador entre al tablero sin
+-- PROCEDENCIA. Toda columna que puede llevar uno —en el tablero y en lo que el
+-- tablero referencia— viene del padrón por el par, o de una fila que la base
+-- acuñó, por una FK validada que empareja el tenant; y eso lo afirma el
+-- CATÁLOGO, no una lista (bloque 128). «Tiene una FK con el tenant» no
+-- alcanzaba: una FK compuesta contra una tabla puente propia guardaba el sub con
+-- todo en verde. Lo que queda abierto está medido y dicho en el bloque 128 y en
+-- la tabla de mutaciones de abajo.
 --
 -- QUÉ NO HACE
 --
@@ -44,9 +50,15 @@
 --   acto aparte, con el ritual de `feedback_aplicar_por_mcp_con_guarda`.
 -- * No le da escritura a nadie más que a `service_role`. No hay ruta ni pantalla
 --   que escriba una tarjeta, y un grant sin llamador es superficie (decisión 11).
+--   Con UNA escritura indirecta que no es un grant y que está medida: borrar un
+--   negocio anula `cited_business_id` en las tarjetas que lo citaban (decisión
+--   1), y DELETE sobre `businesses` lo tiene cualquier miembro activo por
+--   `businesses_rw_member` de la `0001`, un `viewer` incluido. Ver la decisión 11.
 -- * No toca `org_members`, ni `businesses`, ni `organizations`, ni `src/`.
 -- * No impide ciclos de dependencias de dos o más tarjetas (decisión 7), ni que
---   el responsable sea un miembro ARCHIVADO (decisión 12).
+--   el responsable sea un miembro ARCHIVADO, ni que una tarjeta cuyas personas
+--   son miembros de las dos organizaciones se mude de una a otra con un UPDATE
+--   (decisión 12).
 --
 -- CÓMO FALLA
 --
@@ -61,29 +73,45 @@
 --   (2) el 122 corre las MISMAS cuatro sentencias —el mismo texto, concatenado
 --       detrás del alta de la membresía— y exige que pasen al COMMIT;
 --   (3) el 126 lee, como `authenticated` con el `auth.uid()` de una persona de
---       OTRA organización, cada tabla del tablero DESCUBIERTA POR CATÁLOGO, y
---       exige cero filas de la organización dueña; el 127 es su contraprueba: la
---       dueña lee las suyas en cada tabla;
---   (4) el 128 recorre `pg_attribute` y `pg_constraint` sobre las tablas del
---       tablero —prefijo `board_` más el cierre transitivo de lo que las
---       referencia— y exige que toda columna uuid que no sea la PK propia esté
---       cubierta por una FK que empareja `organization_id` con el
---       `organization_id` del padre; imprime cuántas columnas miró y exige que
---       sean más de cero.
+--       OTRA organización, cada relación del tablero DESCUBIERTA POR CATÁLOGO
+--       —tablas, vistas y vistas materializadas: prefijo `board_` más el cierre
+--       transitivo de lo que las referencia por FK, de sus hijas y padres por
+--       herencia, y de toda vista que las lea— y exige cero filas de la
+--       organización dueña; el 127 es su contraprueba: la dueña lee las suyas en
+--       cada relación;
+--   (4) el 128 recorre `pg_attribute`, `pg_type`, `pg_attrdef` y
+--       `pg_constraint` sobre las relaciones del tablero que persisten filas Y
+--       sobre lo que el tablero referencia —hasta el tenant y el padrón— y exige
+--       que toda columna uuid tenga procedencia: el par contra
+--       `org_members (organization_id, user_id)` o una identidad que la base
+--       acuñó, por una FK validada que empareja el tenant; que ninguna columna
+--       sea un contenedor capaz de llevar un identificador; y que ninguna con
+--       nombre de persona quede fuera del padrón. Imprime cuántas columnas miró,
+--       también en verde, y exige que sean más de cero.
 --
 -- Y los demás: el 123 y el 124 cruzan de organización las relaciones que no son
 -- personas (tarjeta, dependencia en sus dos puntas, fuente, negocio) con su
 -- control positivo; el 125 la auto-dependencia; el 129 que toda tabla del
 -- tablero tenga `organization_id` NOT NULL, ENABLE, FORCE y sus dos policies
--- acotadas; el 130 los privilegios; el 131 la baja de una organización entera
--- con el tablero poblado; el 132 y el 133 la baja de UN miembro (decisión 3);
--- el 134 la aprobación a medias (decisión 5); el 135, por catálogo, la regla de
--- la decisión 4 para la próxima tabla.
+-- IGUALES a la forma canónica —por igualdad, no por texto parecido—, que toda
+-- vista del tablero tenga `security_invoker` y que ninguna sea materializada; el
+-- 130 los privilegios, de tabla y por columna; el 131 la baja de una
+-- organización entera con el tablero poblado; el 132 y el 133 la baja de UN
+-- miembro (decisión 3); el 134 la aprobación a medias (decisión 5); el 135, por
+-- catálogo, la regla de la decisión 4 para la próxima tabla.
 --
 -- MEDIDO ROMPIÉNDOLO (2026-10-06), una mutación por vez contra las 135
--- aserciones, cada una sobre una base NUEVA —plantilla con la `0001` a la `0028`,
--- la `0029` mutada, `app_role.sql`—, así que restaurar es no reusar la base:
+-- aserciones. La primera tanda se midió sobre bases NUEVAS —plantilla con la
+-- `0001` a la `0028`, la `0029` mutada, `app_role.sql`—. Después un verificador
+-- independiente encontró doce formas de guardar un sub de Keycloak o de leer el
+-- tablero ajeno con los 135 en verde, y los bloques 126 a 130 se reescribieron.
+-- Esta tabla es la corrida de DESPUÉS, con las viejas repetidas: cada mutación
+-- se inyecta como DDL justo detrás del `BEGIN` de `defects_test.sql` —y su
+-- fixture detrás de la del tablero—, así que el `ROLLBACK` del archivo es la
+-- restauración. Cada rojo se leyó en su evidencia, no sólo en su número: nombra
+-- la columna, la policy o la relación mutada.
 --
+--   LAS DE LA PRIMERA TANDA
 --   el responsable, FK simple a auth.users (id)  . . rojo 121, 128, 133
 --   el colaborador, FK simple a auth.users (id)  . . rojo 121, 128, 133
 --   el colaborador a la tarjeta por FK simple  . . . rojo 123, 128
@@ -107,28 +135,118 @@
 --   una nieta (`board_card_sources.added_by`) que
 --     se niega inmediata  . . . . . . . . . . . . . . rojo 135
 --   una hija nueva SIN prefijo (`card_comments`),
---     sin RLS y con `author_id uuid` suelto  . . . . la corrida se corta en la
---                                                    anti-vacuidad del 126: el
---                                                    catálogo la encontró por su
---                                                    FK y no tiene fila de T
+--     sin RLS y con `author_id uuid` suelto  . . . . rojo 14, 126 (vacua), 127,
+--                                                    128, 129, 130. Antes cortaba
+--                                                    la corrida en la anti-
+--                                                    vacuidad del 126 y escondía
+--                                                    a los demás
 --
--- Esa última, además, con la anti-vacuidad apagada a mano para ver qué decían los
--- bloques: rojo 14, 127, 128, 129 y 130. Y la de la nieta, medida a mano además
--- del 135: con esa FK puesta y una fuente con `added_by`, `DELETE FROM
--- organizations` como `service_role` muere con 23503 en
--- `board_card_sources_added_by_member_fkey`. Es la regla de la decisión 4.
+--   LAS DEL VERIFICADOR, que antes daban los 135 en verde
+--   un padrón propio `board_external_people` con su
+--     PK libre, y `board_cards.external_assignee_id`
+--     contra él  . . . . . . . . . . . . . . . . . . rojo 128
+--   el padrón SIN prefijo, `kc_people (organization_id,
+--     sub)`, padre de `board_cards.kc_assignee`  . . rojo 128
+--   una tabla puente `identity_links (organization_id,
+--     keycloak_sub)`, padre de `reviewer_id` . . . . rojo 128
+--   `kc_identities (organization_id, id)` con PK
+--     compuesta, padre de `reviewer_id` . . . . . . rojo 128
+--   `card_people` con su `id` acuñado y el sub en
+--     `keycloak_sub`, padre de `reviewer_ref`  . . . rojo 128
+--   la misma con nombres neutros (`card_links`,
+--     `external_key`, `link_ref`)  . . . . . . . . . rojo 128 (sólo la regla de
+--                                                    procedencia: el padre se
+--                                                    examina)
+--   `board_member_prefs (user_id PRIMARY KEY
+--     REFERENCES auth.users)`  . . . . . . . . . . . rojo 128
+--   la misma, `user_id uuid PRIMARY KEY` sin FK  . . rojo 128
+--   la misma, con `DEFAULT gen_random_uuid()`  . . . rojo 128 (sólo la línea por
+--                                                    nombre)
+--   `board_watchers (user_id PRIMARY KEY
+--     REFERENCES auth.users)`  . . . . . . . . . . . rojo 128
+--   una hija 1:1 `board_card_reviews (card_id
+--     PRIMARY KEY REFERENCES board_cards (id))`, con
+--     una fila de P colgada de una tarjeta de T  . . rojo 128
+--   una PK libre con nombres neutros
+--     (`board_externals.id`, `board_cards.ext_ref`)  rojo 128 (sólo la regla de
+--                                                    procedencia)
+--   una tabla del tablero con `organization_id` sin
+--     ninguna FK . . . . . . . . . . . . . . . . . . rojo 128, 131
+--   `reviewer_id` de un dominio sobre un dominio
+--     sobre uuid . . . . . . . . . . . . . . . . . . rojo 128
+--   `assignee_sub bytea` . . . . . . . . . . . . . . rojo 128
+--   `reviewer public.org_members` (tipo fila)  . . . rojo 128
+--   `reviewer public.board_person_ref` (compuesto)   rojo 128
+--   `people xml` . . . . . . . . . . . . . . . . . . rojo 128
+--   `reviewer_id numeric(39,0)`  . . . . . . . . . . rojo 128
+--   `approver text`  . . . . . . . . . . . . . . . . rojo 128 (la línea por nombre)
+--   la FK del responsable recreada `NOT VALID` con
+--     una fila de sub suelto adentro . . . . . . . . rojo 128
+--   `archived_cards () INHERITS (board_cards)`, con
+--     RLS y una fila con responsable ajeno . . . . . rojo 128, 131
+--   la misma, sin filas . . . . . . . . . . . . . . rojo 126 (vacua), 127, 128
+--   `board_cards` hija por herencia de un
+--     `cards_base` sin RLS . . . . . . . . . . . . . rojo 126, 128, 129
+--   una vista materializada `board_card_people_mv`   rojo 126, 128, 129, 130
+--   una vista `board_card_people` de `postgres` sin
+--     `security_invoker`, con los grants de la 0029  rojo 126, 129
+--   la misma SIN prefijo (`card_overview`): la
+--     descubre su dependencia  . . . . . . . . . . . rojo 126, 129
+--   la permisiva de `board_cards` `organization_id
+--     IS NOT NULL OR organization_id IN (...)` . . . rojo 129
+--   la restrictiva, igual  . . . . . . . . . . . . . rojo 129
+--   las dos, igual . . . . . . . . . . . . . . . . . rojo 126, 129
+--   la permisiva de las cuatro `... OR true` . . . . rojo 129
+--   la restrictiva de las cuatro `... OR true` . . . rojo 129
+--   las dos `... OR true`  . . . . . . . . . . . . . rojo 126, 129
+--   `GRANT SELECT (id, organization_id, objective,
+--     assignee_id) ON board_cards TO anon` . . . . . rojo 130
+--   `GRANT INSERT (...), UPDATE (...) ON
+--     board_cards TO authenticated`  . . . . . . . . rojo 130
 --
--- LAS DOS QUE SOBREVIVEN, y no son un agujero sino la decisión 4: la FK del
+-- Y la de la nieta, medida a mano además del 135: con esa FK puesta y una fuente
+-- con `added_by`, la baja de la organización como `service_role` muere con
+-- 23503 en `board_card_sources_added_by_member_fkey`. Es la regla de la
+-- decisión 4.
+--
+-- LAS TRES QUE SOBREVIVEN. Dos no son un agujero sino la decisión 4: la FK del
 -- aprobador `DEFERRABLE INITIALLY DEFERRED` y la FK del aprobador `RESTRICT` dan
 -- las dos los 135 en verde. Ninguna aserción distingue esas tres formas porque
 -- no hay diferencia que distinguir con la tarjeta colgando directo de la
 -- organización. La primera versión de este archivo tenía la diferible.
+-- La tercera SÍ es un agujero, y el único de la tabla que el catálogo no puede
+-- cerrar: una tabla del tablero con su PK ACUÑADA (`DEFAULT gen_random_uuid()`),
+-- nombres sin ninguna palabra de persona (`board_externals`, `ext_ref`), y
+-- alguien que inserta A MANO el sub de Keycloak como `id`. Un default se pisa
+-- con un valor explícito —también el de `board_cards.id`—, y el catálogo ve el
+-- diseño, no cada INSERT. Da los 135 en verde, medido; la misma tabla SIN el
+-- default da rojo 128, que es lo que prueba que la regla de la identidad acuñada
+-- es la que separa las dos. Cerrarlo pide mirar los valores, no la forma: es la
+-- regla de `DECISION_IDENTIDAD.md` para quien escriba la migración, y el bloque
+-- 128 es su red, no su reemplazo.
 --
--- Y el `.down`, aparte: sin su `DELETE` de `schema_migrations`,
--- `supabase/qa/rollback.sh 0029_board` se pone rojo («dejó 0029_board en
--- schema_migrations»). Con el `.down` entero, la huella vuelve idéntica (1010
--- objetos). Aplicar esta migración DOS veces deja la misma huella (1107 objetos)
--- y una sola fila en el registro.
+-- Y el `.down`, aparte, con `supabase/qa/rollback.sh 0029_board`. Con el
+-- `.down` entero, la huella vuelve idéntica (1010 objetos). Su NEGATIVA con
+-- datos ya no está medida sólo a mano: `rollback.sh` siembra una tarjeta
+-- (`supabase/qa/down_con_datos/0029_board.sql`) en una copia de la base migrada
+-- y exige que el `.down` se niegue sin permiso, que se niegue con el permiso en
+-- PGOPTIONS nombrándolo, y que revierta con el permiso dado con SET. Medido
+-- rompiéndolo, una mutación por vez sobre el `.down`:
+--
+--   sin la negativa por falta de permiso  . . . . . rojo «revirtió una base CON
+--                                                    DATOS sin que nadie lo
+--                                                    pidiera»
+--   sin la comprobación del origen del permiso . . . rojo «aceptó un permiso que
+--                                                    viene de PGOPTIONS»
+--   negándose SIEMPRE  . . . . . . . . . . . . . . . rojo «se negó con PGOPTIONS,
+--                                                    pero no por el origen del
+--                                                    permiso»
+--   sin su `DELETE` de `schema_migrations` . . . . . rojo «dejó 0029_board en
+--                                                    schema_migrations»
+--
+-- `rollback.sh` no corre en CI: es parte del ritual antes de llevar la migración
+-- a hosted, no del verde de un PR. Aplicar esta migración DOS veces deja la
+-- misma huella (1107 objetos) y una sola fila en el registro.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- LAS DECISIONES
@@ -170,13 +288,24 @@
 --    Keycloak se persiste en Growth OS— se vuelve una propiedad del catálogo y no
 --    una promesa: el sub de Keycloak es un uuid, así que NO se puede detectar por
 --    forma (la corrección del crítico a la puerta); lo que sí se puede es que no
---    haya dónde ponerlo. El bloque 128 exige que toda columna uuid del tablero
---    esté atada por una FK con el tenant, que no haya arrays ni json —un
---    identificador adentro de un contenedor no tiene FK posible—, y como segunda
---    línea, más floja y dicha como tal, que ninguna columna de texto se llame
---    como una identidad (`sub`, `user`, `*_by`, `assignee`, `keycloak`...). Una
---    persona escrita a mano en `objective` o en `result` no la ve nadie: es texto
---    libre, y eso queda declarado.
+--    haya dónde ponerlo. El bloque 128 exige, sobre el tablero Y sobre todo lo
+--    que el tablero referencia —un padre es un lugar donde una persona vive a un
+--    salto de la tarjeta—, que toda columna uuid tenga PROCEDENCIA: o la base la
+--    acuñó (PK de una sola columna, fuera de toda FK, con un default que genera
+--    un uuid), o llega por una FK validada que empareja el tenant y cuyo destino
+--    es `org_members.user_id` o una identidad acuñada del padre. «Atada por una
+--    FK con el tenant», que es lo que la primera versión pedía, dejaba pasar una
+--    tabla puente propia con el sub adentro: lo midió un verificador, y es la
+--    federación por atajo que `DECISION_IDENTIDAD.md` prohíbe. Exige además que
+--    ninguna columna sea un contenedor capaz de llevar un identificador —arrays,
+--    json, xml, bytea, numeric, tipos fila: un identificador adentro de un
+--    contenedor no tiene FK posible—, y como segunda línea, más floja y dicha
+--    como tal, que ninguna columna con nombre de identidad o de rol (`sub`,
+--    `user`, `*_by`, `assignee`, `approver`, `reviewer`, `email`...) sea texto
+--    o un uuid fuera del padrón. LO QUE QUEDA ABIERTO, dicho: una persona
+--    escrita a mano en `objective` o en `result` —texto libre—, y un sub
+--    insertado a mano como `id` de una tabla con PK acuñada y nombres neutros
+--    (la tercera sobreviviente de la tabla de mutaciones).
 --
 -- 3. LA BAJA DE UN MIEMBRO: EL RESPONSABLE SE ANULA; EL APROBADOR SE NIEGA.
 --    ES UNA DECISIÓN DE PRODUCTO, y va a Pablo con su consecuencia.
@@ -309,14 +438,28 @@
 --     sesión todavía; la migración que traiga la pantalla dirá quién escribe.
 --     `growthos_app`, el rol de la suite, recibe lo suyo de `app_role.sql`, como
 --     con la ficha.
+--     «SÓLO LEE» VALE PARA EL GRANT, NO PARA TODO EFECTO, y está medido el
+--     2026-10-06 en la réplica, deshaciendo: un `viewer` de T que intenta
+--     `UPDATE board_cards SET cited_business_id = NULL` recibe
+--     `42501 permission denied for table board_cards`; el mismo `viewer` borra el
+--     negocio citado —`businesses_rw_member` de la `0001` es `FOR ALL` para
+--     cualquier miembro activo, sin mirar el rol— y la acción de la FK
+--     (`ON DELETE SET NULL (cited_business_id)`, decisión 1), que corre como
+--     dueña de la tabla, deja la tarjeta sin negocio citado. No cruza de
+--     organización y la tarjeta queda; lo que se pierde es «sobre qué negocio
+--     era», sin historial. Cerrarlo es una regla sobre quién borra un negocio
+--     —la policy de la `0001`—, no sobre el tablero: otro frente.
 --
 -- 12. LO QUE ESTA MIGRACIÓN NO CIERRA Y SE MIDIÓ, el 2026-10-06 en la réplica,
 --     como `postgres` y deshaciendo: un `viewer` ARCHIVADO entra como
 --     responsable y como aprobador; una tarjeta sin hijas ni personas cambia de
---     `organization_id` con un UPDATE; la misma, con un responsable puesto,
---     muere con 23503 en `board_cards_assignee_member_fkey`. Ninguna aserción
---     las cubre, a propósito: una aserción sobre un defecto que esta migración
---     no cierra estaría en rojo.
+--     `organization_id` con un UPDATE; la misma, con un responsable que NO es
+--     miembro de la organización destino, muere con 23503 en
+--     `board_cards_assignee_member_fkey`; y —medido después, como
+--     `service_role`— una tarjeta APROBADA cuyo responsable, creador y aprobador
+--     son miembros de las DOS organizaciones se muda entera, y sigue aprobada.
+--     Ninguna aserción las cubre, a propósito: una aserción sobre un defecto que
+--     esta migración no cierra estaría en rojo.
 --     a. UN MIEMBRO ARCHIVADO PUEDE SER RESPONSABLE. La FK mira la fila de
 --        `org_members`, no su `state`. Cerrarlo por FK pediría llevar `state` en
 --        la llave, y entonces archivar a alguien violaría las FK de todas sus
@@ -326,9 +469,18 @@
 --        UPDATE de `organization_id` hecho por quien tenga UPDATE: es la decisión
 --        17 de la `0026`, por el mismo motivo (las FK compuestas impiden el par
 --        inconsistente, no un par consistente de otro tenant). Hoy sólo
---        `service_role` tiene UPDATE. Con una persona o una hija puesta, el
---        UPDATE muere: el par de la persona ya no existe en la organización
---        nueva, y las hijas referencian el par viejo con `ON UPDATE NO ACTION`.
+--        `service_role` tiene UPDATE. Con una HIJA puesta, el UPDATE muere: las
+--        hijas referencian el par viejo con `ON UPDATE NO ACTION`. Con una
+--        PERSONA puesta muere SÓLO si esa persona no es miembro de la
+--        organización nueva —el par no existe allá—. Si lo es, pasa, y ése es
+--        el caso corriente, no el raro: la decisión 1 dice que la agencia
+--        trabaja en X siendo miembro de X, así que la gente de la agencia es
+--        miembro de varias organizaciones. Una tarjeta aprobada en T por alguien
+--        de la agencia, mudada a P, queda como aprobada en P sin que ninguna FK
+--        lo note. Cerrarlo es un trigger que niegue el cambio de
+--        `organization_id` en el tablero, o sacarle UPDATE de esa columna a
+--        quien escriba: otro frente, y la pantalla que escriba tarjetas tiene
+--        que decidirlo.
 --     c. EL ROL DEL MIEMBRO NO SE MIRA: un `viewer` puede ser responsable o
 --        aprobador. Quién PUEDE aprobar es una regla de permisos (H3.5), no de
 --        integridad.

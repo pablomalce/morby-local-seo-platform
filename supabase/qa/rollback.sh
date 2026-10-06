@@ -56,7 +56,7 @@ aplicar() {
 
 huella() {
     docker cp "$REPO_ROOT/supabase/qa/schema_fingerprint.sql" "$CONTAINER:/tmp/huella.sql" >/dev/null
-    docker exec "$CONTAINER" psql -U postgres -d "$DB" -tAf /tmp/huella.sql
+    docker exec "$CONTAINER" psql -U postgres -d "${1:-$DB}" -tAf /tmp/huella.sql
 }
 
 echo "==> base limpia"
@@ -95,6 +95,81 @@ if [ "$ANTES" = "$DESPUES" ]; then
     echo "corrida vacua: $MIG no cambió el esquema, así que esta prueba no puede" >&2
     echo "distinguir un .down que anda de uno que no hace nada." >&2
     exit 1
+fi
+
+# EL .down CON DATOS, cuando la migración declara qué tiene que negarse a borrar.
+#
+# La corrida de abajo aplica el .down sobre una base VACÍA, y ahí un .down que se
+# niega con datos y uno que borra sin preguntar son idénticos: los dos revierten.
+# Medido el 2026-10-06 sobre la `0029`: con su negativa quitada, este script
+# seguía verde y el .down tiraba un tablero poblado sin pedir nada, en un
+# proyecto hosted de tier gratuito, sin backups ni PITR. La negativa sólo estaba
+# medida a mano.
+#
+# Si existe `supabase/qa/down_con_datos/<MIG>.sql`, se siembra una COPIA de la
+# base ya migrada —la base de la prueba de abajo no se toca— y sobre ella el
+# .down tiene que:
+#   1. NEGARSE sin permiso, dejando la huella como estaba;
+#   2. NEGARSE con el permiso en PGOPTIONS, nombrándolo —ése sobrevive al RESET
+#      y valdría para todas las corridas—, dejando la huella como estaba;
+#   3. REVERTIR con el permiso dado con SET en la sesión, dejando la huella como
+#      antes de la migración. Es el control: sin él, un .down que no corre nunca
+#      pasaría 1 y 2.
+# La siembra dice el nombre del permiso en una línea `-- permiso: <guc>`.
+SIEMBRA="$REPO_ROOT/supabase/qa/down_con_datos/$MIG.sql"
+if [ -f "$SIEMBRA" ]; then
+    COPIA="${DB}_con_datos"
+    PERMISO="$(sed -n 's/^-- permiso: *\([a-z_.]*\) *$/\1/p' "$SIEMBRA" | head -1)"
+    if [ -z "$PERMISO" ]; then
+        echo "$SIEMBRA no dice el permiso: falta la línea '-- permiso: <guc>'." >&2
+        exit 1
+    fi
+    echo "==> $MIG.down sobre una copia con datos"
+    docker exec "$CONTAINER" psql -U postgres -d postgres -q \
+        -c "DROP DATABASE IF EXISTS $COPIA" -c "CREATE DATABASE $COPIA TEMPLATE $DB" >/dev/null
+    docker cp "$SIEMBRA" "$CONTAINER:/tmp/siembra.sql" >/dev/null
+    docker exec "$CONTAINER" psql -U postgres -d "$COPIA" -v ON_ERROR_STOP=1 -q -f /tmp/siembra.sql >/dev/null
+    docker cp "$REPO_ROOT/supabase/rollback/$MIG.down.sql" "$CONTAINER:/tmp/down.sql" >/dev/null
+    SEMBRADA="$(huella "$COPIA")"
+
+    echo "    sin permiso: tiene que negarse"
+    if docker exec "$CONTAINER" psql -U postgres -d "$COPIA" -v ON_ERROR_STOP=1 -q \
+            -f /tmp/down.sql >/dev/null 2>&1; then
+        echo "el .down de $MIG revirtió una base CON DATOS sin que nadie lo pidiera." >&2
+        exit 1
+    fi
+    if [ "$(huella "$COPIA")" != "$SEMBRADA" ]; then
+        echo "el .down de $MIG se negó, pero dejó el esquema cambiado." >&2
+        exit 1
+    fi
+
+    echo "    con el permiso en PGOPTIONS: tiene que negarse, nombrándolo"
+    if SALIDA="$(docker exec -e PGOPTIONS="-c $PERMISO=si" "$CONTAINER" \
+            psql -U postgres -d "$COPIA" -v ON_ERROR_STOP=1 -q -f /tmp/down.sql 2>&1)"; then
+        echo "el .down de $MIG aceptó un permiso que viene de PGOPTIONS: sobrevive al RESET." >&2
+        exit 1
+    fi
+    if ! echo "$SALIDA" | grep -q "PGOPTIONS"; then
+        echo "el .down de $MIG se negó con PGOPTIONS, pero no por el origen del permiso:" >&2
+        echo "$SALIDA" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    if [ "$(huella "$COPIA")" != "$SEMBRADA" ]; then
+        echo "el .down de $MIG se negó con PGOPTIONS, pero dejó el esquema cambiado." >&2
+        exit 1
+    fi
+
+    echo "    con el permiso en la sesión: tiene que revertir"
+    if ! docker exec "$CONTAINER" psql -U postgres -d "$COPIA" -v ON_ERROR_STOP=1 -q \
+            -c "SET $PERMISO = 'si'" -f /tmp/down.sql >/dev/null; then
+        echo "el .down de $MIG no revierte ni con el permiso en la sesión: la negativa no depende del permiso." >&2
+        exit 1
+    fi
+    if [ "$(huella "$COPIA")" != "$ANTES" ]; then
+        echo "con el permiso, el .down de $MIG no dejó el esquema como estaba antes de la migración." >&2
+        exit 1
+    fi
+    docker exec "$CONTAINER" psql -U postgres -d postgres -q -c "DROP DATABASE IF EXISTS $COPIA" >/dev/null
 fi
 
 echo "==> $MIG.down"

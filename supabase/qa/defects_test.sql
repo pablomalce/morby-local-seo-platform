@@ -5556,18 +5556,39 @@ SELECT 120, 'el esquema también rechaza la baja de un miembro que no firmó nad
 --       de persona, muere con 23503 NOMBRANDO la FK compuesta;
 --   (2) 122 — la MISMA sentencia, con esa persona ya miembro, pasa al COMMIT;
 --   (3) 126 — bajo el `auth.uid()` de una persona de OTRA organización, como
---       `authenticated`, cada tabla del tablero devuelve cero filas de la
---       organización dueña; el 127 es su contraprueba;
---   (4) 128 — por catálogo: ninguna columna uuid del tablero sin una FK que
---       empareje `organization_id` con el del padre, con su denominador.
+--       `authenticated`, cada relación del tablero —tablas, vistas y vistas
+--       materializadas— devuelve cero filas de la organización dueña; el 127 es
+--       su contraprueba;
+--   (4) 128 — por catálogo: toda columna que puede llevar un identificador, en
+--       el tablero y en lo que el tablero referencia, viene del padrón
+--       (`org_members (organization_id, user_id)`) o de una fila que la base
+--       acuñó, por una FK validada que empareja el tenant; con su denominador.
 --
--- LAS TABLAS DEL TABLERO SE DESCUBREN, NO SE ENUMERAN. `pg_temp.tablero()` toma
--- las de `public` con prefijo `board_` y les suma, por cierre transitivo, toda
--- tabla que las referencie. Una tabla nueva del tablero entra sola en el 126, el
--- 127, el 128, el 129 y el 130, y la anti-vacuidad del 126 obliga a poblarla en
--- la fixture: sin una fila suya, la corrida se corta en vez de informar «cero
--- filas ajenas» sobre una tabla vacía. Y una tabla hija con otro nombre también
--- entra, porque la descubre su FK y no su nombre (R14).
+-- LAS RELACIONES DEL TABLERO SE DESCUBREN, NO SE ENUMERAN. `pg_temp.tablero()`
+-- toma las de `public` con prefijo `board_` —tablas, particionadas, vistas,
+-- vistas materializadas y foráneas— y les suma, por cierre transitivo, todo lo
+-- que alcanza sus filas por otro camino:
+--
+--   * toda tabla que las referencie por FK;
+--   * sus hijas por herencia o partición (`pg_inherits`), y sus padres: las filas
+--     de una hija se leen desde el padre, y una hija por `INHERITS` NO hereda las
+--     FK —PostgreSQL no las copia—, así que es exactamente el lugar donde una
+--     tarjeta con un responsable ajeno entraría sin que ninguna FK la mire;
+--   * toda vista o vista materializada que lea de ellas (`pg_depend` sobre su
+--     regla `_RETURN`): una vista de `postgres` sin `security_invoker` lee con
+--     BYPASSRLS, y una materializada no tiene RLS posible.
+--
+-- Una relación nueva del tablero entra sola en el 126, el 127, el 128, el 129 y
+-- el 130, aunque se llame de otra forma, porque la descubre su FK, su herencia o
+-- su dependencia y no su nombre (R14). La anti-vacuidad del 126 obliga a
+-- poblarla en la fixture: sin una fila de T, el 126 se pone ROJO en el informe
+-- —no corta la corrida, para que la misma mutación muestre también qué dicen el
+-- 128 y el 129—.
+--
+-- QUÉ NO VE, y queda dicho: una función `SECURITY DEFINER` que devuelva filas
+-- del tablero. El cuerpo de una función plpgsql no deja dependencias en el
+-- catálogo, así que no hay cierre que la encuentre; es una RPC, y la regla de
+-- las RPC es otra puerta.
 --
 -- LOS BLOQUES DE ESTRUCTURA CORREN COMO `postgres`, por el motivo del encabezado
 -- del 77: tiene BYPASSRLS, así que ninguna policy puede ser lo que rechaza. Y el
@@ -5633,24 +5654,39 @@ SELECT org_t, 'd0290000-0029-4029-8029-000000000c02', 'd0290000-0029-4029-8029-0
 INSERT INTO board_card_sources (organization_id, card_id, url, title)
 SELECT org_t, 'd0290000-0029-4029-8029-000000000c01', 'https://example.org/qa-tablero', 'QA fuente' FROM h31;
 
--- Las tablas del tablero, por catálogo: prefijo `board_` en `public` y el cierre
--- transitivo de lo que las referencia. Ver el encabezado de esta tanda.
+-- Las relaciones del tablero, por catálogo: prefijo `board_` en `public` y el
+-- cierre transitivo de todo lo que alcanza sus filas. Ver el encabezado de esta
+-- tanda. Una sola referencia recursiva —PostgreSQL no admite más—, así que los
+-- tres caminos van como aristas `(nueva, vieja)`: «si `vieja` es del tablero,
+-- `nueva` también».
 CREATE OR REPLACE FUNCTION pg_temp.tablero()
-RETURNS TABLE (oid oid, relname name)
+RETURNS TABLE (oid oid, relname name, relkind "char")
 LANGUAGE sql STABLE AS $$
-    WITH RECURSIVE t(oid) AS (
+    WITH RECURSIVE arista(nueva, vieja) AS (
+        -- quien la referencia por FK
+        SELECT co.conrelid, co.confrelid FROM pg_constraint co WHERE co.contype = 'f'
+        UNION ALL
+        -- sus hijas por herencia o partición, y sus padres
+        SELECT i.inhrelid, i.inhparent FROM pg_inherits i
+        UNION ALL
+        SELECT i.inhparent, i.inhrelid FROM pg_inherits i
+        UNION ALL
+        -- toda vista o vista materializada que la lee
+        SELECT rw.ev_class, d.refobjid
+          FROM pg_depend d
+          JOIN pg_rewrite rw ON rw.oid = d.objid
+         WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
+    ),
+    t(oid) AS (
         SELECT c.oid
           FROM pg_class c
          WHERE c.relnamespace = 'public'::regnamespace
-           AND c.relkind IN ('r', 'p')
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
            AND c.relname LIKE 'board\_%'
         UNION
-        SELECT co.conrelid
-          FROM pg_constraint co
-          JOIN t ON co.confrelid = t.oid
-         WHERE co.contype = 'f'
+        SELECT a.nueva FROM arista a JOIN t ON a.vieja = t.oid
     )
-    SELECT c.oid, c.relname FROM t JOIN pg_class c ON c.oid = t.oid ORDER BY c.relname
+    SELECT c.oid, c.relname, c.relkind FROM t JOIN pg_class c ON c.oid = t.oid ORDER BY c.relname
 $$;
 
 -- Corre una sentencia con un rol, dispara lo que el COMMIT comprobaría, mira el
@@ -5958,38 +5994,62 @@ SELECT 125, 'una tarjeta puede depender de sí misma',
 --
 -- LA CONSULTA SE ARMA COMO `postgres` DESDE EL CATÁLOGO y se ejecuta como
 -- `authenticated`, con el resultado viajando por un GUC: el patrón del 88. Una
--- fila por tabla del tablero, `tabla=n`, con `n` las filas de T que ese lector
--- alcanza.
+-- fila por relación del tablero que se puede leer —tabla, particionada, vista o
+-- vista materializada—, `relación=n`, con `n` las filas de T que ese lector
+-- alcanza. Las vistas también: una vista de `postgres` sin `security_invoker`
+-- lee con BYPASSRLS, y el punto (3) de la puerta es lo que el lector alcanza, no
+-- lo que dice la policy de la tabla de abajo. Por `regclass` y no por nombre en
+-- `public`: la vista que lee el tablero puede vivir en otro esquema.
 --
--- ANTI-VACUIDAD, como `postgres`: toda tabla que el catálogo dice del tablero
--- tiene que tener al menos una fila de T. Sin eso, «pau ve cero» sobre una tabla
--- vacía sería verde y mentira. Y tiene que haber al menos una tabla.
+-- ANTI-VACUIDAD, como `postgres`, y EN EL INFORME, no cortando la corrida: toda
+-- relación legible que el catálogo dice del tablero tiene que tener
+-- `organization_id` y al menos una fila de T. Sin eso, «pau ve cero» sobre una
+-- relación vacía sería verde y mentira. Y tiene que haber al menos una. En el
+-- informe por el motivo del 135: cortar la corrida acá escondía, en la mutación
+-- de una hija nueva, el rojo del 128 y del 129, que son los que dicen qué está
+-- mal en ella.
+CREATE OR REPLACE FUNCTION pg_temp.tiene_tenant(p_rel oid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = p_rel AND a.attname = 'organization_id' AND NOT a.attisdropped)
+$$;
+
 DO $$
 DECLARE
-    r      record;
-    n      bigint;
-    tablas int := 0;
-    vacias text := '';
+    r          record;
+    n          bigint;
+    legibles   int := 0;
+    vacias     text := '';
+    sin_tenant text := '';
 BEGIN
-    FOR r IN SELECT * FROM pg_temp.tablero() LOOP
-        tablas := tablas + 1;
-        EXECUTE format('SELECT count(*) FROM public.%I WHERE organization_id = $1', r.relname)
+    FOR r IN SELECT * FROM pg_temp.tablero() WHERE relkind IN ('r', 'p', 'v', 'm') LOOP
+        legibles := legibles + 1;
+        IF NOT pg_temp.tiene_tenant(r.oid) THEN
+            sin_tenant := sin_tenant || r.relname || ' ';
+            CONTINUE;
+        END IF;
+        EXECUTE format('SELECT count(*) FROM %s WHERE organization_id = $1', r.oid::regclass)
            INTO n USING (SELECT org_t FROM h31);
         IF n = 0 THEN vacias := vacias || r.relname || ' '; END IF;
     END LOOP;
-    IF tablas = 0 OR vacias <> '' THEN
-        RAISE EXCEPTION 'Vacuous run: el catálogo dio % tablas del tablero y sin filas de T: [%]', tablas, vacias;
-    END IF;
-    RAISE NOTICE 'Bloques 126 y 127: % tablas del tablero por catálogo, todas con filas de T.', tablas;
+    PERFORM set_config('qa.b126vacua',
+        CASE WHEN legibles = 0 THEN 'el catálogo no dio ninguna relación legible del tablero'
+             WHEN vacias <> '' OR sin_tenant <> ''
+             THEN format('corrida vacua en [%s]: sin filas de T: [%s]; sin organization_id: [%s]',
+                         btrim(vacias || sin_tenant), btrim(vacias), btrim(sin_tenant))
+             ELSE '' END, true);
+    RAISE NOTICE 'Bloques 126 y 127: % relaciones legibles del tablero por catálogo (%).', legibles,
+        (SELECT string_agg(tb.relname || ':' || tb.relkind::text, ', ' ORDER BY tb.relname) FROM pg_temp.tablero() tb);
 END
 $$;
 
-SELECT set_config('qa.sql126', (
+SELECT set_config('qa.sql126', coalesce((
     SELECT 'SELECT string_agg(r, '', '' ORDER BY r) FROM (' ||
-           string_agg(format('SELECT %L || ''='' || (SELECT count(*) FROM public.%I WHERE organization_id = %L) AS r',
-                             relname, relname, (SELECT org_t FROM h31)), ' UNION ALL ') ||
+           string_agg(format('SELECT %L || ''='' || (SELECT count(*) FROM %s WHERE organization_id = %L) AS r',
+                             tb.relname, tb.oid::regclass, (SELECT org_t FROM h31)), ' UNION ALL ') ||
            ') z'
-      FROM pg_temp.tablero()), true);
+      FROM pg_temp.tablero() tb
+     WHERE tb.relkind IN ('r', 'p', 'v', 'm') AND pg_temp.tiene_tenant(tb.oid)), 'SELECT NULL'), true);
 
 -- Y lo suyo: pau tiene que ser un lector que funciona, no un rol ciego. Armada
 -- acá, como `postgres`: `authenticated` no puede leer `h31`.
@@ -6012,22 +6072,24 @@ RESET ROLE;
 
 INSERT INTO defect_report
 SELECT 126, 'una persona de otra organización lee el tablero',
-       NOT (v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=[1-9]'),
-       CASE WHEN v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=[1-9]'
+       NOT (vacua = '' AND v ~ '^[a-z0-9_]+=[0-9]+(, [a-z0-9_]+=[0-9]+)*$' AND v !~ '=[1-9]'),
+       CASE WHEN vacua <> ''
+            THEN vacua || ' / pau sobre T: ' || v
+            WHEN v ~ '^[a-z0-9_]+=[0-9]+(, [a-z0-9_]+=[0-9]+)*$' AND v !~ '=[1-9]'
             THEN 'pau, de P, como authenticated, ve 0 filas de T en las ' ||
-                 array_length(string_to_array(v, ', '), 1) || ' tablas del tablero: ' || v
+                 array_length(string_to_array(v, ', '), 1) || ' relaciones del tablero: ' || v
             ELSE 'pau alcanza el tablero de T: ' || v END
-  FROM (SELECT current_setting('qa.b126') AS v) x;
+  FROM (SELECT current_setting('qa.b126') AS v, current_setting('qa.b126vacua') AS vacua) x;
 
 -- ── 127 ──────────────────────────────────────────────────────────────────────
 -- LA CONTRAPRUEBA. Sin ella, el 126 lo satisface un REVOKE, una policy que no
--- deja pasar a nadie, o una tabla vacía. La dueña lee lo suyo en CADA tabla, y
--- pau lee lo suyo de P.
+-- deja pasar a nadie, o una tabla vacía. La dueña lee lo suyo en CADA relación,
+-- y pau lee lo suyo de P.
 INSERT INTO defect_report
 SELECT 127, 'la dueña no lee su propio tablero, o el lector del 126 es ciego',
-       NOT (v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'),
-       CASE WHEN v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'
-            THEN 'tere lee T en cada tabla (' || v || ') y pau lee ' || p || ' tarjetas de P'
+       NOT (v ~ '^[a-z0-9_]+=[0-9]+(, [a-z0-9_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'),
+       CASE WHEN v ~ '^[a-z0-9_]+=[0-9]+(, [a-z0-9_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'
+            THEN 'tere lee T en cada relación (' || v || ') y pau lee ' || p || ' tarjetas de P'
             ELSE 'tere: ' || v || ' / pau sobre P: ' || p END
   FROM (SELECT current_setting('qa.b127') AS v, current_setting('qa.b126p') AS p) x;
 
@@ -6036,176 +6098,386 @@ SELECT 127, 'la dueña no lee su propio tablero, o el lector del 126 es ciego',
 --
 -- El sub de Keycloak es un uuid: no se distingue por FORMA de uno de Supabase.
 -- Lo único que vuelve imposible guardarlo es que no haya dónde: que toda columna
--- que pueda llevar un identificador esté atada por una FK al tenant. Esto lo
--- afirma el catálogo, columna por columna, sobre las tablas que el catálogo dice
--- que son del tablero:
+-- que pueda llevar un identificador lo reciba de un lugar que no sea un padrón
+-- libre. «Atada por una FK que empareja el tenant», que era lo que este bloque
+-- pedía en su primera versión, NO alcanzaba, y lo dijeron las mutaciones de un
+-- verificador independiente: una FK compuesta contra CUALQUIER tabla con tenant
+-- —`identity_links (organization_id, keycloak_sub)`, `kc_people`,
+-- `card_people`, una `board_external_people` con su PK libre— guardaba el sub
+-- con los 135 en verde. La pregunta correcta no es «¿tiene FK?» sino «¿de dónde
+-- viene el valor?».
 --
---   a. toda columna cuyo tipo base sea uuid, salvo la PK de una sola columna de
---      su propia tabla, está cubierta por una FK que la contiene Y que empareja
---      el `organization_id` de la fila con el `organization_id` del padre en la
---      MISMA posición. «Contiene `organization_id` en algún lado» no alcanzaba:
---      se mira el emparejamiento, que es lo que pincha el tenant. `organization_id`
---      mismo tiene que estar cubierto por alguna FK;
---   b. ninguna columna es un array ni json/jsonb: un identificador dentro de un
---      contenedor no tiene FK posible (decisión 6 de la `0029`);
---   c. SEGUNDA LÍNEA, MÁS FLOJA Y DICHA COMO TAL: ninguna columna de texto se
---      llama como una identidad. No es la garantía —una persona escrita a mano
---      en `objective` no la ve— pero ve el `assignee_sub text` del día que
---      alguien quiera federar por atajo.
+-- QUÉ SE MIRA. Las relaciones que PERSISTEN filas —tablas, particionadas,
+-- vistas materializadas, foráneas— de `pg_temp.tablero()`, y además sus PADRES:
+-- todo lo que el tablero referencia por FK, transitivamente. Un padre es un
+-- lugar donde una persona puede vivir a un salto de la tarjeta, y
+-- `pg_temp.tablero()` sólo baja (lo que referencia AL tablero), nunca sube. La
+-- subida se detiene en las dos ANCLAS que la puerta nombra: `organizations` —el
+-- tenant— y `org_members` —el padrón, la única fuente de personas—. Hoy el único
+-- padre examinado es `businesses`, por `cited_business_id`, y es a propósito:
+-- una columna nueva de `businesses` que guarde una identidad sin procedencia
+-- pone este bloque en rojo, porque el tablero la nombra.
+--
+-- QUÉ SE EXIGE, columna por columna, con el tipo resuelto hasta el fondo de los
+-- dominios —un dominio sobre un dominio sobre uuid ES uuid; la primera versión
+-- resolvía un solo salto—:
+--
+--   a. TODA COLUMNA uuid, salvo `organization_id`, tiene PROCEDENCIA. O es una
+--      identidad ACUÑADA por la base —la PK de una sola columna de su tabla, que
+--      no está en ninguna FK, y cuyo default es una llamada sin argumentos a una
+--      función volátil que devuelve uuid (`gen_random_uuid()`,
+--      `uuid_generate_v4()`), resuelta por catálogo y no por nombre—, o está
+--      cubierta por una FK VALIDADA que empareja el `organization_id` de la fila
+--      con el del padre Y cuya columna destino es `org_members.user_id` o una
+--      identidad acuñada del padre. VALIDADA porque una FK `NOT VALID` —la forma
+--      estándar de agregar una FK sobre una tabla con datos— no miró las filas
+--      que ya estaban. Y la exención vieja de «la PK propia» se fue: una PK de
+--      una sola columna sin default (`board_external_people.id`), o metida en
+--      una FK (`board_member_prefs.user_id REFERENCES auth.users`,
+--      `board_card_reviews.card_id REFERENCES board_cards (id)`), era exactamente
+--      el hueco;
+--   b. `organization_id` está cubierto por una FK validada contra
+--      `organizations (id)` o contra el `organization_id` de un padre;
+--   c. NINGUNA COLUMNA ES UN CONTENEDOR: todo tipo base que no sea uuid ni texto
+--      y que pueda llevar 128 bits —arrays, json, xml, bytea, numeric, tipos
+--      fila, rangos— está prohibido. Por catálogo y no por lista: un tipo de
+--      longitud fija menor que la de un uuid (`typlen` entre 1 y 15: enteros,
+--      fechas, booleanos, enums) no puede llevar uno entero; cualquier otro, sí.
+--      Un identificador dentro de un contenedor no tiene FK posible (decisión 2
+--      de la `0029`), y la primera versión sólo miraba arrays y json;
+--   d. SEGUNDA LÍNEA, MÁS FLOJA Y DICHA COMO TAL: una columna con nombre de
+--      identidad o de rol de persona —`sub`, `user`, `*_by`, `assignee`,
+--      `approver`, `creator`, `reviewer`, `collaborator`, `author`, `owner`,
+--      `email`...— no puede ser texto, y si es uuid tiene que ser EL PAR contra
+--      el padrón: no le alcanza una identidad acuñada de otra tabla. Es la que ve
+--      un `external_assignee_id` contra un padrón propio con la PK acuñada. No es
+--      la garantía —un nombre neutro la esquiva—: es la red de la (a).
 --
 -- Y aparte, cuántas FK van contra `org_members` y que TODAS emparejen
--- `(organization_id, <persona>)` con `(organization_id, user_id)`: una FK contra
--- `org_members (id)` también ataría la columna a algo, y no a una persona del
--- tenant.
+-- `(organization_id, <persona>)` con `(organization_id, user_id)` y estén
+-- validadas: una FK contra `org_members (id)` también ataría la columna a algo,
+-- y no a una persona del tenant.
 --
--- EL DENOMINADOR SE IMPRIME y se exige: tablas > 0, columnas uuid miradas > 0,
--- FK a `org_members` > 0. Cero sobre cero no informa cero.
+-- LO QUE NO VE, y queda dicho: una tabla con su PK ACUÑADA, sin ninguna palabra
+-- de persona en los nombres, en la que alguien inserta A MANO el sub como `id`.
+-- Un default se pisa con un valor explícito —lo mismo vale para
+-- `board_cards.id`—, y el catálogo ve el diseño, no cada INSERT. Medido: es la
+-- mutación que sobrevive en la tabla de la `0029`. Y una persona escrita a mano
+-- en `objective` o `result`, que es texto libre.
+--
+-- EL DENOMINADOR SE IMPRIME, también en verde, y se exige: relaciones > 0,
+-- columnas uuid miradas > 0, FK a `org_members` > 0. Cero sobre cero no informa
+-- cero.
+CREATE OR REPLACE FUNCTION pg_temp.tipo_base(p_tipo oid) RETURNS oid
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    t oid := p_tipo;
+BEGIN
+    WHILE (SELECT ty.typtype FROM pg_type ty WHERE ty.oid = t) = 'd' LOOP
+        t := (SELECT ty.typbasetype FROM pg_type ty WHERE ty.oid = t);
+    END LOOP;
+    RETURN t;
+END
+$$;
+
+-- Una identidad ACUÑADA por la base. La expresión del default se lee deparseada
+-- por el servidor —no es texto que alguien escribió, no puede traer un
+-- comentario— y la función se resuelve con `to_regprocedure` en la misma sesión
+-- que la deparseó, así que el `search_path` no la mueve.
+CREATE OR REPLACE FUNCTION pg_temp.acunada(p_rel oid, p_attnum int2) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM pg_constraint pk
+                    WHERE pk.conrelid = p_rel AND pk.contype = 'p' AND pk.conkey = ARRAY[p_attnum])
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint fk
+                        WHERE fk.conrelid = p_rel AND fk.contype = 'f' AND p_attnum = ANY (fk.conkey))
+       AND EXISTS (SELECT 1
+                     FROM pg_attrdef d
+                     JOIN pg_proc f
+                       ON f.oid = CASE WHEN pg_get_expr(d.adbin, d.adrelid) ~ '^[[:alnum:]_.]+\(\)$'
+                                       THEN to_regprocedure(pg_get_expr(d.adbin, d.adrelid))::oid END
+                    WHERE d.adrelid = p_rel AND d.adnum = p_attnum
+                      AND f.prorettype = 'uuid'::regtype AND f.provolatile = 'v')
+$$;
+
+CREATE TEMP TABLE h31_examinadas ON COMMIT DROP AS
+WITH RECURSIVE tb AS (SELECT * FROM pg_temp.tablero()),
+padre(oid) AS (
+    SELECT co.confrelid FROM pg_constraint co JOIN tb ON co.conrelid = tb.oid WHERE co.contype = 'f'
+    UNION
+    SELECT co.confrelid
+      FROM pg_constraint co
+      JOIN padre p ON co.conrelid = p.oid
+     WHERE co.contype = 'f'
+       AND p.oid NOT IN ('public.organizations'::regclass, 'public.org_members'::regclass)
+)
+SELECT tb.oid, tb.oid::regclass::text AS relname, 'tablero'::text AS de
+  FROM tb
+ WHERE tb.relkind IN ('r', 'p', 'm', 'f')
+UNION
+SELECT c.oid, c.oid::regclass::text, 'padre'
+  FROM padre p
+  JOIN pg_class c ON c.oid = p.oid
+ WHERE p.oid NOT IN ('public.organizations'::regclass, 'public.org_members'::regclass)
+   AND p.oid NOT IN (SELECT tb.oid FROM tb)
+   AND c.relkind IN ('r', 'p', 'm', 'f');
+
 CREATE TEMP TABLE h31_columnas ON COMMIT DROP AS
-WITH tb AS (SELECT * FROM pg_temp.tablero()),
+WITH padron AS (
+    SELECT (SELECT a.attnum FROM pg_attribute a
+             WHERE a.attrelid = 'public.org_members'::regclass AND a.attname = 'organization_id') AS m_org,
+           (SELECT a.attnum FROM pg_attribute a
+             WHERE a.attrelid = 'public.org_members'::regclass AND a.attname = 'user_id') AS m_user
+),
 col AS (
-    SELECT tb.relname, a.attrelid, a.attnum, a.attname,
-           bt.oid AS base_oid, bt.typname AS base, bt.typcategory AS categoria,
+    SELECT e.relname, e.de, a.attrelid, a.attnum, a.attname,
+           bt.oid AS base_oid, bt.typname AS base, bt.typcategory AS categoria, bt.typlen AS largo,
            (SELECT oa.attnum FROM pg_attribute oa
              WHERE oa.attrelid = a.attrelid AND oa.attname = 'organization_id'
                AND NOT oa.attisdropped) AS org_attnum
-      FROM tb
-      JOIN pg_attribute a ON a.attrelid = tb.oid AND a.attnum > 0 AND NOT a.attisdropped
-      JOIN pg_type ty ON ty.oid = a.atttypid
-      JOIN pg_type bt ON bt.oid = CASE WHEN ty.typtype = 'd' THEN ty.typbasetype ELSE ty.oid END
+      FROM h31_examinadas e
+      JOIN pg_attribute a ON a.attrelid = e.oid AND a.attnum > 0 AND NOT a.attisdropped
+      JOIN pg_type bt ON bt.oid = pg_temp.tipo_base(a.atttypid)
 )
 SELECT c.*,
-       EXISTS (SELECT 1 FROM pg_constraint pk
-                WHERE pk.conrelid = c.attrelid AND pk.contype = 'p'
-                  AND pk.conkey = ARRAY[c.attnum]::int2[]) AS es_pk_propia,
-       EXISTS (SELECT 1 FROM pg_constraint fk
-                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f'
-                  AND c.attnum = ANY (fk.conkey)
-                  AND EXISTS (SELECT 1 FROM generate_subscripts(fk.conkey, 1) i
-                               WHERE fk.conkey[i] = c.org_attnum
+       CASE WHEN c.base_oid = 'uuid'::regtype THEN 'uuid'
+            WHEN c.categoria = 'S'           THEN 'texto'
+            WHEN c.largo BETWEEN 1 AND 15    THEN 'angosto'
+            ELSE 'contenedor' END AS clase,
+       c.attname ~ ('(^|_)(sub|subject|user|users|uid|by|assignee|assignees|assigned|approver|approvers|'
+                    'creator|creators|reviewer|reviewers|collaborator|collaborators|author|authors|owner|'
+                    'owners|member|members|person|people|keycloak|kc|actor|identity|principal|email|mail)(_|$)')
+           AS nombre_de_persona,
+       pg_temp.acunada(c.attrelid, c.attnum) AS acunada,
+       -- (a): una FK validada que la contiene, empareja el tenant con el del
+       -- padre, y apunta al padrón o a una identidad acuñada del padre.
+       EXISTS (SELECT 1
+                 FROM pg_constraint fk
+                CROSS JOIN LATERAL generate_subscripts(fk.conkey, 1) AS g(j)
+                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f' AND fk.convalidated
+                  AND fk.conkey[g.j] = c.attnum
+                  AND EXISTS (SELECT 1 FROM generate_subscripts(fk.conkey, 1) AS h(i)
+                               WHERE fk.conkey[h.i] = c.org_attnum
                                  AND (SELECT pa.attname FROM pg_attribute pa
                                        WHERE pa.attrelid = fk.confrelid
-                                         AND pa.attnum = fk.confkey[i]) = 'organization_id'))
-           AS cubierta_con_tenant,
+                                         AND pa.attnum = fk.confkey[h.i]) = 'organization_id')
+                  AND ((fk.confrelid = 'public.org_members'::regclass
+                        AND fk.confkey[g.j] = (SELECT m_user FROM padron))
+                       OR pg_temp.acunada(fk.confrelid, fk.confkey[g.j])))
+           AS con_procedencia,
+       -- (b): el tenant, contra organizations (id) o contra el tenant del padre.
+       EXISTS (SELECT 1
+                 FROM pg_constraint fk
+                CROSS JOIN LATERAL generate_subscripts(fk.conkey, 1) AS g(j)
+                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f' AND fk.convalidated
+                  AND fk.conkey[g.j] = c.attnum
+                  AND (SELECT pa.attname FROM pg_attribute pa
+                        WHERE pa.attrelid = fk.confrelid AND pa.attnum = fk.confkey[g.j])
+                      = CASE WHEN fk.confrelid = 'public.organizations'::regclass
+                             THEN 'id' ELSE 'organization_id' END)
+           AS tenant_con_procedencia,
+       -- (d): el par contra el padrón, exacto y validado.
        EXISTS (SELECT 1 FROM pg_constraint fk
-                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f'
-                  AND c.attnum = ANY (fk.conkey)) AS cubierta
+                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f' AND fk.convalidated
+                  AND fk.confrelid = 'public.org_members'::regclass
+                  AND fk.conkey = ARRAY[c.org_attnum, c.attnum]::int2[]
+                  AND fk.confkey = (SELECT ARRAY[m_org, m_user]::int2[] FROM padron))
+           AS par_del_padron
   FROM col c;
 
 CREATE TEMP TABLE h31_identidad ON COMMIT DROP AS
-SELECT (SELECT count(DISTINCT attrelid) FROM h31_columnas)                          AS tablas,
-       (SELECT count(*) FROM h31_columnas)                                          AS columnas,
-       (SELECT count(*) FROM h31_columnas WHERE base = 'uuid')                      AS uuid_miradas,
+SELECT (SELECT count(DISTINCT attrelid) FROM h31_columnas WHERE de = 'tablero')        AS relaciones,
+       coalesce((SELECT string_agg(DISTINCT relname, ', ') FROM h31_columnas WHERE de = 'padre'),
+                '')                                                                    AS padres,
+       (SELECT count(*) FROM h31_columnas)                                             AS columnas,
+       (SELECT count(*) FROM h31_columnas WHERE clase = 'uuid')                        AS uuid_miradas,
+       (SELECT count(*) FROM h31_columnas WHERE clase = 'uuid' AND acunada)            AS acunadas,
        coalesce((SELECT string_agg(relname || '.' || attname, ', ' ORDER BY relname, attname)
                    FROM h31_columnas
-                  WHERE base = 'uuid' AND NOT es_pk_propia AND attname <> 'organization_id'
-                    AND NOT cubierta_con_tenant), '')                               AS uuid_sin_par,
+                  WHERE clase = 'uuid' AND attname <> 'organization_id'
+                    AND NOT acunada AND NOT con_procedencia), '')                      AS uuid_sin_procedencia,
        coalesce((SELECT string_agg(relname, ', ' ORDER BY relname)
                    FROM h31_columnas
-                  WHERE attname = 'organization_id' AND NOT cubierta), '')         AS tenant_sin_fk,
+                  WHERE attname = 'organization_id' AND NOT tenant_con_procedencia), '') AS tenant_sin_procedencia,
+       coalesce((SELECT string_agg(relname || '.' || attname || ' (' || base || ')', ', ' ORDER BY relname, attname)
+                   FROM h31_columnas WHERE clase = 'contenedor'), '')                  AS contenedores,
        coalesce((SELECT string_agg(relname || '.' || attname || ' (' || base || ')', ', ' ORDER BY relname, attname)
                    FROM h31_columnas
-                  WHERE categoria = 'A' OR base IN ('json', 'jsonb')), '')         AS contenedores,
-       coalesce((SELECT string_agg(relname || '.' || attname, ', ' ORDER BY relname, attname)
-                   FROM h31_columnas
-                  WHERE categoria = 'S'
-                    AND attname ~ '(^|_)(sub|subject|user|users|uid|by|assignee|owner|member|person|people|keycloak|kc|actor)(_|$)'),
-                '')                                                                  AS texto_con_nombre_de_persona,
+                  WHERE nombre_de_persona
+                    AND (clase = 'texto' OR (clase = 'uuid' AND NOT par_del_padron))), '') AS persona_fuera_del_padron,
        (SELECT count(*) FROM pg_constraint fk
-          JOIN pg_temp.tablero() tb ON tb.oid = fk.conrelid
-         WHERE fk.contype = 'f' AND fk.confrelid = 'public.org_members'::regclass)  AS fk_a_miembros,
+          JOIN h31_examinadas e ON e.oid = fk.conrelid
+         WHERE fk.contype = 'f' AND fk.confrelid = 'public.org_members'::regclass)     AS fk_a_miembros,
        coalesce((SELECT string_agg(fk.conname, ', ' ORDER BY fk.conname)
                    FROM pg_constraint fk
-                   JOIN pg_temp.tablero() tb ON tb.oid = fk.conrelid
+                   JOIN h31_examinadas e ON e.oid = fk.conrelid
                   WHERE fk.contype = 'f' AND fk.confrelid = 'public.org_members'::regclass
-                    AND NOT (array_length(fk.confkey, 1) = 2
+                    AND NOT (fk.convalidated
+                             AND array_length(fk.confkey, 1) = 2
                              AND (SELECT pa.attname FROM pg_attribute pa
                                    WHERE pa.attrelid = fk.conrelid AND pa.attnum = fk.conkey[1]) = 'organization_id'
                              AND (SELECT pa.attname FROM pg_attribute pa
                                    WHERE pa.attrelid = fk.confrelid AND pa.attnum = fk.confkey[1]) = 'organization_id'
                              AND (SELECT pa.attname FROM pg_attribute pa
                                    WHERE pa.attrelid = fk.confrelid AND pa.attnum = fk.confkey[2]) = 'user_id')),
-                '')                                                                  AS fk_a_miembros_mal;
+                '')                                                                     AS fk_a_miembros_mal;
 
 INSERT INTO defect_report
 SELECT 128, 'una columna del tablero puede guardar un identificador de persona sin la FK compuesta',
-       NOT (tablas > 0 AND uuid_miradas > 0 AND fk_a_miembros > 0
-            AND uuid_sin_par = '' AND tenant_sin_fk = '' AND contenedores = ''
-            AND texto_con_nombre_de_persona = '' AND fk_a_miembros_mal = ''),
-       CASE WHEN tablas > 0 AND uuid_miradas > 0 AND fk_a_miembros > 0
-                 AND uuid_sin_par = '' AND tenant_sin_fk = '' AND contenedores = ''
-                 AND texto_con_nombre_de_persona = '' AND fk_a_miembros_mal = ''
-            THEN format('%s columnas de %s tablas del tablero, %s de ellas uuid: toda uuid que no es la PK propia ' ||
-                        'está atada por una FK que empareja organization_id; sin arrays ni json; ' ||
-                        '%s FK a org_members, todas (organization_id, persona) -> (organization_id, user_id)',
-                        columnas, tablas, uuid_miradas, fk_a_miembros)
-            ELSE format('tablas=%s columnas=%s uuid=%s fk_a_miembros=%s; uuid sin par con el tenant: [%s]; ' ||
-                        'organization_id sin FK: [%s]; contenedores: [%s]; texto con nombre de persona: [%s]; ' ||
-                        'FK a org_members que no es el par: [%s]',
-                        tablas, columnas, uuid_miradas, fk_a_miembros, uuid_sin_par, tenant_sin_fk,
-                        contenedores, texto_con_nombre_de_persona, fk_a_miembros_mal)
+       NOT ok,
+       CASE WHEN ok
+            THEN format('%s columnas miradas, de %s relaciones del tablero y de sus padres [%s]; %s de ellas uuid ' ||
+                        '(%s acuñadas por la base): toda uuid viene del padrón o de una identidad acuñada, ' ||
+                        'por una FK validada que empareja el tenant; sin contenedores; ningún nombre de ' ||
+                        'persona fuera del padrón; %s FK a org_members, todas (organization_id, persona) -> ' ||
+                        '(organization_id, user_id)',
+                        columnas, relaciones, padres, uuid_miradas, acunadas, fk_a_miembros)
+            ELSE format('relaciones=%s padres=[%s] columnas=%s uuid=%s fk_a_miembros=%s; ' ||
+                        'uuid sin procedencia: [%s]; organization_id sin procedencia: [%s]; ' ||
+                        'contenedores: [%s]; nombre de persona fuera del padrón: [%s]; ' ||
+                        'FK a org_members que no es el par validado: [%s]',
+                        relaciones, padres, columnas, uuid_miradas, fk_a_miembros, uuid_sin_procedencia,
+                        tenant_sin_procedencia, contenedores, persona_fuera_del_padron, fk_a_miembros_mal)
             END
-  FROM h31_identidad;
+  FROM (SELECT *,
+               relaciones > 0 AND uuid_miradas > 0 AND fk_a_miembros > 0
+               AND uuid_sin_procedencia = '' AND tenant_sin_procedencia = '' AND contenedores = ''
+               AND persona_fuera_del_padron = '' AND fk_a_miembros_mal = '' AS ok
+          FROM h31_identidad) x;
+
+-- El denominador, impreso también en verde: la corrección del crítico lo pide, y
+-- un bloque que sólo lo dice cuando falla no deja ver si miró algo.
+DO $$
+BEGIN
+    RAISE NOTICE 'Bloque 128: % columnas miradas, de % relaciones del tablero y de sus padres [%]; % uuid, % acuñadas; % FK a org_members.',
+        (SELECT columnas FROM h31_identidad), (SELECT relaciones FROM h31_identidad),
+        (SELECT padres FROM h31_identidad), (SELECT uuid_miradas FROM h31_identidad),
+        (SELECT acunadas FROM h31_identidad), (SELECT fk_a_miembros FROM h31_identidad);
+END
+$$;
 
 -- ── 129 ──────────────────────────────────────────────────────────────────────
--- TODA TABLA DEL TABLERO —por catálogo— lleva el tenant, RLS ENABLE y FORCE, y
--- sus dos capas de policy acotadas por `current_user_org_ids()`.
+-- TODA RELACIÓN DEL TABLERO —por catálogo— está acotada al tenant:
+--
+--   * una TABLA (o particionada) lleva `organization_id` uuid NOT NULL, RLS
+--     ENABLE y FORCE, y sus dos capas de policy acotadas EXACTAMENTE por
+--     `current_user_org_ids()`;
+--   * una VISTA lleva `organization_id` y `security_invoker`: sin él, una vista
+--     de `postgres` lee con BYPASSRLS y la policy de la tabla de abajo no corre;
+--   * una VISTA MATERIALIZADA o una tabla FORÁNEA no puede ser del tablero: no
+--     tienen RLS posible.
 --
 -- Las policies por catálogo y no sólo por conducta, por lo que el bloque 94
 -- midió con la ficha: para un SELECT la permisiva y la restrictiva se tapan, así
--- que degradar UNA de las dos deja verdes al 126 y al 127. Y se exige
--- `current_user_org_ids()` en el texto, no sólo `organization_id`: una policy
--- `USING (organization_id IS NOT NULL)` nombra la columna y no aísla nada.
+-- que degradar UNA de las dos deja verdes al 126 y al 127.
+--
+-- Y POR IGUALDAD, NO POR TEXTO PARECIDO (R14). La primera versión pedía
+-- `LIKE '%organization_id%current_user_org_ids()%'`, y un verificador la rompió
+-- dos veces: `organization_id IS NOT NULL OR organization_id IN (...)` y
+-- `organization_id IN (...) OR true` contienen ese texto y no acotan nada, en
+-- UNA capa —verde con los 135— o en las dos —sólo el 126 rojo—. Un escaneo de
+-- texto no distingue un predicado que acota de uno que lo nombra. Ahora cada
+-- expresión tiene que ser IGUAL a la forma canónica, y la forma canónica no está
+-- escrita a mano: se crea una policy con el predicado de la puerta sobre una
+-- tabla temporal y se deparsea en esta misma sesión, así que ni el `search_path`
+-- ni la versión del deparser la mueven.
+--
+-- Qué se exige de las policies de cada tabla:
+--   * una restrictiva `FOR ALL TO authenticated` cuyo USING y WITH CHECK son la
+--     forma canónica;
+--   * una permisiva de lectura (`SELECT` o `ALL`) `TO authenticated` cuyo USING
+--     es la forma canónica;
+--   * NINGUNA permisiva, de ningún rol ni comando, con un USING o un WITH CHECK
+--     distinto de la forma canónica: las permisivas se suman, y una floja abre
+--     la capa aunque la otra esté bien.
+CREATE TEMP TABLE h31_canon (organization_id uuid) ON COMMIT DROP;
+CREATE POLICY h31_canon ON h31_canon USING (organization_id IN (SELECT public.current_user_org_ids()));
+SELECT set_config('qa.canon129',
+                  (SELECT pg_get_expr(p.polqual, p.polrelid) FROM pg_policy p
+                    WHERE p.polrelid = 'h31_canon'::regclass), true);
+
+DO $$
+BEGIN
+    IF coalesce(current_setting('qa.canon129'), '') !~ 'current_user_org_ids' THEN
+        RAISE EXCEPTION 'Vacuous run: la forma canónica del 129 salió vacía: [%]', current_setting('qa.canon129');
+    END IF;
+END
+$$;
+
 CREATE TEMP TABLE h31_tablas ON COMMIT DROP AS
-SELECT tb.relname,
-       coalesce((SELECT a.attnotnull AND a.atttypid = 'uuid'::regtype
+SELECT tb.relname, tb.relkind,
+       coalesce((SELECT a.atttypid = 'uuid'::regtype AND (a.attnotnull OR tb.relkind = 'v')
                    FROM pg_attribute a
                   WHERE a.attrelid = tb.oid AND a.attname = 'organization_id' AND NOT a.attisdropped),
                 false) AS tenant_ok,
        c.relrowsecurity AND c.relforcerowsecurity AS rls_ok,
+       coalesce(array_to_string(c.reloptions, ',') ~* '(^|,)security_invoker=(true|on|yes|1)(,|$)', false)
+           AS invoker_ok,
        EXISTS (SELECT 1 FROM pg_policy p
                 WHERE p.polrelid = tb.oid AND NOT p.polpermissive AND p.polcmd = '*'
                   AND 'authenticated'::regrole::oid = ANY (p.polroles)
-                  AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%'
-                  AND coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%')
+                  AND pg_get_expr(p.polqual, p.polrelid) = current_setting('qa.canon129')
+                  AND pg_get_expr(p.polwithcheck, p.polrelid) = current_setting('qa.canon129'))
            AS restrictiva_ok,
        EXISTS (SELECT 1 FROM pg_policy p
                 WHERE p.polrelid = tb.oid AND p.polpermissive AND p.polcmd IN ('r', '*')
-                  AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%')
+                  AND 'authenticated'::regrole::oid = ANY (p.polroles)
+                  AND pg_get_expr(p.polqual, p.polrelid) = current_setting('qa.canon129'))
            AS lectura_ok,
        NOT EXISTS (SELECT 1 FROM pg_policy p
                     WHERE p.polrelid = tb.oid AND p.polpermissive
-                      AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') NOT LIKE '%current_user_org_ids()%')
+                      AND ((p.polcmd <> 'a'
+                            AND pg_get_expr(p.polqual, p.polrelid) IS DISTINCT FROM current_setting('qa.canon129'))
+                           OR (p.polcmd = 'a'
+                               AND pg_get_expr(p.polwithcheck, p.polrelid) IS DISTINCT FROM current_setting('qa.canon129'))
+                           OR (p.polwithcheck IS NOT NULL
+                               AND pg_get_expr(p.polwithcheck, p.polrelid) <> current_setting('qa.canon129'))))
            AS sin_permisiva_floja
   FROM pg_temp.tablero() tb
   JOIN pg_class c ON c.oid = tb.oid;
 
 INSERT INTO defect_report
-SELECT 129, 'una tabla del tablero no lleva el tenant, RLS ENABLE y FORCE, o sus policies no acotan',
-       count(*) = 0 OR count(*) FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
-                                                  AND lectura_ok AND sin_permisiva_floja)) > 0,
-       CASE WHEN count(*) > 0 AND count(*) FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
-                                                             AND lectura_ok AND sin_permisiva_floja)) = 0
-            THEN 'las ' || count(*) || ' tablas del tablero (' || string_agg(relname, ', ' ORDER BY relname) ||
-                 ') tienen organization_id uuid NOT NULL, ENABLE + FORCE, una restrictiva y una permisiva ' ||
-                 'de lectura por current_user_org_ids(), y ninguna permisiva floja'
-            ELSE coalesce(string_agg(format('%s: tenant=%s rls=%s restrictiva=%s lectura=%s sin_floja=%s',
-                                            relname, tenant_ok, rls_ok, restrictiva_ok, lectura_ok,
-                                            sin_permisiva_floja), ' / ' ORDER BY relname)
-                              FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
-                                                 AND lectura_ok AND sin_permisiva_floja)),
-                          'el catálogo no encontró ninguna tabla del tablero')
+SELECT 129, 'una relación del tablero no lleva el tenant, RLS ENABLE y FORCE, o sus policies no acotan',
+       count(*) = 0 OR count(*) FILTER (WHERE NOT ok) > 0,
+       CASE WHEN count(*) > 0 AND count(*) FILTER (WHERE NOT ok) = 0
+            THEN 'las ' || count(*) || ' relaciones del tablero (' ||
+                 string_agg(relname || ':' || relkind::text, ', ' ORDER BY relname) ||
+                 '): cada tabla con organization_id uuid NOT NULL, ENABLE + FORCE, una restrictiva y una ' ||
+                 'permisiva de lectura IGUALES a la forma canónica (' || current_setting('qa.canon129') ||
+                 '), ninguna permisiva distinta; cada vista con security_invoker; ninguna materializada ni foránea'
+            ELSE coalesce(string_agg(CASE WHEN relkind IN ('r', 'p')
+                                          THEN format('%s: tenant=%s rls=%s restrictiva=%s lectura=%s sin_floja=%s',
+                                                      relname, tenant_ok, rls_ok, restrictiva_ok, lectura_ok,
+                                                      sin_permisiva_floja)
+                                          WHEN relkind = 'v'
+                                          THEN format('%s (vista): tenant=%s security_invoker=%s',
+                                                      relname, tenant_ok, invoker_ok)
+                                          ELSE format('%s (relkind %s): no admite RLS', relname, relkind) END,
+                                     ' / ' ORDER BY relname) FILTER (WHERE NOT ok),
+                          'el catálogo no encontró ninguna relación del tablero')
             END
-  FROM h31_tablas;
+  FROM (SELECT *,
+               CASE WHEN relkind IN ('r', 'p')
+                    THEN tenant_ok AND rls_ok AND restrictiva_ok AND lectura_ok AND sin_permisiva_floja
+                    WHEN relkind = 'v' THEN tenant_ok AND invoker_ok
+                    ELSE false END AS ok
+          FROM h31_tablas) x;
 
 -- ── 130 ──────────────────────────────────────────────────────────────────────
--- LOS PRIVILEGIOS DEL TABLERO, POR CATÁLOGO. `anon` no tiene NADA —ni leer: el
--- bloque 14 mira sólo la escritura de `anon`, y una lectura otorgada de más es
+-- LOS PRIVILEGIOS DEL TABLERO, POR CATÁLOGO, sobre toda relación del tablero
+-- —vistas y materializadas incluidas—. `anon` no tiene NADA —ni leer: el bloque
+-- 14 mira sólo la escritura de `anon`, y una lectura otorgada de más es
 -- superficie aunque hoy la RLS la vacíe—; `authenticated` sólo SELECT (decisión
 -- 11 de la `0029`). Efectivo, con `has_table_privilege`, que cuenta lo que llega
--- por PUBLIC y por pertenencia a otro rol.
+-- por PUBLIC y por pertenencia a otro rol; Y POR COLUMNA, con
+-- `has_any_column_privilege`: un `GRANT SELECT (assignee_id) ... TO anon` no es
+-- un privilegio de tabla y `has_table_privilege` da `f` sobre él, así que la
+-- primera versión de este bloque no lo veía. TRUNCATE, DELETE y TRIGGER no
+-- existen por columna.
 CREATE TEMP TABLE h31_grants ON COMMIT DROP AS
 SELECT tb.relname, r.rol, pr.priv,
-       has_table_privilege(r.rol, tb.oid, pr.priv) AS tiene
+       has_table_privilege(r.rol, tb.oid, pr.priv)
+       OR (pr.priv IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+           AND has_any_column_privilege(r.rol, tb.oid, pr.priv)) AS tiene
   FROM pg_temp.tablero() tb
  CROSS JOIN (VALUES ('anon'), ('authenticated')) r(rol)
  CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
@@ -6215,13 +6487,13 @@ INSERT INTO defect_report
 SELECT 130, 'un rol de la API tiene sobre el tablero más que lo decidido',
        count(*) = 0 OR count(*) FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')) > 0,
        CASE WHEN count(*) > 0 AND count(*) FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')) = 0
-            THEN count(*) || ' privilegios mirados sobre ' || count(DISTINCT relname) ||
-                 ' tablas: anon ninguno, authenticated sólo SELECT'
+            THEN count(*) || ' privilegios mirados, de tabla y por columna, sobre ' || count(DISTINCT relname) ||
+                 ' relaciones: anon ninguno, authenticated sólo SELECT'
             ELSE coalesce('fuera de lo decidido: ' ||
                           string_agg(rol || (CASE WHEN tiene THEN ' tiene ' ELSE ' NO tiene ' END) ||
                                      priv || ' en ' || relname, ', ' ORDER BY relname, rol, priv)
                               FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')),
-                          'el catálogo no encontró ninguna tabla del tablero')
+                          'el catálogo no encontró ninguna relación del tablero')
             END
   FROM h31_grants;
 
