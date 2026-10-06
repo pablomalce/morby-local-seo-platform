@@ -1,4 +1,4 @@
--- A hundred and twenty isolation checks against the Growth OS schema — executable.
+-- A hundred and thirty-five isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -5543,10 +5543,865 @@ SELECT 120, 'el esquema también rechaza la baja de un miembro que no firmó nad
             ELSE 'la baja de inés murió: ' || current_setting('qa.b120') END;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 121 a 135. El tablero transversal — la puerta de H3.1, CERRADO por la 0029
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que una tarjeta no pueda nombrar como responsable, creador,
+-- aprobador o colaborador a alguien que no es miembro de SU organización, que
+-- ninguna organización lea el tablero de otra, y que ninguna columna del tablero
+-- guarde un identificador de persona sin la FK compuesta que lo ata al tenant.
+--
+-- Los cuatro puntos de la puerta, y su bloque:
+--
+--   (1) 121 — la tarjeta con una persona que NO es miembro, en las cuatro columnas
+--       de persona, muere con 23503 NOMBRANDO la FK compuesta;
+--   (2) 122 — la MISMA sentencia, con esa persona ya miembro, pasa al COMMIT;
+--   (3) 126 — bajo el `auth.uid()` de una persona de OTRA organización, como
+--       `authenticated`, cada tabla del tablero devuelve cero filas de la
+--       organización dueña; el 127 es su contraprueba;
+--   (4) 128 — por catálogo: ninguna columna uuid del tablero sin una FK que
+--       empareje `organization_id` con el del padre, con su denominador.
+--
+-- LAS TABLAS DEL TABLERO SE DESCUBREN, NO SE ENUMERAN. `pg_temp.tablero()` toma
+-- las de `public` con prefijo `board_` y les suma, por cierre transitivo, toda
+-- tabla que las referencie. Una tabla nueva del tablero entra sola en el 126, el
+-- 127, el 128, el 129 y el 130, y la anti-vacuidad del 126 obliga a poblarla en
+-- la fixture: sin una fila suya, la corrida se corta en vez de informar «cero
+-- filas ajenas» sobre una tabla vacía. Y una tabla hija con otro nombre también
+-- entra, porque la descubre su FK y no su nombre (R14).
+--
+-- LOS BLOQUES DE ESTRUCTURA CORREN COMO `postgres`, por el motivo del encabezado
+-- del 77: tiene BYPASSRLS, así que ninguna policy puede ser lo que rechaza. Y el
+-- rechazo se exige NOMBRANDO la constraint, no sólo el 23503: dos FK distintas
+-- de la misma fila dan el mismo SQLSTATE, y la puerta dice «por la clave foránea
+-- compuesta», no «por alguna».
+--
+-- FIXTURES PROPIAS: tere (dueña de su organización, la «T», por el alta real de
+-- `handle_new_user`), teo (editor de T; también tiene su organización propia,
+-- porque el alta se la da) y pau (dueño de la «P», NO miembro de T). Ningún
+-- bloque anterior las toca. Los nombres de las filas llevan «QA», como pide la
+-- regla de datos de prueba.
+
+RESET ROLE;
+
+INSERT INTO auth.users (id, email) VALUES
+    ('d0290000-0029-4029-8029-000000000a01', 'tere@example.test'),
+    ('d0290000-0029-4029-8029-000000000a02', 'teo@example.test'),
+    ('d0290000-0029-4029-8029-000000000a03', 'pau@example.test');
+
+CREATE TEMP TABLE h31 AS
+SELECT (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0290000-0029-4029-8029-000000000a01' AND role = 'owner') AS org_t,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0290000-0029-4029-8029-000000000a03' AND role = 'owner') AS org_p;
+
+INSERT INTO org_members (organization_id, user_id, role)
+SELECT org_t, 'd0290000-0029-4029-8029-000000000a02'::uuid, 'editor' FROM h31;
+
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0290000-0029-4029-8029-000000000b01', org_t, 'QA Tablero T' FROM h31;
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0290000-0029-4029-8029-000000000b02', org_p, 'QA Tablero P' FROM h31;
+
+-- T1: las cuatro personas puestas —tere responsable, creadora y aprobadora; teo
+-- colaborador— y el negocio citado. T2: teo responsable y creador, y depende de
+-- T1. T3: sin personas, destino de los controles positivos. P1 y P2: el tablero
+-- de pau, que es lo que hace «cruzado» construible en el 123.
+INSERT INTO board_cards (id, organization_id, product, objective, cited_business_id,
+                         status, priority, estimate_minutes, actual_minutes,
+                         assignee_id, created_by, approved_by, approved_at, result)
+SELECT 'd0290000-0029-4029-8029-000000000c01', org_t, 'growth_os', 'QA auditar la ficha de T',
+       'd0290000-0029-4029-8029-000000000b01', 'done', 'high', 120, 95,
+       'd0290000-0029-4029-8029-000000000a01', 'd0290000-0029-4029-8029-000000000a01',
+       'd0290000-0029-4029-8029-000000000a01', now(), 'QA hecho'
+  FROM h31;
+INSERT INTO board_cards (id, organization_id, product, objective, assignee_id, created_by)
+SELECT 'd0290000-0029-4029-8029-000000000c02', org_t, 'lead_engine', 'QA calificar leads de T',
+       'd0290000-0029-4029-8029-000000000a02', 'd0290000-0029-4029-8029-000000000a02'
+  FROM h31;
+INSERT INTO board_cards (id, organization_id, product, objective)
+SELECT 'd0290000-0029-4029-8029-000000000c03', org_t, 'vulkan_os', 'QA tarjeta sin personas' FROM h31;
+INSERT INTO board_cards (id, organization_id, product, objective, assignee_id)
+SELECT 'd0290000-0029-4029-8029-000000000c11', org_p, 'growth_os', 'QA tablero de P',
+       'd0290000-0029-4029-8029-000000000a03' FROM h31;
+INSERT INTO board_cards (id, organization_id, product, objective)
+SELECT 'd0290000-0029-4029-8029-000000000c12', org_p, 'growth_os', 'QA otra de P' FROM h31;
+
+INSERT INTO board_card_collaborators (organization_id, card_id, user_id)
+SELECT org_t, 'd0290000-0029-4029-8029-000000000c01', 'd0290000-0029-4029-8029-000000000a02' FROM h31;
+INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+SELECT org_t, 'd0290000-0029-4029-8029-000000000c02', 'd0290000-0029-4029-8029-000000000c01' FROM h31;
+INSERT INTO board_card_sources (organization_id, card_id, url, title)
+SELECT org_t, 'd0290000-0029-4029-8029-000000000c01', 'https://example.org/qa-tablero', 'QA fuente' FROM h31;
+
+-- Las tablas del tablero, por catálogo: prefijo `board_` en `public` y el cierre
+-- transitivo de lo que las referencia. Ver el encabezado de esta tanda.
+CREATE OR REPLACE FUNCTION pg_temp.tablero()
+RETURNS TABLE (oid oid, relname name)
+LANGUAGE sql STABLE AS $$
+    WITH RECURSIVE t(oid) AS (
+        SELECT c.oid
+          FROM pg_class c
+         WHERE c.relnamespace = 'public'::regnamespace
+           AND c.relkind IN ('r', 'p')
+           AND c.relname LIKE 'board\_%'
+        UNION
+        SELECT co.conrelid
+          FROM pg_constraint co
+          JOIN t ON co.confrelid = t.oid
+         WHERE co.contype = 'f'
+    )
+    SELECT c.oid, c.relname FROM t JOIN pg_class c ON c.oid = t.oid ORDER BY c.relname
+$$;
+
+-- Corre una sentencia con un rol, dispara lo que el COMMIT comprobaría, mira el
+-- resultado con `p_mira` como `postgres`, y DESHACE todo. Es `al_commit()` del
+-- bloque 118 con una mirada después: el 133 tiene que decir no sólo que la baja
+-- pasó sino qué quedó de la tarjeta. Devuelve `paso; <lo que miró>`, o
+-- `SQLSTATE | mensaje` si murió.
+CREATE OR REPLACE FUNCTION pg_temp.al_commit_y_mira(p_sql text, p_rol text, p_mira text)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    visto  text;
+    salida text;
+BEGIN
+    BEGIN
+        EXECUTE format('SET LOCAL ROLE %I', p_rol);
+        EXECUTE p_sql;
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RESET ROLE;
+        EXECUTE p_mira INTO visto;
+        salida := 'paso; ' || coalesce(visto, '');
+        RAISE EXCEPTION 'qa: deshacer la baja' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN salida;
+    END;
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' | ' || SQLERRM;
+END
+$$;
+
+-- Precondiciones de la fixture, como `postgres`. Si alguna falla, la corrida se
+-- corta acá y no aparece como un rojo de la puerta:
+--   * pau EXISTE en `auth.users` —sin eso, una FK simple contra `auth.users`
+--     también lo rechazaría y el 121 no distinguiría la FK compuesta de la
+--     simple, que es justo la mutación que la puerta nombra—;
+--   * pau NO es miembro de T, y teo sí;
+--   * T1 tiene las cuatro personas puestas y T2 a teo de responsable y creador:
+--     sin eso, el 131 al 133 piden a FK que no tienen nada que comprobar;
+--   * se dispara lo que el COMMIT comprobaría, en una subtransacción, como el
+--     bloque 118: una fixture que violara una FK diferida se corta acá.
+DO $$
+BEGIN
+    BEGIN
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION 'qa: devolver el modo de las constraints' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        NULL;
+    END;
+END
+$$;
+
+DO $$
+DECLARE
+    t     uuid := (SELECT org_t FROM h31);
+    fallas text;
+BEGIN
+    SELECT string_agg(que, '; ') INTO fallas FROM (VALUES
+        ('pau no existe en auth.users',
+         NOT EXISTS (SELECT 1 FROM auth.users WHERE id = 'd0290000-0029-4029-8029-000000000a03')),
+        ('pau ya es miembro de T',
+         EXISTS (SELECT 1 FROM org_members WHERE organization_id = t
+                    AND user_id = 'd0290000-0029-4029-8029-000000000a03')),
+        ('teo no es miembro de T',
+         NOT EXISTS (SELECT 1 FROM org_members WHERE organization_id = t
+                        AND user_id = 'd0290000-0029-4029-8029-000000000a02')),
+        ('T y P son la misma organización', t = (SELECT org_p FROM h31)),
+        ('T1 no tiene las tres personas de la tarjeta',
+         NOT EXISTS (SELECT 1 FROM board_cards WHERE id = 'd0290000-0029-4029-8029-000000000c01'
+                        AND assignee_id = 'd0290000-0029-4029-8029-000000000a01'
+                        AND created_by  = 'd0290000-0029-4029-8029-000000000a01'
+                        AND approved_by = 'd0290000-0029-4029-8029-000000000a01')),
+        ('T2 no tiene a teo de responsable y creador',
+         NOT EXISTS (SELECT 1 FROM board_cards WHERE id = 'd0290000-0029-4029-8029-000000000c02'
+                        AND assignee_id = 'd0290000-0029-4029-8029-000000000a02'
+                        AND created_by  = 'd0290000-0029-4029-8029-000000000a02')),
+        ('teo no colabora en T1',
+         NOT EXISTS (SELECT 1 FROM board_card_collaborators
+                      WHERE organization_id = t AND card_id = 'd0290000-0029-4029-8029-000000000c01'
+                        AND user_id = 'd0290000-0029-4029-8029-000000000a02'))
+    ) AS f(que, falla)
+    WHERE falla;
+
+    IF fallas IS NOT NULL THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 121 a 133 no es la que dicen: %', fallas;
+    END IF;
+END
+$$;
+
+-- ── 121 y 122 ────────────────────────────────────────────────────────────────
+-- LA PUERTA DE H3.1, PUNTOS (1) Y (2), EN LAS CUATRO COLUMNAS DE PERSONA.
+--
+-- Cada caso es UNA sentencia. El 121 la corre tal cual, con pau, que no es
+-- miembro de T. El 122 corre EL MISMO TEXTO concatenado detrás del alta de pau
+-- como miembro de T: no una sentencia «parecida», la misma cadena, así que lo
+-- único que cambió entre las dos corridas es la membresía.
+--
+-- Las dos se corren con `al_commit()` —la del bloque 118— como `postgres`:
+-- dispara lo que el COMMIT comprobaría y deshace, para que el caso siguiente
+-- encuentre la fixture como estaba. Hoy ninguna FK del tablero es diferible
+-- (decisión 4 de la `0029`), y el disparo es lo que hace que este bloque siga
+-- midiendo lo mismo el día que una lo sea: sin él, ese INSERT «pasaría» la
+-- sentencia y el 121 se pondría verde por no haber mirado.
+CREATE TEMP TABLE h31_personas (
+    n         int  PRIMARY KEY,
+    columna   text NOT NULL,
+    fkey      text NOT NULL,
+    sentencia text NOT NULL
+) ON COMMIT DROP;
+
+INSERT INTO h31_personas
+SELECT 1, 'board_cards.assignee_id', 'board_cards_assignee_member_fkey',
+       format($sql$INSERT INTO board_cards (id, organization_id, product, objective, assignee_id)
+                   VALUES ('d0290000-0029-4029-8029-000000000d01', %L, 'growth_os',
+                           'QA responsable ajeno', 'd0290000-0029-4029-8029-000000000a03')$sql$, org_t)
+  FROM h31
+UNION ALL
+SELECT 2, 'board_cards.created_by', 'board_cards_creator_member_fkey',
+       format($sql$INSERT INTO board_cards (id, organization_id, product, objective, created_by)
+                   VALUES ('d0290000-0029-4029-8029-000000000d02', %L, 'growth_os',
+                           'QA creador ajeno', 'd0290000-0029-4029-8029-000000000a03')$sql$, org_t)
+  FROM h31
+UNION ALL
+SELECT 3, 'board_cards.approved_by', 'board_cards_approver_member_fkey',
+       format($sql$INSERT INTO board_cards (id, organization_id, product, objective, approved_by, approved_at)
+                   VALUES ('d0290000-0029-4029-8029-000000000d03', %L, 'growth_os',
+                           'QA aprobador ajeno', 'd0290000-0029-4029-8029-000000000a03', now())$sql$, org_t)
+  FROM h31
+UNION ALL
+SELECT 4, 'board_card_collaborators.user_id', 'board_card_collaborators_member_fkey',
+       format($sql$INSERT INTO board_card_collaborators (organization_id, card_id, user_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c01',
+                           'd0290000-0029-4029-8029-000000000a03')$sql$, org_t)
+  FROM h31;
+
+CREATE TEMP TABLE h31_personas_res ON COMMIT DROP AS
+SELECT p.n, p.columna, p.fkey,
+       pg_temp.al_commit(p.sentencia, 'postgres') AS ajeno,
+       pg_temp.al_commit(format(
+           $sql$INSERT INTO org_members (organization_id, user_id, role)
+                VALUES (%L, 'd0290000-0029-4029-8029-000000000a03', 'editor'); $sql$,
+           (SELECT org_t FROM h31)) || p.sentencia, 'postgres') AS miembro
+  FROM h31_personas p;
+
+-- Anti-vacuidad: cuatro casos, y son las cuatro columnas declaradas.
+DO $$
+DECLARE
+    faltan text;
+BEGIN
+    SELECT string_agg(d, ', ') INTO faltan
+      FROM unnest(ARRAY['board_cards.assignee_id', 'board_cards.created_by',
+                        'board_cards.approved_by', 'board_card_collaborators.user_id']) d
+     WHERE d NOT IN (SELECT columna FROM h31_personas_res);
+    IF (SELECT count(*) FROM h31_personas_res) <> 4 OR faltan IS NOT NULL THEN
+        RAISE EXCEPTION 'Vacuous run: los bloques 121 y 122 midieron % casos; faltan: %',
+            (SELECT count(*) FROM h31_personas_res), coalesce(faltan, '-');
+    END IF;
+END
+$$;
+
+INSERT INTO defect_report
+SELECT 121, 'una tarjeta nombra a una persona que no es miembro de su organización',
+       count(*) FILTER (WHERE ajeno NOT LIKE '23503 |%"' || fkey || '"%') > 0,
+       CASE WHEN count(*) FILTER (WHERE ajeno NOT LIKE '23503 |%"' || fkey || '"%') = 0
+            THEN 'las ' || count(*) || ' columnas de persona rechazan a pau, que no es miembro, ' ||
+                 'con 23503 nombrando su FK compuesta: ' || string_agg(fkey, ', ' ORDER BY n)
+            ELSE 'no rechazan por su FK compuesta: ' ||
+                 string_agg(columna || ' = ' || ajeno, ' / ' ORDER BY n)
+                     FILTER (WHERE ajeno NOT LIKE '23503 |%"' || fkey || '"%')
+            END
+  FROM h31_personas_res;
+
+-- ── 122 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO, Y LA MITAD (2) DE LA PUERTA. Sin él, un esquema que
+-- rechazara toda tarjeta con persona —una FK contra una tabla vacía, un CHECK
+-- imposible— pondría el 121 en verde.
+INSERT INTO defect_report
+SELECT 122, 'la misma tarjeta, con la persona ya miembro, también se rechaza',
+       count(*) FILTER (WHERE miembro <> 'paso') > 0,
+       CASE WHEN count(*) FILTER (WHERE miembro <> 'paso') = 0
+            THEN 'las mismas ' || count(*) || ' sentencias pasan al COMMIT con pau dado de alta en T'
+            ELSE 'rechazadas aun con la membresía: ' ||
+                 string_agg(columna || ' = ' || miembro, ' / ' ORDER BY n) FILTER (WHERE miembro <> 'paso')
+            END
+  FROM h31_personas_res;
+
+-- ── 123 y 124 ────────────────────────────────────────────────────────────────
+-- LAS RELACIONES QUE NO SON PERSONAS, CRUZADAS DE ORGANIZACIÓN. El tenant en
+-- cada punta: la tarjeta de una arista, de una fuente o de una colaboración
+-- tiene que ser de la organización de la fila, y el negocio citado también.
+--
+-- Cada caso con su control positivo: la misma forma, el dato de la propia
+-- organización. Las dos puntas de la dependencia van por separado, porque son
+-- dos FK y cualquiera de las dos podía volverse simple sola.
+CREATE TEMP TABLE h31_cruces (
+    n        int  PRIMARY KEY,
+    relacion text NOT NULL,
+    fkey     text NOT NULL,
+    cruzado  text NOT NULL,
+    legitimo text NOT NULL
+) ON COMMIT DROP;
+
+INSERT INTO h31_cruces
+SELECT 1, 'board_cards -> businesses', 'board_cards_business_fkey',
+       format($sql$INSERT INTO board_cards (id, organization_id, product, objective, cited_business_id)
+                   VALUES ('d0290000-0029-4029-8029-000000000e01', %L, 'growth_os', 'QA cita ajena',
+                           'd0290000-0029-4029-8029-000000000b02')$sql$, org_t),
+       format($sql$INSERT INTO board_cards (id, organization_id, product, objective, cited_business_id)
+                   VALUES ('d0290000-0029-4029-8029-000000000e01', %L, 'growth_os', 'QA cita propia',
+                           'd0290000-0029-4029-8029-000000000b01')$sql$, org_t)
+  FROM h31
+UNION ALL
+SELECT 2, 'board_card_collaborators -> board_cards', 'board_card_collaborators_card_fkey',
+       format($sql$INSERT INTO board_card_collaborators (organization_id, card_id, user_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c01',
+                           'd0290000-0029-4029-8029-000000000a03')$sql$, org_p),
+       format($sql$INSERT INTO board_card_collaborators (organization_id, card_id, user_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c11',
+                           'd0290000-0029-4029-8029-000000000a03')$sql$, org_p)
+  FROM h31
+UNION ALL
+SELECT 3, 'board_card_dependencies.card_id -> board_cards', 'board_card_dependencies_card_fkey',
+       format($sql$INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c01',
+                           'd0290000-0029-4029-8029-000000000c11')$sql$, org_p),
+       format($sql$INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c12',
+                           'd0290000-0029-4029-8029-000000000c11')$sql$, org_p)
+  FROM h31
+UNION ALL
+SELECT 4, 'board_card_dependencies.depends_on_card_id -> board_cards', 'board_card_dependencies_depends_on_fkey',
+       format($sql$INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c03',
+                           'd0290000-0029-4029-8029-000000000c11')$sql$, org_t),
+       format($sql$INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c03',
+                           'd0290000-0029-4029-8029-000000000c01')$sql$, org_t)
+  FROM h31
+UNION ALL
+SELECT 5, 'board_card_sources -> board_cards', 'board_card_sources_card_fkey',
+       format($sql$INSERT INTO board_card_sources (organization_id, card_id, url)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c01', 'https://example.org/qa-cruzada')$sql$, org_p),
+       format($sql$INSERT INTO board_card_sources (organization_id, card_id, url)
+                   VALUES (%L, 'd0290000-0029-4029-8029-000000000c11', 'https://example.org/qa-propia')$sql$, org_p)
+  FROM h31;
+
+CREATE TEMP TABLE h31_cruces_res ON COMMIT DROP AS
+SELECT n, relacion, fkey,
+       pg_temp.al_commit(cruzado, 'postgres')  AS cruzado,
+       pg_temp.al_commit(legitimo, 'postgres') AS legitimo
+  FROM h31_cruces;
+
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM h31_cruces_res) <> 5 THEN
+        RAISE EXCEPTION 'Vacuous run: los bloques 123 y 124 midieron % de 5 relaciones.',
+            (SELECT count(*) FROM h31_cruces_res);
+    END IF;
+END
+$$;
+
+INSERT INTO defect_report
+SELECT 123, 'una fila del tablero se cuelga de una tarjeta o un negocio de otra organización',
+       count(*) FILTER (WHERE cruzado NOT LIKE '23503 |%"' || fkey || '"%') > 0,
+       CASE WHEN count(*) FILTER (WHERE cruzado NOT LIKE '23503 |%"' || fkey || '"%') = 0
+            THEN 'las ' || count(*) || ' relaciones rechazan el cruce con 23503 nombrando su FK compuesta'
+            ELSE 'no rechazan por su FK compuesta: ' ||
+                 string_agg(relacion || ' = ' || cruzado, ' / ' ORDER BY n)
+                     FILTER (WHERE cruzado NOT LIKE '23503 |%"' || fkey || '"%')
+            END
+  FROM h31_cruces_res;
+
+-- ── 124 ──────────────────────────────────────────────────────────────────────
+INSERT INTO defect_report
+SELECT 124, 'el tablero también rechaza la fila legítima de la propia organización',
+       count(*) FILTER (WHERE legitimo <> 'paso') > 0,
+       CASE WHEN count(*) FILTER (WHERE legitimo <> 'paso') = 0
+            THEN 'las ' || count(*) || ' filas legítimas pasan al COMMIT'
+            ELSE 'rechazadas: ' ||
+                 string_agg(relacion || ' = ' || legitimo, ' / ' ORDER BY n) FILTER (WHERE legitimo <> 'paso')
+            END
+  FROM h31_cruces_res;
+
+-- ── 125 ──────────────────────────────────────────────────────────────────────
+-- Una tarjeta que depende de sí misma. El control positivo es el caso 4 del
+-- 124: la misma tabla, otra tarjeta de la misma organización, pasa.
+SELECT set_config('qa.b125', pg_temp.al_commit(format(
+           $sql$INSERT INTO board_card_dependencies (organization_id, card_id, depends_on_card_id)
+                VALUES (%L, 'd0290000-0029-4029-8029-000000000c01',
+                        'd0290000-0029-4029-8029-000000000c01')$sql$, (SELECT org_t FROM h31)),
+           'postgres'), true);
+
+INSERT INTO defect_report
+SELECT 125, 'una tarjeta puede depender de sí misma',
+       current_setting('qa.b125') NOT LIKE '23514 |%"board_card_dependencies_not_self"%',
+       CASE WHEN current_setting('qa.b125') LIKE '23514 |%"board_card_dependencies_not_self"%'
+            THEN 'la auto-dependencia muere con 23514 en board_card_dependencies_not_self'
+            ELSE 'la auto-dependencia devolvió: ' || current_setting('qa.b125') END;
+
+-- ── 126 y 127 ────────────────────────────────────────────────────────────────
+-- LA PUERTA DE H3.1, PUNTO (3): LEÍDO BAJO EL `auth.uid()` DE OTRA ORGANIZACIÓN.
+--
+-- Como `authenticated`, que es el rol al que las ocho policies de la `0029`
+-- apuntan —`growthos_app` no es miembro de ese rol y vería cero filas por no
+-- tener policy aplicable, que es otra cosa (ver el encabezado del archivo)—.
+--
+-- LA CONSULTA SE ARMA COMO `postgres` DESDE EL CATÁLOGO y se ejecuta como
+-- `authenticated`, con el resultado viajando por un GUC: el patrón del 88. Una
+-- fila por tabla del tablero, `tabla=n`, con `n` las filas de T que ese lector
+-- alcanza.
+--
+-- ANTI-VACUIDAD, como `postgres`: toda tabla que el catálogo dice del tablero
+-- tiene que tener al menos una fila de T. Sin eso, «pau ve cero» sobre una tabla
+-- vacía sería verde y mentira. Y tiene que haber al menos una tabla.
+DO $$
+DECLARE
+    r      record;
+    n      bigint;
+    tablas int := 0;
+    vacias text := '';
+BEGIN
+    FOR r IN SELECT * FROM pg_temp.tablero() LOOP
+        tablas := tablas + 1;
+        EXECUTE format('SELECT count(*) FROM public.%I WHERE organization_id = $1', r.relname)
+           INTO n USING (SELECT org_t FROM h31);
+        IF n = 0 THEN vacias := vacias || r.relname || ' '; END IF;
+    END LOOP;
+    IF tablas = 0 OR vacias <> '' THEN
+        RAISE EXCEPTION 'Vacuous run: el catálogo dio % tablas del tablero y sin filas de T: [%]', tablas, vacias;
+    END IF;
+    RAISE NOTICE 'Bloques 126 y 127: % tablas del tablero por catálogo, todas con filas de T.', tablas;
+END
+$$;
+
+SELECT set_config('qa.sql126', (
+    SELECT 'SELECT string_agg(r, '', '' ORDER BY r) FROM (' ||
+           string_agg(format('SELECT %L || ''='' || (SELECT count(*) FROM public.%I WHERE organization_id = %L) AS r',
+                             relname, relname, (SELECT org_t FROM h31)), ' UNION ALL ') ||
+           ') z'
+      FROM pg_temp.tablero()), true);
+
+-- Y lo suyo: pau tiene que ser un lector que funciona, no un rol ciego. Armada
+-- acá, como `postgres`: `authenticated` no puede leer `h31`.
+SELECT set_config('qa.sql126p', format(
+           'SELECT count(*) FROM public.board_cards WHERE organization_id = %L',
+           (SELECT org_p FROM h31)), true);
+
+-- pau, de la organización P, leyendo T.
+SELECT pg_temp.be('d0290000-0029-4029-8029-000000000a03');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b126', pg_temp.escalar(current_setting('qa.sql126')), true);
+SELECT set_config('qa.b126p', pg_temp.escalar(current_setting('qa.sql126p')), true);
+RESET ROLE;
+
+-- tere, la dueña de T, leyendo T.
+SELECT pg_temp.be('d0290000-0029-4029-8029-000000000a01');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b127', pg_temp.escalar(current_setting('qa.sql126')), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 126, 'una persona de otra organización lee el tablero',
+       NOT (v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=[1-9]'),
+       CASE WHEN v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=[1-9]'
+            THEN 'pau, de P, como authenticated, ve 0 filas de T en las ' ||
+                 array_length(string_to_array(v, ', '), 1) || ' tablas del tablero: ' || v
+            ELSE 'pau alcanza el tablero de T: ' || v END
+  FROM (SELECT current_setting('qa.b126') AS v) x;
+
+-- ── 127 ──────────────────────────────────────────────────────────────────────
+-- LA CONTRAPRUEBA. Sin ella, el 126 lo satisface un REVOKE, una policy que no
+-- deja pasar a nadie, o una tabla vacía. La dueña lee lo suyo en CADA tabla, y
+-- pau lee lo suyo de P.
+INSERT INTO defect_report
+SELECT 127, 'la dueña no lee su propio tablero, o el lector del 126 es ciego',
+       NOT (v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'),
+       CASE WHEN v ~ '^[a-z_]+=[0-9]+(, [a-z_]+=[0-9]+)*$' AND v !~ '=0(,|$)' AND p ~ '^[1-9][0-9]*$'
+            THEN 'tere lee T en cada tabla (' || v || ') y pau lee ' || p || ' tarjetas de P'
+            ELSE 'tere: ' || v || ' / pau sobre P: ' || p END
+  FROM (SELECT current_setting('qa.b127') AS v, current_setting('qa.b126p') AS p) x;
+
+-- ── 128 ──────────────────────────────────────────────────────────────────────
+-- LA PUERTA DE H3.1, PUNTO (4), CON LA CORRECCIÓN DEL CRÍTICO.
+--
+-- El sub de Keycloak es un uuid: no se distingue por FORMA de uno de Supabase.
+-- Lo único que vuelve imposible guardarlo es que no haya dónde: que toda columna
+-- que pueda llevar un identificador esté atada por una FK al tenant. Esto lo
+-- afirma el catálogo, columna por columna, sobre las tablas que el catálogo dice
+-- que son del tablero:
+--
+--   a. toda columna cuyo tipo base sea uuid, salvo la PK de una sola columna de
+--      su propia tabla, está cubierta por una FK que la contiene Y que empareja
+--      el `organization_id` de la fila con el `organization_id` del padre en la
+--      MISMA posición. «Contiene `organization_id` en algún lado» no alcanzaba:
+--      se mira el emparejamiento, que es lo que pincha el tenant. `organization_id`
+--      mismo tiene que estar cubierto por alguna FK;
+--   b. ninguna columna es un array ni json/jsonb: un identificador dentro de un
+--      contenedor no tiene FK posible (decisión 6 de la `0029`);
+--   c. SEGUNDA LÍNEA, MÁS FLOJA Y DICHA COMO TAL: ninguna columna de texto se
+--      llama como una identidad. No es la garantía —una persona escrita a mano
+--      en `objective` no la ve— pero ve el `assignee_sub text` del día que
+--      alguien quiera federar por atajo.
+--
+-- Y aparte, cuántas FK van contra `org_members` y que TODAS emparejen
+-- `(organization_id, <persona>)` con `(organization_id, user_id)`: una FK contra
+-- `org_members (id)` también ataría la columna a algo, y no a una persona del
+-- tenant.
+--
+-- EL DENOMINADOR SE IMPRIME y se exige: tablas > 0, columnas uuid miradas > 0,
+-- FK a `org_members` > 0. Cero sobre cero no informa cero.
+CREATE TEMP TABLE h31_columnas ON COMMIT DROP AS
+WITH tb AS (SELECT * FROM pg_temp.tablero()),
+col AS (
+    SELECT tb.relname, a.attrelid, a.attnum, a.attname,
+           bt.oid AS base_oid, bt.typname AS base, bt.typcategory AS categoria,
+           (SELECT oa.attnum FROM pg_attribute oa
+             WHERE oa.attrelid = a.attrelid AND oa.attname = 'organization_id'
+               AND NOT oa.attisdropped) AS org_attnum
+      FROM tb
+      JOIN pg_attribute a ON a.attrelid = tb.oid AND a.attnum > 0 AND NOT a.attisdropped
+      JOIN pg_type ty ON ty.oid = a.atttypid
+      JOIN pg_type bt ON bt.oid = CASE WHEN ty.typtype = 'd' THEN ty.typbasetype ELSE ty.oid END
+)
+SELECT c.*,
+       EXISTS (SELECT 1 FROM pg_constraint pk
+                WHERE pk.conrelid = c.attrelid AND pk.contype = 'p'
+                  AND pk.conkey = ARRAY[c.attnum]::int2[]) AS es_pk_propia,
+       EXISTS (SELECT 1 FROM pg_constraint fk
+                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f'
+                  AND c.attnum = ANY (fk.conkey)
+                  AND EXISTS (SELECT 1 FROM generate_subscripts(fk.conkey, 1) i
+                               WHERE fk.conkey[i] = c.org_attnum
+                                 AND (SELECT pa.attname FROM pg_attribute pa
+                                       WHERE pa.attrelid = fk.confrelid
+                                         AND pa.attnum = fk.confkey[i]) = 'organization_id'))
+           AS cubierta_con_tenant,
+       EXISTS (SELECT 1 FROM pg_constraint fk
+                WHERE fk.conrelid = c.attrelid AND fk.contype = 'f'
+                  AND c.attnum = ANY (fk.conkey)) AS cubierta
+  FROM col c;
+
+CREATE TEMP TABLE h31_identidad ON COMMIT DROP AS
+SELECT (SELECT count(DISTINCT attrelid) FROM h31_columnas)                          AS tablas,
+       (SELECT count(*) FROM h31_columnas)                                          AS columnas,
+       (SELECT count(*) FROM h31_columnas WHERE base = 'uuid')                      AS uuid_miradas,
+       coalesce((SELECT string_agg(relname || '.' || attname, ', ' ORDER BY relname, attname)
+                   FROM h31_columnas
+                  WHERE base = 'uuid' AND NOT es_pk_propia AND attname <> 'organization_id'
+                    AND NOT cubierta_con_tenant), '')                               AS uuid_sin_par,
+       coalesce((SELECT string_agg(relname, ', ' ORDER BY relname)
+                   FROM h31_columnas
+                  WHERE attname = 'organization_id' AND NOT cubierta), '')         AS tenant_sin_fk,
+       coalesce((SELECT string_agg(relname || '.' || attname || ' (' || base || ')', ', ' ORDER BY relname, attname)
+                   FROM h31_columnas
+                  WHERE categoria = 'A' OR base IN ('json', 'jsonb')), '')         AS contenedores,
+       coalesce((SELECT string_agg(relname || '.' || attname, ', ' ORDER BY relname, attname)
+                   FROM h31_columnas
+                  WHERE categoria = 'S'
+                    AND attname ~ '(^|_)(sub|subject|user|users|uid|by|assignee|owner|member|person|people|keycloak|kc|actor)(_|$)'),
+                '')                                                                  AS texto_con_nombre_de_persona,
+       (SELECT count(*) FROM pg_constraint fk
+          JOIN pg_temp.tablero() tb ON tb.oid = fk.conrelid
+         WHERE fk.contype = 'f' AND fk.confrelid = 'public.org_members'::regclass)  AS fk_a_miembros,
+       coalesce((SELECT string_agg(fk.conname, ', ' ORDER BY fk.conname)
+                   FROM pg_constraint fk
+                   JOIN pg_temp.tablero() tb ON tb.oid = fk.conrelid
+                  WHERE fk.contype = 'f' AND fk.confrelid = 'public.org_members'::regclass
+                    AND NOT (array_length(fk.confkey, 1) = 2
+                             AND (SELECT pa.attname FROM pg_attribute pa
+                                   WHERE pa.attrelid = fk.conrelid AND pa.attnum = fk.conkey[1]) = 'organization_id'
+                             AND (SELECT pa.attname FROM pg_attribute pa
+                                   WHERE pa.attrelid = fk.confrelid AND pa.attnum = fk.confkey[1]) = 'organization_id'
+                             AND (SELECT pa.attname FROM pg_attribute pa
+                                   WHERE pa.attrelid = fk.confrelid AND pa.attnum = fk.confkey[2]) = 'user_id')),
+                '')                                                                  AS fk_a_miembros_mal;
+
+INSERT INTO defect_report
+SELECT 128, 'una columna del tablero puede guardar un identificador de persona sin la FK compuesta',
+       NOT (tablas > 0 AND uuid_miradas > 0 AND fk_a_miembros > 0
+            AND uuid_sin_par = '' AND tenant_sin_fk = '' AND contenedores = ''
+            AND texto_con_nombre_de_persona = '' AND fk_a_miembros_mal = ''),
+       CASE WHEN tablas > 0 AND uuid_miradas > 0 AND fk_a_miembros > 0
+                 AND uuid_sin_par = '' AND tenant_sin_fk = '' AND contenedores = ''
+                 AND texto_con_nombre_de_persona = '' AND fk_a_miembros_mal = ''
+            THEN format('%s columnas de %s tablas del tablero, %s de ellas uuid: toda uuid que no es la PK propia ' ||
+                        'está atada por una FK que empareja organization_id; sin arrays ni json; ' ||
+                        '%s FK a org_members, todas (organization_id, persona) -> (organization_id, user_id)',
+                        columnas, tablas, uuid_miradas, fk_a_miembros)
+            ELSE format('tablas=%s columnas=%s uuid=%s fk_a_miembros=%s; uuid sin par con el tenant: [%s]; ' ||
+                        'organization_id sin FK: [%s]; contenedores: [%s]; texto con nombre de persona: [%s]; ' ||
+                        'FK a org_members que no es el par: [%s]',
+                        tablas, columnas, uuid_miradas, fk_a_miembros, uuid_sin_par, tenant_sin_fk,
+                        contenedores, texto_con_nombre_de_persona, fk_a_miembros_mal)
+            END
+  FROM h31_identidad;
+
+-- ── 129 ──────────────────────────────────────────────────────────────────────
+-- TODA TABLA DEL TABLERO —por catálogo— lleva el tenant, RLS ENABLE y FORCE, y
+-- sus dos capas de policy acotadas por `current_user_org_ids()`.
+--
+-- Las policies por catálogo y no sólo por conducta, por lo que el bloque 94
+-- midió con la ficha: para un SELECT la permisiva y la restrictiva se tapan, así
+-- que degradar UNA de las dos deja verdes al 126 y al 127. Y se exige
+-- `current_user_org_ids()` en el texto, no sólo `organization_id`: una policy
+-- `USING (organization_id IS NOT NULL)` nombra la columna y no aísla nada.
+CREATE TEMP TABLE h31_tablas ON COMMIT DROP AS
+SELECT tb.relname,
+       coalesce((SELECT a.attnotnull AND a.atttypid = 'uuid'::regtype
+                   FROM pg_attribute a
+                  WHERE a.attrelid = tb.oid AND a.attname = 'organization_id' AND NOT a.attisdropped),
+                false) AS tenant_ok,
+       c.relrowsecurity AND c.relforcerowsecurity AS rls_ok,
+       EXISTS (SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = tb.oid AND NOT p.polpermissive AND p.polcmd = '*'
+                  AND 'authenticated'::regrole::oid = ANY (p.polroles)
+                  AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%'
+                  AND coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%')
+           AS restrictiva_ok,
+       EXISTS (SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = tb.oid AND p.polpermissive AND p.polcmd IN ('r', '*')
+                  AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') LIKE '%organization_id%current_user_org_ids()%')
+           AS lectura_ok,
+       NOT EXISTS (SELECT 1 FROM pg_policy p
+                    WHERE p.polrelid = tb.oid AND p.polpermissive
+                      AND coalesce(pg_get_expr(p.polqual, p.polrelid), '') NOT LIKE '%current_user_org_ids()%')
+           AS sin_permisiva_floja
+  FROM pg_temp.tablero() tb
+  JOIN pg_class c ON c.oid = tb.oid;
+
+INSERT INTO defect_report
+SELECT 129, 'una tabla del tablero no lleva el tenant, RLS ENABLE y FORCE, o sus policies no acotan',
+       count(*) = 0 OR count(*) FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
+                                                  AND lectura_ok AND sin_permisiva_floja)) > 0,
+       CASE WHEN count(*) > 0 AND count(*) FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
+                                                             AND lectura_ok AND sin_permisiva_floja)) = 0
+            THEN 'las ' || count(*) || ' tablas del tablero (' || string_agg(relname, ', ' ORDER BY relname) ||
+                 ') tienen organization_id uuid NOT NULL, ENABLE + FORCE, una restrictiva y una permisiva ' ||
+                 'de lectura por current_user_org_ids(), y ninguna permisiva floja'
+            ELSE coalesce(string_agg(format('%s: tenant=%s rls=%s restrictiva=%s lectura=%s sin_floja=%s',
+                                            relname, tenant_ok, rls_ok, restrictiva_ok, lectura_ok,
+                                            sin_permisiva_floja), ' / ' ORDER BY relname)
+                              FILTER (WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok
+                                                 AND lectura_ok AND sin_permisiva_floja)),
+                          'el catálogo no encontró ninguna tabla del tablero')
+            END
+  FROM h31_tablas;
+
+-- ── 130 ──────────────────────────────────────────────────────────────────────
+-- LOS PRIVILEGIOS DEL TABLERO, POR CATÁLOGO. `anon` no tiene NADA —ni leer: el
+-- bloque 14 mira sólo la escritura de `anon`, y una lectura otorgada de más es
+-- superficie aunque hoy la RLS la vacíe—; `authenticated` sólo SELECT (decisión
+-- 11 de la `0029`). Efectivo, con `has_table_privilege`, que cuenta lo que llega
+-- por PUBLIC y por pertenencia a otro rol.
+CREATE TEMP TABLE h31_grants ON COMMIT DROP AS
+SELECT tb.relname, r.rol, pr.priv,
+       has_table_privilege(r.rol, tb.oid, pr.priv) AS tiene
+  FROM pg_temp.tablero() tb
+ CROSS JOIN (VALUES ('anon'), ('authenticated')) r(rol)
+ CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+                    ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) pr(priv);
+
+INSERT INTO defect_report
+SELECT 130, 'un rol de la API tiene sobre el tablero más que lo decidido',
+       count(*) = 0 OR count(*) FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')) > 0,
+       CASE WHEN count(*) > 0 AND count(*) FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')) = 0
+            THEN count(*) || ' privilegios mirados sobre ' || count(DISTINCT relname) ||
+                 ' tablas: anon ninguno, authenticated sólo SELECT'
+            ELSE coalesce('fuera de lo decidido: ' ||
+                          string_agg(rol || (CASE WHEN tiene THEN ' tiene ' ELSE ' NO tiene ' END) ||
+                                     priv || ' en ' || relname, ', ' ORDER BY relname, rol, priv)
+                              FILTER (WHERE tiene <> (rol = 'authenticated' AND priv = 'SELECT')),
+                          'el catálogo no encontró ninguna tabla del tablero')
+            END
+  FROM h31_grants;
+
+-- ── 131 ──────────────────────────────────────────────────────────────────────
+-- LA BAJA DE LA ORGANIZACIÓN ENTERA, CON EL TABLERO POBLADO. Es el paso 1 de
+-- `deleteMyAccount` para tere, que es dueña de T: lo corre `service_role`.
+--
+-- Exige que pase al COMMIT —con una tarjeta APROBADA adentro, que es la FK que
+-- se niega: la decisión 4 de la `0029` midió que no necesita ser diferible porque
+-- la tarjeta cuelga directo de la organización— y que no quede una fila de T en
+-- ninguna tabla de `public` con
+-- `organization_id`, contadas por catálogo dentro de `al_commit()`. El número de
+-- tablas miradas se compara contra el MISMO catálogo leído acá afuera: menos
+-- quiere decir que la cuenta no miró lo que dice.
+SELECT set_config('qa.b131', pg_temp.al_commit(
+           format('DELETE FROM organizations WHERE id = %L', (SELECT org_t FROM h31)),
+           'service_role', (SELECT org_t FROM h31)), true);
+
+INSERT INTO defect_report
+SELECT 131, 'una organización con tablero no se puede dar de baja, o la baja deja filas',
+       NOT (v ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
+            AND substring(v FROM '^paso; ([0-9]+) tablas')::int = esperadas),
+       CASE WHEN v ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
+                 AND substring(v FROM '^paso; ([0-9]+) tablas')::int = esperadas
+            THEN 'la baja de T pasó al COMMIT como service_role, con tarjetas, aprobación, colaboración, ' ||
+                 'dependencia y fuente puestas: ' || v
+            ELSE 'la baja de T devolvió: ' || v || ' (se esperaban ' || esperadas || ' tablas)' END
+  FROM (SELECT current_setting('qa.b131') AS v,
+               (SELECT count(*)::int
+                  FROM pg_class c
+                  JOIN pg_namespace s ON s.oid = c.relnamespace AND s.nspname = 'public'
+                  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'organization_id'
+                                     AND NOT a.attisdropped
+                 WHERE c.relkind IN ('r', 'p')) AS esperadas) x;
+
+-- ── 132 ──────────────────────────────────────────────────────────────────────
+-- LA BAJA DE QUIEN APROBÓ SE NIEGA (decisión 3 de la `0029`). Con T en pie, dos
+-- caminos a la misma membresía de tere, y los dos tienen que morir con 23503
+-- NOMBRANDO la FK del aprobador:
+--
+--   a. el paso 2 de `deleteMyAccount`, como `service_role`;
+--   b. tere desde `auth.users`, que cae por cascada en la membresía. Como
+--      `postgres`, por el motivo escrito en el 119: en hosted lo borra GoTrue.
+--
+-- tere es además responsable y creadora de T1: esas dos se anulan en la misma
+-- sentencia, y lo que la frena es la tercera. Un 23503 de otra FK, o un 23514
+-- de un SET NULL que choque con el CHECK de la aprobación, no es la negativa que
+-- se mide.
+SELECT set_config('qa.b132a', pg_temp.al_commit(format(
+           'DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+           (SELECT org_t FROM h31), 'd0290000-0029-4029-8029-000000000a01'), 'service_role'), true);
+SELECT set_config('qa.b132b', pg_temp.al_commit(
+           'DELETE FROM auth.users WHERE id = ''d0290000-0029-4029-8029-000000000a01''',
+           'postgres'), true);
+
+INSERT INTO defect_report
+SELECT 132, 'se puede dar de baja a quien aprobó una tarjeta mientras la tarjeta sigue en pie',
+       NOT (a LIKE '23503 |%"board_cards_approver_member_fkey"%'
+            AND b LIKE '23503 |%"board_cards_approver_member_fkey"%'),
+       CASE WHEN a LIKE '23503 |%"board_cards_approver_member_fkey"%'
+                 AND b LIKE '23503 |%"board_cards_approver_member_fkey"%'
+            THEN 'las dos bajas de tere mueren con 23503 en board_cards_approver_member_fkey'
+            ELSE 'membresía: ' || a || ' / desde auth.users: ' || b END
+  FROM (SELECT current_setting('qa.b132a') AS a, current_setting('qa.b132b') AS b) x;
+
+-- ── 133 ──────────────────────────────────────────────────────────────────────
+-- LA BAJA DEL RESPONSABLE PASA Y ANULA (decisión 3 de la `0029`). teo es
+-- responsable y creador de T2 y colabora en T1, y no aprobó nada. Su baja —el
+-- paso 2 de `deleteMyAccount`, como `service_role`— tiene que pasar al COMMIT y
+-- dejar:
+--   * las dos tarjetas EN PIE (anular no es borrar);
+--   * T2 sin responsable y sin creador;
+--   * la arista de colaboración de teo en T1, borrada;
+--   * la dependencia de T2 sobre T1, intacta.
+-- Si alguien cambia el SET NULL por una negativa, esto se pone rojo: es lo que
+-- hace de la decisión 3 una decisión y no un efecto secundario.
+SELECT set_config('qa.b133', pg_temp.al_commit_y_mira(
+           format('DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+                  (SELECT org_t FROM h31), 'd0290000-0029-4029-8029-000000000a02'),
+           'service_role',
+           $sql$SELECT format('tarjetas=%s responsable=%s creador=%s colaboraciones=%s dependencias=%s',
+                   (SELECT count(*) FROM board_cards
+                     WHERE id IN ('d0290000-0029-4029-8029-000000000c01', 'd0290000-0029-4029-8029-000000000c02')),
+                   (SELECT count(*) FROM board_cards
+                     WHERE id = 'd0290000-0029-4029-8029-000000000c02' AND assignee_id IS NOT NULL),
+                   (SELECT count(*) FROM board_cards
+                     WHERE id = 'd0290000-0029-4029-8029-000000000c02' AND created_by IS NOT NULL),
+                   (SELECT count(*) FROM board_card_collaborators
+                     WHERE user_id = 'd0290000-0029-4029-8029-000000000a02'),
+                   (SELECT count(*) FROM board_card_dependencies
+                     WHERE card_id = 'd0290000-0029-4029-8029-000000000c02'))$sql$), true);
+
+INSERT INTO defect_report
+SELECT 133, 'la baja de un responsable no pasa, o borra la tarjeta en vez de anular',
+       current_setting('qa.b133') <> 'paso; tarjetas=2 responsable=0 creador=0 colaboraciones=0 dependencias=1',
+       CASE WHEN current_setting('qa.b133') = 'paso; tarjetas=2 responsable=0 creador=0 colaboraciones=0 dependencias=1'
+            THEN 'la baja de teo pasó al COMMIT: las dos tarjetas siguen, T2 sin responsable ni creador, ' ||
+                 'su colaboración se fue y la dependencia quedó'
+            ELSE 'la baja de teo devolvió: ' || current_setting('qa.b133') END;
+
+-- ── 134 ──────────────────────────────────────────────────────────────────────
+-- APROBADA QUIERE DECIR FECHA Y PERSONA (decisión 5 de la `0029`). Una tarjeta
+-- con fecha de aprobación y sin quien aprobó, y una con aprobador y sin fecha,
+-- tienen que morir con 23514 nombrando el CHECK. Sin él, una aprobación sin
+-- persona sería exactamente lo que la FK del aprobador no puede mirar: MATCH
+-- SIMPLE deja pasar el NULL. El control positivo es el caso 3 del 122: con las
+-- dos, y con un aprobador que es miembro, la tarjeta entra.
+SELECT set_config('qa.b134a', pg_temp.al_commit(format(
+           $sql$INSERT INTO board_cards (id, organization_id, product, objective, approved_at)
+                VALUES ('d0290000-0029-4029-8029-000000000f01', %L, 'growth_os',
+                        'QA aprobada sin persona', now())$sql$, (SELECT org_t FROM h31)), 'postgres'), true);
+SELECT set_config('qa.b134b', pg_temp.al_commit(format(
+           $sql$INSERT INTO board_cards (id, organization_id, product, objective, approved_by)
+                VALUES ('d0290000-0029-4029-8029-000000000f02', %L, 'growth_os',
+                        'QA aprobada sin fecha', 'd0290000-0029-4029-8029-000000000a01')$sql$,
+           (SELECT org_t FROM h31)), 'postgres'), true);
+
+INSERT INTO defect_report
+SELECT 134, 'una tarjeta puede decir que está aprobada sin persona o sin fecha',
+       NOT (a LIKE '23514 |%"board_cards_approval_is_complete"%'
+            AND b LIKE '23514 |%"board_cards_approval_is_complete"%'),
+       CASE WHEN a LIKE '23514 |%"board_cards_approval_is_complete"%'
+                 AND b LIKE '23514 |%"board_cards_approval_is_complete"%'
+            THEN 'las dos aprobaciones a medias mueren con 23514 en board_cards_approval_is_complete'
+            ELSE 'sin persona: ' || a || ' / sin fecha: ' || b END
+  FROM (SELECT current_setting('qa.b134a') AS a, current_setting('qa.b134b') AS b) x;
+
+-- ── 135 ──────────────────────────────────────────────────────────────────────
+-- LA REGLA DE LA DECISIÓN 4 DE LA `0029`, POR CATÁLOGO, PARA LA PRÓXIMA TABLA.
+--
+-- El 131 mide la baja de la organización con la fixture que hay. No ve una tabla
+-- nueva del tablero cuya persona se NIEGUE si la fixture no la puebla con una
+-- persona puesta —una FK con la columna en NULL no tiene nada que comprobar—, y
+-- la anti-vacuidad del 126 obliga a poblar la tabla, no la columna. Eso lo dijo
+-- una mutación: una nieta con `added_by` inmediata dejaba los 134 en verde.
+--
+-- Lo que sí se puede afirmar sin fixture es la causa. Toda FK de una tabla del
+-- tablero contra `org_members` que se NIEGA (`NO ACTION` o `RESTRICT`) tiene que
+-- estar en una tabla que cuelga DIRECTO de `organizations` con `ON DELETE
+-- CASCADE` —entonces su cascada corre antes que la comprobación, decisión 4— o
+-- ser `DEFERRABLE INITIALLY DEFERRED` —decisión 18 de la `0026`—. Una nieta con
+-- una negativa inmediata traba la baja de la organización entera, y eso es lo que
+-- este bloque nombra. El denominador son las FK de persona que se niegan, y se
+-- imprime: hoy es una, la del aprobador, en una tabla hija directa.
+CREATE TEMP TABLE h31_negativas ON COMMIT DROP AS
+SELECT tb.relname, fk.conname,
+       EXISTS (SELECT 1 FROM pg_constraint o
+                WHERE o.conrelid = fk.conrelid AND o.contype = 'f'
+                  AND o.confrelid = 'public.organizations'::regclass
+                  AND o.confdeltype = 'c') AS hija_directa,
+       fk.condeferrable AND fk.condeferred AS al_commit
+  FROM pg_temp.tablero() tb
+  JOIN pg_constraint fk ON fk.conrelid = tb.oid AND fk.contype = 'f'
+ WHERE fk.confrelid = 'public.org_members'::regclass
+   AND fk.confdeltype IN ('a', 'r');
+
+INSERT INTO defect_report
+SELECT 135, 'una persona que se niega en una nieta de la organización traba la baja de la organización',
+       count(*) = 0 OR count(*) FILTER (WHERE NOT (hija_directa OR al_commit)) > 0,
+       CASE WHEN count(*) = 0
+            -- Anti-vacuidad, dentro del bloque y no como excepción: sin ninguna
+            -- FK que se niegue, «todas cumplen» es cero sobre cero. Y en el
+            -- informe y no cortando la corrida, para que la mutación que saca la
+            -- negativa del aprobador muestre TAMBIÉN el rojo del 132, que es el
+            -- que dice qué se perdió.
+            THEN 'corrida vacua: ninguna FK de persona se niega en el tablero, y la decisión 3 de la 0029 dice que la del aprobador sí'
+            WHEN count(*) FILTER (WHERE NOT (hija_directa OR al_commit)) = 0
+            THEN count(*) || ' FK de persona que se niegan en el tablero, todas en una hija directa de ' ||
+                 'organizations o al COMMIT: ' || string_agg(conname, ', ' ORDER BY conname)
+            ELSE 'inmediatas en una tabla que no cuelga directo de organizations: ' ||
+                 string_agg(relname || '.' || conname, ', ' ORDER BY conname)
+                     FILTER (WHERE NOT (hija_directa OR al_commit))
+            END
+  FROM h31_negativas;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and twenty checks were written, so a hundred and
--- twenty rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and thirty-five checks were written, so a hundred
+-- and thirty-five rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -5562,8 +6417,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 120 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 120 checks recorded a result.', checks;
+    IF checks <> 135 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 135 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -5574,11 +6429,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 120 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 135 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 120 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 135 checks green: the schema prevents every one of them.';
 END
 $$;
 
