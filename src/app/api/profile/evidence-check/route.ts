@@ -2,7 +2,13 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { chequearEvidencia, type Afirmacion, type Fuente } from "@/lib/profile/evidenceCheck";
+import {
+  chequearEvidencia,
+  statusMedido,
+  type Afirmacion,
+  type Fuente,
+  type MotivoNoResuelve,
+} from "@/lib/profile/evidenceCheck";
 import { dependenciasDeProduccion } from "@/lib/profile/nodeTransport";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
@@ -46,7 +52,15 @@ export const maxDuration = 60;
  *    `url_host` devuelve `''`, y se le pregunta de nuevo a la misma función con
  *    `https://` delante, que es lo que ya hace `/api/aeo/audit`. Si igual queda
  *    vacío, el chequeo se NIEGA (`dominio-propio-desconocido`): ver la 0026.
- * 7. La escritura, con `service_role`, porque `authenticated` sólo lee la ficha
+ * 7. La corrida, que sale a la red: hasta ~42 s.
+ * 8. OTRA VEZ los pasos 4 y 5, justo antes de escribir. La autorización y la
+ *    versión se leyeron antes de la red; si mientras tanto se publicó otra
+ *    versión o archivaron a quien disparó la corrida, la escritura con
+ *    `service_role` no sale (`guardado.motivo`), y la `0027` no la frenaría:
+ *    deja escribir la medición en cualquier versión congelada, también en una
+ *    superada. Queda la ventana de milisegundos entre esta lectura y el UPDATE,
+ *    que PostgREST no deja cerrar con un filtro por la versión de la madre.
+ * 9. La escritura, con `service_role`, porque `authenticated` sólo lee la ficha
  *    (decisión 6 de la `0026`). Sólo `last_checked_at` y `last_status`, que es
  *    lo único que la decisión 9 de la `0027` deja cambiar en una versión
  *    publicada; sólo filas que el paso 5 leyó con la sesión; y siempre con la
@@ -63,10 +77,26 @@ export const maxDuration = 60;
  *
  * QUÉ ESCRIBE `last_status`
  *
- * El último status HTTP que se vio, o NULL si la fuente se midió y no hubo
- * respuesta HTTP (DNS, timeout, TLS). Una fuente que ni salió a la red —origen
- * propio, URL ambigua, verificada a mano— no se escribe: esas dos columnas son
- * una medición, y lo que no se midió no se anota como medido.
+ * El status de la respuesta que DECIDIÓ la fuente (`statusMedido` en
+ * `evidenceCheck.ts`): el 2xx de una resuelta, el 404 de una caída. NULL si se
+ * midió y ninguna respuesta la decidió —DNS, timeout, TLS, o un 301 cuyo
+ * destino se rechazó—: con «2xx o 3xx es resuelta», guardar ese 301 haría que
+ * una auditoría con SQL cuente como resuelta una fuente que redirige al propio
+ * sitio. Una fuente que ni salió a la red —origen propio, URL ambigua,
+ * verificada a mano— no se escribe: esas dos columnas son una medición, y lo
+ * que no se midió no se anota como medido.
+ *
+ * QUÉ MOTIVO VE EL NAVEGADOR
+ *
+ * Los motivos que describen la red DE LA PLATAFORMA —`dns`, `ip-no-publica`,
+ * `timeout`, `sin-respuesta`, `tls`— llegan al navegador como uno solo, `red`.
+ * Separar «no existe» de «existe y resuelve a una dirección interna» le dice a
+ * quien carga URLs qué nombres son internos vistos desde la IP de Vercel: el
+ * examen de IP rechazaba bien y el motivo devolvía lo que el examen quería no
+ * dar. El detalle queda en el log del servidor, contado por motivo y sin URLs.
+ * Los motivos que salen de la URL misma —puerto, esquema, IP literal, origen
+ * propio— y los `http-<status>` de un origen público no dicen nada de adentro,
+ * y siguen tal cual.
  *
  * LA «PERSONA» DE UNA FUENTE HTTP, Y POR QUÉ NO SE GUARDA
  *
@@ -92,9 +122,39 @@ export const maxDuration = 60;
  *   R9  el texto de Postgres llega al navegador . los errores de lectura: 5 tests
  *   R10 sin `https://` delante de `ejemplo.com` . «website sin esquema»
  *   R11 un count ausente se lee como cero . . . . «un count que no vino»
+ *   R12 la ficha sin `.eq("business_id")` . . . . «la ficha es la de ESTE negocio»: 2 tests
+ *   R13 `hostFuente` recalculado con Node . . . . «url_host lee el PROPIO dominio…»
+ *   R14 last_status = el último status visto  . . «un 404 se guarda como 404…»
+ *   R15 last_status sólo de las resueltas . . . . «un 404 se guarda como 404…»
+ *   R16 sin el rate limit . . . . . . . . . . . . «la sexta desde la misma IP es 429»
+ *   R17 la recomprobación sin la versión  . . . . «se publicó otra versión»
+ *   R18 la recomprobación sin la membresía  . . . «archivaron a quien la pidió»
+ *   R19 el motivo de red tal cual al navegador  . «el mismo motivo, `red`»
+ *   R20 menos filas escritas cuenta como guardado «menos filas escritas»
+ *   R21 una recomprobación ilegible escribe igual «una recomprobación que no se pudo leer»
+ *   R22 la respuesta sin N y M por tipo . . . . . «y la respuesta trae N y M por tipo»
+ *   P1  una consulta DNS antes de la sesión . . . el barrido (`precondicionRutas.test.ts`),
+ *       que desde esta ronda instrumenta `node:dns`, y «sin sesión» de acá
+ *
+ * R12 a R22 y P1 salieron de refutar la segunda versión: R12, R13, R16 y R20
+ * eran garantías que el código cumplía sin que nada lo midiera; R14/R15, R17
+ * a R19, R21 y R22 son los arreglos de esa ronda.
  */
 
 const schema = z.object({ businessId: z.string().uuid() });
+
+/** Ver «QUÉ MOTIVO VE EL NAVEGADOR» en el encabezado. */
+const MOTIVOS_DE_RED: ReadonlySet<MotivoNoResuelve> = new Set([
+  "dns",
+  "ip-no-publica",
+  "timeout",
+  "sin-respuesta",
+  "tls",
+]);
+
+function motivoParaElNavegador(motivo: MotivoNoResuelve | null): string | null {
+  return motivo !== null && MOTIVOS_DE_RED.has(motivo) ? "red" : motivo;
+}
 
 /** Cuántos ids entran en un `in()` sin que la URL de PostgREST se vuelva un problema. */
 const TANDA = 50;
@@ -129,6 +189,43 @@ async function hostPropioDe(supabase: ClienteSesion, website: string | null): Pr
   const segundo = await supabase.rpc("url_host", { p_url: `https://${sitio}` });
   if (segundo.error) return null;
   return typeof segundo.data === "string" ? segundo.data : "";
+}
+
+/**
+ * ¿Sigue publicada la versión medida, y sigue activa la membresía de quien la
+ * pidió? Con el cliente de SESIÓN, como la primera vez. Un error de lectura
+ * tampoco escribe: no saber no es «sigue».
+ */
+async function sigueVigente(
+  supabase: ClienteSesion,
+  organizacion: string,
+  usuario: string,
+  fichaId: string
+): Promise<"vigente" | "version-superada" | "membresia-vencida" | "recomprobacion-ilegible"> {
+  const { data: membresia, error: errorMembresia } = await supabase
+    .from("org_members")
+    .select("organization_id")
+    .eq("organization_id", organizacion)
+    .eq("user_id", usuario)
+    .eq("state", "active")
+    .maybeSingle();
+  if (errorMembresia) {
+    console.error("[evidence-check] recomprobacion-ilegible:", errorMembresia.code ?? "sin-codigo");
+    return "recomprobacion-ilegible";
+  }
+  if (!membresia) return "membresia-vencida";
+  const { data: vigente, error: errorFicha } = await supabase
+    .from("company_profiles")
+    .select("id")
+    .eq("organization_id", organizacion)
+    .eq("id", fichaId)
+    .eq("status", "published")
+    .maybeSingle();
+  if (errorFicha) {
+    console.error("[evidence-check] recomprobacion-ilegible:", errorFicha.code ?? "sin-codigo");
+    return "recomprobacion-ilegible";
+  }
+  return vigente ? "vigente" : "version-superada";
 }
 
 export async function POST(req: Request) {
@@ -258,11 +355,21 @@ export async function POST(req: Request) {
     const porStatus = new Map<number | null, string[]>();
     for (const f of resultado.fuentes) {
       if (!f.medida) continue;
-      const status = f.status !== null && f.status >= 100 && f.status <= 599 ? f.status : null;
+      const medido = statusMedido(f);
+      const status = medido !== null && medido >= 100 && medido <= 599 ? medido : null;
       porStatus.set(status, [...(porStatus.get(status) ?? []), f.id]);
     }
-    let guardado: { ok: boolean; filas: number; esperadas: number } = { ok: true, filas: 0, esperadas: 0 };
-    if (porStatus.size > 0) {
+    let guardado: { ok: boolean; filas: number; esperadas: number; motivo?: string } = {
+      ok: true,
+      filas: 0,
+      esperadas: 0,
+    };
+    // Paso 8 del encabezado: lo que se comprobó antes de la red, otra vez.
+    const vigencia = porStatus.size > 0 && ficha ? await sigueVigente(supabase, organizacion, user.id, ficha.id) : null;
+    if (vigencia !== null && vigencia !== "vigente") {
+      const esperadas = [...porStatus.values()].reduce((total, ids) => total + ids.length, 0);
+      guardado = { ok: false, filas: 0, esperadas, motivo: vigencia };
+    } else if (porStatus.size > 0) {
       const admin = createSupabaseAdminClient();
       for (const [status, ids] of porStatus) {
         for (const tanda of enTandas(ids, TANDA)) {
@@ -285,6 +392,15 @@ export async function POST(req: Request) {
     }
 
     console.log(`[evidence-check] negocio=${negocio.id} version=${ficha?.version ?? "-"} ${resultado.linea}`);
+    const deRed = new Map<string, number>();
+    for (const f of resultado.fuentes) {
+      if (f.motivo !== null && MOTIVOS_DE_RED.has(f.motivo)) deRed.set(f.motivo, (deRed.get(f.motivo) ?? 0) + 1);
+    }
+    if (deRed.size > 0) {
+      console.log(
+        `[evidence-check] negocio=${negocio.id} motivos de red: ${[...deRed].map(([m, c]) => `${m}=${c}`).join(" ")}`
+      );
+    }
 
     return NextResponse.json(
       {
@@ -293,6 +409,7 @@ export async function POST(req: Request) {
         linea: resultado.linea,
         n: resultado.n,
         m: resultado.m,
+        porTipo: resultado.porTipo,
         cubetas: resultado.cubetas,
         porcentajeAMano: resultado.porcentajeAMano,
         afirmacionesSinEvidencia: resultado.afirmacionesSinEvidencia,
@@ -303,7 +420,7 @@ export async function POST(req: Request) {
           objetivoId: f.objetivoId,
           url: f.url,
           cubeta: f.cubeta,
-          motivo: f.motivo,
+          motivo: motivoParaElNavegador(f.motivo),
           status: f.status,
           degradada: f.degradada,
           saltos: f.saltos,

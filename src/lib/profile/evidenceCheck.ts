@@ -43,6 +43,15 @@
  * el veredicto es rojo con `contraprueba-fallida`: un chequeo que no puede decir
  * que no no está diciendo que sí.
  *
+ * Lo que la contraprueba NO prueba, dicho: ninguno de los dos controles llega
+ * al transporte HTTP. La inventada muere en el DNS y la propia en el examen de
+ * origen, armada en código y no leída de `source_host`. Un transporte que
+ * contestara 200 a todo —un portal de egreso, una regresión en
+ * `nodeTransport.ts`— pasaría la contraprueba; eso lo atrapan los tests con
+ * sockets en CI, no la corrida en producción. Cerrarlo pide un tercer control
+ * con una URL pública que conteste 404 de verdad, y elegir ese origen —propio
+ * de Vulkan o de un tercero— es una decisión, no un arreglo.
+ *
  * QUÉ ES SALIR A LA RED, Y POR QUÉ CADA RECHAZO ES «NO RESUELVE»
  *
  * El servidor sale a URLs que cargó un usuario, así que esto es superficie de
@@ -98,11 +107,32 @@
  *   M17 el transporte no fija la dirección  . . . . S: 10 tests (nodeTransport.ts)
  *   M18 una IP literal se acepta como fuente  . . . E «IP literal, privada O PÚBLICA»
  *   M19 un error de certificado como sin-respuesta  S «qué error es TLS»
+ *   M8c el tope contra las FUENTES, no contra N . . E «sobre N AFIRMACIONES», «el borde»
+ *   M8d el porcentaje impreso contra las fuentes  . E los mismos dos
+ *   M20 la línea con otro N y otro M  . . . . . . . E «la línea publica ESTE N y ESTE M»
+ *   M21 el presupuesto por pedido, no por fuente  . E «cuatro saltos de 60 ms»
+ *   M22 el DNS sin plazo  . . . . . . . . . . . . . E «un DNS que no contesta nunca»
+ *   M23 sin tope de concurrencia  . . . . . . . . . E «nunca hay más fuentes en vuelo»
+ *   M24 una manual sin FECHA alcanza  . . . . . . . E «las dos mitades»
+ *   M25 la manual sin el acuerdo de los parsers . . E «una manual cuya columna…»
+ *   M26 sin M por tipo  . . . . . . . . . . . . . . E «claim y goal»
+ *   M26b sin el desglose por tipo en la línea . . . E «claim y goal»
+ *   M27 last_status con el último status visto  . . E «un 301 hacia el propio sitio», R
+ *   M28 last_status sólo de las resueltas . . . . . E «el 2xx… y el status de un http-»
+ *   M29 el plazo no aborta la consulta DNS  . . . . E «la consulta se CORTA», S «DNS mudo»
  *
  * M18 y M19 no estaban en la primera ronda: salieron de refutar la primera
  * versión. La IP literal dejaba citar el propio sitio por la dirección de su
  * servidor; el error de TLS se midió a mano contra un servidor HTTPS local con
  * una CA de prueba, que no entra en CI porque necesita certificados generados.
+ *
+ * M8c a M29 salieron de refutar la segunda. Siete eran garantías ESCRITAS sin
+ * test —el denominador del tope, la línea, el presupuesto total, el DNS con
+ * plazo, la concurrencia, las dos mitades de una manual, el acuerdo de parsers
+ * en una manual—: el código estaba bien y un cambio que lo rompiera dejaba CI
+ * en verde. Las demás son arreglos: el DNS que no se cortaba (M29, y T1/T2 en
+ * `nodeTransport.ts`), `last_status` con un 3xx de una fuente que no resuelve
+ * (M27/M28) y el desglose claim/goal que la `0026` pedía (M26).
  */
 import { BlockList, isIP } from "node:net";
 
@@ -184,8 +214,13 @@ export type RespuestaHttp =
 export type Resolucion = { ok: true; direcciones: string[] } | { ok: false };
 
 export interface Dependencias {
-  /** DNS. Devuelve TODAS las direcciones: una sola privada alcanza para rechazar. */
-  resolver: (host: string) => Promise<Resolucion>;
+  /**
+   * DNS. Devuelve TODAS las direcciones: una sola privada alcanza para rechazar.
+   * La señal se aborta cuando vence el plazo de la fuente, y el resolvedor de
+   * verdad CORTA la consulta (`nodeTransport.ts`): dejar de esperarla no
+   * alcanza, porque una consulta abandonada sigue ocupando lo que ocupe.
+   */
+  resolver: (host: string, senal: AbortSignal) => Promise<Resolucion>;
   transporte: (pedido: PedidoHttp) => Promise<RespuestaHttp>;
   /** Sufijo aleatorio del host inventado de la contraprueba. */
   sufijoAleatorio: () => string;
@@ -205,6 +240,13 @@ export interface Opciones {
  * fuente, el peor caso es que cada obrero encadene 7 fuentes de 6 s: 42 s, que
  * entran en el `maxDuration = 60` de Vercel Hobby con lugar para las lecturas y
  * la escritura.
+ *
+ * Esa cuenta tiene tres supuestos, y cada uno tiene su test: que los 6 s son
+ * TOTALES por fuente —DNS, saltos y GET degradado sumados, no 6 s por pedido—,
+ * que nunca hay más de 8 fuentes en vuelo, y que cuando la corrida devuelve no
+ * queda nada colgado. El tercero fue falso en la primera versión: el DNS
+ * corría en el pool de libuv, el plazo dejaba de esperarlo sin cortarlo, y la
+ * escritura posterior esperaba 79 s detrás de la cola (ver `nodeTransport.ts`).
  */
 export const OPCIONES_POR_DEFECTO: Opciones = {
   presupuestoPorFuenteMs: 6_000,
@@ -254,6 +296,13 @@ export interface ResultadoChequeo {
   ok: true;
   n: number;
   m: number;
+  /**
+   * N y M por tipo de afirmación. `claim` y `goal` están siempre, aunque sea en
+   * cero: el comentario de `profile_objectives` en la `0026` los declara «dos
+   * cubetas distintas del denominador de H1.4», y una ficha toda de `goal`
+   * —aspiraciones— no se publica con la misma línea que una de hechos.
+   */
+  porTipo: Record<string, { n: number; m: number }>;
   cubetas: { resuelta: number; noResuelve: number; aMano: number; degradadas: number };
   /** `aMano / n` en porcentaje, o null si N = 0: sin denominador no hay porcentaje. */
   porcentajeAMano: number | null;
@@ -379,6 +428,26 @@ export function esOrigenPropio(host: string, propio: string): boolean {
 // Una URL, hasta su respuesta o su rechazo
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Lo que la ruta escribe en `last_status`: el status de la respuesta que
+ * DECIDIÓ la fuente, o null.
+ *
+ * No es «el último status que se vio». Una fuente que contesta 301 hacia el
+ * propio sitio vio un 301, y la puerta define «resuelta» como «2xx o 3xx a
+ * HEAD»: una auditoría con SQL sobre la tabla —que es como la puerta pide
+ * contar— la leería resuelta, y es justo el caso que la puerta existe para
+ * atrapar. Acá se guarda el 2xx de una resuelta, o el status de un
+ * `http-<status>`. Todo lo demás —un salto rechazado después de un 3xx, un
+ * timeout después de un 405, demasiadas redirecciones, un 3xx sin destino— es
+ * null: se midió, y ninguna respuesta HTTP la decidió. La columna nunca dice
+ * 2xx o 3xx de una fuente que el chequeo declaró que no resuelve.
+ */
+export function statusMedido(c: Clasificacion): number | null {
+  if (c.cubeta === "resuelta") return c.status;
+  if (c.motivo !== null && c.motivo.startsWith("http-")) return c.status;
+  return null;
+}
+
 /** Los status con los que un origen rechaza HEAD sin decir nada del recurso. */
 const RECHAZAN_HEAD = new Set([403, 405, 501]);
 
@@ -419,11 +488,21 @@ function esIpLiteral(url: URL): boolean {
   return isIP(url.hostname.replace(/^\[(.*)\]$/, "$1")) !== 0;
 }
 
-async function conPlazo<T>(promesa: Promise<T>, ms: number): Promise<T | "plazo"> {
-  if (ms <= 0) return "plazo";
+/**
+ * Espera a `promesa` como mucho `ms`. Al vencer llama `alVencer`, que es lo que
+ * CORTA el trabajo de abajo: sin eso, el plazo sólo deja de esperar.
+ */
+async function conPlazo<T>(promesa: Promise<T>, ms: number, alVencer?: () => void): Promise<T | "plazo"> {
+  if (ms <= 0) {
+    alVencer?.();
+    return "plazo";
+  }
   let reloj: ReturnType<typeof setTimeout> | undefined;
   const plazo = new Promise<"plazo">((listo) => {
-    reloj = setTimeout(() => listo("plazo"), ms);
+    reloj = setTimeout(() => {
+      alVencer?.();
+      listo("plazo");
+    }, ms);
   });
   try {
     return await Promise.race([promesa, plazo]);
@@ -471,7 +550,8 @@ export async function clasificarUrl(
 
     // Desde acá la fuente se MIDE: hubo una consulta a la red.
     medida = true;
-    const resolucion = await conPlazo(deps.resolver(url.hostname), restante());
+    const corte = new AbortController();
+    const resolucion = await conPlazo(deps.resolver(url.hostname, corte.signal), restante(), () => corte.abort());
     if (resolucion === "plazo") return noResuelve("timeout", estado());
     if (!resolucion.ok || resolucion.direcciones.length === 0) return noResuelve("dns", estado());
     const direcciones = resolucion.direcciones;
@@ -657,6 +737,13 @@ export async function chequearEvidencia(
   const m = afirmaciones.filter((a) => !a.resuelve).length;
   const afirmacionesSinEvidencia = afirmaciones.filter((a) => a.sinEvidencia).length;
 
+  const porTipo: Record<string, { n: number; m: number }> = { claim: { n: 0, m: 0 }, goal: { n: 0, m: 0 } };
+  entrada.afirmaciones.forEach((a, i) => {
+    const cubeta = (porTipo[a.tipo] ??= { n: 0, m: 0 });
+    cubeta.n++;
+    if (!afirmaciones[i].resuelve) cubeta.m++;
+  });
+
   const inventada = resultadoControl("inventada");
   const propiaControl = resultadoControl("propia");
   const subioNoResuelve =
@@ -680,7 +767,9 @@ export async function chequearEvidencia(
   if (m > 0) motivosRojo.push("afirmaciones-sin-evidencia-resoluble");
   if (cubetas.noResuelve > 0) motivosRojo.push("fuentes-que-no-resuelven");
   // En enteros: aMano / n <= 20% es 100·aMano <= 20·n. Sin flotantes que
-  // redondeen un 20,4% a «20».
+  // redondeen un 20,4% a «20». El numerador cuenta FUENTES a mano y el
+  // denominador AFIRMACIONES: mezcla unidades, y sólo puede hacer el tope más
+  // estricto (una afirmación con dos manuales suma dos), nunca diluirlo.
   if (cubetas.aMano * 100 > TOPE_A_MANO_PORCENTAJE * n) motivosRojo.push("a-mano-sobre-el-tope");
   if (!contraprueba.ok) motivosRojo.push("contraprueba-fallida");
 
@@ -688,7 +777,11 @@ export async function chequearEvidencia(
     ok: true,
     n,
     m,
+    porTipo,
     cubetas,
+    // Sobre N, que son AFIRMACIONES, y no sobre la cantidad de fuentes: con
+    // fuentes en el denominador, cargar URLs sanas de relleno diluiría el 20%
+    // sin bajar cuánto depende la ficha de lo declarado a mano.
     porcentajeAMano: porcentaje(cubetas.aMano, n),
     afirmacionesSinEvidencia,
     fuentes,
@@ -711,6 +804,15 @@ export function lineaDeSalida(r: Omit<ResultadoChequeo, "linea">): string {
   const pct = r.porcentajeAMano === null ? "sin denominador" : `${r.porcentajeAMano}% de N`;
   const control = (c: Contraprueba["inventada"]) =>
     c === null ? "no corrió" : `${c.cubeta}${c.motivo ? ` (${c.motivo})` : ""}`;
+  const tipos = [
+    "claim",
+    "goal",
+    ...Object.keys(r.porTipo)
+      .filter((t) => t !== "claim" && t !== "goal")
+      .sort(),
+  ]
+    .map((t) => `${t} N=${r.porTipo[t]?.n ?? 0} M=${r.porTipo[t]?.m ?? 0}`)
+    .join(", ");
   return (
     `${r.n} afirmaciones, ${r.m} sin evidencia resoluble` +
     ` | fuentes: ${r.cubetas.resuelta} resueltas (${r.cubetas.degradadas} degradadas a GET),` +
@@ -718,6 +820,7 @@ export function lineaDeSalida(r: Omit<ResultadoChequeo, "linea">): string {
     ` (tope ${TOPE_A_MANO_PORCENTAJE}%)` +
     ` | contraprueba: inventada ${control(r.contraprueba.inventada)},` +
     ` propia ${control(r.contraprueba.propia)}, no-resuelve +${r.contraprueba.subioNoResuelve}` +
+    ` | por tipo: ${tipos}` +
     ` | ${r.verde ? "VERDE" : `ROJO: ${r.motivosRojo.join(", ")}`}`
   );
 }

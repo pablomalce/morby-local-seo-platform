@@ -28,7 +28,9 @@
  * 3. EL ESPÍA DE FETCH QUEDA EN CERO. Sin sesión, ningún handler sale a la red.
  *    Una llamada saliente que un anónimo puede disparar es gasto — Places y
  *    PageSpeed cobran por request — y es superficie: el `key=` de PageSpeed
- *    viaja en la query string de esa llamada.
+ *    viaja en la query string de esa llamada. «La red» es `fetch`,
+ *    `node:http`/`node:https` Y `node:dns`: una consulta DNS a un nombre que
+ *    eligió quien llama ya es una salida, y un canal.
  *
  * POR QUÉ EL ARNÉS ESTÁ MONTADO ASÍ, Y NO DE LA MANERA CÓMODA
  *
@@ -355,7 +357,8 @@ const FORMA_DE_LLAMADA: Record<
   "/api/organizations": { cuerpo: { name: "Cliente de prueba del barrido" } },
   // H1.4: sale a la red una vez por fuente que cargó un usuario. Un uuid válido
   // para que zod no conteste antes del guardia; medido sin sesión: 401 y espía
-  // en cero, también en `node:http`/`node:https`, que es por donde sale.
+  // en cero, también en `node:http`/`node:https` y `node:dns`, que es por donde
+  // sale.
   "/api/profile/evidence-check": { cuerpo: { businessId: "66666666-6666-4666-8666-666666666666" } },
   // Sin `code`, que es el caso del que entra a mano a la URL. El caso CON code
   // —el mecanismo ejercitado del otro lado— tiene su propio test más abajo.
@@ -884,11 +887,11 @@ beforeAll(async () => {
   // El espía instrumentaba sólo `globalThis.fetch`, y un refutador lo midió con
   // un servidor local: una petición hecha con `node:https`.request salió de
   // verdad y el registro quedó en cero, o sea que el barrido informaba «cero
-  // llamadas» sobre una llamada que había salido. Hoy `grep` sobre `src` no
-  // encuentra ningún uso de estos módulos ni de axios —hay un trinquete más
-  // abajo que falla si aparece uno—, así que esto no cambia ninguna medición:
-  // cubre el día en que alguien agregue un cliente que no use fetch, que es
-  // justo el día en que nadie se acordaría de venir a extender el espía.
+  // llamadas» sobre una llamada que había salido. Desde H1.4 hay UN archivo en
+  // `src` que usa estos módulos —`src/lib/profile/nodeTransport.ts`, que fija
+  // la dirección a la que conecta—, y lo hace por el objeto del módulo, que es
+  // donde este espía se instala. Un trinquete más abajo
+  // («ningún módulo nativo de red fuera de la lista») falla si aparece otro.
   for (const modulo of ["node:http", "node:https"]) {
     const nativo = requerir(modulo) as Record<string, unknown>;
     for (const metodo of ["request", "get"]) {
@@ -906,6 +909,40 @@ beforeAll(async () => {
         arnes.salientes.push(registro);
         arnes.todasLasSalientes.push(registro);
         throw new Error(`[espia] llamada saliente sin sesion, rechazada: ${registro}`);
+      };
+    }
+  }
+
+  // Y el DNS. H1.4 resuelve con `dns.promises.Resolver` (c-ares) ANTES de
+  // conectar, y una consulta DNS ya sale de la plataforma: sin esto, una
+  // resolución antes del guardia dejaba el barrido en verde. Se instrumentan
+  // las dos puertas —`getaddrinfo` (`lookup`) y c-ares (`resolve*`, `reverse`)—,
+  // en el módulo, en `promises`, y en el prototipo de los dos `Resolver`, que
+  // es por donde pasa una instancia creada con `new`.
+  const dnsNativo = requerir("node:dns") as Record<string, unknown> & {
+    promises: Record<string, unknown> & { Resolver: { prototype: Record<string, unknown> } };
+    Resolver: { prototype: Record<string, unknown> };
+  };
+  const puertasDns: Array<{ donde: string; objeto: Record<string, unknown>; promesa: boolean }> = [
+    { donde: "node:dns", objeto: dnsNativo, promesa: false },
+    { donde: "node:dns.promises", objeto: dnsNativo.promises, promesa: true },
+    { donde: "node:dns.Resolver", objeto: dnsNativo.Resolver.prototype, promesa: false },
+    { donde: "node:dns.promises.Resolver", objeto: dnsNativo.promises.Resolver.prototype, promesa: true },
+  ];
+  for (const { donde, objeto, promesa } of puertasDns) {
+    const nombres = new Set([...Object.keys(objeto), ...Object.getOwnPropertyNames(objeto)]);
+    for (const metodo of nombres) {
+      if (metodo !== "lookup" && metodo !== "reverse" && !metodo.startsWith("resolve")) continue;
+      const original = objeto[metodo];
+      if (typeof original !== "function") continue;
+      nativosOriginales.push({ nativo: objeto, metodo, original });
+      objeto[metodo] = (...args: unknown[]) => {
+        const registro = `${donde}.${metodo} ${String(args[0])}`;
+        arnes.salientes.push(registro);
+        arnes.todasLasSalientes.push(registro);
+        const error = new Error(`[espia] consulta DNS sin sesion, rechazada: ${registro}`);
+        if (promesa) return Promise.reject(error);
+        throw error;
       };
     }
   }
@@ -1447,6 +1484,58 @@ describe("la precondición global se mide llamando, no leyendo", () => {
           "node-fetch SALIERON y el espía registró cero. O se instrumenta acá, o el cero de la " +
           "propiedad 3 deja de significar algo."
       ).toEqual([]);
+    });
+
+    it("ningún módulo nativo de red fuera de la lista: lo que no está acá, el espía no lo vigila", () => {
+      // El trinquete de arriba mira `package.json`; éste mira `src`. Un
+      // `import net from "node:net"` con `net.connect`, o `node:tls`, o
+      // `node:dgram`, sale sin pasar por ninguna de las tres puertas que el
+      // espía instrumenta. Cada entrada dice qué usa y por qué el espía lo ve.
+      const PERMITIDOS: Record<string, string> = {
+        "src/lib/profile/nodeTransport.ts":
+          "node:http/https (request, instrumentados) y node:dns (Resolver, instrumentado); node:net sólo isIP",
+        "src/lib/profile/evidenceCheck.ts": "node:net sólo BlockList e isIP: no abre sockets",
+      };
+      // `from "…"`, `import "…"`, `import("…")` y `require("…")`, con o sin `node:`.
+      const DE_RED =
+        /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'](?:node:)?(?:http|https|http2|net|tls|dgram|dns)(?:\/promises)?["']/;
+      const enSrc: string[] = [];
+      const recorrer = (directorio: string) => {
+        for (const entrada of readdirSync(directorio)) {
+          const completo = path.join(directorio, entrada);
+          if (statSync(completo).isDirectory()) {
+            if (entrada !== "__tests__" && entrada !== "test") recorrer(completo);
+          } else if (/\.(tsx?|jsx?|mjs|cjs)$/.test(entrada) && !/\.(test|spec)\./.test(entrada)) {
+            if (DE_RED.test(readFileSync(completo, "utf8"))) {
+              enSrc.push(path.relative(RAIZ, completo).replace(/\\/g, "/"));
+            }
+          }
+        }
+      };
+      recorrer(path.join(RAIZ, "src"));
+
+      expect(
+        enSrc.sort(),
+        "Un archivo de src importa un módulo nativo de red y no está en la lista. Si abre sockets " +
+          "o consulta DNS por un camino que el espía no instrumenta, el cero de la propiedad 3 deja " +
+          "de significar algo: o se instrumenta acá, o se dice en la lista qué usa y por qué el " +
+          "espía lo ve."
+      ).toEqual(Object.keys(PERMITIDOS).sort());
+    });
+
+    it("el espía de DNS registra Y rechaza, por las dos puertas", async () => {
+      const dnsNativo = requerir("node:dns") as {
+        lookup: (host: string, cb: () => void) => void;
+        promises: { Resolver: new () => { resolve4: (host: string) => Promise<string[]> } };
+      };
+      const antes = arnes.salientes.length;
+      expect(() => dnsNativo.lookup(HOST_DE_CONTROL, () => {})).toThrow("[espia]");
+      await expect(new dnsNativo.promises.Resolver().resolve4(HOST_DE_CONTROL)).rejects.toThrow("[espia]");
+      expect(arnes.salientes.slice(antes)).toEqual([
+        `node:dns.lookup ${HOST_DE_CONTROL}`,
+        `node:dns.promises.Resolver.resolve4 ${HOST_DE_CONTROL}`,
+      ]);
+      arnes.salientes.length = antes;
     });
 
     it("la fuga listada sigue existiendo, o hay que borrarla de la lista", () => {

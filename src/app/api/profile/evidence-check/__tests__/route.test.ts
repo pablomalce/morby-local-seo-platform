@@ -29,6 +29,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const ORG_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ORG_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const NEGOCIO_A = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+/** El segundo negocio de ORG_A: una agencia con dos clientes es lo normal. */
+const NEGOCIO_A2 = "a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2";
 const NEGOCIO_B = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1";
 const ALICIA = "11111111-1111-4111-8111-111111111111";
 const BRUNO = "22222222-2222-4222-8222-222222222222";
@@ -52,6 +54,11 @@ const estado = vi.hoisted(() => ({
   red: [] as string[],
   dns: new Map<string, string[]>(),
   sitios: new Map<string, number>(),
+  redirecciones: new Map<string, string>(),
+  /** Lo que pasa en el mundo MIENTRAS la ruta está afuera: corre en el primer pedido HTTP. */
+  alSalir: null as null | (() => void),
+  /** Si no es null, cuántas filas dice haber tocado cada UPDATE (un trigger que saltea, una fila borrada). */
+  cuentaEscrita: null as number | null,
   rpcs: [] as Array<{ nombre: string; args: Record<string, unknown> }>,
 }));
 
@@ -103,9 +110,10 @@ function consulta(tabla: string, conRls: boolean) {
       return { data: null, error: { code: "45002", message: "profile_evidence de una version publicada" }, count: null };
     }
     const filas = visibles();
-    for (const f of filas) Object.assign(f, valores);
-    estado.escrituras.push({ tabla, valores: { ...valores }, filtros: [...filtros], filas: filas.length });
-    return { data: null, error: null, count: opciones?.count === "exact" ? filas.length : null };
+    const tocadas = estado.cuentaEscrita === null ? filas : filas.slice(0, estado.cuentaEscrita);
+    for (const f of tocadas) Object.assign(f, valores);
+    estado.escrituras.push({ tabla, valores: { ...valores }, filtros: [...filtros], filas: tocadas.length });
+    return { data: null, error: null, count: opciones?.count === "exact" ? tocadas.length : null };
   };
 
   const q = {
@@ -169,7 +177,12 @@ vi.mock("@/lib/profile/nodeTransport", () => ({
     },
     transporte: async (p: { metodo: string; url: string }) => {
       estado.red.push(`${p.metodo} ${p.url}`);
-      return { tipo: "respuesta", status: estado.sitios.get(p.url) ?? 404, location: null };
+      const alSalir = estado.alSalir;
+      estado.alSalir = null;
+      alSalir?.();
+      const status = estado.sitios.get(p.url) ?? 404;
+      const destino = estado.redirecciones.get(p.url) ?? null;
+      return { tipo: "respuesta", status: destino ? 301 : status, location: destino };
     },
     sufijoAleatorio: () => "abcdef0123456789",
   }),
@@ -178,11 +191,14 @@ vi.mock("@/lib/profile/nodeTransport", () => ({
 const { POST } = await import("../route");
 
 let ip = 0;
-function pedido(cuerpo: unknown): Request {
+function pedido(cuerpo: unknown, desde?: string): Request {
   ip += 1;
   return new Request("http://localhost/api/profile/evidence-check", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-forwarded-for": `10.14.${Math.floor(ip / 250)}.${ip % 250}` },
+    headers: {
+      "content-type": "application/json",
+      "x-forwarded-for": desde ?? `10.14.${Math.floor(ip / 250)}.${ip % 250}`,
+    },
     body: JSON.stringify(cuerpo),
   });
 }
@@ -220,6 +236,9 @@ beforeEach(() => {
   estado.red = [];
   estado.dns = new Map();
   estado.sitios = new Map();
+  estado.redirecciones = new Map();
+  estado.alSalir = null;
+  estado.cuentaEscrita = null;
   estado.rpcs = [];
   estado.tablas = {
     org_members: [
@@ -229,6 +248,7 @@ beforeEach(() => {
     ],
     businesses: [
       { id: NEGOCIO_A, organization_id: ORG_A, website: "https://www.ejemplo-a.com" },
+      { id: NEGOCIO_A2, organization_id: ORG_A, website: "https://otra-a.com" },
       { id: NEGOCIO_B, organization_id: ORG_B, website: "https://ejemplo-b.com" },
     ],
     company_profiles: [
@@ -303,6 +323,60 @@ describe("quién puede correrlo", () => {
     const res = await POST(pedido({ businessId: NEGOCIO_A }));
     expect(res.status).toBe(404);
     expect(estado.adminCreado).toBe(0);
+  });
+
+  it("5 corridas por minuto: la sexta desde la misma IP es 429, sin leer ni salir", async () => {
+    // Mutación R16: sin el rate limit, una ruta que sale a URLs cargadas por
+    // usuarios no tiene tope. El resto del archivo usa una IP por pedido a
+    // propósito; acá es una sola.
+    const desde = "10.99.0.1";
+    for (let i = 0; i < 5; i++) {
+      expect((await POST(pedido({ businessId: NEGOCIO_A }, desde))).status, `corrida ${i + 1}`).toBe(200);
+    }
+    estado.red = [];
+    estado.lecturas = [];
+    const res = await POST(pedido({ businessId: NEGOCIO_A }, desde));
+    expect(res.status).toBe(429);
+    expect(estado.lecturas).toEqual([]);
+    expect(estado.red).toEqual([]);
+  });
+});
+
+describe("la ficha es la de ESTE negocio", () => {
+  it("otro negocio de la MISMA organización sin versión publicada: N = 0, no la ficha del hermano", async () => {
+    // Mutación R12: sin `.eq("business_id")`, la lectura toma la ficha
+    // publicada de NEGOCIO_A, contesta verde con N = 2, juzga el origen propio
+    // contra el website equivocado y escribe con service_role en la evidencia
+    // del otro negocio.
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A2 }))).json();
+    expect(cuerpo.n).toBe(0);
+    expect(cuerpo.version).toBeNull();
+    expect(cuerpo.motivosRojo).toContain("n-cero");
+    expect(cuerpo.verde).toBe(false);
+    expect(estado.escrituras).toEqual([]);
+    expect(fila("ev-a1").last_checked_at).toBeNull();
+  });
+
+  it("y si el hermano también tiene su versión publicada, se mide la suya y la del otro no se toca", async () => {
+    estado.tablas.company_profiles.push({
+      id: "perfil-a2-1",
+      organization_id: ORG_A,
+      business_id: NEGOCIO_A2,
+      version: 1,
+      status: "published",
+    });
+    estado.tablas.profile_objectives.push({ id: "obj-a2-1", organization_id: ORG_A, profile_id: "perfil-a2-1", kind: "claim" });
+    estado.tablas.profile_evidence.push(evidencia("ev-a2-1", ORG_A, "obj-a2-1", "https://fuente-hermana.org/z"));
+    sitio("https://fuente-hermana.org/z");
+
+    const res = await POST(pedido({ businessId: NEGOCIO_A2 }));
+    expect(res.status).toBe(200);
+    const cuerpo = await res.json();
+    expect(cuerpo.n).toBe(1);
+    expect(cuerpo.version).toBe(1);
+    expect(cuerpo.contraprueba.propia.url).toBe("https://otra-a.com/");
+    expect(fila("ev-a2-1").last_status).toBe(200);
+    expect(fila("ev-a1").last_checked_at, "la evidencia del hermano no se toca").toBeNull();
   });
 });
 
@@ -406,6 +480,130 @@ describe("la corrida", () => {
   });
 });
 
+describe("lo que se compara es la columna de la base, no un host recalculado", () => {
+  it("una URL donde url_host lee el PROPIO dominio y Node lee otro host: url-ambigua, rojo, y no sale a la red", async () => {
+    // Mutación R13: `hostFuente: new URL(f.url).hostname` en vez de la columna
+    // generada. El acuerdo entre los dos parsers se vuelve tautológico, la
+    // fuente sale, contesta 200 y queda RESUELTA aunque la base diga que es
+    // del propio dominio.
+    const url = "https://fuente-uno.org\\@ejemplo-a.com/x";
+    const ambigua = evidencia("ev-amb", ORG_A, "obj-a1", url);
+    expect(ambigua.source_host).toBe("ejemplo-a.com");
+    expect(new URL(url).hostname).toBe("fuente-uno.org");
+    estado.tablas.profile_evidence.push(ambigua);
+    estado.sitios.set(new URL(url).toString(), 200);
+
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(cuerpo.fuentes.find((f: { id: string }) => f.id === "ev-amb")).toMatchObject({
+      cubeta: "no-resuelve",
+      motivo: "url-ambigua",
+    });
+    expect(cuerpo.verde).toBe(false);
+    expect(transporte().some((r) => r.includes("@ejemplo-a.com"))).toBe(false);
+    expect(fila("ev-amb").last_checked_at, "no se midió, no se escribe").toBeNull();
+  });
+});
+
+describe("lo que se escribe es lo que decidió la fuente", () => {
+  it("un 404 se guarda como 404, y un 301 hacia el propio sitio como NULL, no como 3xx", async () => {
+    // Mutación R14: `last_status` desde `f.status` en vez de `statusMedido`:
+    // el 301 quedaría escrito y una auditoría con «2xx o 3xx» la contaría
+    // resuelta. Mutación R15: sólo las resueltas con status, y el 404 queda
+    // NULL — indistinguible de un DNS caído.
+    estado.tablas.profile_evidence = [
+      evidencia("ev-a1", ORG_A, "obj-a1", "https://fuente-uno.org/informe"),
+      evidencia("ev-rota", ORG_A, "obj-a2", "https://fuente-rota.org/x"),
+      evidencia("ev-vuelve", ORG_A, "obj-a2", "https://acortador.io/x"),
+    ];
+    sitio("https://fuente-rota.org/x", 404);
+    sitio("https://acortador.io/x");
+    estado.redirecciones.set("https://acortador.io/x", "https://www.ejemplo-a.com/");
+
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(cuerpo.fuentes.find((f: { id: string }) => f.id === "ev-vuelve")).toMatchObject({
+      motivo: "origen-propio",
+      status: 301,
+    });
+    expect(fila("ev-a1")).toMatchObject({ last_status: 200, last_checked_at: cuerpo.ejecutadoEn });
+    expect(fila("ev-rota")).toMatchObject({ last_status: 404, last_checked_at: cuerpo.ejecutadoEn });
+    expect(fila("ev-vuelve")).toMatchObject({ last_status: null, last_checked_at: cuerpo.ejecutadoEn });
+  });
+});
+
+describe("lo que se leyó antes de la red se vuelve a leer antes de escribir", () => {
+  it("si mientras corría se publicó otra versión, la superada no recibe la medición", async () => {
+    // Mutación R17: sin la recomprobación, service_role escribe en la v2 ya
+    // superada —la 0027 lo deja— y la respuesta informa la v2 como vigente.
+    estado.alSalir = () => {
+      estado.tablas.company_profiles = estado.tablas.company_profiles.map((p) =>
+        p.id === "perfil-a-2" ? { ...p, status: "superseded" } : p
+      );
+      estado.tablas.company_profiles.push({
+        id: "perfil-a-3",
+        organization_id: ORG_A,
+        business_id: NEGOCIO_A,
+        version: 3,
+        status: "published",
+      });
+    };
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(estado.red.length).toBeGreaterThan(0);
+    expect(cuerpo.guardado).toEqual({ ok: false, filas: 0, esperadas: 2, motivo: "version-superada" });
+    expect(estado.adminCreado).toBe(0);
+    expect(fila("ev-a1").last_checked_at).toBeNull();
+  });
+
+  it("si mientras corría archivaron a quien la pidió, la escritura privilegiada no sale", async () => {
+    // Mutación R18: la recomprobación sin la membresía.
+    estado.alSalir = () => {
+      for (const m of estado.tablas.org_members) {
+        if (m.user_id === ALICIA) m.state = "archived";
+      }
+    };
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(cuerpo.guardado).toMatchObject({ ok: false, filas: 0, motivo: "membresia-vencida" });
+    expect(estado.adminCreado).toBe(0);
+    expect(estado.escrituras).toEqual([]);
+  });
+
+  it("una recomprobación que no se pudo leer tampoco escribe, y sin el texto de Postgres", async () => {
+    estado.alSalir = () => {
+      estado.errores.org_members = { code: "XX000", message: SECRETO_DE_POSTGRES };
+    };
+    const res = await POST(pedido({ businessId: NEGOCIO_A }));
+    const texto = await res.text();
+    expect(JSON.parse(texto).guardado).toMatchObject({ ok: false, motivo: "recomprobacion-ilegible" });
+    expect(texto).not.toContain("constraint_secreta");
+    expect(estado.escrituras).toEqual([]);
+  });
+});
+
+describe("el navegador no recibe un mapa del DNS interno", () => {
+  it("«no existe» y «resuelve a una IP interna» llegan como el mismo motivo, `red`", async () => {
+    // Mutación R19: el motivo de cada fuente tal cual. Quien carga URLs podría
+    // enumerar qué nombres son internos vistos desde la IP de la plataforma.
+    estado.tablas.profile_evidence = [
+      evidencia("ev-no-existe", ORG_A, "obj-a1", "https://no-existe.org/x"),
+      evidencia("ev-interna", ORG_A, "obj-a2", "https://intranet.cliente.org/x"),
+      evidencia("ev-puerto", ORG_A, "obj-a2", "https://fuente-dos.org:8443/dato"),
+    ];
+    estado.dns.set("intranet.cliente.org", ["10.0.0.7"]);
+    const texto = await (await POST(pedido({ businessId: NEGOCIO_A }))).text();
+    const cuerpo = JSON.parse(texto);
+    const motivo = (id: string) => cuerpo.fuentes.find((f: { id: string }) => f.id === id).motivo;
+    expect(motivo("ev-no-existe")).toBe("red");
+    expect(motivo("ev-interna")).toBe("red");
+    // Lo que sale de la URL misma no dice nada de adentro, y sigue tal cual.
+    expect(motivo("ev-puerto")).toBe("puerto");
+    expect(texto).not.toContain("ip-no-publica");
+  });
+
+  it("y la respuesta trae N y M por tipo de afirmación", async () => {
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(cuerpo.porTipo).toEqual({ claim: { n: 1, m: 0 }, goal: { n: 1, m: 0 } });
+  });
+});
+
 describe("ausencia, cero y fallo", () => {
   it("una página de evidencia cortada es 502 lectura-incompleta, no una afirmación sin evidencia", async () => {
     estado.recortes.profile_evidence = 1;
@@ -449,6 +647,15 @@ describe("ausencia, cero y fallo", () => {
       expect(estado.escrituras).toEqual([]);
     });
   }
+
+  it("menos filas escritas que las pedidas también es no haber guardado", async () => {
+    // Mutación R20: sin comparar filas con esperadas, un UPDATE que toca una de
+    // dos (una fila borrada en el medio, un trigger que la saltea) se informa
+    // como guardado.
+    estado.cuentaEscrita = 1;
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO_A }))).json();
+    expect(cuerpo.guardado).toEqual({ ok: false, filas: 1, esperadas: 2 });
+  });
 
   it("una escritura rechazada no cambia el veredicto, se informa, y sin el texto de Postgres", async () => {
     estado.errores["update:profile_evidence"] = { code: "45002", message: SECRETO_DE_POSTGRES };

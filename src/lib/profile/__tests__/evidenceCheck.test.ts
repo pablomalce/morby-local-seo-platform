@@ -27,6 +27,7 @@ import {
   esIpPublica,
   esOrigenPropio,
   OPCIONES_POR_DEFECTO,
+  statusMedido,
   type Afirmacion,
   type Dependencias,
   type EntradaChequeo,
@@ -42,7 +43,7 @@ import {
 const IP_PUBLICA = "93.184.216.34";
 const IP_PUBLICA_2 = "151.101.1.69";
 
-type Respuesta = { status: number; location?: string } | "cuelga" | "error";
+type Respuesta = { status: number; location?: string; demoraMs?: number } | "cuelga" | "error";
 type Manejador = (pedido: PedidoHttp) => Respuesta;
 
 function crearInternet() {
@@ -63,6 +64,7 @@ function crearInternet() {
       const r = manejador ? manejador(pedido) : { status: 404 };
       if (r === "cuelga") return new Promise(() => {});
       if (r === "error") return { tipo: "error", motivo: "sin-respuesta" };
+      if (r.demoraMs) await new Promise((listo) => setTimeout(listo, r.demoraMs));
       return { tipo: "respuesta", status: r.status, location: r.location ?? null };
     },
     sufijoAleatorio: () => "0123456789abcdef",
@@ -227,6 +229,59 @@ describe("el denominador es el de PostgreSQL, no el de la lista", () => {
     expect(r.cubetas.noResuelve).toBe(1);
     expect(r.fuentes.find((f) => f.url.endsWith("/borrada"))?.motivo).toBe("http-404");
     expect(r.verde).toBe(false);
+  });
+
+  it("la línea publica ESTE N y ESTE M, con más fuentes que afirmaciones y M distinto de las sin evidencia", async () => {
+    // Mutación M20: la línea es lo que se pega en BLOQUEOS como evidencia. Con
+    // `fuentes.length` como N y `afirmacionesSinEvidencia` como M, los casos de
+    // una fuente por afirmación y M = 0 no ven la diferencia; éste sí: 3
+    // fuentes, N = 2, M = 1 y ninguna afirmación sin evidencia.
+    const internet = crearInternet();
+    internet.sitio("https://a.org/1", sano);
+    internet.sitio("https://b.org/2", sano);
+    internet.sitio("https://c.org/borrada", () => ({ status: 404 }));
+    const r = await correr(
+      {
+        afirmaciones: afirmaciones(2),
+        fuentes: [
+          fuenteHttp("obj-1", "https://a.org/1"),
+          fuenteHttp("obj-1", "https://b.org/2"),
+          fuenteHttp("obj-2", "https://c.org/borrada"),
+        ],
+      },
+      internet
+    );
+    expect([r.n, r.m, r.afirmacionesSinEvidencia, r.fuentes.length]).toEqual([2, 1, 0, 3]);
+    expect(r.linea.startsWith("2 afirmaciones, 1 sin evidencia resoluble | ")).toBe(true);
+  });
+});
+
+describe("claim y goal son dos cubetas del denominador", () => {
+  it("N y M se publican también por tipo, en el resultado y en la línea", async () => {
+    // Mutación M26: sin el desglose, una ficha toda de `goal` se publica con la
+    // misma línea que una de hechos verificables.
+    const internet = crearInternet();
+    internet.sitio("https://a.org/1", sano);
+    internet.sitio("https://c.org/borrada", () => ({ status: 404 }));
+    const r = await correr(
+      {
+        afirmaciones: [
+          { id: "obj-1", tipo: "claim" },
+          { id: "obj-2", tipo: "goal" },
+          { id: "obj-3", tipo: "goal" },
+        ],
+        fuentes: [fuenteHttp("obj-1", "https://a.org/1"), fuenteHttp("obj-2", "https://c.org/borrada")],
+      },
+      internet
+    );
+    expect(r.porTipo).toEqual({ claim: { n: 1, m: 0 }, goal: { n: 2, m: 2 } });
+    expect(r.linea).toContain("| por tipo: claim N=1 M=0, goal N=2 M=2 |");
+  });
+
+  it("los dos tipos están siempre, aunque sea en cero", async () => {
+    const r = await correr({ afirmaciones: [] });
+    expect(r.porTipo).toEqual({ claim: { n: 0, m: 0 }, goal: { n: 0, m: 0 } });
+    expect(r.linea).toContain("por tipo: claim N=0 M=0, goal N=0 M=0");
   });
 });
 
@@ -530,6 +585,55 @@ describe("el servidor no sale a donde no debe", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Lo que se guarda en last_status
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("last_status guarda el status que decidió la fuente, no el último que se vio", () => {
+  it("un 301 hacia el propio sitio se midió, pero no se guarda como 3xx: con «2xx o 3xx es resuelta» se leería resuelta", async () => {
+    // Mutación M27: con `statusMedido = c.status`, la columna dice 302 de una
+    // fuente que el chequeo declaró que no resuelve.
+    const internet = crearInternet();
+    internet.sitio("https://acortador.io/x", () => ({ status: 302, location: `https://${PROPIO}/` }));
+    internet.sitio("https://trampolin.org/y", () => ({ status: 307, location: "http://interno.corp/admin" }));
+    internet.dns.set("interno.corp", ["10.0.0.7"]);
+    for (let i = 0; i < 4; i++) internet.sitio(`https://r.org/${i}`, () => ({ status: 302, location: `https://r.org/${i + 1}` }));
+    internet.sitio("https://raro.org/x", () => ({ status: 302 }));
+    internet.sitio("https://lento-get.org/x", (p) => (p.metodo === "HEAD" ? { status: 405 } : "cuelga"));
+
+    const opciones = { ...OPCIONES_POR_DEFECTO, presupuestoPorFuenteMs: 80 };
+    for (const [url, motivo] of [
+      ["https://acortador.io/x", "origen-propio"],
+      ["https://trampolin.org/y", "ip-no-publica"],
+      ["https://r.org/0", "demasiadas-redirecciones"],
+      ["https://raro.org/x", "redireccion-sin-destino"],
+      ["https://lento-get.org/x", "timeout"],
+    ] as const) {
+      const c = await clasificarUrl(url, hostDe(url), PROPIO, internet.deps, opciones);
+      expect(c.motivo, url).toBe(motivo);
+      expect(c.status, `${url}: el status visto sigue en la clasificación`).not.toBeNull();
+      expect(statusMedido(c), `${url}: pero no se guarda`).toBeNull();
+    }
+  });
+
+  it("el 2xx de una resuelta (también degradada) y el status de un http-<status> sí se guardan", async () => {
+    // Mutación M28: con «sólo las resueltas tienen status», un 404 quedaría
+    // NULL, indistinguible de un DNS caído — y la 0026 dice que «respondió
+    // 404» es un estado propio.
+    const internet = crearInternet();
+    internet.sitio("https://sana.org/", sano);
+    internet.sitio("https://sin-head.org/", (p) => (p.metodo === "HEAD" ? { status: 405 } : { status: 206 }));
+    internet.sitio("https://rota.org/", () => ({ status: 404 }));
+    internet.sitio("https://caida.org/", () => ({ status: 503 }));
+    const medido = async (url: string) => statusMedido(await clasificarUrl(url, hostDe(url), PROPIO, internet.deps));
+    expect(await medido("https://sana.org/")).toBe(200);
+    expect(await medido("https://sin-head.org/")).toBe(206);
+    expect(await medido("https://rota.org/")).toBe(404);
+    expect(await medido("https://caida.org/")).toBe(503);
+    expect(await medido("https://no-existe.org/")).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Verificada a mano
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -565,12 +669,82 @@ describe("verificada a mano es una cubeta aparte, con techo", () => {
     expect(r.verde).toBe(false);
   });
 
-  it("una manual sin fecha o sin persona no es una verificación", async () => {
-    const r = await correr({
-      afirmaciones: afirmaciones(1),
-      fuentes: [{ ...fuenteManual("obj-1", "https://detras-de-login.org/1"), verificadaPor: null }],
-    });
-    expect(r.fuentes[0]).toMatchObject({ cubeta: "no-resuelve", motivo: "manual-sin-verificacion" });
+  it("el tope es sobre N AFIRMACIONES, no sobre las fuentes: el relleno http no diluye lo declarado a mano", async () => {
+    // Mutaciones M8c (el veredicto contra la cantidad de fuentes) y M8d (el
+    // porcentaje impreso contra la cantidad de fuentes). Los casos de arriba
+    // tienen una fuente por afirmación y no las distinguen. Acá N = 5: tres
+    // afirmaciones apoyadas SÓLO a mano y dos con diez URLs sanas cada una.
+    // Sobre fuentes sería 3 de 23 = 13% y verde; sobre N es 60% y rojo.
+    const internet = crearInternet();
+    const fuentes: Fuente[] = [1, 2, 3].map((i) => fuenteManual(`obj-${i}`, `https://login.org/${i}`));
+    for (const objetivo of ["obj-4", "obj-5"]) {
+      for (let k = 0; k < 10; k++) {
+        const url = `https://relleno.org/${objetivo}/${k}`;
+        internet.sitio(url, sano);
+        fuentes.push(fuenteHttp(objetivo, url));
+      }
+    }
+    const r = await correr({ afirmaciones: afirmaciones(5), fuentes }, internet);
+
+    expect(r.m).toBe(0);
+    expect(r.cubetas).toMatchObject({ resuelta: 20, aMano: 3, noResuelve: 0 });
+    expect(r.porcentajeAMano).toBe(60);
+    expect(r.motivosRojo).toEqual(["a-mano-sobre-el-tope"]);
+    expect(r.linea).toContain("3 verificadas a mano = 60% de N (tope 20%)");
+    expect(r.verde).toBe(false);
+  });
+
+  it("y el borde también: con 5 fuentes y N = 2, una manual es el 50% de N, no el 20% de las fuentes", async () => {
+    const internet = crearInternet();
+    const fuentes: Fuente[] = [fuenteManual("obj-1", "https://login.org/1")];
+    for (const [objetivo, url] of [
+      ["obj-1", "https://a.org/1"],
+      ["obj-1", "https://a.org/2"],
+      ["obj-1", "https://a.org/3"],
+      ["obj-2", "https://b.org/1"],
+    ]) {
+      internet.sitio(url, sano);
+      fuentes.push(fuenteHttp(objetivo, url));
+    }
+    const r = await correr({ afirmaciones: afirmaciones(2), fuentes }, internet);
+    expect(r.porcentajeAMano).toBe(50);
+    expect(r.motivosRojo).toEqual(["a-mano-sobre-el-tope"]);
+  });
+
+  it("una manual sin fecha o sin persona no es una verificación: las dos mitades, cada una por su lado", async () => {
+    // Mutación M24: con `!verificadaPor` solo, una manual con persona y sin
+    // fecha entraba en «a mano». El CHECK de la 0026 lo cubre en la base; acá
+    // se cubre lo que este archivo promete no contar.
+    for (const [cual, cambio] of [
+      ["sin persona", { verificadaPor: null }],
+      ["sin fecha", { verificadaEn: null }],
+    ] as const) {
+      const r = await correr({
+        afirmaciones: afirmaciones(1),
+        fuentes: [{ ...fuenteManual("obj-1", "https://detras-de-login.org/1"), ...cambio }],
+      });
+      expect(r.fuentes[0], cual).toMatchObject({ cubeta: "no-resuelve", motivo: "manual-sin-verificacion" });
+    }
+  });
+
+  it("una manual cuya columna dice el propio dominio y Node lee otro host es url-ambigua, no «a mano»", async () => {
+    // Mutación M25. `url_host` de la 0026 lee `ejemplo-propio.com` (saca todo
+    // hasta la @) y Node lee `otro.org`: sin la comparación entre los dos
+    // parsers, la manual pasa el examen de origen propio con el host de Node
+    // y cae en «a mano», con la base diciendo que es del propio dominio.
+    const url = `https://otro.org\\@${PROPIO}/casos`;
+    expect(new URL(url).hostname).toBe("otro.org");
+    expect(hostDe(url)).toBe(PROPIO);
+    const internet = crearInternet();
+    const fuentes: Fuente[] = [{ ...fuenteManual("obj-1", url), hostFuente: hostDe(url) }];
+    for (let i = 2; i <= 5; i++) {
+      internet.sitio(`https://fuente.org/${i}`, sano);
+      fuentes.push(fuenteHttp(`obj-${i}`, `https://fuente.org/${i}`));
+    }
+    const r = await correr({ afirmaciones: afirmaciones(5), fuentes }, internet);
+    expect(r.fuentes[0]).toMatchObject({ cubeta: "no-resuelve", motivo: "url-ambigua" });
+    expect(r.cubetas.aMano).toBe(0);
+    expect(r.verde).toBe(false);
   });
 
   it("una manual en el propio dominio tampoco vale", async () => {
@@ -655,4 +829,81 @@ describe("la corrida tiene tope, y lo que queda afuera no se da por bueno", () =
     expect(r.cubetas.resuelta).toBe(tope + 1);
     expect(r.verde).toBe(false);
   });
+
+  it("nunca hay más fuentes en vuelo que la concurrencia, y la concurrencia se usa", async () => {
+    // Mutación M23: con el tope de obreros ignorado salen las 30 a la vez — 50
+    // sockets simultáneos desde la IP de la plataforma con el tope de 48 URLs —
+    // y la cuenta de 42 s supone 8.
+    const internet = crearInternet();
+    let enVuelo = 0;
+    let maximo = 0;
+    const transporte = internet.deps.transporte;
+    const deps: Dependencias = {
+      ...internet.deps,
+      transporte: async (pedido) => {
+        enVuelo++;
+        maximo = Math.max(maximo, enVuelo);
+        try {
+          return await transporte(pedido);
+        } finally {
+          enVuelo--;
+        }
+      },
+    };
+    const fuentes: Fuente[] = [];
+    for (let i = 1; i <= 30; i++) {
+      internet.sitio(`https://fuente.org/${i}`, () => ({ status: 200, demoraMs: 5 }));
+      fuentes.push(fuenteHttp(`obj-${i}`, `https://fuente.org/${i}`));
+    }
+    const salida = await chequearEvidencia({ n: 30, afirmaciones: afirmaciones(30), fuentes, hostPropio: PROPIO }, deps);
+    expect(salida.ok && salida.cubetas.resuelta).toBe(30);
+    expect(maximo).toBe(OPCIONES_POR_DEFECTO.concurrencia);
+  });
+
+  it("el presupuesto es TOTAL por fuente: cuatro saltos de 60 ms no entran en 150 ms", async () => {
+    // Mutación M21: con el plazo por PEDIDO —`restante` devolviendo siempre el
+    // presupuesto entero— cada salto tiene 150 ms y la fuente resuelve en 240.
+    // En producción eso es 6 s por DNS, por HEAD y por GET en cada uno de
+    // cuatro saltos: la cuenta de 42 s deja de valer.
+    const internet = crearInternet();
+    for (let i = 0; i < 3; i++) {
+      internet.sitio(`https://saltos.org/${i}`, () => ({ status: 302, location: `https://saltos.org/${i + 1}`, demoraMs: 60 }));
+    }
+    internet.sitio("https://saltos.org/3", () => ({ status: 200, demoraMs: 60 }));
+    const antes = Date.now();
+    const c = await clasificarUrl("https://saltos.org/0", "saltos.org", PROPIO, internet.deps, {
+      ...OPCIONES_POR_DEFECTO,
+      presupuestoPorFuenteMs: 150,
+    });
+    expect(c).toMatchObject({ cubeta: "no-resuelve", motivo: "timeout" });
+    expect(c.saltos).toBeLessThan(3);
+    // El motivo es lo que discrimina; el tiempo es una cota de cordura, holgada
+    // porque la máquina de CI puede estar cargada.
+    expect(Date.now() - antes).toBeLessThan(1_000);
+  });
+
+  it("un DNS que no contesta nunca es timeout dentro del presupuesto, y la consulta se CORTA, no sólo se deja de esperar", async () => {
+    // Mutación M22: sin el plazo alrededor del resolvedor, la fuente cuelga
+    // hasta que el test se rinde. Mutación M29: con el plazo y sin abortar la
+    // señal, la fuente vuelve a tiempo pero la consulta sigue viva — que es
+    // exactamente lo que tomaba el pool de libuv (ver nodeTransport.ts).
+    const senales: AbortSignal[] = [];
+    const deps: Dependencias = {
+      resolver: (_host, senal) => {
+        senales.push(senal);
+        return new Promise(() => {});
+      },
+      transporte: async () => ({ tipo: "respuesta", status: 200, location: null }),
+      sufijoAleatorio: () => "x",
+    };
+    const antes = Date.now();
+    const c = await clasificarUrl("https://dns-mudo.org/", "dns-mudo.org", PROPIO, deps, {
+      ...OPCIONES_POR_DEFECTO,
+      presupuestoPorFuenteMs: 100,
+    });
+    expect(c).toMatchObject({ cubeta: "no-resuelve", motivo: "timeout", saltos: 0, medida: true });
+    expect(Date.now() - antes).toBeLessThan(1_000);
+    expect(senales).toHaveLength(1);
+    expect(senales[0].aborted, "la consulta se cortó al vencer el plazo").toBe(true);
+  }, 3_000);
 });
