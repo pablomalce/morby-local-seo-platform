@@ -290,6 +290,30 @@ describe("quién puede correrlo", () => {
     expect(estado.adminCreado).toBe(0);
   });
 
+  it("sin sesión, un cuerpo que zod rechaza también es 401: la sesión va antes del esquema", async () => {
+    // P2. MEDIDO EN PRODUCCIÓN el 2026-10-07: anónimo con `{}` -> 400 «Request
+    // could not be processed.», anónimo con cuerpo bien formado -> 401. El test
+    // de arriba manda un cuerpo válido y por eso no lo veía.
+    estado.usuario = null;
+    const noJson = new Request("http://localhost/api/profile/evidence-check", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": "10.98.0.1" },
+      body: "esto no es json {",
+    });
+    for (const [nombre, req] of [
+      ["{}", pedido({})],
+      ["un businessId que no es uuid", pedido({ businessId: "no-es-un-uuid" })],
+      ["un cuerpo que no es JSON", noJson],
+    ] as const) {
+      const res = await POST(req);
+      expect(res.status, nombre).toBe(401);
+      expect(await res.json(), nombre).toEqual({ error: "not authenticated" });
+    }
+    expect(estado.lecturas).toEqual([]);
+    expect(estado.red).toEqual([]);
+    expect(estado.adminCreado).toBe(0);
+  });
+
   it("un businessId que no es uuid es 400, sin salir", async () => {
     const res = await POST(pedido({ businessId: "no-es-un-uuid" }));
     expect(res.status).toBe(400);

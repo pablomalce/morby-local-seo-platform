@@ -62,18 +62,21 @@ const schema = z.object({
 });
 
 export async function POST(req: Request) {
-  // Escribe en el ledger —reserva una fila— aunque no publique. 20/min por IP.
-  const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "publishing-rehearse" });
-  if (limitado) return limitado;
-
   try {
-    const { assetId } = schema.parse(await req.json().catch(() => ({})));
-
+    // La sesión primero, antes del rate limit y de zod: sin ella, 401 y nada
+    // más (el orden de /api/reports/generate; lo mide `precondicionRutas.test.ts`
+    // con un cuerpo inválido).
     const supabase = await createSupabaseServerClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+
+    // Escribe en el ledger —reserva una fila— aunque no publique. 20/min por IP.
+    const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "publishing-rehearse" });
+    if (limitado) return limitado;
+
+    const { assetId } = schema.parse(await req.json().catch(() => ({})));
 
     const { data: asset, error } = await supabase
       .from("content_assets")

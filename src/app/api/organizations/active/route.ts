@@ -35,13 +35,16 @@ const VIDA = 60 * 60 * 24 * 30;
 
 export async function POST(req: Request) {
   try {
-    const { organizationId } = schema.parse(await req.json().catch(() => ({})));
-
+    // La sesión primero, antes de zod: sin ella, 401 y nada más (el orden de
+    // /api/reports/generate; lo mide `precondicionRutas.test.ts` con un cuerpo
+    // inválido).
     const supabase = await createSupabaseServerClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+
+    const { organizationId } = schema.parse(await req.json().catch(() => ({})));
 
     const { data, error } = await supabase
       .from("org_members")

@@ -96,6 +96,9 @@
  *
  *   - que un handler conteste algo que no sea `401`/`403` sin sesión y no esté
  *     en `EXENCIONES` con su motivo escrito;
+ *   - que lo conteste con un cuerpo INVÁLIDO: un `400` de zod a un anónimo es
+ *     la sesión mirada después del esquema (ver `VARIANTES`, medido en
+ *     producción el 2026-10-07);
  *   - que un handler conteste `500`, o tire sin atrapar, sin sesión;
  *   - que quede UNA URL en el espía;
  *   - que el barrido deje de encontrar rutas, o que encuentre una ruta cuyo
@@ -114,6 +117,10 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { apiError } from "@/lib/api/error";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 /**
  * El estado que los mocks necesitan poder ver y el test necesita poder cambiar.
@@ -278,6 +285,101 @@ const ORIGEN = "https://growth-os.test";
 /** El `state` del OAuth: 64 caracteres, el largo que escribe la ruta de arranque. */
 const ESTADO_OAUTH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
 
+/** Lo que hace falta mandar para que un pedido llegue a la decisión de identidad. */
+interface Forma {
+  cuerpo?: unknown;
+  query?: Record<string, string>;
+  cookies?: Record<string, string>;
+}
+
+/**
+ * LAS TRES MANERAS DE LLAMAR A CADA HANDLER, Y POR QUÉ UNA SOLA NO ALCANZA
+ *
+ * `FORMA_DE_LLAMADA` manda el pedido BIEN FORMADO y mide hasta dónde llega un
+ * anónimo cuando el esquema no lo frena: si a un handler le faltara el guardia,
+ * un cuerpo válido lo hace caminar hasta la red y la fuga queda en el espía. Un
+ * cuerpo inválido lo mataría en zod y la escondería.
+ *
+ * Pero sola, la forma es ciega al ORDEN. MEDIDO EN PRODUCCIÓN el 2026-10-07:
+ * `POST /api/profile/evidence-check` anónimo con cuerpo `{}` contestaba `400
+ * Request could not be processed.`, y con cuerpo bien formado `401`. El handler
+ * hacía `schema.parse(await req.json())` antes de `auth.getUser()`, y este
+ * barrido estaba verde porque sólo lo llamaba con el cuerpo bien formado: el
+ * `400` del esquema nunca pasó por la aserción que lo prohíbe. La primera
+ * corrida con estas variantes encontró OCHO handlers con ese orden, y se
+ * cerraron en el mismo PR.
+ *
+ * Por eso cada handler se llama TRES veces sin sesión, y las tres tienen que
+ * contestar lo mismo —`401`/`403`, o el status de su exención— y dejar el
+ * espía en cero:
+ *
+ *   - `forma`: el pedido de `FORMA_DE_LLAMADA`;
+ *   - `cuerpo-vacio`: `{}`, JSON válido que no cumple ningún esquema con un
+ *     campo obligatorio;
+ *   - `no-json`: un cuerpo que no es JSON, con `content-type: application/json`
+ *     igual, que es como llega el de quien prueba a mano.
+ *
+ * Un `GET`/`HEAD` no lleva cuerpo —`new Request` tira si se le pone—, así que
+ * ahí lo que el handler parsea es la query: `cuerpo-vacio` va sin query, y
+ * `no-json` lleva las claves de su forma con un valor basura (o una query
+ * basura si su forma no tiene claves). Ninguna variante inválida lleva las
+ * cookies de la forma: son parte del pedido bien formado.
+ *
+ * No es una lista por ruta: las variantes se aplican igual a todo lo que
+ * `readdirSync` encuentra. Y el test «el barrido VE un handler que valida antes
+ * de preguntar» comprueba, con un handler escrito en este archivo, que la forma
+ * sola no lo ve y las variantes sí.
+ */
+type Variante = "forma" | "cuerpo-vacio" | "no-json";
+const VARIANTES: readonly Variante[] = ["forma", "cuerpo-vacio", "no-json"];
+
+/** El cuerpo de `no-json`. La llave sin cerrar es para que ningún parser lo acepte. */
+const NO_JSON = "esto no es json {";
+
+/** El pedido de una variante, y las cookies que lleva. */
+function armarPedido(
+  ruta: string,
+  verbo: string,
+  forma: Forma,
+  variante: Variante
+): { pedido: Request; cookies: Record<string, string> } {
+  const url = new URL(ORIGEN + ruta);
+  const sinCuerpo = verbo === "GET" || verbo === "HEAD";
+
+  if (variante === "forma") {
+    for (const [clave, valor] of Object.entries(forma.query ?? {})) {
+      url.searchParams.set(clave, valor);
+    }
+    const llevaCuerpo = !sinCuerpo && forma.cuerpo !== undefined;
+    return {
+      pedido: new Request(url.toString(), {
+        method: verbo,
+        headers: llevaCuerpo ? { "content-type": "application/json" } : {},
+        body: llevaCuerpo ? JSON.stringify(forma.cuerpo) : undefined,
+      }),
+      cookies: forma.cookies ?? {},
+    };
+  }
+
+  if (sinCuerpo) {
+    if (variante === "no-json") {
+      const claves = Object.keys(forma.query ?? {});
+      if (claves.length === 0) url.search = `?${encodeURIComponent(NO_JSON)}`;
+      for (const clave of claves) url.searchParams.set(clave, NO_JSON);
+    }
+    return { pedido: new Request(url.toString(), { method: verbo }), cookies: {} };
+  }
+
+  return {
+    pedido: new Request(url.toString(), {
+      method: verbo,
+      headers: { "content-type": "application/json" },
+      body: variante === "cuerpo-vacio" ? "{}" : NO_JSON,
+    }),
+    cookies: {},
+  };
+}
+
 /**
  * CÓMO SE LLAMA A CADA RUTA.
  *
@@ -287,16 +389,18 @@ const ESTADO_OAUTH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9
  * cuerpo, qué query y qué cookies hacen falta para que el pedido LLEGUE a la
  * decisión de identidad.
  *
- * Y eso es lo que hace la diferencia entre medir y no medir. Diez de estos
- * handlers corren `zod` ANTES de mirar la sesión, así que un cuerpo vacío da
- * `400` y un barrido que sólo mandara `{}` informaría dieciséis `400` y ningún
- * hallazgo: el `400` de un esquema y el `401` de un guardia se parecen en que
- * los dos son «no», y no se parecen en nada más.
+ * Y eso es lo que hace la diferencia entre medir y no medir. Cuando se
+ * escribió, diez de estos handlers corrían `zod` ANTES de mirar la sesión, así
+ * que un cuerpo vacío daba `400` y un barrido que sólo mandara `{}` habría
+ * informado dieciséis `400` y ningún hallazgo: el `400` de un esquema y el
+ * `401` de un guardia se parecen en que los dos son «no», y no se parecen en
+ * nada más.
+ *
+ * La forma bien formada sigue haciendo falta, pero ya no sola: ver `VARIANTES`.
+ * Ella mide hasta dónde llega un anónimo cuando el esquema no lo frena; las
+ * variantes inválidas miden si el esquema corre antes que la sesión.
  */
-const FORMA_DE_LLAMADA: Record<
-  string,
-  { cuerpo?: unknown; query?: Record<string, string>; cookies?: Record<string, string> }
-> = {
+const FORMA_DE_LLAMADA: Record<string, Forma> = {
   // `scopeId` es obligatorio (route.ts:9); sin él, `zod` contesta antes del guardia.
   "/api/agents/run-all": { cuerpo: { scope: "business", scopeId: "biz-morby" } },
   // `agentId` y `scopeId` obligatorios (route.ts:8-10).
@@ -712,10 +816,21 @@ const EXENCIONES: Array<{
  * la página vive en `/app/reports`. La lista queda vacía a propósito, no se
  * borra: un handler nuevo que nazca abierto tiene que venir a escribirse acá,
  * con motivo, y este comentario es lo que va a leer.
+ *
+ * Y SIGUIÓ VACÍA EL 2026-10-07, cuando las `VARIANTES` de cuerpo inválido
+ * encontraron ocho handlers que contestaban `400` a un anónimo porque corrían
+ * zod antes de la sesión. Los ocho se arreglaron en el mismo PR —la sesión
+ * primero, el mismo movimiento en cada uno— en vez de escribirse acá.
  */
 const ABIERTAS_HOY: Array<{
   ruta: string;
   verbo: string;
+  /**
+   * La variante en la que se midió abierta; sin ella, `forma`. Un handler que
+   * valida antes de la sesión se escribiría con `cuerpo-vacio` y `no-json`,
+   * una entrada cada una, porque con la forma contesta `401`.
+   */
+  variante?: Variante;
   statusMedido: number;
   porque: string;
   queLaCierra: string;
@@ -752,11 +867,21 @@ const ABIERTAS_HOY: Array<{
  * todo el barrido — y el `afterAll` de abajo lo exige con igualdad exacta, así
  * que la fuga no puede volver sin que alguien la escriba acá con nombre.
  */
-const FUGAS_HOY: Array<{ ruta: string; verbo: string; destinos: string[] }> = [];
+const FUGAS_HOY: Array<{ ruta: string; verbo: string; variante?: Variante; destinos: string[] }> = [];
 
-/** La clave con la que un handler medido se busca en las listas de arriba. */
+/**
+ * La clave con la que se cruzan una medición y una entrada de las listas.
+ *
+ * La variante entra en la clave porque una misma ruta puede negar con la forma
+ * y atender con un cuerpo inválido, y ésos son dos hechos distintos: si la
+ * clave fuera sólo verbo y ruta, una medición taparía a la otra.
+ */
+function claveDe(verbo: string, ruta: string, variante: Variante = "forma"): string {
+  return variante === "forma" ? `${verbo} ${ruta}` : `${verbo} ${ruta} [${variante}]`;
+}
+
 function clave(m: Medicion): string {
-  return `${m.verbo} ${m.ruta}`;
+  return claveDe(m.verbo, m.ruta, m.variante);
 }
 
 /**
@@ -830,6 +955,8 @@ interface Medicion {
   ruta: string;
   archivo: string;
   verbo: string;
+  /** Con qué pedido se lo llamó. Ver `VARIANTES`. */
+  variante: Variante;
   /** El status que devolvió la respuesta, o null si el handler tiró. */
   status: number | null;
   /** El mensaje del throw sin atrapar. En Next, esto es un 500. */
@@ -838,6 +965,57 @@ interface Medicion {
   fetchSalientes: string[];
   /** Cuántas veces preguntó quién llama antes de contestar. */
   consultasIdentidad: number;
+}
+
+type Handler = (req: Request, ctx: { params: Promise<object> }) => unknown;
+
+/**
+ * Una llamada sin sesión, con el arnés limpio antes y la ventana cerrada
+ * después. La usan el barrido y el control de las variantes, para que el
+ * control mida con el MISMO instrumento que el barrido.
+ */
+async function llamar(
+  handler: Handler,
+  pedido: Request,
+  cookies: Record<string, string>
+): Promise<Pick<Medicion, "status" | "tiro" | "fetchSalientes" | "consultasIdentidad">> {
+  arnes.cookies.clear();
+  for (const [nombre, valor] of Object.entries(cookies)) arnes.cookies.set(nombre, valor);
+  arnes.salientes.length = 0;
+  arnes.consultasIdentidad = 0;
+
+  let status: number | null = null;
+  let tiro: string | null = null;
+  try {
+    // El segundo argumento va siempre: ninguna ruta de este inventario tiene
+    // segmento dinámico —lo afirma un test de abajo— y pasarlo igual hace que
+    // el día que aparezca uno, el handler reciba la forma que Next le da.
+    const respuesta = await handler(pedido, { params: Promise.resolve({}) });
+    status = (respuesta as Response)?.status ?? null;
+    if (status === null) {
+      tiro = `el handler no devolvió una Response (devolvió ${typeof respuesta})`;
+    }
+  } catch (error) {
+    // Un throw sin atrapar dentro de un route handler es un 500 en Next. Se
+    // registra como tal y no como «no se pudo llamar»: el handler se llamó y
+    // reventó, que es justo el defecto que la propiedad 2 busca.
+    tiro = error instanceof Error ? error.message : String(error);
+  }
+
+  // Cerrar la ventana. El handler ya contestó, pero una llamada diferida
+  // por `setTimeout(..., 0)` o por un `void async` sin `await` todavía no
+  // salió: sin este drenaje la foto se saca antes de la fuga y el barrido
+  // informa cero. Medido por un refutador, verde, con la llamada
+  // disparándose de verdad.
+  await new Promise((listo) => setTimeout(listo, 0));
+  await new Promise((listo) => setImmediate(listo));
+
+  return {
+    status,
+    tiro,
+    fetchSalientes: [...arnes.salientes],
+    consultasIdentidad: arnes.consultasIdentidad,
+  };
 }
 
 const archivos = rutasEnDisco(DIRECTORIO_RUTAS).sort();
@@ -962,61 +1140,17 @@ beforeAll(async () => {
       handlersDescubiertos++;
       if (NO_INVOCABLES.some((n) => n.ruta === ruta && n.verbo === verbo)) continue;
 
-      arnes.cookies.clear();
-      for (const [nombre, valor] of Object.entries(forma.cookies ?? {})) {
-        arnes.cookies.set(nombre, valor);
+      const handler = modulo[verbo] as Handler;
+      for (const variante of VARIANTES) {
+        const { pedido, cookies } = armarPedido(ruta, verbo, forma, variante);
+        mediciones.push({
+          ruta,
+          archivo: path.relative(RAIZ, archivo).replace(/\\/g, "/"),
+          verbo,
+          variante,
+          ...(await llamar(handler, pedido, cookies)),
+        });
       }
-      arnes.salientes.length = 0;
-      arnes.consultasIdentidad = 0;
-
-      const url = new URL(ORIGEN + ruta);
-      for (const [clave, valor] of Object.entries(forma.query ?? {})) {
-        url.searchParams.set(clave, valor);
-      }
-
-      const llevaCuerpo = verbo !== "GET" && verbo !== "HEAD" && forma.cuerpo !== undefined;
-      const pedido = new Request(url.toString(), {
-        method: verbo,
-        headers: llevaCuerpo ? { "content-type": "application/json" } : {},
-        body: llevaCuerpo ? JSON.stringify(forma.cuerpo) : undefined,
-      });
-
-      const handler = modulo[verbo] as (req: Request, ctx: { params: Promise<object> }) => unknown;
-      let status: number | null = null;
-      let tiro: string | null = null;
-      try {
-        // El segundo argumento va siempre: ninguna ruta de este inventario tiene
-        // segmento dinámico —lo afirma un test de abajo— y pasarlo igual hace que
-        // el día que aparezca uno, el handler reciba la forma que Next le da.
-        const respuesta = await handler(pedido, { params: Promise.resolve({}) });
-        status = (respuesta as Response)?.status ?? null;
-        if (status === null) {
-          tiro = `el handler no devolvió una Response (devolvió ${typeof respuesta})`;
-        }
-      } catch (error) {
-        // Un throw sin atrapar dentro de un route handler es un 500 en Next. Se
-        // registra como tal y no como «no se pudo llamar»: el handler se llamó y
-        // reventó, que es justo el defecto que la propiedad 2 busca.
-        tiro = error instanceof Error ? error.message : String(error);
-      }
-
-      // Cerrar la ventana. El handler ya contestó, pero una llamada diferida
-      // por `setTimeout(..., 0)` o por un `void async` sin `await` todavía no
-      // salió: sin este drenaje la foto se saca antes de la fuga y el barrido
-      // informa cero. Medido por un refutador, verde, con la llamada
-      // disparándose de verdad.
-      await new Promise((listo) => setTimeout(listo, 0));
-      await new Promise((listo) => setImmediate(listo));
-
-      mediciones.push({
-        ruta,
-        archivo: path.relative(RAIZ, archivo).replace(/\\/g, "/"),
-        verbo,
-        status,
-        tiro,
-        fetchSalientes: [...arnes.salientes],
-        consultasIdentidad: arnes.consultasIdentidad,
-      });
     }
   }
 }, 120_000);
@@ -1047,7 +1181,7 @@ afterAll(() => {
 /** Lo medido, en una línea legible para el mensaje de una falla. */
 function linea(m: Medicion): string {
   const estado = m.tiro ? `TIRÓ (${m.tiro})` : String(m.status);
-  return `${m.verbo} ${m.ruta} -> ${estado}  [${m.archivo}]`;
+  return `${clave(m)} -> ${estado}  [${m.archivo}]`;
 }
 
 describe("la precondición global se mide llamando, no leyendo", () => {
@@ -1109,11 +1243,66 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       // excepción del arnés, una entrada silenciosa en NO_INVOCABLES— los dos
       // números se separan y esto falla, en vez de que el barrido informe verde
       // sobre los que sí pudo llamar.
-      expect(
-        mediciones.length,
-        `Se descubrieron ${handlersDescubiertos} handlers y se llamaron ${mediciones.length}. ` +
-          "Un handler descubierto y no llamado no está medido."
-      ).toBe(handlersDescubiertos);
+      //
+      // Y la igualdad es POR VARIANTE: un handler llamado con la forma y no con
+      // el cuerpo inválido es exactamente el agujero que dejó pasar el 400 de
+      // evidence-check a producción.
+      for (const variante of VARIANTES) {
+        const llamados = mediciones.filter((m) => m.variante === variante).length;
+        expect(
+          llamados,
+          `Se descubrieron ${handlersDescubiertos} handlers y con la variante «${variante}» se ` +
+            `llamaron ${llamados}. Un handler descubierto y no llamado no está medido.`
+        ).toBe(handlersDescubiertos);
+      }
+      expect(mediciones.length).toBe(handlersDescubiertos * VARIANTES.length);
+    });
+
+    it("el barrido VE un handler que valida el cuerpo antes de preguntar quién llama — y con la forma sola, no", async () => {
+      // El control positivo de las variantes, con el mismo instrumento que el
+      // barrido (`armarPedido` y `llamar`). Este handler es el orden que tenía
+      // `/api/profile/evidence-check` hasta el 2026-10-07: zod, y después la
+      // sesión. Con la forma bien formada pasa por todo —401, y preguntó—, y
+      // por eso el barrido estaba verde con el defecto en producción. Con un
+      // cuerpo inválido contesta el 400 de `apiError` sin haber preguntado, y
+      // ese 400 es lo que «todo handler no exento contesta 401 o 403» rechaza.
+      //
+      // Si alguien vuelve las variantes inofensivas —que manden la forma, o que
+      // dejen de llamarse— esto se pone rojo antes que nada.
+      const esquema = z.object({ businessId: z.string().uuid() });
+      const validaPrimero: Handler = async (req) => {
+        try {
+          esquema.parse(await req.json().catch(() => ({})));
+          const supabase = await createSupabaseServerClient();
+          const {
+            data: { user },
+          } = await supabase.auth.getUser();
+          if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+          return NextResponse.json({ ok: true });
+        } catch (error) {
+          return apiError(error);
+        }
+      };
+      const forma: Forma = { cuerpo: { businessId: "77777777-7777-4777-8777-777777777777" } };
+
+      const medido: Record<string, string> = {};
+      // `apiError` registra el ZodError, que acá es el resultado esperado.
+      const silencio = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        for (const variante of VARIANTES) {
+          const { pedido, cookies } = armarPedido("/api/control-del-barrido", "POST", forma, variante);
+          const r = await llamar(validaPrimero, pedido, cookies);
+          medido[variante] = `${r.status}, ${r.consultasIdentidad} consultas, fetch=${r.fetchSalientes.length}`;
+        }
+      } finally {
+        silencio.mockRestore();
+      }
+
+      expect(medido).toEqual({
+        forma: "401, 1 consultas, fetch=0",
+        "cuerpo-vacio": "400, 0 consultas, fetch=0",
+        "no-json": "400, 0 consultas, fetch=0",
+      });
     });
 
     it("no hay handlers declarados no invocables", () => {
@@ -1153,7 +1342,7 @@ describe("la precondición global se mide llamando, no leyendo", () => {
 
     it("todo handler no exento contesta 401 o 403, salvo los ya medidos como abiertos", () => {
       const exentas = new Set(EXENCIONES.map((e) => e.ruta));
-      const yaAbiertos = new Set(ABIERTAS_HOY.map((a) => `${a.verbo} ${a.ruta}`));
+      const yaAbiertos = new Set(ABIERTAS_HOY.map((a) => claveDe(a.verbo, a.ruta, a.variante)));
       const abiertos = mediciones
         .filter((m) => !exentas.has(m.ruta))
         .filter((m) => m.status !== 401 && m.status !== 403)
@@ -1165,7 +1354,9 @@ describe("la precondición global se mide llamando, no leyendo", () => {
         "Estos handlers atendieron a un llamador SIN SESIÓN con algo que no es una negación, y no " +
           "estaban en la medición del 2026-09-10. Un 200 es la puerta abierta; un 400 de esquema " +
           "es peor que un 401 porque se lee como una negación y no lo es (el pedido murió en zod, " +
-          "el guardia nunca corrió). Un 404 tampoco: puede venir de la RLS y no del handler. O " +
+          "el guardia nunca corrió). Si el 400 sale sólo con [cuerpo-vacio] o [no-json], el " +
+          "handler valida el cuerpo ANTES de preguntar quién llama: la sesión va primero, como en " +
+          "/api/reports/generate. Un 404 tampoco: puede venir de la RLS y no del handler. O " +
           "contestan 401/403, o van a EXENCIONES con motivo, mecanismo, huellas y status " +
           "esperado. Agregarlos a ABIERTAS_HOY es la salida de último recurso y hay que " +
           "justificarla ahí."
@@ -1177,21 +1368,22 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       const vencidas: string[] = [];
 
       for (const a of ABIERTAS_HOY) {
-        const m = porClave.get(`${a.verbo} ${a.ruta}`);
+        const k = claveDe(a.verbo, a.ruta, a.variante);
+        const m = porClave.get(k);
         if (!m) {
-          vencidas.push(`${a.verbo} ${a.ruta}: listada como abierta y el barrido ya no la llama`);
+          vencidas.push(`${k}: listada como abierta y el barrido ya no la llama`);
           continue;
         }
         if (m.status === 401 || m.status === 403) {
           vencidas.push(
-            `${a.verbo} ${a.ruta}: YA ESTÁ CERRADA (contesta ${m.status}). Borrá su entrada de ` +
+            `${k}: YA ESTÁ CERRADA (contesta ${m.status}). Borrá su entrada de ` +
               `ABIERTAS_HOY: dejarla ahí vuelve a permitir que se abra sin que nada falle.`
           );
           continue;
         }
         if (m.status !== a.statusMedido) {
           vencidas.push(
-            `${a.verbo} ${a.ruta}: contesta ${m.status} y su entrada dice ${a.statusMedido}. ` +
+            `${k}: contesta ${m.status} y su entrada dice ${a.statusMedido}. ` +
               `Cambió algo en el camino; releé el motivo antes de actualizar el número.`
           );
         }
@@ -1230,8 +1422,14 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       // identidad: el callback de Google además pide membresía de agencia, o sea
       // que sí pregunta. Esto pone ese hecho en el registro, para que el día que
       // una exención deje de preguntar alguien tenga que venir a decir por qué.
+      //
+      // Con la FORMA, y sólo con ella: con un pedido inválido el callback de
+      // Google niega en el CSRF del `state`, antes de preguntar, y eso es su
+      // mecanismo haciendo su trabajo. Que con las tres variantes conteste el
+      // status declarado lo fija «cada exención contesta exactamente el status
+      // que declaró», que corre sobre todas.
       const registro = EXENCIONES.map((e) => {
-        const m = mediciones.find((x) => x.ruta === e.ruta);
+        const m = mediciones.find((x) => x.ruta === e.ruta && x.variante === "forma");
         return `${e.ruta}: ${m ? m.consultasIdentidad : "no medida"} consultas`;
       }).sort();
 
@@ -1300,7 +1498,9 @@ describe("la precondición global se mide llamando, no leyendo", () => {
        * guardia corta antes de llegar a él, así que el contador vuelve a 1 y
        * esa única pregunta es la del guardia.
        */
-      const m = mediciones.find((x) => x.ruta === "/api/reports/generate" && x.verbo === "POST");
+      const m = mediciones.find(
+        (x) => x.ruta === "/api/reports/generate" && x.verbo === "POST" && x.variante === "forma"
+      );
 
       expect(m, "la ruta del reporte ya no está en el barrido").toBeDefined();
       expect(
@@ -1410,7 +1610,9 @@ describe("la precondición global se mide llamando, no leyendo", () => {
 
   describe("propiedad 3: el espía de fetch en cero", () => {
     it("ningún handler sale a la red sin sesión, salvo la fuga ya medida", () => {
-      const conocidas = new Map(FUGAS_HOY.map((f) => [`${f.verbo} ${f.ruta}`, f.destinos]));
+      const conocidas = new Map(
+        FUGAS_HOY.map((f) => [claveDe(f.verbo, f.ruta, f.variante), f.destinos])
+      );
       const fugas: string[] = [];
 
       for (const m of mediciones) {
@@ -1543,9 +1745,9 @@ describe("la precondición global se mide llamando, no leyendo", () => {
         mediciones.filter((m) => m.fetchSalientes.length > 0).map((m) => [clave(m), m])
       );
 
-      const vencidas = FUGAS_HOY.filter((f) => !medidas.has(`${f.verbo} ${f.ruta}`)).map(
+      const vencidas = FUGAS_HOY.filter((f) => !medidas.has(claveDe(f.verbo, f.ruta, f.variante))).map(
         (f) =>
-          `${f.verbo} ${f.ruta}: listada como fuga y ya no sale a la red sin sesión. Borrá su ` +
+          `${claveDe(f.verbo, f.ruta, f.variante)}: listada como fuga y ya no sale a la red sin sesión. Borrá su ` +
           `entrada de FUGAS_HOY para que el trinquete no vuelva a permitir la que se acaba de cerrar.`
       );
 
@@ -1579,7 +1781,8 @@ describe("la precondición global se mide llamando, no leyendo", () => {
       // puedan pegar a una línea de salida en vez de recordarse.
       const filas = mediciones.map((m) => `  ${linea(m)}  fetch=${m.fetchSalientes.length}`);
       console.log(
-        `\n[precondición] ${mediciones.length} handlers llamados sin sesión:\n${filas.join("\n")}\n`
+        `\n[precondición] ${handlersDescubiertos} handlers llamados sin sesión, ${VARIANTES.length} ` +
+          `veces cada uno (${VARIANTES.join(", ")}):\n${filas.join("\n")}\n`
       );
       expect(filas.length).toBe(mediciones.length);
     });

@@ -53,19 +53,22 @@ const schema = z.object({
 });
 
 export async function POST(req: Request) {
-  // Crear organizaciones es barato para la base y caro para el orden: 20 por
-  // minuto alcanza para una agencia dando de alta clientes y no para un bucle.
-  const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "organizations-create" });
-  if (limitado) return limitado;
-
   try {
-    const entrada = schema.parse(await req.json().catch(() => ({})));
-
+    // La sesión primero, antes del rate limit y de zod: sin ella, 401 y nada
+    // más (el orden de /api/reports/generate; lo mide `precondicionRutas.test.ts`
+    // con un cuerpo inválido).
     const supabase = await createSupabaseServerClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+
+    // Crear organizaciones es barato para la base y caro para el orden: 20 por
+    // minuto alcanza para una agencia dando de alta clientes y no para un bucle.
+    const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "organizations-create" });
+    if (limitado) return limitado;
+
+    const entrada = schema.parse(await req.json().catch(() => ({})));
 
     // La función decide el slug y crea la membresía owner de QUIEN LLAMA. No se
     // le manda ningún usuario: esta ruta no puede dar de alta a nombre de otro

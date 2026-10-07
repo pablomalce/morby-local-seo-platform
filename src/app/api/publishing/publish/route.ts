@@ -80,20 +80,23 @@ const schema = z.object({
 });
 
 export async function POST(req: Request) {
-  // Más apretado que el ensayo —que permite 20/min— porque esto sale a la red de
-  // un tercero y deja una publicación visible. Un ensayo se puede repetir; esto
-  // no.
-  const limitado = rateLimit(req, { limit: 5, windowMs: 60_000, key: "publishing-publish" });
-  if (limitado) return limitado;
-
   try {
-    const { assetId } = schema.parse(await req.json().catch(() => ({})));
-
+    // La sesión primero, antes del rate limit y de zod: sin ella, 401 y nada
+    // más (el orden de /api/reports/generate; lo mide `precondicionRutas.test.ts`
+    // con un cuerpo inválido).
     const supabase = await createSupabaseServerClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+
+    // Más apretado que el ensayo —que permite 20/min— porque esto sale a la red de
+    // un tercero y deja una publicación visible. Un ensayo se puede repetir; esto
+    // no.
+    const limitado = rateLimit(req, { limit: 5, windowMs: 60_000, key: "publishing-publish" });
+    if (limitado) return limitado;
+
+    const { assetId } = schema.parse(await req.json().catch(() => ({})));
 
     const { data: asset, error } = await supabase
       .from("content_assets")
