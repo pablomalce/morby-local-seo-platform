@@ -2,8 +2,14 @@
 --
 -- La lee `supabase/qa/rollback.sh 0029_board`: la siembra sobre una COPIA de la
 -- base ya migrada y exige que `supabase/rollback/0029_board.down.sql` se niegue
--- sin permiso y con el permiso en PGOPTIONS, y que revierta con el permiso dado
--- con SET en la sesión. Ver el encabezado de ese bloque en `rollback.sh`.
+-- sin permiso, con el permiso en PGOPTIONS y con un permiso que no es 'si', y
+-- que revierta con el permiso dado con SET en la sesión, sacando su registro y
+-- consumiendo el permiso. Y la corre OTRA VEZ, sobre otra copia con el tablero
+-- vacío, adentro de una transacción que no confirma hasta que el .down está
+-- esperando un lock: la carrera del lock. Por eso este archivo tiene que poder
+-- correr entero dentro de una transacción abierta, sobre una base sin nada
+-- sembrado —crea su propia persona—. Ver el encabezado de ese bloque en
+-- `rollback.sh`.
 --
 -- UNA tarjeta alcanza: la negativa del .down es «mientras exista una». Datos de
 -- prueba, con «QA» en el nombre, en una base descartable.

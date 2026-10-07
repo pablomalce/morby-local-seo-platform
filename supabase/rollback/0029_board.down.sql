@@ -36,12 +36,21 @@
 -- pasa sin pedir nada. Y `supabase/qa/rollback.sh 0029_board` deja la huella
 -- idéntica (1010 objetos); con el `DELETE` del registro quitado, se pone rojo.
 --
--- Y DESDE EL MISMO DÍA NO SÓLO A MANO: `rollback.sh` siembra una tarjeta
+-- Y NO SÓLO A MANO: `rollback.sh` siembra una tarjeta
 -- (`supabase/qa/down_con_datos/0029_board.sql`) en una copia de la base
--- migrada y exige las tres conductas de arriba —negarse sin permiso, negarse
--- con el permiso en PGOPTIONS nombrándolo, revertir con el SET—. Sin la
--- negativa, sin la comprobación del origen, o negándose siempre, se pone rojo:
--- medido, una mutación por vez (encabezado de la `0029`).
+-- migrada y exige, desde el 2026-10-06, negarse sin permiso, negarse con el
+-- permiso en PGOPTIONS nombrándolo y revertir con el SET; y desde el
+-- 2026-10-07, porque una segunda ronda de verificación encontró cuatro mutantes
+-- de este archivo que lo dejaban en verde: negarse con un permiso que no es
+-- 'si' (`SET ... = 'no'`); al revertir, sacar la fila del registro también en
+-- el camino POBLADO —el chequeo del registro corría sólo sobre la base vacía— y
+-- dejar el permiso vacío en la MISMA sesión —cada paso era un `psql` nuevo y la
+-- sesión moría con el permiso adentro, así que nadie miraba el `RESET` de
+-- abajo—; y, en otra copia con el tablero vacío, negarse a una tarjeta que otra
+-- sesión confirma MIENTRAS esto corre —nadie ejercitaba el lock de abajo, y
+-- sin él el DROP se llevaba esa tarjeta sin permiso—. Cada conducta tiene su
+-- mutación de este archivo medida en rojo, ocho en total (encabezado de la
+-- `0029`).
 --
 -- LAS NEGATIVAS SE PROTEGEN SOLAS: `ON_ERROR_STOP` propio, todo en UNA
 -- transacción, y el lock va ANTES de contar, para que nadie cree una tarjeta
