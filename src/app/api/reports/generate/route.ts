@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { quienLlama } from "@/lib/api/sesion";
 import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import type { ClientSnapshotInput } from "@/lib/reports/orchestrator";
@@ -88,24 +88,18 @@ const schema = z.object({
  * 401 sin sesión y cero fetch.
  */
 export async function POST(req: Request) {
-  // El guardia lleva su propio try, y no es decoración. En "modo demo" —sin
-  // las envs de Supabase, un estado que el middleware documenta y soporta—
-  // `createSupabaseServerClient()` las pasa como `undefined!` y `getUser()`
-  // TIRA. Sin este catch, un anónimo recibía un 500: exactamente lo que el
-  // barrido prohíbe ("un 500 sin sesión significa una de dos cosas, y las dos
-  // son el defecto"), y encima escondiendo la razón.
-  //
-  // Falla CERRADO, como `requireInternalSecret` cuando le falta el secreto: si
-  // no hay proveedor de identidad no hay nadie autenticado, y eso es un 401.
-  let user: { id: string } | null = null;
-  try {
-    const supabase = await createSupabaseServerClient();
-    const { data } = await supabase.auth.getUser();
-    user = data.user;
-  } catch {
-    user = null;
+  // El guardia va fuera del try del trabajo, y no es decoración. En "modo
+  // demo" —sin las envs de Supabase, un estado que el middleware documenta y
+  // soporta— `createSupabaseServerClient()` TIRA, y dentro de ese try un
+  // anónimo recibía lo que contestara el catch: exactamente lo que el barrido
+  // prohíbe ("un 500 sin sesión significa una de dos cosas, y las dos son el
+  // defecto"). Esta ruta lo resolvió primero con un try propio; desde el
+  // 2026-10-07 ese try vive en `quienLlama` (`src/lib/api/sesion.ts`) y lo usa
+  // cada ruta con sesión: falla CERRADO, sin proveedor es nadie, y nadie es un
+  // 401.
+  if (!(await quienLlama())) {
+    return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
-  if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
 
   // Still rate-limited per IP: a report takes 20–40s and costs two PageSpeed
   // calls, so 10/min is generous for a person and a brake for a loop.

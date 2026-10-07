@@ -24,7 +24,7 @@
  * TOKEN, que es uno solo y no es de quien mira.
  */
 
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { quienLlama } from "@/lib/api/sesion";
 import { resolveAgencyOrgId } from "./agency";
 
 /** Por qué alguien no puede operar la conexión de la agencia. */
@@ -54,11 +54,14 @@ export async function esOperadorDeLaAgencia(
   const agencia = resolveAgencyOrgId(env);
   if (!agencia.ok) return { ok: false, reason: "agency-unresolved" };
 
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return { ok: false, reason: "not-authenticated" };
+  // `quienLlama` y no `getUser()` a mano: en modo demo —sin las envs de
+  // Supabase— construir el cliente TIRA, y este guardia no tenía try. MEDIDO el
+  // 2026-10-07 con la variante `sin-proveedor` del barrido: las dos rutas de
+  // OAuth le tiraban un 500 a un anónimo. Sin proveedor no hay nadie, y nadie
+  // va al login como cualquier otro `not-authenticated`.
+  const sesion = await quienLlama();
+  if (!sesion) return { ok: false, reason: "not-authenticated" };
+  const { supabase, user } = sesion;
 
   const { data, error } = await supabase
     .from("org_members")
