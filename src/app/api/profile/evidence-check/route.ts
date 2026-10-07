@@ -12,6 +12,7 @@ import {
 import { dependenciasDeProduccion } from "@/lib/profile/nodeTransport";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { quienLlama } from "@/lib/api/sesion";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -31,10 +32,22 @@ export const maxDuration = 60;
  *
  * EL ORDEN, Y POR QUÉ ES ESTE
  *
- * 1. Rate limit y zod, que no tocan nada.
- * 2. Sesión. Sin ella, 401 ANTES de cualquier lectura y de cualquier salida a
- *    la red: este handler sale a URLs que cargó un usuario, y un anónimo que
+ * 1. Sesión. Sin ella, 401 ANTES de todo lo demás: antes del rate limit, antes
+ *    de leer el cuerpo, antes de cualquier lectura y de cualquier salida a la
+ *    red. Este handler sale a URLs que cargó un usuario, y un anónimo que
  *    pudiera dispararlo tendría un proxy con la IP de la plataforma.
+ *    Hasta el 2026-10-07 el paso 1 era «rate limit y zod, que no tocan nada»,
+ *    y MEDIDO EN PRODUCCIÓN ese día: un anónimo con cuerpo `{}` recibía
+ *    `400 Request could not be processed.` y con cuerpo bien formado `401`.
+ *    No tocaban nada, pero contestaban: a quien no tiene sesión la ruta le
+ *    describía su esquema en vez de negarle la puerta. Es el orden de
+ *    `/api/reports/generate` (#103), y el barrido lo mide con un cuerpo
+ *    inválido además del bien formado.
+ *    «Antes de todo» incluye el `catch` del trabajo: la pregunta es
+ *    `quienLlama()` (`src/lib/api/sesion.ts`), fuera de ese try, porque en
+ *    modo demo —sin las envs de Supabase— construir el cliente TIRA, y ese
+ *    throw caía en el `apiError(error, 500)` de abajo: un anónimo recibía 500.
+ * 2. Rate limit y zod.
  * 3. El negocio, leído COMO EL USUARIO: la RLS le esconde el de otra
  *    organización y recibe 404, igual que quien pide un id inventado.
  * 4. La membresía ACTIVA en la organización dueña del negocio, comprobada en
@@ -135,6 +148,14 @@ export const maxDuration = 60;
  *   R22 la respuesta sin N y M por tipo . . . . . «y la respuesta trae N y M por tipo»
  *   P1  una consulta DNS antes de la sesión . . . el barrido (`precondicionRutas.test.ts`),
  *       que desde esta ronda instrumenta `node:dns`, y «sin sesión» de acá
+ *   P2  zod antes de la sesión (2026-10-07) . . . «sin sesión, un cuerpo que zod rechaza»
+ *       y el barrido con las variantes `cuerpo-vacio`, `no-json` y `no-objeto`
+ *   P3  el rate limit antes de la sesión  . . . . «sin sesión, el rate limit no corre»
+ *       y el barrido, con el limitador siempre agotado
+ *   P4  leer el cuerpo antes de la sesión . . . . «sin sesión, un cuerpo que zod rechaza»
+ *       (`bodyUsed`) y el barrido (`cuerpoTocado`)
+ *   P5  un 500 sin proveedor de identidad . . . . «sin proveedor de identidad» y el barrido
+ *       con la variante `sin-proveedor`
  *
  * R12 a R22 y P1 salieron de refutar la segunda versión: R12, R13, R16 y R20
  * eran garantías que el código cumplía sin que nada lo midiera; R14/R15, R17
@@ -229,19 +250,20 @@ async function sigueVigente(
 }
 
 export async function POST(req: Request) {
-  // Sale a la red una vez por fuente: 5 por minuto alcanza para chequear una
-  // ficha y no para usar la plataforma de rastreador.
-  const limitado = rateLimit(req, { limit: 5, windowMs: 60_000, key: "profile-evidence-check" });
-  if (limitado) return limitado;
+  // Paso 1 del encabezado: la sesión, antes del rate limit y antes de leer el
+  // cuerpo, y FUERA del try del trabajo: sin proveedor de identidad también es
+  // 401 (`quienLlama`), no el 500 de este catch.
+  const sesion = await quienLlama();
+  if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+  const { supabase, user } = sesion;
 
   try {
-    const { businessId } = schema.parse(await req.json().catch(() => ({})));
+    // Sale a la red una vez por fuente: 5 por minuto alcanza para chequear una
+    // ficha y no para usar la plataforma de rastreador.
+    const limitado = rateLimit(req, { limit: 5, windowMs: 60_000, key: "profile-evidence-check" });
+    if (limitado) return limitado;
 
-    const supabase = await createSupabaseServerClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+    const { businessId } = schema.parse(await req.json().catch(() => ({})));
 
     const { data: negocio, error: errorNegocio } = await supabase
       .from("businesses")

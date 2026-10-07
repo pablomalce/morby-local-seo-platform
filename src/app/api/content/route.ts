@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { quienLlama } from "@/lib/api/sesion";
 import type { Locale } from "@/lib/types/core";
 
 export const dynamic = "force-dynamic";
@@ -55,17 +55,18 @@ const schema = z.object({
 });
 
 export async function POST(req: Request) {
-  const limitado = rateLimit(req, { limit: 30, windowMs: 60_000, key: "content-create" });
-  if (limitado) return limitado;
+  // La sesión primero, antes del rate limit, del cuerpo y de zod, y FUERA del
+  // try del trabajo: sin ella —o sin proveedor de identidad, `quienLlama`— 401
+  // y nada más. Lo mide `precondicionRutas.test.ts` con cada variante de pedido.
+  const sesion = await quienLlama();
+  if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+  const { supabase } = sesion;
 
   try {
-    const entrada = schema.parse(await req.json().catch(() => ({})));
+    const limitado = rateLimit(req, { limit: 30, windowMs: 60_000, key: "content-create" });
+    if (limitado) return limitado;
 
-    const supabase = await createSupabaseServerClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+    const entrada = schema.parse(await req.json().catch(() => ({})));
 
     const { data: negocio, error: errorLectura } = await supabase
       .from("businesses")

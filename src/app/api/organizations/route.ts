@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { quienLlama } from "@/lib/api/sesion";
 import type { Locale } from "@/lib/types/core";
 
 export const dynamic = "force-dynamic";
@@ -53,19 +53,20 @@ const schema = z.object({
 });
 
 export async function POST(req: Request) {
-  // Crear organizaciones es barato para la base y caro para el orden: 20 por
-  // minuto alcanza para una agencia dando de alta clientes y no para un bucle.
-  const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "organizations-create" });
-  if (limitado) return limitado;
+  // La sesión primero, antes del rate limit, del cuerpo y de zod, y FUERA del
+  // try del trabajo: sin ella —o sin proveedor de identidad, `quienLlama`— 401
+  // y nada más. Lo mide `precondicionRutas.test.ts` con cada variante de pedido.
+  const sesion = await quienLlama();
+  if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+  const { supabase } = sesion;
 
   try {
-    const entrada = schema.parse(await req.json().catch(() => ({})));
+    // Crear organizaciones es barato para la base y caro para el orden: 20 por
+    // minuto alcanza para una agencia dando de alta clientes y no para un bucle.
+    const limitado = rateLimit(req, { limit: 20, windowMs: 60_000, key: "organizations-create" });
+    if (limitado) return limitado;
 
-    const supabase = await createSupabaseServerClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
+    const entrada = schema.parse(await req.json().catch(() => ({})));
 
     // La función decide el slug y crea la membresía owner de QUIEN LLAMA. No se
     // le manda ningún usuario: esta ruta no puede dar de alta a nombre de otro

@@ -60,6 +60,8 @@ const estado = vi.hoisted(() => ({
   /** Si no es null, cuántas filas dice haber tocado cada UPDATE (un trigger que saltea, una fila borrada). */
   cuentaEscrita: null as number | null,
   rpcs: [] as Array<{ nombre: string; args: Record<string, unknown> }>,
+  /** Modo demo: sin las envs de Supabase, construir el cliente de sesión tira. */
+  sinProveedor: false,
 }));
 
 /** La `url_host` de la 0026, traducida expresión por expresión. */
@@ -148,7 +150,17 @@ function consulta(tabla: string, conRls: boolean) {
 }
 
 vi.mock("@/lib/supabase/server", () => ({
-  createSupabaseServerClient: async () => ({
+  createSupabaseServerClient: async () => {
+    // Lo que tira `createServerClient` de verdad con las envs sin poner.
+    if (estado.sinProveedor) {
+      throw new Error("Your project's URL and Key are required to create a Supabase client!");
+    }
+    return clienteDeSesion();
+  },
+}));
+
+function clienteDeSesion() {
+  return {
     auth: { getUser: async () => ({ data: { user: estado.usuario }, error: null }) },
     from: (tabla: string) => consulta(tabla, true),
     rpc: async (nombre: string, args: Record<string, unknown>) => {
@@ -158,8 +170,8 @@ vi.mock("@/lib/supabase/server", () => ({
       if (nombre === "url_host") return { data: urlHost(args.p_url as string), error: null };
       return { data: null, error: { code: "PGRST202", message: "no existe" } };
     },
-  }),
-}));
+  };
+}
 
 vi.mock("@/lib/supabase/admin", () => ({
   createSupabaseAdminClient: () => {
@@ -240,6 +252,7 @@ beforeEach(() => {
   estado.alSalir = null;
   estado.cuentaEscrita = null;
   estado.rpcs = [];
+  estado.sinProveedor = false;
   estado.tablas = {
     org_members: [
       { organization_id: ORG_A, user_id: ALICIA, state: "active" },
@@ -285,6 +298,62 @@ describe("quién puede correrlo", () => {
     estado.usuario = null;
     const res = await POST(pedido({ businessId: NEGOCIO_A }));
     expect(res.status).toBe(401);
+    expect(estado.lecturas).toEqual([]);
+    expect(estado.red).toEqual([]);
+    expect(estado.adminCreado).toBe(0);
+  });
+
+  it("sin sesión, un cuerpo que zod rechaza también es 401: la sesión va antes del esquema", async () => {
+    // P2. MEDIDO EN PRODUCCIÓN el 2026-10-07: anónimo con `{}` -> 400 «Request
+    // could not be processed.», anónimo con cuerpo bien formado -> 401. El test
+    // de arriba manda un cuerpo válido y por eso no lo veía.
+    estado.usuario = null;
+    const noJson = new Request("http://localhost/api/profile/evidence-check", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": "10.98.0.1" },
+      body: "esto no es json {",
+    });
+    for (const [nombre, req] of [
+      ["{}", pedido({})],
+      ["un businessId que no es uuid", pedido({ businessId: "no-es-un-uuid" })],
+      ["un cuerpo que no es JSON", noJson],
+      ["un cuerpo bien formado", pedido({ businessId: NEGOCIO_A })],
+    ] as const) {
+      const res = await POST(req);
+      expect(res.status, nombre).toBe(401);
+      expect(await res.json(), nombre).toEqual({ error: "not authenticated" });
+      // P4. «401 y nada más» incluye no LEER el cuerpo: un refutador puso
+      // `await req.json()` arriba de la sesión, validó después, y el status de
+      // arriba seguía en 401.
+      expect(req.bodyUsed, `${nombre}: el cuerpo de un anónimo no se lee`).toBe(false);
+    }
+    expect(estado.lecturas).toEqual([]);
+    expect(estado.red).toEqual([]);
+    expect(estado.adminCreado).toBe(0);
+  });
+
+  it("sin sesión, el rate limit no corre: siete anónimos desde una IP son siete 401, no 429", async () => {
+    // P3. El limitador deja pasar cinco por minuto. Consultado ANTES de la
+    // sesión, un refutador midió `[401,401,401,401,401,429,429]`: el sexto
+    // anónimo ya no recibía la negación de identidad sino un 429, y gastaba el
+    // cupo de quien sí tiene sesión desde esa IP.
+    estado.usuario = null;
+    const statuses: number[] = [];
+    for (let i = 0; i < 7; i++) statuses.push((await POST(pedido({ businessId: NEGOCIO_A }, "10.97.0.1"))).status);
+    expect(statuses).toEqual([401, 401, 401, 401, 401, 401, 401]);
+  });
+
+  it("sin proveedor de identidad (modo demo), 401 y no el 500 del catch", async () => {
+    // P5. MEDIDO el 2026-10-07: sin las envs de Supabase construir el cliente
+    // tira, y con la sesión dentro del try del trabajo ese throw caía en
+    // `apiError(error, 500)`. La pregunta vive en `quienLlama`, que falla
+    // cerrado.
+    estado.sinProveedor = true;
+    const req = pedido({ businessId: NEGOCIO_A });
+    const res = await POST(req);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "not authenticated" });
+    expect(req.bodyUsed).toBe(false);
     expect(estado.lecturas).toEqual([]);
     expect(estado.red).toEqual([]);
     expect(estado.adminCreado).toBe(0);
