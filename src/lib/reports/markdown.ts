@@ -36,7 +36,11 @@ function citationLine(c: ProfileCitation | undefined): string {
   }
   switch (c.status) {
     case "cited":
-      return `Written against strategic profile **version ${c.version}**, published ${new Date(c.publishedAt).toLocaleDateString()} — version id \`${c.versionId}\`.`;
+      return (
+        `Written against strategic profile **version ${c.version}**, published ${new Date(c.publishedAt).toLocaleDateString()} — version id \`${c.versionId}\`.` +
+        "\n\n" +
+        icpLines(c.icp)
+      );
     case "none":
       return "No strategic profile has been published for this business yet, so this report cites none.";
     case "demo":
@@ -44,6 +48,33 @@ function citationLine(c: ProfileCitation | undefined): string {
     case "error":
       return `The strategic profile could not be read (${c.reason}), so this report cites none. This is a failure on our side, not a missing profile.`;
   }
+}
+
+/**
+ * El ICP de la versión citada (H1.3), en el texto que el cliente se lleva.
+ *
+ * Es la mitad de Growth OS de la puerta «cambiar el ICP una vez cambia el
+ * prompt del Lead Engine Y el texto del reporte»: el ICP sale de la cita, que
+ * sale de la misma lectura que sirve la ficha al Lead Engine. No hay un ICP
+ * escrito acá ni uno por defecto: si la versión no tiene, se dice.
+ *
+ * Tres casos y no dos. `undefined` es un reporte guardado entre H1.2 y H1.3 —
+ * citaba la versión y todavía no traía su ICP— y vuelve así del historial de
+ * `localStorage`; exportarlo no puede reventar ni fingir un ICP vacío. `null`
+ * es una versión publicada sin ICP, que la base permite.
+ */
+function icpLines(icp: Extract<ProfileCitation, { status: "cited" }>["icp"] | undefined): string {
+  if (icp === undefined) {
+    return "This report was generated before reports showed the ideal customer profile (ICP) of the version they cite.";
+  }
+  if (icp === null) {
+    return "This version of the strategic profile has no ideal customer profile (ICP).";
+  }
+  const lineas = [`**Ideal customer profile (ICP):** ${icp.definition}`];
+  if (icp.disqualifiers) lineas.push(`- **Disqualifiers:** ${icp.disqualifiers}`);
+  if (icp.buyingTrigger) lineas.push(`- **Buying trigger:** ${icp.buyingTrigger}`);
+  if (icp.budgetBand) lineas.push(`- **Budget band:** ${icp.budgetBand}`);
+  return lineas.join("\n");
 }
 
 export function reportToMarkdown(r: Report): string {
