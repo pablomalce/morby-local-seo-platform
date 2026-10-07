@@ -15,6 +15,7 @@
 
 import "server-only";
 import { buildBusinessSnapshot, businesses, locations, services } from "@/lib/mock/universal";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
@@ -217,13 +218,146 @@ async function hydrateWithPlaces(snap: BusinessSnapshot): Promise<DataSourceHeal
 const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Cuánto puede estar en el FUTURO un `fetched_at` y seguir sirviéndose.
+ *
+ * El `fetched_at` lo pone `lookupPageSpeed` con el reloj de ESTE servidor en el
+ * momento en que Google contestó, así que uno futuro sólo puede venir de dos
+ * lados: el reloj de otra instancia adelantado unos milisegundos, o una fila
+ * que no escribió este código. La segunda existió: hasta la `0030`, cualquier
+ * cuenta escribía la fila con el `fetched_at` que quisiera, y con uno en el año
+ * 2999 la cuenta `ahora - fetched_at < TTL` da negativo, o sea «fresca», PARA
+ * SIEMPRE: nunca se volvía a preguntar a Google ni se pisaba la fila. Medido en
+ * la réplica y con este archivo el 2026-10-07.
+ *
+ * Cinco minutos cubren de sobra el primer caso y le ponen techo al segundo: lo
+ * más que una fila con fecha futura puede durar es el TTL más este margen.
+ */
+const PAGESPEED_RELOJ_MS = 5 * 60 * 1000;
+
+type WebVitals = NonNullable<BusinessSnapshot["webVitals"]>;
+
+/**
+ * LA CACHÉ DE PAGESPEED ES DE CADA ORGANIZACIÓN, Y LA TOCA SÓLO EL SERVIDOR (0030)
+ *
+ * Con `service_role` —`createSupabaseAdminClient`— y NUNCA con la sesión. Medido
+ * en producción el 2026-10-06: con la sesión de por medio, la tabla tenía que
+ * estar abierta a quien la sesión representa, y eso era `anon` para leer —la
+ * lista de URLs de los clientes, con la clave del bundle— y `authenticated` para
+ * escribir, con el alta de cuentas abierta: cualquiera con un correo
+ * upserteaba un resultado inventado para la URL de un cliente y este archivo lo
+ * servía 24 h en su reporte. La `0030` le saca la tabla a los dos; con la sesión,
+ * estas dos funciones sólo verían 42501.
+ *
+ * Y POR ORGANIZACIÓN, porque el servidor solo no alcanzaba. `service_role`
+ * saltea la RLS, y con la clave por URL sola el servidor hacía de diputado
+ * confundido: medido el 2026-10-07, una cuenta recién registrada pedía un
+ * reporte con la URL de un cliente ajeno —por `clientSnapshot`, o creando en su
+ * propia organización un negocio con esa web, que el alta le deja hacer— y el
+ * servidor le contestaba desde la caché del cliente: sin llamar a Google, en
+ * milisegundos y con el `fetchedAt` del último reporte del cliente. Era un
+ * oráculo de «¿esta URL es cliente de alguien acá, y cuándo fue su último
+ * reporte?», sobre el mismo activo que la `0030` vino a cerrar. Con la clave
+ * `(organization_id, url, strategy)` cada organización sólo se encuentra a sí
+ * misma, y el `organization_id` sale del negocio que la sesión LEYÓ de la base
+ * bajo su RLS, nunca del pedido.
+ *
+ * Sin organización —el reporte de demostración y el de `clientSnapshot`— no hay
+ * caché: ni se lee ni se escribe, igual que la sonda de más abajo. Esos
+ * reportes van siempre a Google.
+ *
+ * SIGUE SIENDO BEST-EFFORT, PERO NO EN SILENCIO
+ *
+ * Un fallo de caché no tumba el reporte: una lectura que falla es «no hay
+ * caché» y la consulta va a Google; una escritura que falla deja el reporte
+ * como estaba. Lo que cambia es que ya no se traga: hasta la `0030`, el error de
+ * PostgREST se descartaba sin mirarlo, y un permiso denegado —el estado en que
+ * deja la `0030` al código viejo— se veía igual que una caché vacía, con cada
+ * reporte gastando cuota de Google sin que nada lo dijera. Ahora queda en el log
+ * con el CÓDIGO y no con el mensaje, que puede nombrar tablas (la lección de
+ * #104, la misma que sigue el INSERT de `reports` más abajo). Ni la URL ni la
+ * organización van al log: la URL es justamente lo que esto protege.
+ *
+ * Y el cliente de servicio TIRA si le faltan sus variables —
+ * `SUPABASE_SERVICE_ROLE_KEY` sin cargar en un deploy—, por eso el `try`: es lo
+ * mismo que hace `guardarSonda`, y por el mismo motivo.
+ */
+function avisarCache(paso: "lectura" | "escritura", motivo: string): void {
+  console.warn(`[pagespeed-cache] ${paso}: ${motivo}`);
+}
+
+/**
+ * Las tres columnas de la clave primaria de la `0030`, en su orden. El upsert
+ * las nombra en vez de confiar en el default de PostgREST, y el test lo afirma:
+ * un `ignoreDuplicates` o un `onConflict` que no sea la clave cambia qué hace el
+ * upsert sin que nada se rompa a la vista.
+ */
+const CLAVE_DE_LA_CACHE = "organization_id,url,strategy";
+
+async function leerPageSpeedCacheado(
+  organizationId: string,
+  url: string,
+  strategy: string
+): Promise<{ result: WebVitals; fetched_at: string } | null> {
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data, error } = await admin
+      .from("pagespeed_cache")
+      .select("result, fetched_at")
+      .eq("organization_id", organizationId)
+      .eq("url", url)
+      .eq("strategy", strategy)
+      .maybeSingle();
+    if (error) {
+      avisarCache("lectura", error.code || "sin código");
+      return null;
+    }
+    return (data as { result: WebVitals; fetched_at: string } | null) ?? null;
+  } catch {
+    avisarCache("lectura", "el cliente de servicio no se pudo crear o tiró");
+    return null;
+  }
+}
+
+async function guardarPageSpeedEnCache(
+  organizationId: string,
+  url: string,
+  strategy: string,
+  webVitals: WebVitals
+): Promise<void> {
+  try {
+    const admin = createSupabaseAdminClient();
+    const { error } = await admin
+      .from("pagespeed_cache")
+      .upsert(
+        { organization_id: organizationId, url, strategy, result: webVitals, fetched_at: webVitals.fetchedAt },
+        { onConflict: CLAVE_DE_LA_CACHE }
+      );
+    if (error) avisarCache("escritura", error.code || "sin código");
+  } catch {
+    avisarCache("escritura", "el cliente de servicio no se pudo crear o tiró");
+  }
+}
+
+/**
+ * Si una fila de la caché se puede servir. `invalida` es un `fetched_at` que no
+ * se puede leer o que está más allá de `PAGESPEED_RELOJ_MS` en el futuro: no la
+ * escribió una consulta de este servidor, y se trata como si no estuviera.
+ */
+function frescura(fetchedAt: string, ahora: number): "fresca" | "vencida" | "invalida" {
+  const medida = Date.parse(fetchedAt);
+  if (!Number.isFinite(medida) || medida - ahora > PAGESPEED_RELOJ_MS) return "invalida";
+  return ahora - medida < PAGESPEED_TTL_MS ? "fresca" : "vencida";
+}
+
+/**
  * Hydrate the snapshot with real Core Web Vitals from Google PageSpeed Insights.
  * Returns the resulting DataSourceHealth status so the report shows provenance.
  *
  * Caching strategy: PageSpeed is slow (15–40s) and flaky on slow sites, so we cache only
- * SUCCESSFUL results in the `pagespeed_cache` table (keyed by url+strategy, 24h TTL). A fresh hit
- * is served instantly and survives redeploys; failures are never cached. All cache access is
- * best-effort — if the table/RLS isn't present yet, we transparently fall back to a live call.
+ * SUCCESSFUL results in the `pagespeed_cache` table (keyed by organization+url+strategy, 24h
+ * TTL). A fresh hit is served instantly and survives redeploys; failures are never cached. All
+ * cache access is best-effort, server-only and per organization — see `leerPageSpeedCacheado`
+ * above for why, and why its failures are logged instead of swallowed.
  *
  * POR QUÉ ADEMÁS ANOTA UNA SONDA
  *
@@ -237,7 +371,7 @@ const PAGESPEED_TTL_MS = 24 * 60 * 60 * 1000;
  * se anota nada: la tabla tiene `organization_id NOT NULL`, y una demo no tiene
  * organización. Sólo se anota cuando de verdad hubo una llamada — un cache hit no
  * consultó a Google, así que declarar `ok` sería afirmar sobre una consulta que
- * no ocurrió.
+ * no ocurrió. La caché sigue la misma regla, por el motivo de su encabezado.
  */
 async function hydrateWithPageSpeed(
   snap: BusinessSnapshot,
@@ -248,21 +382,21 @@ async function hydrateWithPageSpeed(
   if (!website) return "missing";
   const strategy = "mobile";
 
-  const supabase = await createSupabaseServerClient();
-
-  // 1. Serve a fresh cached good result if we have one.
-  const { data: cached } = await supabase
-    .from("pagespeed_cache")
-    .select("result, fetched_at")
-    .eq("url", website)
-    .eq("strategy", strategy)
-    .maybeSingle();
-  if (cached && Date.now() - new Date(cached.fetched_at).getTime() < PAGESPEED_TTL_MS) {
-    snap.webVitals = cached.result as BusinessSnapshot["webVitals"];
-    return "live";
+  // 1. Serve a fresh cached good result if this organization has one.
+  if (organizationId) {
+    const cached = await leerPageSpeedCacheado(organizationId, website, strategy);
+    if (cached) {
+      const estado = frescura(cached.fetched_at, Date.now());
+      if (estado === "fresca") {
+        snap.webVitals = cached.result;
+        return "live";
+      }
+      // La fila se ignora y el upsert de abajo la pisa con lo que conteste Google.
+      if (estado === "invalida") avisarCache("lectura", "fetched_at futuro o ilegible, se ignora la fila");
+    }
   }
 
-  // 2. Cache miss / stale → fresh lookup.
+  // 2. Cache miss / stale / no organization → fresh lookup.
   const result = await lookupPageSpeed({ url: website, strategy });
 
   // La sonda va antes de mirar el resultado, y se guarda también cuando salió
@@ -287,9 +421,10 @@ async function hydrateWithPageSpeed(
     };
     snap.webVitals = webVitals;
     // 3. Cache the good result (best-effort — never block the report on a cache write).
-    await supabase
-      .from("pagespeed_cache")
-      .upsert({ url: website, strategy, result: webVitals, fetched_at: webVitals.fetchedAt });
+    // `webVitals` sale de `result`, o sea de la respuesta de Google a este
+    // servidor; del pedido no llega nada a esta fila, y la URL y la organización
+    // salen del negocio que la sesión leyó de la base.
+    if (organizationId) await guardarPageSpeedEnCache(organizationId, website, strategy, webVitals);
     return "live";
   }
   if (result.status === "missing-key") return "missing";

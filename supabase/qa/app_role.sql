@@ -151,6 +151,28 @@ BEGIN
 END
 $$;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Y NADA sobre `pagespeed_cache` desde la 0030: ni leer.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Por lo mismo que `ingest_events`, y las dos direcciones duelen igual que allá:
+-- LEER es la lista de URLs de los clientes —la clave de la tabla—, y ESCRIBIR es
+-- poner un resultado inventado en el reporte de otra organización durante 24 h.
+-- La 0030 le saca todo a `anon` y a `authenticated` y deja sólo a
+-- `service_role`; el GRANT sobre ALL TABLES de más arriba se lo devolvería entero
+-- a este rol, y entonces la suite mediría una sesión que puede lo que la de
+-- producción ya no. El bloque 140 de defects_test.sql lo mide.
+--
+-- Guardado con `to_regclass` aunque la tabla existe desde la 0002: `rollback.sh
+-- 0002_pagespeed_cache` aplica este archivo sobre una base que sólo tiene la
+-- 0001, y sin la guarda muere ahí.
+DO $$
+BEGIN
+    IF to_regclass('public.pagespeed_cache') IS NOT NULL THEN
+        REVOKE ALL ON public.pagespeed_cache FROM growthos_app;
+    END IF;
+END
+$$;
+
 GRANT SELECT ON auth.users TO growthos_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public, auth TO growthos_app;
 

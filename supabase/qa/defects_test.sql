@@ -1,4 +1,4 @@
--- A hundred and thirty-five isolation checks against the Growth OS schema — executable.
+-- A hundred and forty-three isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -479,8 +479,10 @@ WHERE tg.tgrelid = 'public.businesses'::regclass
 -- the next table that ships this way instead of only the one that did.
 --
 -- SELECT is out of scope on purpose: a policy that lets everyone READ may be a
--- deliberate decision, and pagespeed_cache is one -- it holds PageSpeed scores
--- of public websites keyed by URL, with nothing tenant-scoped to leak.
+-- deliberate decision. pagespeed_cache used to be cited here as one, and it was
+-- the wrong example: its key is the URL of a client, so reading it is reading
+-- the client list -- measured in production on 2026-10-06. 0030 closed it, and
+-- blocks 136 to 141 measure that, including the read this check never looks at.
 
 RESET ROLE;
 
@@ -6943,10 +6945,456 @@ SELECT 135, 'una persona que se niega en una nieta de la organización traba la 
   FROM h31_negativas;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 136 a 143. La caché de PageSpeed, de cada organización y sólo del servidor —
+-- CERRADO por la 0030
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que la lista de clientes no se pueda leer con la clave del bundle,
+-- que nadie que no sea el servidor escriba lo que un reporte presenta como
+-- medido por Google, y que la caché de una organización no conteste por otra.
+--
+-- Medido en producción el 2026-10-06, y ninguno de los 120 bloques de entonces
+-- lo veía: el 10 sólo mira policies de ESCRITURA que aplican a PUBLIC —la `0005`
+-- las había pasado a `authenticated`, así que daba verde—, y declaraba el SELECT
+-- abierto de esta tabla como una decisión deliberada. Era la decisión
+-- equivocada: la clave de la tabla es la URL del cliente. Y la escritura de
+-- `authenticated` no protegía nada con el alta de cuentas abierta. Ver el
+-- encabezado de la `0030`.
+--
+-- NUMERACIÓN: 121 a 135 son del tablero (`0029`, rama
+-- `feat/el-tablero-nace-con-la-llave`), que se mergea antes que éstos. En una
+-- base sin la `0029` el conteo de abajo es 128 y no 143; con las dos, 143.
+--
+-- CADA ROL SE MIDE DOS VECES, y las dos hacen falta. Por PRIVILEGIO, en el
+-- catálogo, porque es lo que dice qué puede pasar mañana con una policy nueva.
+-- Y por INTENTO, ejecutando como ese rol el SELECT, el upsert y el INSERT que
+-- PostgREST haría, porque el catálogo dice qué privilegio hay y no qué pasa. El
+-- intento se afirma por MENSAJE y no sólo por SQLSTATE: una policy que rechaza
+-- una fila también da 42501 («new row violates row-level security policy»), y
+-- eso sería la RLS conteniendo un privilegio que no tendría que estar — la
+-- lección del bloque 54 con el Vault.
+--
+-- Y EL PRIVILEGIO ES DE TABLA Y DE COLUMNA. La primera versión de estos bloques
+-- preguntaba con `has_table_privilege`, que mira sólo el nivel de tabla, y
+-- leía `relacl` y no `attacl`. Medido el 2026-10-07: con un `GRANT INSERT (url,
+-- strategy, result, fetched_at) ... TO anon, authenticated` los 126 de entonces
+-- seguían en verde —el único intento era el upsert, que además pide UPDATE y
+-- SELECT y moría igual en el privilegio—, y un INSERT plano como `anon` pasaba
+-- el privilegio y lo frenaba recién la RLS. Por eso el catálogo se pregunta con
+-- `has_any_column_privilege` donde existe, el intento incluye el INSERT plano, y
+-- el 140 lee las dos ACL.
+--
+-- Y LA TABLA NO ES EL ÚNICO CAMINO. Una función SECURITY DEFINER o una vista
+-- sobre esta tabla corren como su dueño, `postgres`, que tiene BYPASSRLS; y los
+-- default privileges de `postgres` en `public` le dan EXECUTE y SELECT a `anon`
+-- y `authenticated` en todo lo nuevo, sin un GRANT a mano. Medido el
+-- 2026-10-07: con una función que lee la fila y otra que la upsertea, `anon`
+-- leía el 91 y lo pisaba con un 3, y los 126 de entonces seguían en verde. Eso
+-- es el 142.
+--
+-- FIXTURES PROPIAS: dos personas dadas de alta por el alta real
+-- (`handle_new_user`), cada una con su organización. La del CLIENTE es dueña de
+-- la fila de caché, escrita como `postgres` —el dueño, con BYPASSRLS en la
+-- imagen de Supabase—. La RECIÉN REGISTRADA no tiene relación con ese cliente:
+-- es exactamente quien hizo el envenenamiento medido. Los intentos de escritura
+-- corren SIN HUELLA (ver `error_sin_huella`), así que la fila sigue diciendo 91
+-- para el 141 y existiendo para el 143.
+
+RESET ROLE;
+
+INSERT INTO auth.users (id, email) VALUES
+    ('d0300000-0030-4030-8030-000000000001', 'recien-registrada@example.test'),
+    ('d0300000-0030-4030-8030-000000000002', 'cliente-de-la-agencia@example.test');
+
+SELECT set_config('qa.psc_org_sonda', (SELECT organization_id::text FROM org_members
+         WHERE user_id = 'd0300000-0030-4030-8030-000000000001' AND role = 'owner'), true);
+SELECT set_config('qa.psc_org_cliente', (SELECT organization_id::text FROM org_members
+         WHERE user_id = 'd0300000-0030-4030-8030-000000000002' AND role = 'owner'), true);
+
+INSERT INTO public.pagespeed_cache (organization_id, url, strategy, result, fetched_at)
+VALUES (current_setting('qa.psc_org_cliente')::uuid, 'https://cliente-de-la-agencia.example', 'mobile',
+        '{"lcp": 2100, "inp": 180, "cls": 0.05, "lighthouseScore": 91, "fetchedAt": "2026-10-06T00:00:00.000Z"}',
+        now());
+
+-- Anti-vacuidad: un SELECT que «no ve nada» sobre una tabla vacía no mide un
+-- cierre, una persona sin organización no es alguien recién registrado, y dos
+-- personas en la misma organización no miden nada entre organizaciones.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM public.pagespeed_cache
+         WHERE url = 'https://cliente-de-la-agencia.example') <> 1 THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 136 a 143 no dejó UNA fila en la caché.';
+    END IF;
+    IF current_setting('qa.psc_org_sonda', true) IS NULL
+       OR current_setting('qa.psc_org_cliente', true) IS NULL
+       OR current_setting('qa.psc_org_sonda') = current_setting('qa.psc_org_cliente') THEN
+        RAISE EXCEPTION 'Vacuous run: las dos personas de los bloques 136 a 143 no pasaron por el alta real, o comparten organización.';
+    END IF;
+END
+$$;
+
+-- Como `sqlstate_sin_huella()`, pero devuelve también el MENSAJE: acá dos
+-- negativas distintas —privilegio y policy— comparten el 42501, y lo que se
+-- afirma es cuál de las dos fue. NULL quiere decir «fue aceptada», y en ese caso
+-- su efecto ya se deshizo.
+CREATE OR REPLACE FUNCTION pg_temp.error_sin_huella(p_sql text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+    BEGIN
+        EXECUTE p_sql;
+        RAISE EXCEPTION 'qa: deshacer el intento' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN NULL;
+    END;
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' | ' || SQLERRM;
+END
+$$;
+
+-- Lo que PostgREST ejecuta con `GET /rest/v1/pagespeed_cache?select=url`, con
+-- el upsert del orquestador viejo y con un INSERT a secas, armado como
+-- `postgres` y viajando por un GUC como en los bloques 49 y 51: `anon` y
+-- `authenticated` no escriben en `defect_report`, y darles ese permiso sería
+-- ensancharles los privilegios a los roles que estos bloques miden.
+--
+-- El upsert pisa la fila del cliente con un 3 y un `fetched_at` en el año 2999:
+-- la forma exacta del envenenamiento que, antes de la `0030`, quedaba «fresco»
+-- para siempre. El INSERT es una URL que todavía no está en la caché, que es
+-- el envenenamiento que no necesita UPDATE ni SELECT.
+SELECT set_config('qa.psc_leer', 'SELECT count(*) FROM public.pagespeed_cache', true);
+SELECT set_config('qa.psc_envenenar', format($s$
+    INSERT INTO public.pagespeed_cache (organization_id, url, strategy, result, fetched_at)
+    VALUES (%L, 'https://cliente-de-la-agencia.example', 'mobile',
+            '{"lcp": 9999, "inp": 9999, "cls": 1, "lighthouseScore": 3, "fetchedAt": "2999-01-01T00:00:00.000Z"}',
+            '2999-01-01T00:00:00Z')
+    ON CONFLICT (organization_id, url, strategy) DO UPDATE
+       SET result = EXCLUDED.result, fetched_at = EXCLUDED.fetched_at
+$s$, current_setting('qa.psc_org_cliente')), true);
+SELECT set_config('qa.psc_insertar', format($s$
+    INSERT INTO public.pagespeed_cache (organization_id, url, strategy, result, fetched_at)
+    VALUES (%L, 'https://nuevo-cliente.example', 'mobile', '{"lighthouseScore": 3}', now())
+$s$, current_setting('qa.psc_org_cliente')), true);
+SELECT set_config('qa.psc_denegado', '42501 | permission denied for table pagespeed_cache', true);
+
+-- Los privilegios de escritura, uno por uno para que la evidencia diga cuál
+-- sobra. REFERENCES, TRIGGER y MAINTAIN no escriben una fila, y están igual: la
+-- `0030` revoca ALL, y un privilegio que nadie necesita es uno que no se deja.
+CREATE TEMP TABLE psc_escritura (privilegio text) ON COMMIT DROP;
+INSERT INTO psc_escritura VALUES
+    ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN');
+
+-- Los que sobran para un rol, de tabla o de columna. INSERT, UPDATE y
+-- REFERENCES existen también por columna, y `has_any_column_privilege` los ve
+-- en los dos niveles; los otros cuatro sólo existen por tabla. La evidencia dice
+-- «por columna» cuando el de tabla no está.
+CREATE OR REPLACE FUNCTION pg_temp.psc_sobran(p_rol text) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT string_agg(privilegio ||
+               CASE WHEN has_table_privilege(p_rol, 'public.pagespeed_cache', privilegio)
+                    THEN '' ELSE ' por columna' END,
+               ', ' ORDER BY privilegio)
+      FROM psc_escritura
+     WHERE has_table_privilege(p_rol, 'public.pagespeed_cache', privilegio)
+        OR (privilegio IN ('INSERT', 'UPDATE', 'REFERENCES')
+            AND has_any_column_privilege(p_rol, 'public.pagespeed_cache', privilegio));
+$$;
+
+-- ── 136 ──────────────────────────────────────────────────────────────────────
+-- `anon` LEE la caché: la lista de clientes, con la clave del bundle y sin
+-- sesión. Es el defecto 1 de la `0030`, el que se midió en producción.
+SET LOCAL ROLE anon;
+SELECT set_config('qa.b136', pg_temp.escalar(current_setting('qa.psc_leer')), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 136, 'anon puede leer la caché de PageSpeed, o sea la lista de clientes',
+       has_any_column_privilege('anon', 'public.pagespeed_cache', 'SELECT')
+         OR current_setting('qa.b136') <> 'ERROR ' || current_setting('qa.psc_denegado'),
+       'privilegio SELECT de anon, de tabla o de alguna columna: ' ||
+       has_any_column_privilege('anon', 'public.pagespeed_cache', 'SELECT')::text ||
+       '; el SELECT como anon dio: ' || current_setting('qa.b136') ||
+       ' (se espera ERROR ' || current_setting('qa.psc_denegado') || ')';
+
+-- ── 137 ──────────────────────────────────────────────────────────────────────
+-- `anon` ESCRIBE la caché. Cerrado desde la `0005` por privilegio; se vuelve a
+-- medir porque la `0030` toca el mismo GRANT, y porque el intento es la única
+-- forma de saber que no lo para una policy en vez del privilegio.
+SET LOCAL ROLE anon;
+SELECT set_config('qa.b137a',
+       coalesce(pg_temp.error_sin_huella(current_setting('qa.psc_envenenar')), 'ACEPTADO'), true);
+SELECT set_config('qa.b137b',
+       coalesce(pg_temp.error_sin_huella(current_setting('qa.psc_insertar')), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 137, 'anon puede escribir la caché de PageSpeed',
+       coalesce(sobran, '') <> ''
+         OR current_setting('qa.b137a') <> current_setting('qa.psc_denegado')
+         OR current_setting('qa.b137b') <> current_setting('qa.psc_denegado'),
+       'privilegios de escritura de anon: [' || coalesce(sobran, '') ||
+       ']; el upsert como anon dio: ' || current_setting('qa.b137a') ||
+       '; el INSERT como anon dio: ' || current_setting('qa.b137b') ||
+       ' (se espera ' || current_setting('qa.psc_denegado') || ' en los dos)'
+  FROM (SELECT pg_temp.psc_sobran('anon') AS sobran) x;
+
+-- ── 138 ──────────────────────────────────────────────────────────────────────
+-- `authenticated` LEE la caché. Con el alta abierta, «tener sesión» es «tener
+-- un correo»: lo mismo que el 136, con un paso más.
+SELECT pg_temp.be('d0300000-0030-4030-8030-000000000001');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b138', pg_temp.escalar(current_setting('qa.psc_leer')), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 138, 'una sesión cualquiera puede leer la caché de PageSpeed',
+       has_any_column_privilege('authenticated', 'public.pagespeed_cache', 'SELECT')
+         OR current_setting('qa.b138') <> 'ERROR ' || current_setting('qa.psc_denegado'),
+       'privilegio SELECT de authenticated, de tabla o de alguna columna: ' ||
+       has_any_column_privilege('authenticated', 'public.pagespeed_cache', 'SELECT')::text ||
+       '; el SELECT de una persona recién registrada dio: ' || current_setting('qa.b138') ||
+       ' (se espera ERROR ' || current_setting('qa.psc_denegado') || ')';
+
+-- ── 139 ──────────────────────────────────────────────────────────────────────
+-- `authenticated` ESCRIBE la caché: el envenenamiento, ejecutado. Una persona
+-- recién registrada upsertea un 3 de Lighthouse, con fecha del año 2999, en la
+-- fila de un cliente que no es suyo, e inserta una URL nueva a nombre de esa
+-- organización; con la `0005`, entraba y se servía en el reporte del cliente.
+SELECT pg_temp.be('d0300000-0030-4030-8030-000000000001');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b139a',
+       coalesce(pg_temp.error_sin_huella(current_setting('qa.psc_envenenar')), 'ACEPTADO'), true);
+SELECT set_config('qa.b139b',
+       coalesce(pg_temp.error_sin_huella(current_setting('qa.psc_insertar')), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 139, 'una sesión cualquiera puede escribir el resultado de PageSpeed del reporte de otro',
+       coalesce(sobran, '') <> ''
+         OR current_setting('qa.b139a') <> current_setting('qa.psc_denegado')
+         OR current_setting('qa.b139b') <> current_setting('qa.psc_denegado'),
+       'privilegios de escritura de authenticated: [' || coalesce(sobran, '') ||
+       ']; el upsert de una persona recién registrada sobre la fila de un cliente dio: ' ||
+       current_setting('qa.b139a') || '; su INSERT dio: ' || current_setting('qa.b139b') ||
+       ' (se espera ' || current_setting('qa.psc_denegado') || ' en los dos)'
+  FROM (SELECT pg_temp.psc_sobran('authenticated') AS sobran) x;
+
+-- ── 140 ──────────────────────────────────────────────────────────────────────
+-- LA SEGUNDA CAPA, por catálogo. Del 136 al 139 los para el privilegio; esto es
+-- lo que los sigue parando el día que alguien devuelva un GRANT —los default
+-- privileges de Supabase lo hacen solos en cada tabla nueva, y un `GRANT ... ON
+-- ALL TABLES` como el de la `0010` lo haría con ésta—:
+--
+--   * ninguna policy de la tabla alcanza a PUBLIC, `anon` o `authenticated`
+--     (con RLS y sin policy, un GRANT devuelto da cero filas y no una fuga);
+--   * la RLS sigue ENABLE y FORCE;
+--   * PUBLIC, `anon`, `authenticated` y `growthos_app` no tienen ningún
+--     privilegio, ni en la tabla (`relacl`) ni en una columna (`attacl`). El
+--     último es el rol con el que la suite hace de aplicación: si `app_role.sql`
+--     dejara de revocárselo, mediría una sesión más laxa que la de producción.
+--
+-- Cada condición pone el bloque en rojo por sí sola, y la evidencia dice cuál.
+INSERT INTO defect_report
+SELECT 140, 'algo que no es el servidor sigue alcanzando la caché de PageSpeed por policy, RLS o privilegio',
+       coalesce(policies, '') <> '' OR NOT (rls AND forzada) OR coalesce(acl, '') <> ''
+         OR coalesce(columnas, '') <> '',
+       'policies para PUBLIC/anon/authenticated: [' || coalesce(policies, '') ||
+       ']; RLS enable=' || rls || ' force=' || forzada ||
+       '; privilegios de tabla de PUBLIC, anon, authenticated o growthos_app: [' || coalesce(acl, '') ||
+       ']; de columna: [' || coalesce(columnas, '') || ']'
+  FROM (SELECT
+          (SELECT string_agg(p.polname, ', ' ORDER BY p.polname)
+             FROM pg_policy p
+            WHERE p.polrelid = 'public.pagespeed_cache'::regclass
+              AND (p.polroles && ARRAY[0::oid, 'anon'::regrole::oid, 'authenticated'::regrole::oid])) AS policies,
+          c.relrowsecurity AS rls,
+          c.relforcerowsecurity AS forzada,
+          (SELECT string_agg(CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END
+                             || ' ' || a.privilege_type, ', ' ORDER BY a.grantee, a.privilege_type)
+             FROM aclexplode(c.relacl) a
+            WHERE a.grantee IN (0, 'anon'::regrole::oid, 'authenticated'::regrole::oid,
+                                'growthos_app'::regrole::oid)) AS acl,
+          (SELECT string_agg(t.attname || ' ' ||
+                             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END
+                             || ' ' || a.privilege_type, ', ' ORDER BY t.attname, a.grantee, a.privilege_type)
+             FROM pg_attribute t, LATERAL aclexplode(t.attacl) a
+            WHERE t.attrelid = c.oid AND t.attnum > 0 AND NOT t.attisdropped
+              AND a.grantee IN (0, 'anon'::regrole::oid, 'authenticated'::regrole::oid,
+                                'growthos_app'::regrole::oid)) AS columnas
+          FROM pg_class c
+         WHERE c.oid = 'public.pagespeed_cache'::regclass) x;
+
+-- ── 141 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO: `service_role` —el rol de `createSupabaseAdminClient`,
+-- con el que el orquestador lee y escribe desde la `0030`— lee la fila del
+-- cliente, la upsertea por el camino del conflicto de la clave nueva (que pide
+-- SELECT, INSERT y UPDATE), guarda la MISMA URL para OTRA organización sin
+-- chocar —eso es la clave por organización, y con la vieja `(url, strategy)`
+-- muere con 23505— y la puede borrar. Sin este bloque, una migración que
+-- cerrara la tabla también para el servidor pondría del 136 al 140 en verde con
+-- la caché muerta: cada reporte volvería a gastar cuota de Google, y nada lo
+-- diría.
+SET LOCAL ROLE service_role;
+SELECT set_config('qa.b141a', pg_temp.escalar(format($s$
+    SELECT result->>'lighthouseScore' FROM public.pagespeed_cache
+     WHERE organization_id = %L AND url = 'https://cliente-de-la-agencia.example' AND strategy = 'mobile'
+$s$, current_setting('qa.psc_org_cliente'))), true);
+SELECT set_config('qa.b141b', coalesce(pg_temp.error_sin_huella(format($s$
+    INSERT INTO public.pagespeed_cache (organization_id, url, strategy, result, fetched_at)
+    VALUES (%L, 'https://cliente-de-la-agencia.example', 'mobile', '{"lighthouseScore": 92}', now())
+    ON CONFLICT (organization_id, url, strategy) DO UPDATE
+       SET result = EXCLUDED.result, fetched_at = EXCLUDED.fetched_at
+$s$, current_setting('qa.psc_org_cliente'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b141c', coalesce(pg_temp.error_sin_huella(format($s$
+    INSERT INTO public.pagespeed_cache (organization_id, url, strategy, result, fetched_at)
+    VALUES (%L, 'https://cliente-de-la-agencia.example', 'mobile', '{"lighthouseScore": 40}', now())
+$s$, current_setting('qa.psc_org_sonda'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b141d', coalesce(pg_temp.error_sin_huella(format($s$
+    DELETE FROM public.pagespeed_cache WHERE organization_id = %L
+$s$, current_setting('qa.psc_org_cliente'))), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 141, 'el servidor no puede leer, escribir por organización o purgar la caché de PageSpeed',
+       NOT (current_setting('qa.b141a') = '91'
+            AND current_setting('qa.b141b') = 'ACEPTADO'
+            AND current_setting('qa.b141c') = 'ACEPTADO'
+            AND current_setting('qa.b141d') = 'ACEPTADO'),
+       'service_role leyendo la fila del cliente dio: ' || current_setting('qa.b141a') ||
+       ' (se espera 91); su upsert por (organization_id, url, strategy) dio: ' || current_setting('qa.b141b') ||
+       '; la misma URL para otra organización dio: ' || current_setting('qa.b141c') ||
+       '; su DELETE dio: ' || current_setting('qa.b141d') || ' (se esperan los tres ACEPTADO)';
+
+-- ── 142 ──────────────────────────────────────────────────────────────────────
+-- NADA MÁS EN LA BASE ALCANZA LA TABLA. Del 136 al 140 miran la tabla; esto
+-- mira lo que podría llegar a ella sin pasar por sus privilegios:
+--
+--   * una VISTA o una REGLA cuya reescritura la nombra: corre como su dueño,
+--     y `postgres` tiene BYPASSRLS, así que el FORCE tampoco la frena;
+--   * una FUNCIÓN que la nombra, por texto (`prosrc`) o por dependencia (un
+--     cuerpo `BEGIN ATOMIC` no deja texto, deja `pg_depend`). Cualquier
+--     función y no sólo las SECURITY DEFINER: una INVOKER llamada desde una
+--     DEFINER que no nombra la tabla corre con los privilegios de la de afuera;
+--   * una FK de otra tabla que la referencia: el chequeo de la FK corre como
+--     el dueño, y un INSERT en la otra tabla contesta si la fila existe.
+--
+-- Hoy no hay ninguno de los cuatro (medido el 2026-10-07: `pg_rewrite` sin
+-- nada que dependa de la tabla, y ningún `prosrc` con «pagespeed»). La caché la
+-- toca el orquestador por PostgREST con `service_role`, y nada en la base tiene
+-- por qué nombrarla. Lo que NO ve: SQL dinámico que arme el nombre por partes
+-- (`'pagespeed' || '_cache'`). Eso no lo ve ningún catálogo.
+--
+-- Las funciones de `pg_temp` quedan fuera —las de este archivo nombran la
+-- tabla— y las de una extensión también: no son de este repositorio.
+CREATE OR REPLACE FUNCTION pg_temp.psc_caminos() RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT string_agg(camino, '; ' ORDER BY camino) FROM (
+        SELECT DISTINCT 'relación ' || r.ev_class::regclass::text AS camino
+          FROM pg_depend d
+          JOIN pg_rewrite r ON r.oid = d.objid
+         WHERE d.classid = 'pg_rewrite'::regclass
+           AND d.refclassid = 'pg_class'::regclass
+           AND d.refobjid = 'public.pagespeed_cache'::regclass
+           AND r.ev_class <> 'public.pagespeed_cache'::regclass
+        UNION
+        SELECT DISTINCT 'función ' || p.oid::regprocedure::text
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+           AND n.nspname NOT LIKE 'pg_temp%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend e
+                            WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.deptype = 'e')
+           AND (p.prosrc ILIKE '%pagespeed_cache%'
+                OR EXISTS (SELECT 1 FROM pg_depend d
+                            WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                              AND d.refclassid = 'pg_class'::regclass
+                              AND d.refobjid = 'public.pagespeed_cache'::regclass))
+        UNION
+        SELECT 'FK ' || co.conrelid::regclass::text || '.' || co.conname
+          FROM pg_constraint co
+         WHERE co.contype = 'f'
+           AND co.confrelid = 'public.pagespeed_cache'::regclass
+           AND co.conrelid <> 'public.pagespeed_cache'::regclass
+    ) x;
+$$;
+
+-- EL CONTROL DEL DETECTOR. Cero caminos sobre una consulta que no sabe
+-- encontrarlos no mide nada, así que acá se arman los cuatro —una función de
+-- texto, una `BEGIN ATOMIC`, una vista y una FK— en una subtransacción que se
+-- deshace, y el detector los tiene que nombrar a los cuatro. La FK se arma
+-- sobre la clave primaria que la tabla TENGA, leída del catálogo: si no, un
+-- cambio de clave abortaría el archivo acá en vez de ponerse rojo donde se mide.
+DO $$
+DECLARE
+    clave  text;
+    vistos text;
+BEGIN
+    BEGIN
+        SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord) INTO clave
+          FROM pg_constraint c,
+               unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+          JOIN pg_attribute a ON a.attrelid = 'public.pagespeed_cache'::regclass AND a.attnum = k.attnum
+         WHERE c.conrelid = 'public.pagespeed_cache'::regclass AND c.contype = 'p';
+
+        EXECUTE $f$CREATE FUNCTION public.qa_psc_leer(p_url text) RETURNS jsonb
+            LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+            AS 'SELECT result FROM public.pagespeed_cache WHERE url = p_url'$f$;
+        EXECUTE $f$CREATE FUNCTION public.qa_psc_contar() RETURNS bigint
+            LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+            BEGIN ATOMIC SELECT count(*) FROM public.pagespeed_cache; END$f$;
+        EXECUTE 'CREATE VIEW public.qa_psc_sitios AS SELECT url FROM public.pagespeed_cache';
+        EXECUTE format('CREATE TABLE public.qa_psc_sonda AS SELECT %s FROM public.pagespeed_cache WITH NO DATA', clave);
+        EXECUTE format('ALTER TABLE public.qa_psc_sonda ADD CONSTRAINT qa_psc_sonda_fkey
+                            FOREIGN KEY (%s) REFERENCES public.pagespeed_cache (%s)', clave, clave);
+
+        vistos := pg_temp.psc_caminos();
+        RAISE EXCEPTION 'qa: deshacer el control' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        NULL;
+    END;
+    PERFORM set_config('qa.b142_control', coalesce(vistos, ''), true);
+END
+$$;
+
+INSERT INTO defect_report
+SELECT 142, 'una vista, regla, función o FK de otra tabla alcanza la caché de PageSpeed sin pasar por sus privilegios',
+       coalesce(caminos, '') <> '' OR control <> esperado,
+       'caminos hacia la tabla: [' || coalesce(caminos, '') ||
+       ']; el detector, con cuatro caminos armados a propósito, vio: [' || control ||
+       '] (se espera [' || esperado || '])'
+  FROM (SELECT pg_temp.psc_caminos() AS caminos,
+               current_setting('qa.b142_control') AS control,
+               'FK qa_psc_sonda.qa_psc_sonda_fkey; función qa_psc_contar(); ' ||
+               'función qa_psc_leer(text); relación qa_psc_sitios' AS esperado) x;
+
+-- ── 143 ──────────────────────────────────────────────────────────────────────
+-- LA BAJA DE UN CLIENTE SE LLEVA SUS URLs. Hasta la `0030` la tabla no tenía
+-- organización, así que la baja de un cliente dejaba su web en la caché para
+-- siempre: en la tabla que `anon` leía. La FK con cascada es la que lo impide,
+-- y esto la mide por su efecto, con la misma baja del 118: la organización del
+-- cliente, borrada como `service_role`, tiene que pasar al COMMIT sin dejar
+-- nada en ninguna tabla con `organization_id`.
+--
+-- Anti-vacuidad: la organización tiene que tener SU fila en la caché antes de
+-- la baja; sin ella, «no quedó nada» no mediría la cascada.
+SELECT set_config('qa.b143', pg_temp.al_commit(
+           format('DELETE FROM organizations WHERE id = %L', current_setting('qa.psc_org_cliente')),
+           'service_role', current_setting('qa.psc_org_cliente')::uuid), true);
+
+INSERT INTO defect_report
+SELECT 143, 'la baja de una organización deja sus URLs en la caché de PageSpeed, o no se puede dar',
+       NOT (resultado ~ '^paso; [0-9]+ tablas; quedaron: \[\]$' AND tenia = 1),
+       'la organización del cliente tenía ' || tenia || ' fila(s) en la caché (se espera 1); ' ||
+       'su baja como service_role devolvió: ' || resultado
+  FROM (SELECT current_setting('qa.b143') AS resultado,
+               (SELECT count(*) FROM public.pagespeed_cache
+                 WHERE organization_id = current_setting('qa.psc_org_cliente')::uuid) AS tenia) x;
+
+RESET ROLE;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and thirty-five checks were written, so a hundred
--- and thirty-five rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and forty-three checks were written, so a hundred
+-- and forty-three rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -6962,8 +7410,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 135 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 135 checks recorded a result.', checks;
+    IF checks <> 143 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 143 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -6974,11 +7422,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 135 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 143 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 135 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 143 checks green: the schema prevents every one of them.';
 END
 $$;
 
