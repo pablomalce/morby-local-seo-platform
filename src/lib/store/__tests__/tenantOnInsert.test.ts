@@ -41,9 +41,15 @@ const SRC = path.join(process.cwd(), "src");
  * The child tables from 0003/0004 that carry a tenant of their own.
  *
  * `businesses` is not here: it is the parent, and its `organization_id` is the
- * one every row below is compared against. `pagespeed_cache` is not here
- * either — it is keyed by URL and has no tenant column, and since 0030 only
- * the server reads or writes it (checks 136 to 141).
+ * one every row below is compared against.
+ *
+ * `pagespeed_cache` is the one entry that is not a child of `businesses`. Until
+ * 0030 it was keyed by URL alone and shared by every organisation; 0030 made
+ * `organization_id` part of its primary key, because a cache shared across
+ * tenants and read with `service_role` answered "is this URL somebody's client"
+ * to anyone who asked the server. Its only writer is the orchestrator's upsert,
+ * and an upsert without the column would be refused by NOT NULL — the same
+ * failure this list exists to catch before it ships.
  */
 const TENANT_SCOPED = [
   "business_locations",
@@ -56,6 +62,7 @@ const TENANT_SCOPED = [
   "platform_tasks",
   "social_image_assets",
   "agent_runs",
+  "pagespeed_cache",
 ];
 
 function sourceFiles(dir: string): string[] {

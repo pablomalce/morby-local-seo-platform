@@ -8,16 +8,27 @@
 --     la lista de URLs de los clientes, sin sesión;
 --   * `authenticated` —cualquiera que se registre: el alta está abierta— vuelve
 --     a ESCRIBIRLA, y un resultado inventado para la URL de un cliente se sirve
---     24 h en su reporte.
+--     24 h en su reporte (o para siempre, con un `fetched_at` futuro, si el
+--     código también se revierte);
+--   * la clave vuelve a ser la URL sola, compartida entre organizaciones.
 --
--- No se pierde ningún dato: la `0030` no borró filas y esto tampoco. Lo que se
--- pierde es el cierre.
+-- SE BORRA LA CACHÉ, Y TIENE QUE SER ASÍ
 --
--- EL CÓDIGO NO HACE FALTA REVERTIRLO, y conviene no hacerlo. El orquestador que
--- llegó con la `0030` lee y escribe con `service_role`, que conserva SELECT,
--- INSERT, UPDATE y DELETE en las dos direcciones (y ALL después de esto, como
--- antes), así que sigue andando sobre el esquema revertido. Revertir el código
--- devolvería la escritura a la sesión, que es la mitad del agujero.
+-- Las filas de la `0030` son de una organización cada una, y dos
+-- organizaciones pueden tener la misma URL. De vuelta a la clave `(url,
+-- strategy)`, esas dos filas chocan y el `ADD PRIMARY KEY` aborta con 23505
+-- (medido). Y si no chocaran, sería peor: la entrada de una organización
+-- quedaría servida en el reporte de la otra, en una tabla que `anon` vuelve a
+-- leer. Elegir cuál de las dos sobrevive sería inventar. Es una caché: lo que
+-- se pierde cuesta una consulta a Google por sitio en el próximo reporte, igual
+-- que cuando la `0030` borró lo que había.
+--
+-- EL CÓDIGO NO HACE FALTA REVERTIRLO, PERO SIN LA 0030 SU CACHÉ NO ANDA. El
+-- orquestador que llegó con la `0030` lee y escribe con `service_role`
+-- filtrando por `organization_id`; sobre el esquema revertido esa columna no
+-- existe, así que la lectura da 42703 y el upsert PGRST204, los dos al log, y
+-- cada reporte va a Google. Nada se cae. Revertir el código devolvería la
+-- escritura a la sesión, que es la mitad del agujero.
 --
 -- QUÉ RESTAURA, EXACTAMENTE
 --
@@ -29,8 +40,10 @@
 --   authenticated  SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER
 --   service_role   ALL                           (la `0010`)
 --
--- y las tres policies con la forma que les dejó la `0005`: la de lectura sin rol
--- —o sea PUBLIC—, las de escritura `TO authenticated`.
+-- la clave primaria `(url, strategy)` con su nombre de siempre, sin
+-- `organization_id` ni su FK, y las tres policies con la forma que les dejó la
+-- `0005`: la de lectura sin rol —o sea PUBLIC—, las de escritura
+-- `TO authenticated`.
 --
 -- QUÉ NO TOCA
 --
@@ -43,12 +56,20 @@
 --
 -- En una transacción y con `ON_ERROR_STOP` propio, como los `.down` de la `0026`
 -- a la `0028`: a medias, este archivo dejaría las policies sin el privilegio que
--- las hace alcanzables, o al revés, y un `psql -f` a secas sigue de largo
--- después de un error.
+-- las hace alcanzables, o la tabla sin clave, y un `psql -f` a secas sigue de
+-- largo después de un error.
 
 \set ON_ERROR_STOP on
 
 BEGIN;
+
+DELETE FROM public.pagespeed_cache;
+
+-- La clave, de vuelta a la URL sola. La columna se lleva su FK.
+ALTER TABLE public.pagespeed_cache DROP CONSTRAINT pagespeed_cache_pkey;
+ALTER TABLE public.pagespeed_cache DROP COLUMN organization_id;
+ALTER TABLE public.pagespeed_cache
+    ADD CONSTRAINT pagespeed_cache_pkey PRIMARY KEY (url, strategy);
 
 DROP POLICY IF EXISTS "pagespeed_cache_select" ON public.pagespeed_cache;
 CREATE POLICY "pagespeed_cache_select" ON public.pagespeed_cache
@@ -65,6 +86,8 @@ CREATE POLICY "pagespeed_cache_update" ON public.pagespeed_cache
 GRANT SELECT, REFERENCES, TRIGGER ON public.pagespeed_cache TO anon;
 GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER ON public.pagespeed_cache TO authenticated;
 GRANT ALL ON public.pagespeed_cache TO service_role;
+
+NOTIFY pgrst, 'reload schema';
 
 -- Aparte de la huella, y no es redundante: `schema_fingerprint.sql` compara
 -- OBJETOS, no contenido de tablas, así que un .down que se olvide esta línea
