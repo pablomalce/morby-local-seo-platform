@@ -20,6 +20,13 @@
  * el motor dice `none` sin cita; la frase de `error` es la de `none`; el id va
  * recortado a ocho caracteres; y sin la guarda de `undefined`, el export de un
  * reporte viejo tira un TypeError.
+ *
+ * Y desde H1.3, que el texto del reporte NO muestre el ICP de la versión que
+ * cita —la mitad de Growth OS de «cambiar el ICP una vez cambia el prompt del
+ * Lead Engine y el texto del reporte»—, o que lo invente cuando la versión no
+ * tiene, o que un reporte guardado entre H1.2 y H1.3 (cita sin `icp`) reviente
+ * el export. Las mutaciones de este tramo están en el bloque «el ICP de la
+ * versión citada», con su resultado.
  */
 import { describe, expect, it } from "vitest";
 
@@ -53,7 +60,13 @@ function seccion(md: string): string {
 describe("la cita a la ficha en el reporte que el cliente se lleva", () => {
   it("cita: la versión y el id ENTERO, que es lo que se resuelve con un select", () => {
     const md = reportToMarkdown(
-      reporte({ status: "cited", versionId: V, version: 3, publishedAt: "2026-09-01T10:00:00.000Z" }),
+      reporte({
+        status: "cited",
+        versionId: V,
+        version: 3,
+        publishedAt: "2026-09-01T10:00:00.000Z",
+        icp: null,
+      }),
     );
 
     const s = seccion(md);
@@ -90,5 +103,89 @@ describe("la cita a la ficha en el reporte que el cliente se lleva", () => {
 
     expect(r.profileCitation).toEqual({ status: "demo" });
     expect(seccion(reportToMarkdown(r))).toContain("Demo report");
+  });
+});
+
+/**
+ * EL ICP DE LA VERSIÓN CITADA (H1.3)
+ *
+ * MEDIDO CON `scripts/mutar.sh` (2026-10-07), cada una sola contra el árbol
+ * entero (832 tests); todas CAYERON y todas acá. Entre paréntesis, lo que cayó
+ * además en orchestrator.profileCitation.test.ts:
+ *
+ *   markdown.ts                                             cae
+ *   ─────────────────────────────────────────────────────── ──────────────────
+ *   `icpLines(c.icp)` sale de la línea de la cita           1, 2, 3, 4 (9, 11)
+ *   la definición no se imprime (sólo la etiqueta)          1, 2 (9)
+ *   `icp === null` pasa a `icp == undefined`                3 (11)
+ *   sin la guarda de `undefined` (TypeError en .definition) 4
+ *   los opcionales se imprimen aunque sean null             2
+ */
+describe("el ICP de la versión citada, en el texto que el cliente se lleva", () => {
+  const NONCE = "icp-nonce-7f3c9a1e-unico-en-esta-corrida";
+  const citada = (icp: Extract<ProfileCitation, { status: "cited" }>["icp"]): ProfileCitation => ({
+    status: "cited",
+    versionId: V,
+    version: 4,
+    publishedAt: "2026-10-01T10:00:00.000Z",
+    icp,
+  });
+
+  it("1. la definición del ICP de la versión citada aparece en la sección, entera", () => {
+    const s = seccion(
+      reportToMarkdown(
+        reporte(
+          citada({
+            definition: `Clínicas dentales de Estocolmo ${NONCE}`,
+            disqualifiers: "cadenas con más de 20 sedes",
+            buyingTrigger: "abren una segunda sede",
+            budgetBand: "2-5k SEK/mes",
+          }),
+        ),
+      ),
+    );
+
+    expect(s).toContain(`\`${V}\``);
+    expect(s).toContain(`Clínicas dentales de Estocolmo ${NONCE}`);
+    expect(s).toContain("cadenas con más de 20 sedes");
+    expect(s).toContain("abren una segunda sede");
+    expect(s).toContain("2-5k SEK/mes");
+  });
+
+  it("2. los campos opcionales ausentes no se imprimen como `null`", () => {
+    const s = seccion(
+      reportToMarkdown(
+        reporte(citada({ definition: NONCE, disqualifiers: null, buyingTrigger: null, budgetBand: null })),
+      ),
+    );
+
+    expect(s).toContain(NONCE);
+    expect(s).not.toContain("null");
+    expect(s).not.toContain("Disqualifiers");
+    expect(s).not.toContain("Buying trigger");
+    expect(s).not.toContain("Budget band");
+  });
+
+  it("3. una versión publicada SIN ICP lo dice, y no inventa uno", () => {
+    const s = seccion(reportToMarkdown(reporte(citada(null))));
+
+    // La cita sigue: la versión existe y se citó.
+    expect(s).toContain(`\`${V}\``);
+    expect(s).toContain("has no ideal customer profile");
+    expect(s).not.toContain("Ideal customer profile (ICP):**");
+    expect(s).not.toContain("generated before reports showed");
+  });
+
+  it("4. un reporte guardado entre H1.2 y H1.3 (cita sin `icp`) se exporta y dice que es viejo", () => {
+    // Es lo que vuelve del historial de `localStorage`: la cita de H1.2 no
+    // tenía `icp`. El tipo dice que el campo existe; el JSON guardado, no.
+    const vieja = { status: "cited", versionId: V, version: 2, publishedAt: "2026-09-15T10:00:00.000Z" };
+    const r = reporte(vieja as ProfileCitation);
+
+    const s = seccion(reportToMarkdown(r));
+
+    expect(s).toContain(`\`${V}\``);
+    expect(s).toContain("generated before reports showed the ideal customer profile");
+    expect(s).not.toContain("has no ideal customer profile");
   });
 });

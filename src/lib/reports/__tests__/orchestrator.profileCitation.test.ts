@@ -51,6 +51,19 @@
  *
  * La del `select` sin `id` es la que la revisión encontró viva: el doble
  * devolvía la fila entera y el test comparaba la proyección por substring.
+ *
+ * DESDE H1.3 la lectura vive en `src/lib/profile/fichaPublicada.ts`, la misma
+ * que sirve la ficha al Lead Engine, y el reporte muestra el ICP DE LA VERSIÓN
+ * QUE CITA. Los casos 8 a 11 nombran sus modos de fallo:
+ *
+ * 8. El ICP se busca por otra cosa que el id de la versión citada (la empresa,
+ *    «el más nuevo»): el texto y la cita se separan.
+ * 9. Cambiar el ICP —publicar otra versión— y regenerar no cambia el texto del
+ *    reporte: es la mitad de Growth OS de la puerta H1.3, con un nonce.
+ * 10. Una lectura del ICP que falla se presenta como «la versión no tiene ICP».
+ * 11. Una versión sin ICP inventa uno, o deja de citarse.
+ *
+ * Las mutaciones de este tramo están en el bloque de esos casos.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -79,7 +92,18 @@ const NEGOCIO_EN_BASE = {
   created_at: "2026-01-01T00:00:00.000Z",
 };
 
-type Fila = { id: string; version: number; published_at: string };
+/**
+ * La fila de `company_profiles`. Sin `organization_id` ni `business_id`, es la
+ * del par que se pidió —como con los filtros puestos—; el test 12 la pone de
+ * OTRO par para simular una consulta que perdió el filtro.
+ */
+type Fila = {
+  id: string;
+  version: number;
+  published_at: string;
+  organization_id?: string;
+  business_id?: string;
+};
 
 /** La versión publicada que `company_profiles` devuelve. Cada test la define. */
 let publicada: Fila | null = null;
@@ -87,6 +111,23 @@ let publicada: Fila | null = null;
 let errorDeFicha: { code?: string; message: string } | null = null;
 /** Un fallo del INSERT de `reports`, cuando el test lo pide. */
 let errorDeInsert: { code?: string; message: string } | null = null;
+
+type FilaIcp = {
+  definition: string;
+  disqualifiers: string | null;
+  buying_trigger: string | null;
+  budget_band: string | null;
+};
+/**
+ * Las filas de `profile_icp`, por id de VERSIÓN. El doble sólo devuelve la de
+ * la versión que la consulta pide con `.eq("profile_id", …)`, como la base: un
+ * ICP buscado por otra cosa no encuentra nada, o encuentra el de otra versión.
+ */
+let icpPorVersion: Record<string, FilaIcp> = {};
+/** Un fallo de lectura del ICP, cuando el test lo pide. */
+let errorDeIcp: { code?: string; message: string } | null = null;
+/** Cada consulta al ICP: sus filtros, en orden, y cómo terminó. */
+let consultasAlIcp: { filtros: [string, unknown][]; columnas?: string; terminal?: string }[] = [];
 let haySesion = true;
 
 /** Cada consulta a la ficha: sus filtros, en orden, y cómo terminó. */
@@ -104,9 +145,12 @@ function columnasDe(proyeccion: string | undefined): string[] {
 
 function proyectar(fila: Fila | null, proyeccion: string | undefined): Record<string, unknown> | null {
   if (!fila) return null;
+  const completa: Fila = { organization_id: ORG, business_id: NEGOCIO, ...fila };
   const columnas = columnasDe(proyeccion);
-  if (columnas.includes("*")) return { ...fila };
-  return Object.fromEntries(columnas.filter((c) => c in fila).map((c) => [c, fila[c as keyof Fila]]));
+  if (columnas.includes("*")) return { ...completa };
+  return Object.fromEntries(
+    columnas.filter((c) => c in completa).map((c) => [c, completa[c as keyof Fila]])
+  );
 }
 
 const createSupabaseServerClient = vi.fn(async () => ({
@@ -120,6 +164,7 @@ const createSupabaseServerClient = vi.fn(async () => ({
       terminal: undefined as string | undefined,
     };
     if (tabla === "company_profiles") consultasALaFicha.push(consulta);
+    if (tabla === "profile_icp") consultasAlIcp.push(consulta);
 
     const respuesta = () => {
       if (tabla === "businesses") return { data: NEGOCIO_EN_BASE, error: null };
@@ -150,6 +195,14 @@ const createSupabaseServerClient = vi.fn(async () => ({
           // published_at")` —sin `id`— dejaba los siete tests verdes y en
           // producción citaba `undefined`. Lo encontró la revisión adversarial.
           return { data: proyectar(publicada, consulta.columnas), error: null };
+        }
+        if (tabla === "profile_icp") {
+          if (errorDeIcp) return { data: null, error: errorDeIcp };
+          // Como la base: el ICP de la versión que pide el filtro, y sólo si el
+          // filtro de tenant es el de la organización del negocio.
+          const filtros = Object.fromEntries(consulta.filtros);
+          if (filtros.organization_id !== ORG) return { data: null, error: null };
+          return { data: icpPorVersion[String(filtros.profile_id)] ?? null, error: null };
         }
         return { data: null, error: null };
       },
@@ -190,6 +243,9 @@ beforeEach(() => {
   publicada = null;
   errorDeFicha = null;
   errorDeInsert = null;
+  icpPorVersion = {};
+  errorDeIcp = null;
+  consultasAlIcp = [];
   haySesion = true;
   consultasALaFicha = [];
   insertados = [];
@@ -218,6 +274,7 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
       versionId: V1,
       version: 3,
       publishedAt: "2026-09-01T10:00:00.000Z",
+      icp: null,
     });
     expect(insertados).toHaveLength(1);
     expect(insertados[0].profile_version_id).toBe(V1);
@@ -246,7 +303,14 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
     expect(consulta.terminal).toBe("maybeSingle");
     // Por TOKENS y no por substring: la primera versión hacía
     // `toContain("id")` sobre el texto, y "business_id" lo satisfacía.
-    expect(columnasDe(consulta.columnas).sort()).toEqual(["id", "published_at", "version"]);
+    // Y el par de la fila, que `leerFichaPublicada` compara con el pedido.
+    expect(columnasDe(consulta.columnas).sort()).toEqual([
+      "business_id",
+      "id",
+      "organization_id",
+      "published_at",
+      "version",
+    ]);
   });
 
   it("3. cambiar la ficha y regenerar el MISMO reporte cita un id distinto (la mitad c)", async () => {
@@ -343,5 +407,125 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
     // log del servidor y no hay por qué nombrar el esquema ahí tampoco.
     await expect(intento).rejects.not.toThrow(/reports_profile_version_fkey/);
     expect(insertados).toHaveLength(1);
+  });
+});
+
+/**
+ * EL REPORTE MUESTRA EL ICP DE LA VERSIÓN QUE CITA (H1.3)
+ *
+ * MEDIDO CON `scripts/mutar.sh` (2026-10-07), cada una sola contra el árbol
+ * entero (832 tests); todas CAYERON. Lo que cayó en este archivo; las que
+ * además cayeron en la ruta (`src/app/api/profile/published`) están en la
+ * tabla de su test:
+ *
+ *   fichaPublicada.ts / orchestrator.ts                       cae acá
+ *   ───────────────────────────────────────────────────────── ─────────────
+ *   el ICP se busca sin el filtro de `organization_id`         8, 9
+ *   el ICP se busca por `business_id` y no por la versión      8, 9
+ *   `.maybeSingle()` del ICP pasa a `.single()`                1, 8, 9, 10, 11
+ *   un error del ICP se ignora                                 10
+ *   el fallo lleva el error entero y no el código              5, 10
+ *   la cita no lleva el ICP (`icp: null` fijo)                 8, 9
+ *   un fallo de la ficha se cita como `none`                   5, 10
+ *   la versión se busca sin `organization_id`                  2
+ *   la versión publicada pasa a ser la borrador                2
+ *
+ * El `.single()` hace caer el 1 porque, como PostgREST, cero filas con
+ * `single` es un error: una versión sin ICP dejaría de citarse.
+ */
+describe("el reporte muestra el ICP de la versión que cita (H1.3)", () => {
+  const NONCE_A = "nonce-a-3b9e0c71-icp-de-la-version-1";
+  const NONCE_B = "nonce-b-c5d2e8f4-icp-de-la-version-2";
+
+  function icp(definition: string): FilaIcp {
+    return { definition, disqualifiers: null, buying_trigger: "abre otra sede", budget_band: null };
+  }
+
+  async function markdownDe(report: Awaited<ReturnType<typeof generar>>) {
+    const { reportToMarkdown } = await import("@/lib/reports/markdown");
+    return reportToMarkdown(report!);
+  }
+
+  it("8. el ICP se lee por el id de la versión citada y con el tenant, y va dentro de la cita", async () => {
+    publicada = { id: V1, version: 1, published_at: "2026-09-01T10:00:00.000Z" };
+    icpPorVersion = { [V1]: icp(NONCE_A), [V2]: icp(NONCE_B) };
+
+    const report = await generar();
+
+    expect(consultasAlIcp).toHaveLength(1);
+    const [consulta] = consultasAlIcp;
+    expect(Object.fromEntries(consulta.filtros)).toEqual({ organization_id: ORG, profile_id: V1 });
+    expect(consulta.filtros).toHaveLength(2);
+    expect(consulta.terminal).toBe("maybeSingle");
+    expect(report?.profileCitation).toEqual({
+      status: "cited",
+      versionId: V1,
+      version: 1,
+      publishedAt: "2026-09-01T10:00:00.000Z",
+      icp: { definition: NONCE_A, disqualifiers: null, buyingTrigger: "abre otra sede", budgetBand: null },
+    });
+    // Y lo que se guarda en la base dice lo mismo que lo que se muestra.
+    expect(JSON.parse(insertados[0].content as string).profileCitation.icp.definition).toBe(NONCE_A);
+  });
+
+  it("9. cambiar el ICP —publicar otra versión— y regenerar cambia el texto del reporte (nonce)", async () => {
+    publicada = { id: V1, version: 1, published_at: "2026-09-01T10:00:00.000Z" };
+    icpPorVersion = { [V1]: icp(NONCE_A) };
+    const a = await markdownDe(await generar());
+
+    // Cambiar el ICP, desde la `0027`, es publicar la versión 2 con otro ICP:
+    // la fila de la 1 no se puede editar.
+    publicada = { id: V2, version: 2, published_at: "2026-09-15T10:00:00.000Z" };
+    icpPorVersion = { [V1]: icp(NONCE_A), [V2]: icp(NONCE_B) };
+    const b = await markdownDe(await generar());
+
+    expect(a).toContain(NONCE_A);
+    expect(a).not.toContain(NONCE_B);
+    expect(b).toContain(NONCE_B);
+    expect(b).not.toContain(NONCE_A);
+    expect(b).toContain(V2);
+  });
+
+  it("10. si el ICP no se puede leer, el reporte no cita: `error` con el código, y no «sin ICP»", async () => {
+    publicada = { id: V1, version: 1, published_at: "2026-09-01T10:00:00.000Z" };
+    errorDeIcp = { code: "42501", message: 'permission denied for table "profile_icp"' };
+
+    const report = await generar();
+
+    expect(report?.profileCitation).toEqual({ status: "error", reason: "42501" });
+    expect(insertados[0]).not.toHaveProperty("profile_version_id");
+    expect(JSON.stringify(report)).not.toContain("permission denied");
+  });
+
+  it("11. una versión publicada sin ICP se cita igual, y el texto dice que no tiene", async () => {
+    publicada = { id: V1, version: 1, published_at: "2026-09-01T10:00:00.000Z" };
+    icpPorVersion = { [V2]: icp(NONCE_B) };
+
+    const report = await generar();
+    const md = await markdownDe(report);
+
+    expect(report?.profileCitation.status).toBe("cited");
+    expect(insertados[0].profile_version_id).toBe(V1);
+    expect(md).toContain("has no ideal customer profile");
+    // El ICP de OTRA versión no se cuela.
+    expect(md).not.toContain(NONCE_B);
+  });
+
+  it("12. si la fila leída no es de ESTA empresa (una consulta sin filtro), el reporte no la cita: `error`", async () => {
+    // La lectura es la misma que sirve al Lead Engine, así que la comparación
+    // del par también protege al reporte (revisión del 2026-10-07).
+    publicada = {
+      id: V1,
+      version: 4,
+      published_at: "2026-09-01T10:00:00.000Z",
+      business_id: "018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1d33",
+    };
+    icpPorVersion = { [V1]: icp(NONCE_A) };
+
+    const report = await generar();
+
+    expect(report?.profileCitation).toEqual({ status: "error", reason: "fila-de-otro-par" });
+    expect(insertados[0]).not.toHaveProperty("profile_version_id");
+    expect(JSON.stringify(report)).not.toContain(NONCE_A);
   });
 });

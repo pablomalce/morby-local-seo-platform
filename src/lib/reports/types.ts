@@ -6,6 +6,8 @@
  * and `issues[].rationale` while keeping the structured fields rule-derived.
  */
 
+import type { IcpPublicado } from "@/lib/profile/fichaPublicada";
+
 export type IssueSeverity = "P1" | "P2" | "P3";
 /**
  * Owner of an action. Holds a localized label (e.g. "Operations" / "Operaciones" / "Drift")
@@ -118,13 +120,24 @@ export interface DataSourceHealth {
  *
  * - `cited`: había una versión publicada y ésta es. `versionId` es el que la
  *   base guarda en `reports.profile_version_id`, con FK compuesta (la `0028`).
+ *   `icp` es el ICP DE ESA VERSIÓN (H1.3), leído por su id en la misma
+ *   `leerFichaPublicada` que sirve la ficha al Lead Engine: cambiar el ICP —es
+ *   decir, publicar otra versión— cambia la cita y este texto juntos. `null` es
+ *   una versión publicada sin ICP, que la base permite. Un reporte guardado
+ *   antes de H1.3 no trae el campo: ver `citationLine` en `markdown.ts`.
  * - `none`: con sesión, la lectura anduvo, y no hay versión publicada.
  * - `demo`: reporte de demostración, sin organización: no hay nada que citar.
  * - `error`: con sesión, la lectura falló. `reason` es el código, nunca el
  *   mensaje de Postgres, que puede nombrar tablas y constraints.
  */
 export type ProfileCitation =
-  | { status: "cited"; versionId: string; version: number; publishedAt: string }
+  | {
+      status: "cited";
+      versionId: string;
+      version: number;
+      publishedAt: string;
+      icp: IcpPublicado | null;
+    }
   | { status: "none" }
   | { status: "demo" }
   | { status: "error"; reason: string };

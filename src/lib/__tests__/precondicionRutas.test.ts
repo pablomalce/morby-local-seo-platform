@@ -103,6 +103,13 @@
  *     (`src/lib/integrations/leadEngine/signature.ts:60`). Los dos son `401`;
  *     sólo uno prueba que la firma se compara.
  *
+ *   - `VULKAN_PROFILE_READ_SECRET` se pone por lo mismo, para la lectura de
+ *     servicio de la ficha (`GET /api/profile/published`, H1.3). Ahí la
+ *     diferencia además se VE en el status: sin el secreto esa ruta contesta
+ *     `503 sin-secreto` —falla cerrado, y lo dice—, y con él, sin firma,
+ *     `401`. Medir sin la variable sería medir la configuración de quien corre
+ *     la suite, no la firma.
+ *
  * QUÉ TIENE QUE ESTAR ROTO PARA QUE ESTO DÉ ROJO
  *
  *   - que un handler conteste algo que no sea `401`/`403` sin sesión y no esté
@@ -548,6 +555,16 @@ const FORMA_DE_LLAMADA: Record<string, Forma> = {
   // Sin header `x-vulkan-signature`: es el pedido de un desconocido, que es el
   // caso que la firma existe para rechazar.
   "/api/webhooks/lead-won": { cuerpo: { event: "lead.won" } },
+  // Dos uuid válidos y SIN `x-vulkan-signature` ni `x-vulkan-timestamp`: el
+  // pedido de quien sabe qué ficha quiere y no tiene el secreto. Los ids van
+  // bien formados para que el `401` venga de la firma y no de la forma (que,
+  // además, se mira DESPUÉS de la firma: route.ts).
+  "/api/profile/published": {
+    query: {
+      organization_id: "66666666-6666-4666-8666-666666666666",
+      business_id: "77777777-7777-4777-8777-777777777777",
+    },
+  },
   // Las dos que entraron con #90 y #91 el 2026-09-16. El barrido se puso rojo
   // en main por diseño: dos rutas nuevas sin forma de llamada, contestando 400
   // en zod antes de llegar al guardia. Medidas con cuerpo válido antes de
@@ -661,6 +678,37 @@ const EXENCIONES: Array<{
       // este archivo a `return { ok: true }` dejaba la exención verde.
       { archivo: "src/lib/integrations/leadEngine/signature.ts", texto: "createHmac(" },
       { archivo: "src/lib/integrations/leadEngine/signature.ts", texto: "timingSafeEqual(" },
+    ],
+    statusEsperado: [401],
+  },
+  {
+    ruta: "/api/profile/published",
+    publicaAProposito: true,
+    porque:
+      "Es la lectura de servicio de la ficha publicada (H1.3, decisión 8a): la llama el Lead " +
+      "Engine, servidor a servidor, que no tiene sesión de navegador ni es miembro de ninguna " +
+      "organización de Growth OS. Igual contesta 401 sin firma, así que cumple la propiedad 2 — " +
+      "está acá, como lead-won, porque su identidad no es una sesión y eso hay que declararlo.",
+    mecanismo:
+      "HMAC-SHA256 con VULKAN_PROFILE_READ_SECRET (propio, no el del webhook) sobre " +
+      "\"GET\\n/api/profile/published\\n\" + organization_id + \"\\n\" + business_id + \"\\n\" + timestamp, " +
+      "cabeceras x-vulkan-signature y x-vulkan-timestamp, ventana de 300 s, comparado en tiempo " +
+      "constante (src/lib/integrations/leadEngine/profileReadSignature.ts). Falla cerrado: sin " +
+      "secreto contesta 503 sin-secreto. El cliente service_role se crea DESPUÉS de verificar.",
+    huellas: [
+      { archivo: "src/app/api/profile/published/route.ts", texto: "verificarFirmaDeLectura(" },
+      { archivo: "src/app/api/profile/published/route.ts", texto: "x-vulkan-signature" },
+      { archivo: "src/app/api/profile/published/route.ts", texto: "x-vulkan-timestamp" },
+      // Como en lead-won: el mecanismo vive en otro archivo, y vaciarlo a
+      // `return { ok: true }` tiene que hacer caer la exención.
+      {
+        archivo: "src/lib/integrations/leadEngine/profileReadSignature.ts",
+        texto: "createHmac(",
+      },
+      {
+        archivo: "src/lib/integrations/leadEngine/profileReadSignature.ts",
+        texto: "timingSafeEqual(",
+      },
     ],
     statusEsperado: [401],
   },
@@ -1169,6 +1217,7 @@ beforeAll(async () => {
   process.env.GOOGLE_PAGESPEED_API_KEY = "clave-falsa-de-pagespeed-para-el-espia";
   process.env.VULKAN_AGENCY_ORG_ID = "99999999-9999-4999-8999-999999999999";
   process.env.GROWTH_OS_WEBHOOK_SECRET = "secreto-falso-para-que-la-firma-se-compare";
+  process.env.VULKAN_PROFILE_READ_SECRET = "secreto-falso-para-que-la-firma-de-lectura-se-compare";
   process.env.NEXT_PUBLIC_SUPABASE_URL = "https://proyecto-inexistente.supabase.co";
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-falsa";
 
@@ -1729,6 +1778,7 @@ describe("la precondición global se mide llamando, no leyendo", () => {
         "/api/integrations/gbp/profile: 0 consultas",
         "/api/integrations/images/generate: 0 consultas",
         "/api/integrations/places/search: 0 consultas",
+        "/api/profile/published: 0 consultas",
         "/api/seo/audit: 0 consultas",
         "/api/webhooks/lead-won: 0 consultas",
         "/auth/callback: 0 consultas",

@@ -10,6 +10,7 @@
  */
 
 import { DATA_SOURCE_KEYS, DATA_SOURCE_LABELS } from "./dataSources";
+import { citaLegible, ETIQUETA_DEL_ICP, type IcpLegible } from "./citaLegible";
 import type { ProfileCitation, Report } from "./types";
 
 /**
@@ -31,19 +32,31 @@ import type { ProfileCitation, Report } from "./types";
  * es viejo; no finge una cita que nunca tuvo.
  */
 function citationLine(c: ProfileCitation | undefined): string {
-  if (!c) {
-    return "This report was generated before reports cited a strategic profile, so it cites none.";
-  }
-  switch (c.status) {
-    case "cited":
-      return `Written against strategic profile **version ${c.version}**, published ${new Date(c.publishedAt).toLocaleDateString()} — version id \`${c.versionId}\`.`;
-    case "none":
-      return "No strategic profile has been published for this business yet, so this report cites none.";
-    case "demo":
-      return "Demo report: there is no organisation behind it, so there is no strategic profile to cite.";
-    case "error":
-      return `The strategic profile could not be read (${c.reason}), so this report cites none. This is a failure on our side, not a missing profile.`;
-  }
+  const cita = citaLegible(c);
+  if (cita.tipo === "aviso") return cita.texto;
+  return (
+    `Written against strategic profile **version ${cita.version}**, published ${new Date(cita.publicadaEl).toLocaleDateString()} — version id \`${cita.versionId}\`.` +
+    "\n\n" +
+    icpLines(cita.icp)
+  );
+}
+
+/**
+ * El ICP de la versión citada (H1.3), en el texto que el cliente se lleva.
+ *
+ * Es la mitad de Growth OS de la puerta «cambiar el ICP una vez cambia el
+ * prompt del Lead Engine Y el texto del reporte»: el ICP sale de la cita, que
+ * sale de la misma lectura que sirve la ficha al Lead Engine. No hay un ICP
+ * escrito acá ni uno por defecto: si la versión no tiene, se dice. Qué se dice
+ * en cada caso lo decide `citaLegible`, la misma que usa la pantalla
+ * (`ReportView`); acá sólo va el formato Markdown.
+ */
+function icpLines(icp: IcpLegible): string {
+  if (icp.tipo === "aviso") return icp.texto;
+  return [
+    `**${ETIQUETA_DEL_ICP}:** ${icp.definicion}`,
+    ...icp.campos.map((c) => `- **${c.etiqueta}:** ${c.valor}`),
+  ].join("\n");
 }
 
 export function reportToMarkdown(r: Report): string {

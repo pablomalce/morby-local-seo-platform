@@ -25,6 +25,7 @@ import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate
 import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
 import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
 import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
+import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
 import type {
@@ -71,6 +72,11 @@ interface SnapshotResult {
 /**
  * La versión publicada de la ficha de ESTA empresa, o por qué no hay cita.
  *
+ * La lectura es `leerFichaPublicada` (src/lib/profile/fichaPublicada.ts), la
+ * MISMA que sirve la ficha al Lead Engine por `GET /api/profile/published`:
+ * desde H1.3 el reporte y el prompt del Lead Engine leen el ICP por un solo
+ * camino, así que no pueden citar ICP distintos. Acá sólo se traduce a la cita.
+ *
  * Un error de lectura es `error` y NO `none`: «no tiene ficha publicada» es un
  * hecho sobre el cliente y «no se pudo leer» es un fallo nuestro. Hoy, además,
  * es el caso normal en hosted —la `0026` no está aplicada y `company_profiles`
@@ -79,19 +85,27 @@ interface SnapshotResult {
  *
  * `reason` es el código de PostgREST o de Postgres y nunca el mensaje, que
  * puede nombrar tablas y constraints; la lección del ensayo de publicación
- * (#104). Y `maybeSingle` y no `single`: cero filas es `none`, no un error. Dos
- * filas SÍ son un error —PGRST116—, y está bien que lo sean: el único parcial de
- * la decisión 16 de la `0026` dice que no pueden existir, y si existieran
- * elegir una sería citar al azar.
+ * (#104). Cero filas es `none`; dos filas publicadas son un error (PGRST116),
+ * porque elegir una sería citar al azar. Ver el encabezado de la lectura.
+ *
+ * El ICP viaja DENTRO de la cita, de la misma variable: el texto del reporte
+ * muestra el ICP de la versión que cita, no uno leído aparte.
  */
-function citationFrom(resp: {
-  data: unknown;
-  error: { code?: string } | null;
-}): ProfileCitation {
-  if (resp.error) return { status: "error", reason: resp.error.code || "sin-codigo" };
-  const row = resp.data as { id: string; version: number; published_at: string } | null;
-  if (!row) return { status: "none" };
-  return { status: "cited", versionId: row.id, version: row.version, publishedAt: row.published_at };
+function citationFrom(lectura: LecturaDeFicha): ProfileCitation {
+  switch (lectura.estado) {
+    case "fallo":
+      return { status: "error", reason: lectura.codigo };
+    case "sin-version":
+      return { status: "none" };
+    case "publicada":
+      return {
+        status: "cited",
+        versionId: lectura.ficha.versionId,
+        version: lectura.ficha.version,
+        publishedAt: lectura.ficha.publishedAt,
+        icp: lectura.ficha.icp,
+      };
+  }
 }
 
 async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput): Promise<SnapshotResult | null> {
@@ -113,15 +127,9 @@ async function loadSnapshot({ businessId, clientSnapshot }: GenerateReportInput)
         supabase.from("reviews").select("*").eq("business_id", businessId),
         supabase.from("content_assets").select("*").eq("business_id", businessId),
         supabase.from("platform_tasks").select("*").eq("business_id", businessId),
-        // H1.2: la versión PUBLICADA de la ficha de esta empresa, con el tenant
-        // en el filtro como toda consulta desde la `0004`. Ver `citationFrom`.
-        supabase
-          .from("company_profiles")
-          .select("id, version, published_at")
-          .eq("organization_id", biz.organization_id)
-          .eq("business_id", businessId)
-          .eq("status", "published")
-          .maybeSingle(),
+        // H1.2 y H1.3: la versión PUBLICADA de la ficha de esta empresa, con su
+        // ICP, por la lectura compartida con el Lead Engine. Ver `citationFrom`.
+        leerFichaPublicada(supabase, biz.organization_id, businessId),
       ]);
 
       const business = {
