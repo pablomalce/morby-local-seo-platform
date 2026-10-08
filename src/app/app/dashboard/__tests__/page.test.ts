@@ -51,6 +51,11 @@ describe("de dónde salen los datos de esta pantalla", () => {
     expect(PAGINA).toContain("sin-organizacion");
   });
 
+  it("el próximo paso y las cifras internas los decide el rol, con las listas de rol.ts (H4.1)", () => {
+    expect(PAGINA).toMatch(/opera=\{rolPuede\(organizacion\.rol, "escribir"\)\}/);
+    expect(PAGINA).toMatch(/veLoInterno=\{rolPuede\(organizacion\.rol, "personal"\)\}/);
+  });
+
   it("delega la organización activa en UN solo lugar", () => {
     // La regla «sólo membresías activas» vivía acá y se mudó a
     // `@/lib/org/servidor`, porque cuatro pantallas con cuatro copias del

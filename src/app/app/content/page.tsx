@@ -4,6 +4,7 @@ import { HudLabel } from "@/components/ui";
 import { ContenidoDeLaOrganizacion } from "./client";
 import type { AssetVisto } from "@/lib/content/estadoDelAsset";
 import { organizacionActiva } from "@/lib/org/servidor";
+import { rolPuede } from "@/lib/org/rol";
 
 export const dynamic = "force-dynamic";
 
@@ -82,7 +83,11 @@ export default async function ContentPage() {
     <div className="mx-auto max-w-3xl">
       <HudLabel>05 / CONTENT</HudLabel>
       <h1 className="mt-3 display-h text-3xl">Content and approval</h1>
-      <ContenidoDeLaOrganizacion assets={assets} businessId={businessId} />
+      <ContenidoDeLaOrganizacion
+        assets={assets}
+        businessId={businessId}
+        puedeAprobar={rolPuede(organizacion.rol, "aprobar")}
+      />
     </div>
   );
 }

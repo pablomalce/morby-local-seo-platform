@@ -5,6 +5,7 @@ import { ProductoResumen, type NegocioResumen } from "./client";
 import { SelectorDeOrganizacion } from "@/components/SelectorDeOrganizacion";
 import { AvisosDeEscala } from "@/components/AvisosDeEscala";
 import { organizacionActiva } from "@/lib/org/servidor";
+import { rolPuede } from "@/lib/org/rol";
 import type { EstadoDelProducto } from "@/lib/product/proximoPaso";
 
 export const dynamic = "force-dynamic";
@@ -123,7 +124,13 @@ export default async function ProductDashboardPage() {
         divergiría del primero en cuanto uno de los dos cambie de criterio.
       */}
       <AvisosDeEscala clientes={organizacion.disponibles.length} />
-      <ProductoResumen organizacion={organizacion.name} negocios={negocios} estado={estado} />
+      <ProductoResumen
+        organizacion={organizacion.name}
+        negocios={negocios}
+        estado={estado}
+        opera={rolPuede(organizacion.rol, "escribir")}
+        veLoInterno={rolPuede(organizacion.rol, "personal")}
+      />
     </div>
   );
 }

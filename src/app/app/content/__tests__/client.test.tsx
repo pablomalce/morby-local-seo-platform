@@ -53,7 +53,7 @@ afterEach(() => {
 
 describe("el botón de aprobar", () => {
   it("llama a la ruta de aprobación con el id del asset", async () => {
-    render(<ContenidoDeLaOrganizacion assets={[BORRADOR]} businessId="b1" />);
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
     fireEvent.click(screen.getByTestId("aprobar"));
 
     await waitFor(() => expect(llamadas).toHaveLength(1));
@@ -62,7 +62,7 @@ describe("el botón de aprobar", () => {
   });
 
   it("NO manda el sello: quién y con qué hash lo decide el servidor", async () => {
-    render(<ContenidoDeLaOrganizacion assets={[BORRADOR]} businessId="b1" />);
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
     fireEvent.click(screen.getByTestId("aprobar"));
 
     await waitFor(() => expect(llamadas).toHaveLength(1));
@@ -70,7 +70,7 @@ describe("el botón de aprobar", () => {
   });
 
   it("refresca cuando salió bien, para que la fila deje de decir borrador", async () => {
-    render(<ContenidoDeLaOrganizacion assets={[BORRADOR]} businessId="b1" />);
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
     fireEvent.click(screen.getByTestId("aprobar"));
     await waitFor(() => expect(refrescar).toHaveBeenCalled());
   });
@@ -78,7 +78,7 @@ describe("el botón de aprobar", () => {
   it("un fallo se MUESTRA, y el texto cambiado tiene su propio mensaje", async () => {
     // Un fallo silencioso deja a alguien apretando un botón que no hace nada.
     respuesta = { ok: false, status: 409, cuerpo: { motivo: "el-texto-cambio" } };
-    render(<ContenidoDeLaOrganizacion assets={[BORRADOR]} businessId="b1" />);
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
     fireEvent.click(screen.getByTestId("aprobar"));
 
     await waitFor(() =>
@@ -89,7 +89,7 @@ describe("el botón de aprobar", () => {
 
   it("no se ofrece sobre un asset ya aprobado", async () => {
     render(
-      <ContenidoDeLaOrganizacion
+      <ContenidoDeLaOrganizacion puedeAprobar
         assets={[{ ...BORRADOR, status: "approved", approvedHash: HUELLA }]}
         businessId="b1"
       />
@@ -98,10 +98,39 @@ describe("el botón de aprobar", () => {
   });
 
   it("sin contenido lo dice, y distingue no tener negocio de no tener contenido", () => {
-    const { rerender } = render(<ContenidoDeLaOrganizacion assets={[]} businessId="b1" />);
+    const { rerender } = render(<ContenidoDeLaOrganizacion puedeAprobar assets={[]} businessId="b1" />);
     expect(screen.getByTestId("sin-contenido").textContent).toMatch(/no tiene contenido/i);
 
-    rerender(<ContenidoDeLaOrganizacion assets={[]} businessId={null} />);
+    rerender(<ContenidoDeLaOrganizacion puedeAprobar assets={[]} businessId={null} />);
     expect(screen.getByTestId("sin-contenido").textContent).toMatch(/ningún negocio/i);
+  });
+});
+
+describe("el botón, según el rol (H4.1, D4; crítico del 2026-10-08)", () => {
+  it("a quien no aprueba no se le ofrece APPROVE, y se le dice quién lo hace", () => {
+    render(<ContenidoDeLaOrganizacion puedeAprobar={false} assets={[BORRADOR]} businessId="b1" />);
+
+    expect(screen.queryByTestId("aprobar")).toBeNull();
+    expect(screen.getByTestId("sin-rol-para-aprobar").textContent).toMatch(/owner, admin o manager/);
+    // El contenido se sigue viendo: el client lo lee, es suyo.
+    expect(screen.getAllByTestId("asset")).toHaveLength(1);
+  });
+
+  it("y a quien aprueba no se le muestra esa línea", () => {
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
+    expect(screen.queryByTestId("sin-rol-para-aprobar")).toBeNull();
+  });
+
+  it("un 403 se lee como una negativa de rol, no como «No se pudo aprobar (403)»", async () => {
+    // La ruta decide igual: si la pantalla y el rol no coinciden (otra pestaña,
+    // un rol que cambió), el 403 tiene que decir qué pasó.
+    respuesta = { ok: false, status: 403, cuerpo: { ok: false, motivo: "sin-permiso" } };
+    render(<ContenidoDeLaOrganizacion puedeAprobar assets={[BORRADOR]} businessId="b1" />);
+    fireEvent.click(screen.getByTestId("aprobar"));
+
+    const texto = await waitFor(() => screen.getByTestId("error-al-aprobar").textContent ?? "");
+    expect(texto).toMatch(/owner, admin o manager/);
+    expect(texto).not.toMatch(/\(403\)/);
+    expect(refrescar).not.toHaveBeenCalled();
   });
 });

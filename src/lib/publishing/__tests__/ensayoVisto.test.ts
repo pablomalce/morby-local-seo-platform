@@ -85,6 +85,17 @@ describe("cómo se lee la respuesta de un ensayo", () => {
     expect(l.clase).toBe("sin-sesion");
   });
 
+  it("403 dice que el rol no ensaya, que no se reservó nada y que no es un defecto (H4.1, D4)", () => {
+    // Antes caía en `defecto-del-servidor`: «no reintentar, es un defecto del
+    // código». A un editor que ayer ensayaba. Lo midió un crítico el 2026-10-08.
+    const l = lecturaDeEnsayo(403, { ok: false, motivo: "sin-permiso" });
+    expect(l.clase).toBe("sin-permiso");
+    expect(l.quePaso).toMatch(/owner, admin o manager/);
+    expect(l.quePaso).toMatch(/no se reservó nada/);
+    expect(`${l.quePaso} ${l.queHacer}`).not.toMatch(/defecto/i);
+    expect(salioBien(l.clase)).toBe(false);
+  });
+
   it("400 se lee como defecto de la pantalla, no como algo que reintentar", () => {
     const l = lecturaDeEnsayo(400, { error: "Request could not be processed." });
     expect(l.clase).toBe("pedido-invalido");
@@ -148,6 +159,7 @@ describe("las frases, que son la garantía", () => {
       [200, { estado: "ya-publicado" }],
       [400, {}],
       [401, {}],
+      [403, { ok: false, motivo: "sin-permiso" }],
       [404, {}],
       [409, {}],
       [429, {}],

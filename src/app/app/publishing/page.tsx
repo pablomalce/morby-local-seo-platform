@@ -5,6 +5,7 @@ import { EnsayoDePublicacion, Ledger } from "./client";
 import type { FilaLedger } from "@/lib/publishing/ledgerView";
 import type { AssetEnsayable } from "@/lib/publishing/ensayoVisto";
 import { organizacionActiva } from "@/lib/org/servidor";
+import { rolPuede } from "@/lib/org/rol";
 
 export const dynamic = "force-dynamic";
 
@@ -127,7 +128,7 @@ export default async function PublishingPage() {
           </p>
         </div>
       ) : (
-        <EnsayoDePublicacion aprobados={aprobados} />
+        <EnsayoDePublicacion aprobados={aprobados} puedeEnsayar={rolPuede(organizacion.rol, "aprobar")} />
       )}
 
       {ledgerRes.error ? (
