@@ -84,6 +84,7 @@ $$;
 
 DROP POLICY IF EXISTS "content_assets_approver_insert" ON public.content_assets;
 DROP POLICY IF EXISTS "content_assets_approver_update" ON public.content_assets;
+DROP POLICY IF EXISTS "content_assets_approver_delete" ON public.content_assets;
 
 DROP FUNCTION IF EXISTS public.is_internal_surface(text);
 DROP FUNCTION IF EXISTS public.current_user_approver_org_ids();

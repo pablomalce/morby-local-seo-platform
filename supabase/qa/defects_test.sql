@@ -1,4 +1,4 @@
--- A hundred and fifty-seven isolation checks against the Growth OS schema — executable.
+-- A hundred and sixty isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -7403,7 +7403,7 @@ SELECT 143, 'la baja de una organización deja sus URLs en la caché de PageSpee
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 200 a 213. El rol de cliente no es cosmético — CERRADO por la 0031 (H4.1)
+-- 200 a 216. El rol de cliente no es cosmético — CERRADO por la 0031 (H4.1)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- QUÉ CUIDAN: la puerta H4.1. Un usuario con rol `client` en la organización X,
 -- autenticado de verdad (`SET ROLE authenticated` y el GUC del uid, como los
@@ -7700,10 +7700,10 @@ DECLARE
 BEGIN
     SELECT count(*) INTO total FROM h41_tablas;
     IF total < 32 THEN
-        RAISE EXCEPTION 'Vacuous run: el catálogo de los bloques 200 a 213 trajo % tablas, y la 0031 encontró 32.', total;
+        RAISE EXCEPTION 'Vacuous run: el catálogo de los bloques 200 a 216 trajo % tablas, y la 0031 encontró 32.', total;
     END IF;
     IF (SELECT count(DISTINCT clase) FROM h41_tablas) <> 3 THEN
-        RAISE EXCEPTION 'Vacuous run: el catálogo de los bloques 200 a 213 no tiene las tres clases: %',
+        RAISE EXCEPTION 'Vacuous run: el catálogo de los bloques 200 a 216 no tiene las tres clases: %',
             (SELECT string_agg(DISTINCT clase, ', ') FROM h41_tablas);
     END IF;
     FOR r IN SELECT tabla FROM h41_tablas ORDER BY tabla LOOP
@@ -7716,7 +7716,7 @@ BEGIN
         END IF;
     END LOOP;
     IF vacias <> '' THEN
-        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 200 a 213 no tiene filas en X y en Y de: %', vacias;
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 200 a 216 no tiene filas en X y en Y de: %', vacias;
     END IF;
 END
 $$;
@@ -7845,7 +7845,7 @@ BEGIN
       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
      WHERE i.indrelid = ('public.' || quote_ident(p_tabla))::regclass AND i.indisprimary;
     IF clave IS NULL THEN
-        RAISE EXCEPTION 'Vacuous run: % no tiene clave primaria; los bloques 200 a 213 no saben nombrar su fila.', p_tabla;
+        RAISE EXCEPTION 'Vacuous run: % no tiene clave primaria; los bloques 200 a 216 no saben nombrar su fila.', p_tabla;
     END IF;
     EXECUTE format('SELECT to_jsonb(r) FROM public.%I r WHERE r.organization_id = $1 '
                    'ORDER BY %s LIMIT 1', p_tabla, clave)
@@ -8208,13 +8208,25 @@ SELECT 210, 'el client de X se puede dar un rol mayor',
 --   e. eva INSERTANDO un asset que nace sellado: 42501 de la RLS. Es la otra
 --      mitad del eje —la policy de INSERT— y sin este caso se podía borrar
 --      entera con la suite en verde (medido: la mutación sobrevivió);
---   f. marta, el mismo INSERT: 1 fila.
-CREATE OR REPLACE FUNCTION pg_temp.h41_sellar(p_uid uuid) RETURNS text
+--   f. marta, el mismo INSERT: 1 fila;
+--   g. eva sellando el borrador como `scheduled`, y h. como `published`: 42501
+--      de la RLS. El CHECK de la 0015 acepta los dos estados con el sello
+--      puesto, y la ruta de publicar decide por el SELLO y no por el estado
+--      (`publish/route.ts`: sin `approved_hash` no se publica). Sin estos dos,
+--      un eje que mirara `status = 'approved'` en vez del sello dejaba la suite
+--      157/157 con un editor sellando como `scheduled` —medido por un crítico
+--      el 2026-10-08—, y ese sello se publica;
+--   i. eva INSERTANDO un asset que nace sellado como `scheduled`: 42501 de la
+--      RLS, por lo mismo;
+--   j. marta, el UPDATE de g, y k. el INSERT de i: 1 fila cada uno. Sin la
+--      contraprueba, una policy que rechazara `scheduled` a TODOS pondría
+--      verdes g, h e i sin decir nada del rol.
+CREATE OR REPLACE FUNCTION pg_temp.h41_sellar(p_uid uuid, p_estado text DEFAULT 'approved') RETURNS text
 LANGUAGE sql AS $$
     SELECT pg_temp.h41_como(p_uid, format(
-        'UPDATE public.content_assets SET status = ''approved'', approved_hash = payload_hash, '
+        'UPDATE public.content_assets SET status = %L, approved_hash = payload_hash, '
         'approved_by = %L, approved_at = now() WHERE id = %L',
-        p_uid, pg_temp.h41_id(1, 10)));
+        p_estado, p_uid, pg_temp.h41_id(1, 10)));
 $$;
 
 SELECT set_config('qa.b211a', pg_temp.h41_sellar(pg_temp.h41_id(0, 5)), true);
@@ -8229,34 +8241,50 @@ SELECT set_config('qa.b211d', pg_temp.h41_sellar(pg_temp.h41_id(0, 2)), true);
 -- El hash se calcula acá, como `postgres`, con la misma función que la columna
 -- generada: lo que se mide es quién puede escribir una fila sellada, no si
 -- `authenticated` puede llamar a `content_payload_hash()`.
-CREATE OR REPLACE FUNCTION pg_temp.h41_nace_sellado(p_uid uuid) RETURNS text
+CREATE OR REPLACE FUNCTION pg_temp.h41_nace_sellado(p_uid uuid, p_estado text DEFAULT 'approved') RETURNS text
 LANGUAGE sql AS $$
     SELECT pg_temp.h41_como(p_uid, format(
         'INSERT INTO public.content_assets (organization_id, business_id, kind, body, locale, status, '
         'approved_hash, approved_by, approved_at) '
-        'VALUES (%L, %L, ''post'', ''Nace sellado H41'', ''en'', ''approved'', %L, %L, now())',
-        (SELECT x FROM h41), pg_temp.h41_id(1, 2),
+        'VALUES (%L, %L, ''post'', ''Nace sellado H41'', ''en'', %L, %L, %L, now())',
+        (SELECT x FROM h41), pg_temp.h41_id(1, 2), p_estado,
         public.content_payload_hash(NULL, 'Nace sellado H41', 'en', 'post', NULL), p_uid));
 $$;
 
 SELECT set_config('qa.b211e', pg_temp.h41_nace_sellado(pg_temp.h41_id(0, 3)), true);
 SELECT set_config('qa.b211f', pg_temp.h41_nace_sellado(pg_temp.h41_id(0, 2)), true);
+SELECT set_config('qa.b211g', pg_temp.h41_sellar(pg_temp.h41_id(0, 3), 'scheduled'), true);
+SELECT set_config('qa.b211h', pg_temp.h41_sellar(pg_temp.h41_id(0, 3), 'published'), true);
+SELECT set_config('qa.b211i', pg_temp.h41_nace_sellado(pg_temp.h41_id(0, 3), 'scheduled'), true);
+SELECT set_config('qa.b211j', pg_temp.h41_sellar(pg_temp.h41_id(0, 2), 'scheduled'), true);
+SELECT set_config('qa.b211k', pg_temp.h41_nace_sellado(pg_temp.h41_id(0, 2), 'scheduled'), true);
 
 INSERT INTO defect_report
 SELECT 211, 'se puede aprobar o reservar una publicación por PostgREST sin un rol que aprueba',
-       NOT (a = 'n=0' AND b = 'ERR 42501 priv' AND c = 'ERR 42501 rls' AND d = 'n=1'
-            AND e = 'ERR 42501 rls' AND f = 'n=1'),
-       CASE WHEN a = 'n=0' AND b = 'ERR 42501 priv' AND c = 'ERR 42501 rls' AND d = 'n=1'
-                 AND e = 'ERR 42501 rls' AND f = 'n=1'
+       NOT ok,
+       CASE WHEN ok
             THEN 'clara no sella (0 filas) ni reserva en el ledger (42501 privilegio); eva, editor, ' ||
-                 'no sella (42501 rls) ni inserta algo ya sellado (42501 rls); marta, manager de la ' ||
-                 'misma organización, sella (1 fila) e inserta sellado (1 fila)'
+                 'no sella como approved, scheduled ni published (42501 rls x3) ni inserta algo ya ' ||
+                 'sellado como approved ni scheduled (42501 rls x2); marta, manager de la misma ' ||
+                 'organización, sella como approved y como scheduled e inserta sellado como approved ' ||
+                 'y como scheduled (1 fila cada uno)'
             ELSE 'clara sella: ' || a || ' / clara reserva: ' || b || ' / eva sella: ' || c ||
-                 ' / marta sella: ' || d || ' / eva inserta sellado: ' || e || ' / marta inserta sellado: ' || f
+                 ' / marta sella: ' || d || ' / eva inserta sellado: ' || e || ' / marta inserta sellado: ' || f ||
+                 ' / eva sella scheduled: ' || g || ' / eva sella published: ' || h ||
+                 ' / eva inserta scheduled: ' || i || ' / marta sella scheduled: ' || j ||
+                 ' / marta inserta scheduled: ' || k
             END
-  FROM (SELECT current_setting('qa.b211a') AS a, current_setting('qa.b211b') AS b,
-               current_setting('qa.b211c') AS c, current_setting('qa.b211d') AS d,
-               current_setting('qa.b211e') AS e, current_setting('qa.b211f') AS f) x;
+  FROM (SELECT *,
+               a = 'n=0' AND b = 'ERR 42501 priv' AND c = 'ERR 42501 rls' AND d = 'n=1'
+               AND e = 'ERR 42501 rls' AND f = 'n=1'
+               AND g = 'ERR 42501 rls' AND h = 'ERR 42501 rls' AND i = 'ERR 42501 rls'
+               AND j = 'n=1' AND k = 'n=1' AS ok
+          FROM (SELECT current_setting('qa.b211a') AS a, current_setting('qa.b211b') AS b,
+                       current_setting('qa.b211c') AS c, current_setting('qa.b211d') AS d,
+                       current_setting('qa.b211e') AS e, current_setting('qa.b211f') AS f,
+                       current_setting('qa.b211g') AS g, current_setting('qa.b211h') AS h,
+                       current_setting('qa.b211i') AS i, current_setting('qa.b211j') AS j,
+                       current_setting('qa.b211k') AS k) c) x;
 
 -- ── 212 ──────────────────────────────────────────────────────────────────────
 -- EL CONTROL POSITIVO DEL EJE DE APROBACIÓN: eva edita el cuerpo de un asset
@@ -8314,6 +8342,132 @@ SELECT 213, 'el client de X modifica o lee las integraciones de su organización
             END
   FROM h41_integraciones;
 
+-- ── 214 ──────────────────────────────────────────────────────────────────────
+-- LAS FUNCIONES QUE DICEN QUIÉN FIJAN SU `search_path`. Las tres de la 0031 son
+-- SECURITY DEFINER, dueñas de `postgres` y con BYPASSRLS: si no fijan el
+-- `search_path`, resuelven `org_members` con el de quien llama, y una sesión que
+-- se arme el suyo decide qué tabla leen. Un crítico midió el 2026-10-08 que
+-- sacarles el `SET search_path = public` dejaba la suite 157/157: ningún bloque
+-- lo exigía para las nuevas.
+--
+-- Se mide sobre TODA función SECURITY DEFINER de `public`, no sólo las tres: la
+-- próxima que se escriba sin fijarlo cae acá. Anti-vacío: las tres de la 0031
+-- tienen que estar entre las medidas.
+INSERT INTO defect_report
+SELECT 214, 'una función SECURITY DEFINER de public no fija su search_path',
+       count(*) FILTER (WHERE NOT fija) > 0 OR count(*) FILTER (WHERE de_la_0031) <> 3,
+       CASE WHEN count(*) FILTER (WHERE NOT fija) = 0 AND count(*) FILTER (WHERE de_la_0031) = 3
+            THEN 'las ' || count(*) || ' funciones SECURITY DEFINER de public fijan su search_path, ' ||
+                 'las tres de la 0031 incluidas'
+            ELSE 'sin search_path: ' || coalesce(string_agg(proname, ', ' ORDER BY proname) FILTER (WHERE NOT fija), '-') ||
+                 ' / de la 0031 medidas: ' || count(*) FILTER (WHERE de_la_0031) || ' de 3'
+            END
+  FROM (SELECT p.proname::text AS proname,
+               EXISTS (SELECT 1 FROM unnest(coalesce(p.proconfig, '{}')) c WHERE c LIKE 'search\_path=%') AS fija,
+               p.proname IN ('current_user_writer_org_ids', 'current_user_staff_org_ids',
+                             'current_user_approver_org_ids') AS de_la_0031
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+         WHERE p.prosecdef) f;
+
+-- ── 215 ──────────────────────────────────────────────────────────────────────
+-- UN ROL QUE SE AGREGUE MAÑANA NACE SIN NADA. El encabezado de la 0031 promete
+-- que las tres funciones listan los roles que SÍ y no los que no. El 209 mira
+-- personas con los roles de hoy, así que una función escrita como lista de
+-- exclusión —`role <> 'client'`— le da a ESOS roles lo mismo y lo pone verde
+-- igual. Medido por un crítico el 2026-10-08: esa mutación en la de personal
+-- sobrevivía a toda la suite.
+--
+-- Cómo se mide sin dejar huella: dentro de una subtransacción que siempre se
+-- deshace, se saca el CHECK, se da de alta a una usuaria en X con un rol que no
+-- existe (`futuro`) y se le preguntan las cuatro funciones. Tiene que ser
+-- miembro (anti-vacío: el alta ocurrió) y nada más: «0001».
+CREATE OR REPLACE FUNCTION pg_temp.h41_rol_futuro() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    salida text;
+BEGIN
+    BEGIN
+        ALTER TABLE public.org_members DROP CONSTRAINT org_members_role_check;
+        INSERT INTO public.org_members (organization_id, user_id, role, state)
+        VALUES ((SELECT x FROM h41), pg_temp.h41_id(0, 7), 'futuro', 'active');
+        SELECT string_agg(CASE WHEN pg_temp.h41_como(pg_temp.h41_id(0, 7),
+                                   format('SELECT count(*) FROM %s() f WHERE f = %L', f.fn, (SELECT x FROM h41)),
+                                   'cuenta') = 'n=1' THEN '1' ELSE '0' END, '' ORDER BY f.orden)
+          INTO salida
+          FROM (VALUES (1, 'public.current_user_writer_org_ids'),
+                       (2, 'public.current_user_staff_org_ids'),
+                       (3, 'public.current_user_approver_org_ids'),
+                       (4, 'public.current_user_org_ids')) f(orden, fn);
+        RAISE EXCEPTION 'qa: deshacer el rol futuro' USING ERRCODE = 'QA000';
+    EXCEPTION
+        WHEN SQLSTATE 'QA000' THEN RETURN salida;
+        WHEN OTHERS THEN RETURN 'ERR ' || SQLSTATE || ' ' || left(SQLERRM, 160);
+    END;
+END
+$$;
+
+SELECT set_config('qa.b215', pg_temp.h41_rol_futuro(), true);
+
+INSERT INTO defect_report
+SELECT 215, 'un rol nuevo en el CHECK nace escribiendo, viendo lo interno o aprobando',
+       current_setting('qa.b215') <> '0001',
+       CASE WHEN current_setting('qa.b215') = '0001'
+            THEN 'una usuaria con un rol que ninguna lista nombra (futuro) es miembro de X y no escribe, ' ||
+                 'no es personal ni aprueba (escribe/personal/aprueba/miembro: 0001)'
+            ELSE 'escribe/personal/aprueba/miembro con el rol futuro: ' || current_setting('qa.b215') ||
+                 ' (esperado 0001)'
+            END;
+
+-- ── 216 ──────────────────────────────────────────────────────────────────────
+-- BORRAR LO SELLADO. El eje de rol deja borrar a todo el que escribe, y
+-- `publications_asset_fkey` es ON DELETE CASCADE (0016). Sin la policy de DELETE
+-- del eje de aprobación, eva —editor, que no aprueba ni publica (D4)— borraba
+-- el asset sellado k = 11 y la cascada se llevaba su fila del ledger, en una
+-- tabla donde `authenticated` no tiene ningún privilegio. Medido por un crítico
+-- el 2026-10-08: DELETE 1, y las publicaciones de X pasaban de 1 a 0.
+--
+--   a. eva, el sellado CON publicación (k = 11): 0 filas;
+--   b. eva, el sellado SIN publicación (k = 29): 0 filas;
+--   c. clara, el sellado con publicación: 0 filas;
+--   d. eva, el BORRADOR (k = 10): 1 fila. Sin esto, una policy que negara todo
+--      DELETE de un editor pondría verdes a y b y rompería su trabajo;
+--   e. marta, el sellado sin publicación: 1 fila. La contraprueba del rol: la
+--      negativa a eva es por no aprobar, no por la organización.
+--
+-- Que (a) borre 0 filas es lo que mide la cascada: la acción de la FK corre
+-- al final de la sentencia y sólo si la fila se borró. Anti-vacío: k = 11 TIENE
+-- su publicación (k = 28), leída como `postgres`; sin ella, (a) no hablaría del
+-- ledger.
+SELECT set_config('qa.b216a', pg_temp.h41_como(pg_temp.h41_id(0, 3), format(
+           'DELETE FROM public.content_assets WHERE id = %L', pg_temp.h41_id(1, 11))), true);
+SELECT set_config('qa.b216b', pg_temp.h41_como(pg_temp.h41_id(0, 3), format(
+           'DELETE FROM public.content_assets WHERE id = %L', pg_temp.h41_id(1, 29))), true);
+SELECT set_config('qa.b216c', pg_temp.h41_como(pg_temp.h41_id(0, 5), format(
+           'DELETE FROM public.content_assets WHERE id = %L', pg_temp.h41_id(1, 11))), true);
+SELECT set_config('qa.b216d', pg_temp.h41_como(pg_temp.h41_id(0, 3), format(
+           'DELETE FROM public.content_assets WHERE id = %L', pg_temp.h41_id(1, 10))), true);
+SELECT set_config('qa.b216e', pg_temp.h41_como(pg_temp.h41_id(0, 2), format(
+           'DELETE FROM public.content_assets WHERE id = %L', pg_temp.h41_id(1, 29))), true);
+
+INSERT INTO defect_report
+SELECT 216, 'un editor borra por PostgREST un asset sellado, y la cascada se lleva su publicación',
+       NOT ok OR pub <> 1,
+       CASE WHEN ok AND pub = 1
+            THEN 'eva, editor, no borra el sellado con publicación (0 filas, la publicación sigue) ni el ' ||
+                 'sellado sin publicación (0 filas); clara tampoco (0 filas); eva borra el borrador (1 fila) ' ||
+                 'y marta, manager de la misma organización, el sellado (1 fila)'
+            ELSE 'eva sellado con publicación: ' || a || ' / eva sellado: ' || b ||
+                 ' / clara sellado: ' || c || ' / eva borrador: ' || d || ' / marta sellado: ' || e ||
+                 ' / publicación de k = 11 en la fixture: ' || pub || ' (esperada 1)'
+            END
+  FROM (SELECT *, a = 'n=0' AND b = 'n=0' AND c = 'n=0' AND d = 'n=1' AND e = 'n=1' AS ok,
+               (SELECT count(*) FROM public.publications
+                 WHERE id = pg_temp.h41_id(1, 28) AND asset_id = pg_temp.h41_id(1, 11)) AS pub
+          FROM (SELECT current_setting('qa.b216a') AS a, current_setting('qa.b216b') AS b,
+                       current_setting('qa.b216c') AS c, current_setting('qa.b216d') AS d,
+                       current_setting('qa.b216e') AS e) v) x;
+
 -- El denominador, publicado: lo que estos bloques miraron, para que el verde se
 -- lea como lo que es y no como «todas».
 DO $$
@@ -8337,14 +8491,14 @@ $$;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and fifty-seven checks were written, so a hundred
--- and fifty-seven rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and sixty checks were written, so a hundred
+-- and sixty rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
 -- arrancaron en 200 cuando la 0029 (121 a 135) y la 0030 (136 en adelante)
 -- todavía estaban en PRs abiertos, para que los tres frentes no chocaran al
--- mergearse. El conteo de abajo es de FILAS, no el número más alto: 143 + 14.
+-- mergearse. El conteo de abajo es de FILAS, no el número más alto: 143 + 17.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -8359,8 +8513,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 157 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 157 checks recorded a result.', checks;
+    IF checks <> 160 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 160 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -8371,11 +8525,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 157 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 160 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 157 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 160 checks green: the schema prevents every one of them.';
 END
 $$;
 
