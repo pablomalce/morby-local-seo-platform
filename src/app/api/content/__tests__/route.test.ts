@@ -20,20 +20,34 @@ let filaEscrita: Record<string, unknown> | null = null;
 let devuelve: { id: string; status: string } | null = null;
 let errorEscritura: { message?: string } | null = null;
 
+/** La membresía de quien llama. Por defecto editor: el rol más bajo que escribe (D3). */
+let membresias: { role: string; state: string }[] = [];
+
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
     auth: { getUser: async () => ({ data: { user: usuario } }) },
-    from: () => ({
-      select: () => ({
-        eq: () => ({ maybeSingle: async () => ({ data: negocio, error: errorLectura }) }),
-      }),
-      insert: (valores: Record<string, unknown>) => {
-        filaEscrita = valores;
-        return {
-          select: () => ({ maybeSingle: async () => ({ data: devuelve, error: errorEscritura }) }),
-        };
-      },
-    }),
+    from: (tabla: string) =>
+      tabla === "org_members"
+        ? {
+            select: () => {
+              const cadena = {
+                eq: () => cadena,
+                limit: async () => ({ data: membresias, error: null }),
+              };
+              return cadena;
+            },
+          }
+        : {
+            select: () => ({
+              eq: () => ({ maybeSingle: async () => ({ data: negocio, error: errorLectura }) }),
+            }),
+            insert: (valores: Record<string, unknown>) => {
+              filaEscrita = valores;
+              return {
+                select: () => ({ maybeSingle: async () => ({ data: devuelve, error: errorEscritura }) }),
+              };
+            },
+          },
   }),
 }));
 
@@ -58,6 +72,7 @@ beforeEach(() => {
   errorEscritura = null;
   filaEscrita = null;
   devuelve = { id: "asset-1", status: "draft" };
+  membresias = [{ role: "editor", state: "active" }];
 });
 
 describe("qué se escribe al crear", () => {
@@ -132,4 +147,32 @@ describe("cuándo NO se escribe", () => {
     const res = await POST(pedido(VALIDO));
     expect(res.status).toBe(404);
   });
+});
+
+describe("quién crea: un rol que escribe (H4.1, D3)", () => {
+  // Desde la 0031 la base rechaza el INSERT de un viewer o un client por su
+  // cuenta; lo que se mide acá es que la ruta lo diga como 403 y que ni lo
+  // intente — sin la comprobación llegaba como un 502 «no se pudo escribir».
+  for (const rol of ["client", "viewer"]) {
+    it(`un ${rol} de la organización recibe 403 y no se intenta el INSERT`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido(VALIDO));
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, motivo: "sin-permiso" });
+      expect(filaEscrita).toBeNull();
+    });
+  }
+
+  for (const rol of ["editor", "manager", "admin", "owner"]) {
+    it(`un ${rol} de la misma organización crea`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido(VALIDO));
+
+      expect(res.status).toBe(201);
+      expect(filaEscrita).toMatchObject({ organization_id: ORG_DEL_NEGOCIO, status: "draft" });
+    });
+  }
 });

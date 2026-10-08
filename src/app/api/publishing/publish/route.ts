@@ -5,6 +5,7 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { agencyAccessToken } from "@/lib/integrations/google/tokenStore";
 import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
 import { publicar, type Destino, type Publicador } from "@/lib/publishing/transport";
+import { permisoEn } from "@/lib/org/rol";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { quienLlama } from "@/lib/api/sesion";
 
@@ -71,6 +72,15 @@ export const runtime = "nodejs";
  * `integration_properties`, también con el cliente de sesión, porque la `0017`
  * le da a `authenticated` justamente `SELECT` sobre esa tabla y la RLS ya sabe
  * cuáles son sus organizaciones.
+ *
+ * LA DECISIÓN, REVISADA POR LA PUERTA H4.1 (D4, 2026-10-07)
+ *
+ * «Quien puede ensayar puede publicar» sigue valiendo, y ahora los dos piden
+ * ROL: owner, admin o manager de la organización del asset. Lo de arriba
+ * anunciaba que separar quién aprueba de quién publica sería «una migración de
+ * roles y su propio frente»; ése fue la 0031, y decidió que son los mismos. La
+ * membresía sola dejaba publicar en la ficha de un cliente a un `viewer` — o al
+ * cliente mismo. 403, antes de armar el publicador y de pedir el token.
  */
 
 /** El único destino, igual que el CHECK de la `0016` y que `Destino`. */
@@ -86,7 +96,7 @@ export async function POST(req: Request) {
   // y nada más. Lo mide `precondicionRutas.test.ts` con cada variante de pedido.
   const sesion = await quienLlama();
   if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
-  const { supabase } = sesion;
+  const { supabase, user } = sesion;
 
   try {
     // Más apretado que el ensayo —que permite 20/min— porque esto sale a la red de
@@ -107,6 +117,16 @@ export async function POST(req: Request) {
     // seguir: sin la fila no hay organización, ni hash, ni texto que mandar.
     if (error) return NextResponse.json({ error: "asset unreadable" }, { status: 502 });
     if (!asset) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+    // El rol, en la organización del ASSET. Antes que el sello: a quien no
+    // puede publicar no le importa si el asset está aprobado.
+    const permiso = await permisoEn(supabase, user.id, asset.organization_id, "aprobar");
+    if (!permiso.ok) {
+      if (permiso.motivo === "ilegible") {
+        return NextResponse.json({ error: "membership unreadable" }, { status: 502 });
+      }
+      return NextResponse.json({ ok: false, motivo: "sin-permiso" }, { status: 403 });
+    }
 
     if (!asset.approved_hash) {
       return NextResponse.json({ ok: false, motivo: "no-aprobado" }, { status: 409 });

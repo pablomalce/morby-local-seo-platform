@@ -3,6 +3,7 @@ import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 import type { Locale } from "@/lib/types/core";
 
 export const dynamic = "force-dynamic";
@@ -31,6 +32,12 @@ export const runtime = "nodejs";
  * llama, escribir sobre el negocio ajeno guardaría la fila en la organización
  * propia. Se lee el negocio COMO EL USUARIO, así que la RLS contesta la
  * membresía y un no-miembro recibe 404.
+ *
+ * Y CREAR PIDE UN ROL QUE ESCRIBE (decisión D3 de la puerta H4.1, 2026-10-07)
+ *
+ * owner, admin, manager o editor. Desde la 0031 la base rechaza el INSERT de un
+ * `viewer` o un `client` por su cuenta; sin esta línea esa negativa llegaba como
+ * un 502 «no se pudo escribir», que manda a buscar un servidor roto. Es un 403.
  */
 
 /**
@@ -60,7 +67,7 @@ export async function POST(req: Request) {
   // y nada más. Lo mide `precondicionRutas.test.ts` con cada variante de pedido.
   const sesion = await quienLlama();
   if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
-  const { supabase } = sesion;
+  const { supabase, user } = sesion;
 
   try {
     const limitado = rateLimit(req, { limit: 30, windowMs: 60_000, key: "content-create" });
@@ -76,6 +83,14 @@ export async function POST(req: Request) {
 
     if (errorLectura) return NextResponse.json({ error: "business unreadable" }, { status: 502 });
     if (!negocio) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+    const permiso = await permisoEn(supabase, user.id, negocio.organization_id, "escribir");
+    if (!permiso.ok) {
+      if (permiso.motivo === "ilegible") {
+        return NextResponse.json({ error: "membership unreadable" }, { status: 502 });
+      }
+      return NextResponse.json({ ok: false, motivo: "sin-permiso" }, { status: 403 });
+    }
 
     const { data, error } = await supabase
       .from("content_assets")

@@ -36,18 +36,43 @@ let usuario: { id: string } | null = { id: "11111111-1111-4111-8111-111111111111
 let fila: { id: string; organization_id: string; approved_hash: string | null } | null = null;
 let errorLectura: { message: string } | null = null;
 
+/**
+ * La membresía de quien llama, leída como el usuario. Por defecto manager: el
+ * rol más bajo que ensaya y publica (D4 de H4.1).
+ */
+let membresias: { role: string; state: string }[] = [];
+let errorMembresia: { message: string } | null = null;
+let filtrosDeMembresia: Record<string, string> = {};
+
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
     auth: { getUser: async () => ({ data: { user: usuario } }) },
-    from: () => ({
-      select: () => ({
-        eq: () => ({
-          maybeSingle: async () => ({ data: fila, error: errorLectura }),
-        }),
-      }),
-    }),
+    from: (tabla: string) =>
+      tabla === "org_members"
+        ? {
+            select: () => {
+              const cadena = {
+                eq: (col: string, val: string) => {
+                  filtrosDeMembresia[col] = val;
+                  return cadena;
+                },
+                limit: async () => ({ data: errorMembresia ? null : membresias, error: errorMembresia }),
+              };
+              return cadena;
+            },
+          }
+        : {
+            select: () => ({
+              eq: () => ({
+                maybeSingle: async () => ({ data: fila, error: errorLectura }),
+              }),
+            }),
+          },
   }),
 }));
+
+/** Toda salida a la red. Un ensayo no sale: tiene que quedar en cero siempre. */
+let salidas = 0;
 
 /** Cada llamada al transporte, con TODOS sus argumentos. */
 let llamadas: unknown[][] = [];
@@ -66,10 +91,18 @@ vi.mock("@/lib/publishing/transport", () => ({
 
 const { POST } = await import("../route");
 
+// Una IP por pedido, contada aparte: con la IP derivada de `llamadas`, los 403
+// —que no llaman al transporte— repetían la misma y el limitador de 20/min
+// contestaba 429 antes de que la ruta decidiera nada.
+let pedidos = 0;
 function pedido(cuerpo: unknown): Request {
+  pedidos += 1;
   return new Request("http://localhost/api/publishing/rehearse", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-forwarded-for": `10.0.0.${llamadas.length + 1}` },
+    headers: {
+      "content-type": "application/json",
+      "x-forwarded-for": `10.0.${Math.floor(pedidos / 250)}.${pedidos % 250}`,
+    },
     body: JSON.stringify(cuerpo),
   });
 }
@@ -77,6 +110,14 @@ function pedido(cuerpo: unknown): Request {
 beforeEach(() => {
   usuario = { id: "11111111-1111-4111-8111-111111111111" };
   fila = { id: ASSET, organization_id: ORG_DEL_ASSET, approved_hash: HASH_APROBADO };
+  membresias = [{ role: "manager", state: "active" }];
+  errorMembresia = null;
+  filtrosDeMembresia = {};
+  salidas = 0;
+  vi.stubGlobal("fetch", async () => {
+    salidas += 1;
+    throw new Error("el ensayo no sale a la red");
+  });
   errorLectura = null;
   llamadas = [];
   respuesta = { ok: true, estado: "ensayado", publicationId: "pub-1" };
@@ -228,5 +269,63 @@ describe("lo que contesta cuando el transporte dice que no", () => {
       externalId: "gbp-9",
     });
     expect(llamadas).toHaveLength(1);
+  });
+});
+
+describe("quién ensaya: el rol, en la organización del asset (H4.1, D4)", () => {
+  // Las negativas, en la MISMA organización donde el manager sí ensaya: el
+  // client lee el asset —es contenido suyo—, así que lo único que cambia es el
+  // rol. Y sin esta comprobación el client reservaba en el ledger con
+  // `service_role`, que ninguna policy frena.
+  for (const rol of ["client", "viewer", "editor"]) {
+    it(`un ${rol} de la organización recibe 403: el transporte no se llama y nada sale a la red`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido({ assetId: ASSET }));
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, motivo: "sin-permiso" });
+      expect(llamadas).toHaveLength(0);
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["manager", "admin", "owner"]) {
+    it(`un ${rol} de la misma organización ensaya`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido({ assetId: ASSET }));
+
+      expect(res.status).toBe(200);
+      expect(llamadas).toHaveLength(1);
+    });
+  }
+
+  it("el rol se pregunta en la organización DEL ASSET, no en la del pedido", async () => {
+    await POST(pedido({ assetId: ASSET, organizationId: "00000000-0000-4000-8000-000000000000" }));
+
+    expect(filtrosDeMembresia).toEqual({
+      user_id: "11111111-1111-4111-8111-111111111111",
+      organization_id: ORG_DEL_ASSET,
+    });
+  });
+
+  it("la negativa va ANTES de mirar el sello: un client sobre un borrador también es 403", async () => {
+    membresias = [{ role: "client", state: "active" }];
+    fila = { id: ASSET, organization_id: ORG_DEL_ASSET, approved_hash: null };
+
+    const res = await POST(pedido({ assetId: ASSET }));
+
+    expect(res.status).toBe(403);
+    expect(llamadas).toHaveLength(0);
+  });
+
+  it("si la membresía no se puede leer, 502 y el ledger no se toca", async () => {
+    errorMembresia = { message: "connection reset" };
+
+    const res = await POST(pedido({ assetId: ASSET }));
+
+    expect(res.status).toBe(502);
+    expect(llamadas).toHaveLength(0);
   });
 });

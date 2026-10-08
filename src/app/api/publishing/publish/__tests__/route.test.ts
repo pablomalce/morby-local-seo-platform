@@ -47,25 +47,55 @@ let errorLectura: { message: string } | null = null;
 /** El mapeo vivo de Business Profile, o su ausencia. */
 let propiedad: { property_ref: string } | null = null;
 
+/**
+ * La membresía de quien llama, leída como el usuario. Por defecto manager: el
+ * rol más bajo que publica (D4 de H4.1).
+ */
+let membresias: { role: string; state: string }[] = [];
+let filtrosDeMembresia: Record<string, string> = {};
+
+/** Las tablas que la ruta consultó, en orden. Un 403 no puede llegar al mapeo. */
+let tablasConsultadas: string[] = [];
+
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
     auth: { getUser: async () => ({ data: { user: usuario } }) },
-    from: () => ({
-      select: () => ({
-        eq: () => ({
-          // La lectura del asset termina acá.
-          maybeSingle: async () => ({ data: asset, error: errorLectura }),
-          // La del mapeo encadena provider y `unmapped_at is null`.
+    from: (tabla: string) => {
+      tablasConsultadas.push(tabla);
+      if (tabla === "org_members") {
+        return {
+          select: () => {
+            const cadena = {
+              eq: (col: string, val: string) => {
+                filtrosDeMembresia[col] = val;
+                return cadena;
+              },
+              limit: async () => ({ data: membresias, error: null }),
+            };
+            return cadena;
+          },
+        };
+      }
+      return {
+        select: () => ({
           eq: () => ({
-            is: () => ({
-              maybeSingle: async () => ({ data: propiedad, error: null }),
+            // La lectura del asset termina acá.
+            maybeSingle: async () => ({ data: asset, error: errorLectura }),
+            // La del mapeo encadena provider y `unmapped_at is null`.
+            eq: () => ({
+              is: () => ({
+                maybeSingle: async () => ({ data: propiedad, error: null }),
+              }),
             }),
           }),
         }),
-      }),
-    }),
+      };
+    },
   }),
 }));
+
+/** Toda salida a la red desde la ruta. En un 403 tiene que ser cero. */
+let salidas = 0;
 
 /** Cada llamada al transporte, con TODOS sus argumentos. */
 let llamadas: unknown[][] = [];
@@ -83,10 +113,14 @@ vi.mock("@/lib/publishing/transport", () => ({
   },
 }));
 
-/** Cómo contesta el custodio del token de la agencia. */
+/** Cómo contesta el custodio del token de la agencia, y cuántas veces se le pidió. */
 let token: { ok: boolean; accessToken?: string } = { ok: true, accessToken: "no-es-un-token" };
+let pedidosDeToken = 0;
 vi.mock("@/lib/integrations/google/tokenStore", () => ({
-  agencyAccessToken: async () => token,
+  agencyAccessToken: async () => {
+    pedidosDeToken += 1;
+    return token;
+  },
 }));
 
 /** Con qué se armó el publicador, si es que se armó. */
@@ -131,6 +165,15 @@ beforeEach(() => {
     externalId: "accounts/1/locations/123/localPosts/9",
   };
   process.env.GOOGLE_BUSINESS_ACCOUNT_ID = "accounts/1";
+  membresias = [{ role: "manager", state: "active" }];
+  filtrosDeMembresia = {};
+  tablasConsultadas = [];
+  pedidosDeToken = 0;
+  salidas = 0;
+  vi.stubGlobal("fetch", async () => {
+    salidas += 1;
+    throw new Error("este test no deja salir a Google");
+  });
 });
 
 describe("POST /api/publishing/publish — el cableado", () => {
@@ -299,5 +342,48 @@ describe("POST /api/publishing/publish — ningún fallo contesta 200", () => {
 
     expect(res.status).toBe(200);
     expect(cuerpo.estado).toBe("ya-publicado");
+  });
+});
+
+describe("POST /api/publishing/publish — quién publica: el rol (H4.1, D4)", () => {
+  // Esto publica EN VIVO en la ficha de un cliente. Las negativas son en la
+  // MISMA organización donde el manager sí publica: lo único que cambia es el
+  // rol. Y lo que se mide no es sólo el 403: es que no se armó el publicador, no
+  // se pidió el token, no se leyó el mapeo y no salió nada a la red.
+  for (const rol of ["client", "viewer", "editor"]) {
+    it(`un ${rol} de la organización recibe 403 y no se toca nada`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await pedir({ assetId: ASSET });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, motivo: "sin-permiso" });
+      expect(llamadas).toHaveLength(0);
+      expect(publicadoresArmados).toHaveLength(0);
+      expect(pedidosDeToken).toBe(0);
+      expect(tablasConsultadas).not.toContain("integration_properties");
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["manager", "admin", "owner"]) {
+    it(`un ${rol} de la misma organización publica`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await pedir({ assetId: ASSET });
+
+      expect(res.status).toBe(200);
+      expect(llamadas).toHaveLength(1);
+      expect(publicadoresArmados).toHaveLength(1);
+    });
+  }
+
+  it("el rol se pregunta en la organización DEL ASSET, no en la del pedido", async () => {
+    await pedir({ assetId: ASSET, organizationId: "00000000-0000-4000-8000-000000000000" });
+
+    expect(filtrosDeMembresia).toEqual({
+      user_id: "11111111-1111-4111-8111-111111111111",
+      organization_id: ORG_DEL_ASSET,
+    });
   });
 });

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 import { publicar, type Destino } from "@/lib/publishing/transport";
 
 export const dynamic = "force-dynamic";
@@ -52,6 +53,13 @@ export const runtime = "nodejs";
  * no hay entrada que construir: `EntradaPublicacion.approvedHash` es un `string`,
  * y la columna del ledger es `NOT NULL`. Mandarlo igual daría `23502`, que el
  * transporte lee como `ledger-ilegible` — un motivo que no es el verdadero.
+ *
+ * Y ENSAYAR PIDE ROL (decisión D4 de la puerta H4.1, 2026-10-07)
+ *
+ * owner, admin o manager de la organización del asset: los mismos que aprueban.
+ * La RLS de la `0014` contesta la MEMBRESÍA, no el rol — y un `client` lee sus
+ * assets, así que sin esta línea reservaba en el ledger con `service_role`. 403,
+ * antes de llamar al transporte: un ensayo escribe aunque no publique.
  */
 
 /** El único destino, igual que el CHECK de la `0016` y que `Destino`. */
@@ -67,7 +75,7 @@ export async function POST(req: Request) {
   // y nada más. Lo mide `precondicionRutas.test.ts` con cada variante de pedido.
   const sesion = await quienLlama();
   if (!sesion) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
-  const { supabase } = sesion;
+  const { supabase, user } = sesion;
 
   try {
     // Escribe en el ledger —reserva una fila— aunque no publique. 20/min por IP.
@@ -86,6 +94,16 @@ export async function POST(req: Request) {
     // seguir: sin la fila no hay `organization_id` ni hash que mandar.
     if (error) return NextResponse.json({ error: "asset unreadable" }, { status: 502 });
     if (!asset) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+    // El rol, en la organización del ASSET. Antes que el sello: a quien no
+    // puede publicar no le importa si el asset está aprobado.
+    const permiso = await permisoEn(supabase, user.id, asset.organization_id, "aprobar");
+    if (!permiso.ok) {
+      if (permiso.motivo === "ilegible") {
+        return NextResponse.json({ error: "membership unreadable" }, { status: 502 });
+      }
+      return NextResponse.json({ ok: false, motivo: "sin-permiso" }, { status: 403 });
+    }
 
     if (!asset.approved_hash) {
       return NextResponse.json({ ok: false, motivo: "no-aprobado" }, { status: 409 });
