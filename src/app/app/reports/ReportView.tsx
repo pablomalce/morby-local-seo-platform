@@ -1,9 +1,10 @@
 "use client";
 
-import { AlertOctagon, AlertTriangle, CheckCircle2, Info, Target, TrendingUp } from "lucide-react";
+import { AlertOctagon, AlertTriangle, BookOpen, CheckCircle2, Info, Target, TrendingUp } from "lucide-react";
 import { Badge, Card, HudLabel } from "@/components/ui";
+import { citaLegible, ETIQUETA_DEL_ICP } from "@/lib/reports/citaLegible";
 import { DATA_SOURCE_LABELS, displayForStatus } from "@/lib/reports/dataSources";
-import type { Report, ReportIssue } from "@/lib/reports/types";
+import type { ProfileCitation, Report, ReportIssue } from "@/lib/reports/types";
 
 export function ReportView({ report }: { report: Report }) {
   return (
@@ -20,6 +21,9 @@ export function ReportView({ report }: { report: Report }) {
           </div>
         </div>
       </Card>
+
+      {/* Strategic profile cited (H1.2) and its ICP (H1.3) */}
+      <ProfileCitationCard citation={report.profileCitation} />
 
       {/* Current state */}
       <Card>
@@ -174,6 +178,71 @@ export function ReportView({ report }: { report: Report }) {
         </div>
       </Card>
     </div>
+  );
+}
+
+/**
+ * La ficha que el reporte cita, y su ICP, en la pantalla.
+ *
+ * Hasta el 2026-10-07 la cita y el ICP sólo estaban en el Markdown descargado:
+ * quien regeneraba el reporte y lo abría acá no veía contra qué versión se
+ * escribió ni a quién le vende el cliente (lo encontró la revisión de la
+ * puerta H1.3). Lo que se dice sale de `citaLegible`, la misma función que
+ * arma el Markdown; acá sólo va el formato. El id va entero: es lo que alguien
+ * pega en una consulta para resolver la cita.
+ *
+ * `citation` puede venir `undefined` aunque el tipo diga que no: el historial
+ * de `localStorage` devuelve reportes de antes de H1.2 sin el campo.
+ */
+function ProfileCitationCard({ citation }: { citation: ProfileCitation | undefined }) {
+  const cita = citaLegible(citation);
+  return (
+    <Card data-testid="cita-de-la-ficha">
+      <div className="flex items-start gap-3">
+        <BookOpen className="mt-0.5 h-4 w-4 shrink-0 text-vulkan-orange" />
+        <div className="min-w-0 flex-1">
+          <HudLabel>STRATEGIC PROFILE</HudLabel>
+          {cita.tipo === "aviso" ? (
+            <p className="mt-3 text-[13px] text-metal-300">{cita.texto}</p>
+          ) : (
+            <>
+              <p className="mt-3 text-[13px] text-metal-200">
+                Written against strategic profile{" "}
+                <span className="font-display uppercase tracking-hud text-vulkan-white">
+                  version {cita.version}
+                </span>
+                , published {new Date(cita.publicadaEl).toLocaleDateString()}.
+              </p>
+              <p className="mt-1 break-all font-mono text-[10px] uppercase tracking-hud text-metal-500">
+                Version id {cita.versionId}
+              </p>
+              {cita.icp.tipo === "aviso" ? (
+                <p className="mt-3 text-[13px] text-metal-300">{cita.icp.texto}</p>
+              ) : (
+                <div className="mt-4 space-y-2 border-l-2 border-vulkan-orange/30 pl-4">
+                  <p className="font-mono text-[10px] uppercase tracking-hud text-vulkan-orange">
+                    {ETIQUETA_DEL_ICP}
+                  </p>
+                  <p className="text-[13px] text-vulkan-white">{cita.icp.definicion}</p>
+                  {cita.icp.campos.length > 0 && (
+                    <dl className="mt-2 grid gap-2 sm:grid-cols-3">
+                      {cita.icp.campos.map((campo) => (
+                        <div key={campo.etiqueta}>
+                          <dt className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+                            {campo.etiqueta}
+                          </dt>
+                          <dd className="mt-1 text-[12px] text-metal-300">{campo.valor}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </Card>
   );
 }
 

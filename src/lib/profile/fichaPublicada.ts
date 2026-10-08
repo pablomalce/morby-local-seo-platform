@@ -20,7 +20,9 @@
  *    mismo que una empresa inexistente. `maybeSingle` y no `single`: cero filas
  *    es un hecho del cliente, no un error. Dos filas SÍ son un error (PGRST116)
  *    y está bien: el índice parcial `company_profiles_one_published_key` dice
- *    que no pueden existir, y elegir una sería citar al azar.
+ *    que no pueden existir, y elegir una sería citar al azar. Y la fila trae
+ *    su propio par, que se compara con el pedido: si no coincide es un fallo
+ *    (`fila-de-otro-par`), nunca una ficha.
  * 2. El ICP y la oferta DE ESA VERSIÓN, por su id. No «el ICP más nuevo» ni
  *    «el de la empresa»: el de la versión citada. Desde la `0027` el contenido
  *    de una versión publicada o superada no se edita, así que lo que se lee por
@@ -61,6 +63,15 @@ export interface OfertaPublicada {
 }
 
 export interface FichaPublicada {
+  /**
+   * El par de la FILA leída, no el que se pidió. Si un día la consulta pierde
+   * el filtro de tenant, estos dos ya no coinciden con el pedido, y
+   * `leerFichaPublicada` lo devuelve como fallo antes de que nadie lo sirva.
+   * La ruta los usa en su 200 para que el chequeo de eco del Lead Engine mida
+   * la fila y no la query (hallazgo de la revisión, 2026-10-07).
+   */
+  organizationId: string;
+  businessId: string;
   versionId: string;
   version: number;
   publishedAt: string;
@@ -84,6 +95,8 @@ function fallo(error: { code?: string }): LecturaDeFicha {
 
 interface FilaVersion {
   id: string;
+  organization_id: string;
+  business_id: string;
   version: number;
   published_at: string;
 }
@@ -114,7 +127,7 @@ export async function leerFichaPublicada(
 ): Promise<LecturaDeFicha> {
   const version = (await cliente
     .from("company_profiles")
-    .select("id, version, published_at")
+    .select("id, organization_id, business_id, version, published_at")
     .eq("organization_id", organizationId)
     .eq("business_id", businessId)
     .eq("status", "published")
@@ -123,6 +136,19 @@ export async function leerFichaPublicada(
   if (version.error) return fallo(version.error);
   if (!version.data) return { estado: "sin-version" };
   const fila = version.data;
+
+  // La fila tiene que ser del par que se pidió. Con los filtros de arriba
+  // siempre lo es; esto es lo que queda en pie el día que alguien los saque o
+  // los cambie —medido por la revisión del 2026-10-07: sin los `.eq`, la ruta
+  // servía 200 con el ICP de OTRO cliente y los ids de la query, y el chequeo
+  // de eco del Lead Engine lo dejaba pasar—. Sin mayúsculas en la comparación:
+  // Postgres devuelve el uuid en minúsculas y la query puede no traerlo así.
+  if (
+    fila.organization_id?.toLowerCase() !== organizationId.toLowerCase() ||
+    fila.business_id?.toLowerCase() !== businessId.toLowerCase()
+  ) {
+    return { estado: "fallo", codigo: "fila-de-otro-par" };
+  }
 
   // Las dos hijas, por el id de la versión que se va a citar. El tenant va en
   // el filtro aunque la FK compuesta ya lo ate: la consulta dice qué pide.
@@ -160,6 +186,8 @@ export async function leerFichaPublicada(
   return {
     estado: "publicada",
     ficha: {
+      organizationId: fila.organization_id,
+      businessId: fila.business_id,
       versionId: fila.id,
       version: fila.version,
       publishedAt: fila.published_at,

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verificarFirmaDeLectura } from "@/lib/integrations/leadEngine/profileReadSignature";
-import { leerFichaPublicada } from "@/lib/profile/fichaPublicada";
+import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
 
 export const dynamic = "force-dynamic";
 /** Node y no edge: la verificación de firma usa `node:crypto`. */
@@ -34,20 +34,28 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * 2. Validar la forma de los ids. Después de la firma, porque quien llega acá
  *    ya es el productor y lo que necesita es saber qué mandó mal.
  * 3. Leer con `service_role` por `leerFichaPublicada`, la MISMA función que usa
- *    el reporte, filtrando por organización Y empresa.
+ *    el reporte, filtrando por organización Y empresa. Todo lo que puede TIRAR
+ *    —crear el cliente sin `SUPABASE_SERVICE_ROLE_KEY`, por ejemplo— va adentro
+ *    del `try`: un 500 de Next no es ningún status del contrato (hallazgo de la
+ *    revisión del 2026-10-07).
  *
  * QUÉ DEVUELVE
  *
- *   200  la versión publicada, con su ICP y su oferta;
+ *   200  la versión publicada, con su ICP (o `null` si no tiene fila) y su
+ *        oferta, tal como están en la base. Los dos ids son los de la FILA
+ *        leída, no los de la query: hasta la revisión eran los de la query, y
+ *        el chequeo de eco del Lead Engine no podía ver una consulta que
+ *        perdiera el filtro de tenant;
  *   400  firmado, y un id no es un uuid;
  *   401  sin firma, mal formada, de otro secreto, o fuera de la ventana. Un
  *        solo cuerpo para los cuatro: decirle a quien prueba cuál le falló es
  *        darle el mapa. El motivo queda en el log fuera de producción;
  *   404  no hay versión publicada de ESE par —incluido el negocio que no es de
  *        esa organización, que tiene que ser indistinguible de uno inexistente—;
- *   502  la base falló. Ausencia no es fallo, y el cuerpo no lleva ni el código
- *        ni el mensaje de Postgres: el Lead Engine no puede hacer nada con ellos
- *        y un tercero aprendería el esquema;
+ *   502  la base falló, la fila leída no es del par pedido, o algo tiró
+ *        después de la firma. Ausencia no es fallo, y el cuerpo no lleva ni el
+ *        código ni el mensaje: el Lead Engine no puede hacer nada con ellos y
+ *        un tercero aprendería el esquema;
  *   503  falta VULKAN_PROFILE_READ_SECRET en este lado.
  *
  * Y `no-store`: una respuesta firmada para un pedido no es para ningún caché.
@@ -77,7 +85,15 @@ export async function GET(request: Request) {
     return responder({ error: "parametros-invalidos" }, 400);
   }
 
-  const lectura = await leerFichaPublicada(createSupabaseAdminClient(), organizationId, businessId);
+  let lectura: LecturaDeFicha;
+  try {
+    lectura = await leerFichaPublicada(createSupabaseAdminClient(), organizationId, businessId);
+  } catch (e) {
+    // El mensaje queda en el log (es el de este lado, p. ej. «supabaseKey is
+    // required.»: dice qué variable falta) y nunca en el cuerpo.
+    console.warn("[profile/published] la lectura tiró:", e instanceof Error ? e.message : String(e));
+    return responder({ error: "lectura-fallida" }, 502);
+  }
 
   if (lectura.estado === "fallo") {
     if (process.env.NODE_ENV !== "production") {
@@ -92,8 +108,9 @@ export async function GET(request: Request) {
   const f = lectura.ficha;
   return responder(
     {
-      organization_id: organizationId,
-      business_id: businessId,
+      // De la fila, no de la query: ver «QUÉ DEVUELVE».
+      organization_id: f.organizationId,
+      business_id: f.businessId,
       version_id: f.versionId,
       version: f.version,
       published_at: f.publishedAt,

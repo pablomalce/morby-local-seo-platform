@@ -92,7 +92,18 @@ const NEGOCIO_EN_BASE = {
   created_at: "2026-01-01T00:00:00.000Z",
 };
 
-type Fila = { id: string; version: number; published_at: string };
+/**
+ * La fila de `company_profiles`. Sin `organization_id` ni `business_id`, es la
+ * del par que se pidió —como con los filtros puestos—; el test 12 la pone de
+ * OTRO par para simular una consulta que perdió el filtro.
+ */
+type Fila = {
+  id: string;
+  version: number;
+  published_at: string;
+  organization_id?: string;
+  business_id?: string;
+};
 
 /** La versión publicada que `company_profiles` devuelve. Cada test la define. */
 let publicada: Fila | null = null;
@@ -134,9 +145,12 @@ function columnasDe(proyeccion: string | undefined): string[] {
 
 function proyectar(fila: Fila | null, proyeccion: string | undefined): Record<string, unknown> | null {
   if (!fila) return null;
+  const completa: Fila = { organization_id: ORG, business_id: NEGOCIO, ...fila };
   const columnas = columnasDe(proyeccion);
-  if (columnas.includes("*")) return { ...fila };
-  return Object.fromEntries(columnas.filter((c) => c in fila).map((c) => [c, fila[c as keyof Fila]]));
+  if (columnas.includes("*")) return { ...completa };
+  return Object.fromEntries(
+    columnas.filter((c) => c in completa).map((c) => [c, completa[c as keyof Fila]])
+  );
 }
 
 const createSupabaseServerClient = vi.fn(async () => ({
@@ -289,7 +303,14 @@ describe("el reporte cita la versión publicada de la ficha (H1.2)", () => {
     expect(consulta.terminal).toBe("maybeSingle");
     // Por TOKENS y no por substring: la primera versión hacía
     // `toContain("id")` sobre el texto, y "business_id" lo satisfacía.
-    expect(columnasDe(consulta.columnas).sort()).toEqual(["id", "published_at", "version"]);
+    // Y el par de la fila, que `leerFichaPublicada` compara con el pedido.
+    expect(columnasDe(consulta.columnas).sort()).toEqual([
+      "business_id",
+      "id",
+      "organization_id",
+      "published_at",
+      "version",
+    ]);
   });
 
   it("3. cambiar la ficha y regenerar el MISMO reporte cita un id distinto (la mitad c)", async () => {
@@ -488,5 +509,23 @@ describe("el reporte muestra el ICP de la versión que cita (H1.3)", () => {
     expect(md).toContain("has no ideal customer profile");
     // El ICP de OTRA versión no se cuela.
     expect(md).not.toContain(NONCE_B);
+  });
+
+  it("12. si la fila leída no es de ESTA empresa (una consulta sin filtro), el reporte no la cita: `error`", async () => {
+    // La lectura es la misma que sirve al Lead Engine, así que la comparación
+    // del par también protege al reporte (revisión del 2026-10-07).
+    publicada = {
+      id: V1,
+      version: 4,
+      published_at: "2026-09-01T10:00:00.000Z",
+      business_id: "018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1d33",
+    };
+    icpPorVersion = { [V1]: icp(NONCE_A) };
+
+    const report = await generar();
+
+    expect(report?.profileCitation).toEqual({ status: "error", reason: "fila-de-otro-par" });
+    expect(insertados[0]).not.toHaveProperty("profile_version_id");
+    expect(JSON.stringify(report)).not.toContain(NONCE_A);
   });
 });

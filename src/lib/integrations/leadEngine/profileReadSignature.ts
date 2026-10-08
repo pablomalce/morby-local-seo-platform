@@ -10,6 +10,22 @@
  * enumeración de fichas ajenas es esta firma. Por eso la ruta no crea el
  * cliente de servicio hasta que esta función dice `ok`.
  *
+ * CÓMO SE MANTIENE IDÉNTICO
+ *
+ * El bloque que va del título del contrato (la línea que empieza con «EL
+ * CONTRATO (H1.3») hasta la que cierra el comando de ejemplo
+ * (`| openssl dgst -sha256 -hmac "$SECRETO"`), las dos inclusive, es el mismo,
+ * letra por letra, que el del encabezado de
+ * `lib/integrations/growthosProfile.ts` del Lead Engine, que lo copia de este
+ * archivo tal como quedó en 836f89f. `__tests__/contratoDeLectura.test.ts` lo
+ * extrae de acá, le saca el prefijo de comentario y compara su SHA-256 con uno
+ * fijado (el comando `awk | sed | shasum` que lo recalcula sin TypeScript está
+ * en ese test): editarlo de un solo lado pone ese test en rojo, y el arreglo es
+ * editarlo en los dos repositorios y mover los dos números juntos.
+ * Hasta la revisión del 2026-10-07 los dos encabezados decían cosas
+ * distintas —el del Lead Engine no tenía `icp: … | null` ni el 400— y cada
+ * lado medía contra el suyo.
+ *
  * EL CONTRATO (H1.3, decisión 8a) — IDÉNTICO EN LOS DOS REPOSITORIOS
  *
  * Esto es el contrato, no un comentario sobre el código. El otro lado
@@ -67,6 +83,26 @@
  *
  *     printf 'GET\n/api/profile/published\n%s\n%s\n%s' "$ORG" "$NEGOCIO" "$TS" \
  *       | openssl dgst -sha256 -hmac "$SECRETO"
+ *
+ * CÓMO SE QUEDA ADENTRO DE ESE CONTRATO ESTE LADO
+ *
+ * Esto no es contrato: es lo que hace la ruta con estados que su base permite.
+ *
+ *   - Una versión publicada sin fila de ICP se sirve con `icp: null`, como dice
+ *     el bloque; una con `definition` vacío o en blanco, tal cual. Es el Lead
+ *     Engine el que les pone nombre (`sin-icp`) y no arma el prompt. Ninguno de
+ *     los dos lados rellena un ICP.
+ *   - Una oferta con `name` en blanco se sirve tal cual (`profile_offers.name`
+ *     es NOT NULL y admite `''`); el Lead Engine la deja afuera sin tumbar la
+ *     ficha.
+ *   - `organization_id` y `business_id` del 200 son los de la FILA leída, no
+ *     los de la query, y si la fila no es del par pedido la ruta contesta 502.
+ *     Así el chequeo de eco del Lead Engine mide algo que este lado SÍ puede
+ *     romper (hallazgo de la revisión: antes devolvía los de la query).
+ *   - Cualquier excepción después de la firma —falta
+ *     `SUPABASE_SERVICE_ROLE_KEY` y `createClient` tira, por ejemplo— es 502
+ *     `lectura-fallida`, nunca un 500 de Next.
+ *   - El secreto «vacío» incluye el que es sólo espacios: 503 igual.
  *
  * POR QUÉ LA FIRMA CUBRE LOS DOS IDS Y LA HORA
  *
