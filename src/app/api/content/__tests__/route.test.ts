@@ -22,6 +22,8 @@ let errorEscritura: { message?: string } | null = null;
 
 /** La membresía de quien llama. Por defecto editor: el rol más bajo que escribe (D3). */
 let membresias: { role: string; state: string }[] = [];
+/** Un fallo al leer la membresía, cuando el test lo pide. */
+let errorDeMembresia: { message: string } | null = null;
 
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
@@ -32,7 +34,7 @@ vi.mock("@/lib/supabase/server", () => ({
             select: () => {
               const cadena = {
                 eq: () => cadena,
-                limit: async () => ({ data: membresias, error: null }),
+                limit: async () => ({ data: errorDeMembresia ? null : membresias, error: errorDeMembresia }),
               };
               return cadena;
             },
@@ -73,6 +75,7 @@ beforeEach(() => {
   filaEscrita = null;
   devuelve = { id: "asset-1", status: "draft" };
   membresias = [{ role: "editor", state: "active" }];
+  errorDeMembresia = null;
 });
 
 describe("qué se escribe al crear", () => {
@@ -164,6 +167,18 @@ describe("quién crea: un rol que escribe (H4.1, D3)", () => {
       expect(filaEscrita).toBeNull();
     });
   }
+
+  it("una membresía ilegible es 502, no un 403, y no se intenta el INSERT", async () => {
+    // La rama existía y ningún test la ejecutaba (crítico del 2026-10-08): sin
+    // ella, una caída de Supabase le decía «sin permiso» a un editor.
+    errorDeMembresia = { message: "caída" };
+
+    const res = await POST(pedido(VALIDO));
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "membership unreadable" });
+    expect(filaEscrita).toBeNull();
+  });
 
   for (const rol of ["editor", "manager", "admin", "owner"]) {
     it(`un ${rol} de la misma organización crea`, async () => {

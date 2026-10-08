@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * El guardia del reporte, medido en los tres estados en que puede estar la
@@ -106,5 +106,150 @@ describe("POST /api/reports/generate — el guardia va antes del gasto", () => {
 
     expect(res.status).toBe(200);
     expect(vi.mocked(generateReport)).toHaveBeenCalledWith({ businessId: "biz-1", clientSnapshot: undefined });
+  });
+});
+
+/**
+ * EL ROL, ANTES DEL ORQUESTADOR (H4.1, D3; crítico del 2026-10-08)
+ *
+ * Medido sobre la réplica con PostgREST: un client de X que pedía el reporte de
+ * un negocio de X disparaba, con `service_role` y antes de que la base le
+ * rechazara el INSERT en `reports`, un upsert en `integration_probe`, otro en
+ * `pagespeed_cache` y el refresco del token de la agencia. El orquestador es
+ * quien hace todo eso, así que «no se llama» es «cero escrituras y cero
+ * salidas»; y por las dudas `fetch` también se cuenta.
+ */
+describe("POST /api/reports/generate — el rol, antes del orquestador", () => {
+  const NEGOCIO = "c4100000-0031-4031-8031-100000000002";
+  const ORG_X = "c4100000-0031-4031-8031-200000000001";
+  let salidas = 0;
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Un cliente de sesión que contesta el negocio y la membresía, y anota qué se leyó. */
+  function sesionCon(opciones: {
+    negocio?: { organization_id: string } | null;
+    rol?: string | null;
+    errorNegocio?: { message: string };
+    errorMembresia?: { message: string };
+  }) {
+    const lecturas: { tabla: string; filtros: Record<string, unknown> }[] = [];
+    const cliente = {
+      auth: { getUser: async () => ({ data: { user: { id: "u-1" } }, error: null }) },
+      from(tabla: string) {
+        const filtros: Record<string, unknown> = {};
+        const cadena = {
+          select: () => cadena,
+          eq: (col: string, val: unknown) => {
+            filtros[col] = val;
+            return cadena;
+          },
+          maybeSingle: async () => {
+            lecturas.push({ tabla, filtros });
+            return opciones.errorNegocio
+              ? { data: null, error: opciones.errorNegocio }
+              : { data: opciones.negocio === undefined ? { organization_id: ORG_X } : opciones.negocio, error: null };
+          },
+          limit: async () => {
+            lecturas.push({ tabla, filtros });
+            if (opciones.errorMembresia) return { data: null, error: opciones.errorMembresia };
+            return { data: opciones.rol ? [{ role: opciones.rol, state: "active" }] : [], error: null };
+          },
+        };
+        return cadena;
+      },
+    };
+    vi.mocked(createSupabaseServerClient).mockResolvedValue(cliente as never);
+    return lecturas;
+  }
+
+  const pedir = (businessId: string) =>
+    POST(
+      new Request("http://localhost/api/reports/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ businessId }),
+      }),
+    );
+
+  beforeEach(() => {
+    salidas = 0;
+    vi.stubGlobal("fetch", async () => {
+      salidas += 1;
+      throw new Error("la ruta no sale a la red antes del orquestador");
+    });
+    vi.mocked(generateReport).mockResolvedValue({ id: "r-1" } as never);
+  });
+
+  for (const rol of ["client", "viewer"]) {
+    it(`un ${rol} de la organización del negocio recibe 403 y el orquestador no se llama`, async () => {
+      sesionCon({ rol });
+
+      const res = await pedir(NEGOCIO);
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, motivo: "sin-permiso" });
+      expect(vi.mocked(generateReport)).not.toHaveBeenCalled();
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["owner", "admin", "manager", "editor"]) {
+    it(`la contraprueba: un ${rol} de la MISMA organización genera el reporte`, async () => {
+      sesionCon({ rol });
+
+      const res = await pedir(NEGOCIO);
+
+      expect(res.status).toBe(200);
+      expect(vi.mocked(generateReport)).toHaveBeenCalledWith({ businessId: NEGOCIO, clientSnapshot: undefined });
+    });
+  }
+
+  it("el rol se pregunta en la organización DEL NEGOCIO, leída como el usuario, y por ese usuario", async () => {
+    const lecturas = sesionCon({ rol: "manager" });
+
+    await pedir(NEGOCIO);
+
+    expect(lecturas[0]).toEqual({ tabla: "businesses", filtros: { id: NEGOCIO } });
+    expect(lecturas[1]).toEqual({ tabla: "org_members", filtros: { user_id: "u-1", organization_id: ORG_X } });
+  });
+
+  it("una membresía ilegible es 502, no un 403 ni un permiso", async () => {
+    sesionCon({ errorMembresia: { message: "caída" } });
+
+    const res = await pedir(NEGOCIO);
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "membership unreadable" });
+    expect(vi.mocked(generateReport)).not.toHaveBeenCalled();
+  });
+
+  it("un negocio ilegible es 502: sin saber de quién es, no se sigue", async () => {
+    sesionCon({ errorNegocio: { message: "caída" } });
+
+    const res = await pedir(NEGOCIO);
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "business unreadable" });
+    expect(vi.mocked(generateReport)).not.toHaveBeenCalled();
+  });
+
+  it("un negocio que la sesión no alcanza sigue al orquestador: es el reporte sin organización, que no escribe", async () => {
+    const lecturas = sesionCon({ negocio: null });
+
+    const res = await pedir(NEGOCIO);
+
+    expect(res.status).toBe(200);
+    expect(vi.mocked(generateReport)).toHaveBeenCalled();
+    expect(lecturas.some((l) => l.tabla === "org_members")).toBe(false);
+  });
+
+  it("un id de la semilla no se le pregunta a la base", async () => {
+    const lecturas = sesionCon({ rol: "client" });
+
+    const res = await pedir("biz-morby");
+
+    expect(res.status).toBe(200);
+    expect(lecturas).toEqual([]);
   });
 });

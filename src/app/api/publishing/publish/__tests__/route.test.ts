@@ -53,6 +53,8 @@ let propiedad: { property_ref: string } | null = null;
  */
 let membresias: { role: string; state: string }[] = [];
 let filtrosDeMembresia: Record<string, string> = {};
+/** Un fallo al leer la membresía, cuando el test lo pide. */
+let errorDeMembresia: { message: string } | null = null;
 
 /** Las tablas que la ruta consultó, en orden. Un 403 no puede llegar al mapeo. */
 let tablasConsultadas: string[] = [];
@@ -70,7 +72,7 @@ vi.mock("@/lib/supabase/server", () => ({
                 filtrosDeMembresia[col] = val;
                 return cadena;
               },
-              limit: async () => ({ data: membresias, error: null }),
+              limit: async () => ({ data: errorDeMembresia ? null : membresias, error: errorDeMembresia }),
             };
             return cadena;
           },
@@ -167,6 +169,7 @@ beforeEach(() => {
   process.env.GOOGLE_BUSINESS_ACCOUNT_ID = "accounts/1";
   membresias = [{ role: "manager", state: "active" }];
   filtrosDeMembresia = {};
+  errorDeMembresia = null;
   tablasConsultadas = [];
   pedidosDeToken = 0;
   salidas = 0;
@@ -377,6 +380,22 @@ describe("POST /api/publishing/publish — quién publica: el rol (H4.1, D4)", (
       expect(publicadoresArmados).toHaveLength(1);
     });
   }
+
+  it("una membresía ilegible es 502, no un 403: una caída no es un «no podés»", async () => {
+    // La rama existía y ningún test la ejecutaba: borrarla le decía «sin permiso»
+    // a un manager durante una caída de Supabase, con la suite en verde (crítico
+    // del 2026-10-08). Y tampoco publica: una caída tampoco es un permiso.
+    errorDeMembresia = { message: "caída" };
+
+    const res = await pedir({ assetId: ASSET });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "membership unreadable" });
+    expect(llamadas).toHaveLength(0);
+    expect(publicadoresArmados).toHaveLength(0);
+    expect(pedidosDeToken).toBe(0);
+    expect(salidas).toBe(0);
+  });
 
   it("el rol se pregunta en la organización DEL ASSET, no en la del pedido", async () => {
     await pedir({ assetId: ASSET, organizationId: "00000000-0000-4000-8000-000000000000" });

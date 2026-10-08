@@ -61,12 +61,38 @@ describe("las listas de rol.ts son las de la 0031", () => {
     expect([...QUIEN_PUEDE.aprobar].sort()).toEqual(rolesDeLaFuncion("current_user_approver_org_ids").sort());
   });
 
+  it("personal === current_user_staff_org_ids()", () => {
+    // La tercera copia, que la primera versión no comparaba: una función de
+    // personal escrita como `role <> 'client'` pasaba todo (medido por un
+    // crítico el 2026-10-08). El bloque 215 lo mide en la base; esto, que la
+    // pantalla pregunte lo mismo.
+    expect(rolesDeLaFuncion("current_user_staff_org_ids").length).toBeGreaterThan(0);
+    expect([...QUIEN_PUEDE.personal].sort()).toEqual(rolesDeLaFuncion("current_user_staff_org_ids").sort());
+  });
+
+  it("las tres funciones listan los roles que SÍ: ninguna es una lista de exclusión", () => {
+    // `rolesDeLaFuncion` lee el primer `role IN (...)`; un cuerpo con un
+    // `role <> ...` o un `NOT IN` además de él lo pasaría por alto.
+    for (const nombre of [
+      "current_user_writer_org_ids",
+      "current_user_staff_org_ids",
+      "current_user_approver_org_ids",
+    ]) {
+      const cuerpo = MIGRACION.match(
+        new RegExp(`FUNCTION public\\.${nombre}\\(\\)[\\s\\S]*?AS \\$\\$([\\s\\S]*?)\\$\\$;`)
+      )?.[1];
+      expect(cuerpo, nombre).toBeDefined();
+      expect(cuerpo, nombre).toMatch(/role IN \(/);
+      expect(cuerpo, nombre).not.toMatch(/role\s*(<>|!=|NOT\s+IN)/i);
+    }
+  });
+
   it("ROLES === el CHECK de org_members.role", () => {
     expect([...ROLES].sort()).toEqual(rolesDelCheck().sort());
   });
 
-  it("client no está en ninguna de las tres acciones: es lo que D2 decidió", () => {
-    for (const accion of ["escribir", "aprobar", "integrar"] as const) {
+  it("client no está en ninguna de las acciones: es lo que D2 decidió", () => {
+    for (const accion of ["escribir", "aprobar", "integrar", "personal"] as const) {
       expect(rolPuede("client", accion), accion).toBe(false);
     }
   });

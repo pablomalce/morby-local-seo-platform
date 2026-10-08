@@ -28,11 +28,11 @@ import type { createSupabaseServerClient } from "@/lib/supabase/server";
  *
  * LAS LISTAS, Y DÓNDE MÁS ESTÁN
  *
- * `escribir` y `aprobar` repiten las funciones de la 0031
- * (`current_user_writer_org_ids()` y `current_user_approver_org_ids()`). Dos
- * copias de una regla se separan, así que `rol.test.ts` lee la migración y las
- * compara con estas. `integrar` no tiene copia en la base: las integraciones las
- * escribe sólo el servidor.
+ * `escribir`, `aprobar` y `personal` repiten las funciones de la 0031
+ * (`current_user_writer_org_ids()`, `current_user_approver_org_ids()` y
+ * `current_user_staff_org_ids()`). Dos copias de una regla se separan, así que
+ * `rol.test.ts` lee la migración y las compara con estas. `integrar` no tiene
+ * copia en la base: las integraciones las escribe sólo el servidor.
  *
  * Y las tres listan los roles que SÍ, no los que no. Un rol nuevo nace sin
  * permiso hasta que alguien lo agregue acá, que es la dirección barata del error.
@@ -41,8 +41,13 @@ import type { createSupabaseServerClient } from "@/lib/supabase/server";
 export const ROLES = ["owner", "admin", "manager", "editor", "viewer", "client"] as const;
 export type Rol = (typeof ROLES)[number];
 
-/** Las tres acciones que una ruta decide por rol. */
-export type Accion = "escribir" | "aprobar" | "integrar";
+/**
+ * Las acciones que una ruta o una pantalla deciden por rol. `personal` no es una
+ * acción de escritura: es «ve lo interno», lo que separa al `viewer` del
+ * `client` (D2), y lo usan las pantallas para no ofrecerle a un cliente lo que
+ * la base le esconde.
+ */
+export type Accion = "escribir" | "aprobar" | "integrar" | "personal";
 
 /**
  * Quién puede cada una. Decisiones D3 y D4 de la puerta H4.1, tomadas el
@@ -53,8 +58,13 @@ export const QUIEN_PUEDE: Readonly<Record<Accion, readonly Rol[]>> = {
   escribir: ["owner", "admin", "manager", "editor"],
   /** D4: aprobar, ensayar y publicar. El editor escribe pero no sella. */
   aprobar: ["owner", "admin", "manager"],
-  /** D4: mapear y desmapear propiedades, conectar Google. */
+  /**
+   * D4: mapear y desmapear propiedades, conectar Google. En la organización
+   * destino Y en la agencia: ver `property-actions.ts` y `agencyGuard.ts`.
+   */
   integrar: ["owner", "admin"],
+  /** D2: el personal de la agencia, que ve lo interno. Todos menos `client`. */
+  personal: ["owner", "admin", "manager", "editor", "viewer"],
 };
 
 /** Si un rol, tal como viene de la base, alcanza para una acción. */

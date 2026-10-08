@@ -31,7 +31,7 @@
  * TOKEN, que es uno solo y no es de quien mira.
  */
 
-import { quienLlama } from "@/lib/api/sesion";
+import { quienLlama, type ClienteDeServidor } from "@/lib/api/sesion";
 import { permisoEn } from "@/lib/org/rol";
 import { resolveAgencyOrgId } from "./agency";
 
@@ -61,8 +61,7 @@ export type GuardResult =
 export async function esOperadorDeLaAgencia(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<GuardResult> {
-  const agencia = resolveAgencyOrgId(env);
-  if (!agencia.ok) return { ok: false, reason: "agency-unresolved" };
+  if (!resolveAgencyOrgId(env).ok) return { ok: false, reason: "agency-unresolved" };
 
   // `quienLlama` y no `getUser()` a mano: en modo demo —sin las envs de
   // Supabase— construir el cliente TIRA, y este guardia no tenía try. MEDIDO el
@@ -71,9 +70,31 @@ export async function esOperadorDeLaAgencia(
   // va al login como cualquier otro `not-authenticated`.
   const sesion = await quienLlama();
   if (!sesion) return { ok: false, reason: "not-authenticated" };
-  const { supabase, user } = sesion;
 
-  const permiso = await permisoEn(supabase, user.id, agencia.organizationId, "integrar");
+  return operadorDeLaAgencia(sesion.supabase, sesion.user.id, env);
+}
+
+/**
+ * La misma pregunta, para quien ya tiene la sesión en la mano.
+ *
+ * La usa también el mapeo de propiedades (`property-actions.ts`), y no por
+ * prolijidad: es lo que cierra el hallazgo del crítico del 2026-10-08. Toda
+ * cuenta es owner de una organización —la personal que crea `handle_new_user`
+ * (0001), y las que quiera crear con `create_client_organization` (0024)—, así
+ * que «owner o admin de la organización destino» lo cumple cualquiera que se
+ * registre. Y lo que se mapea ahí se lee con el token de la AGENCIA, que llega a
+ * las properties de todos los clientes. La llave es de la agencia; quién la
+ * apunta a una property lo decide la agencia, con esta función.
+ */
+export async function operadorDeLaAgencia(
+  supabase: ClienteDeServidor,
+  userId: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<GuardResult> {
+  const agencia = resolveAgencyOrgId(env);
+  if (!agencia.ok) return { ok: false, reason: "agency-unresolved" };
+
+  const permiso = await permisoEn(supabase, userId, agencia.organizationId, "integrar");
 
   // Un fallo de lectura NO es una membresía. Devolver «es de la agencia» ante un
   // error de la base convertiría una caída de Supabase en un permiso.
