@@ -27,11 +27,20 @@
  * La membresía se comprueba con el cliente de sesión, no con el de servicio: la
  * pregunta es «¿qué alcanza ESTE usuario?», y hacerla con una llave que lo
  * alcanza todo la contesta siempre que sí.
+ *
+ * Y NO ALCANZA CON SER MIEMBRO (decisión D4 de la puerta H4.1, 2026-10-07)
+ *
+ * Mapear y desmapear exigen owner o admin de esa organización. Hasta acá
+ * alcanzaba con una membresía cualquiera, así que un `viewer` —o el cliente
+ * mismo, con el rol `client` de la 0031— movía la frontera entre clientes con
+ * `service_role`. Ninguna policy lo puede frenar: la escritura de abajo no pasa
+ * por la RLS. Es esta comprobación o nada, y `permisoEn()` es quien la hace.
  */
 
 import { revalidatePath } from "next/cache";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { permisoEn } from "@/lib/org/rol";
 import { validarPropertyRef, FORMA_ESPERADA } from "@/lib/integrations/google/mapping";
 import type { GoogleSurface } from "@/lib/integrations/google/sources";
 
@@ -44,6 +53,8 @@ export type PropertyActionError =
   | "not-authenticated"
   /** Hay sesión, y no es de esta organización. */
   | "not-a-member"
+  /** Es de esta organización, y su rol no alcanza para tocar integraciones (D4). */
+  | "not-allowed"
   /** La superficie no es una de las tres. */
   | "unknown-surface"
   /** El identificador no tiene la forma que la 0017 exige. */
@@ -57,9 +68,10 @@ export type PropertyActionError =
 const PANTALLA = "/app/integrations";
 
 /**
- * Que el usuario de la sesión sea miembro de la organización que dice.
+ * Que el usuario de la sesión pueda tocar las integraciones de la organización
+ * que dice: miembro ACTIVO, con un rol que integra.
  *
- * Devuelve el id sólo si lo es. Sin esto, la mitad de arriba de este archivo no
+ * Devuelve `null` sólo si puede. Sin esto, la mitad de arriba de este archivo no
  * sirve de nada: el privilegio quedaría del lado del servidor y el servidor
  * escribiría lo que le pidan.
  */
@@ -70,17 +82,13 @@ async function organizacionDelUsuario(organizationId: string): Promise<PropertyA
   } = await supabase.auth.getUser();
   if (!user) return "not-authenticated";
 
-  const { data, error } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("organization_id", organizationId)
-    .limit(1);
+  const permiso = await permisoEn(supabase, user.id, organizationId, "integrar");
+  if (permiso.ok) return null;
 
   // Un fallo de lectura NO es una membresía. Devolver «miembro» ante un error de
-  // la base convertiría una caída de Supabase en un permiso.
-  if (error || !data || data.length === 0) return "not-a-member";
-  return null;
+  // la base convertiría una caída de Supabase en un permiso — así que falla
+  // cerrado, como antes de que hubiera roles.
+  return permiso.motivo === "rol-insuficiente" ? "not-allowed" : "not-a-member";
 }
 
 /**
@@ -189,6 +197,8 @@ function mensaje(code: PropertyActionError): string {
       return "Hay que iniciar sesión.";
     case "not-a-member":
       return "Esa organización no es tuya.";
+    case "not-allowed":
+      return "Tu rol en esta organización no permite cambiar sus integraciones.";
     case "unknown-surface":
       return "Esa superficie de Google no existe.";
     case "bad-shape":

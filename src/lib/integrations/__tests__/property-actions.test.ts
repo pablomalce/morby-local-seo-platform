@@ -28,8 +28,11 @@ vi.mock("next/cache", () => ({ revalidatePath }));
 
 /** Hay sesión, y de quién. */
 let usuario: { id: string } | null = { id: "11111111-1111-4111-8111-111111111111" };
-/** Las membresías que la lectura de sesión devuelve. */
-let membresias: { organization_id: string }[] = [];
+/**
+ * Las membresías que la lectura de sesión devuelve. Con rol desde H4.1: mapear
+ * pide owner o admin (D4), y admin es el más bajo que alcanza.
+ */
+let membresias: { organization_id: string; role?: string; state?: string }[] = [];
 /** Un fallo de lectura de membresías, cuando el test lo pide. */
 let errorDeMembresia: { message: string } | null = null;
 /** Y si además del error el driver devuelve filas, que es lo que a veces hace. */
@@ -133,7 +136,7 @@ const escrituraDeSesion = () => escrituras().filter((o) => o.cliente === "sesion
 
 beforeEach(() => {
   usuario = { id: "11111111-1111-4111-8111-111111111111" };
-  membresias = [{ organization_id: ORG }];
+  membresias = [{ organization_id: ORG, role: "admin", state: "active" }];
   errorDeMembresia = null;
   membresiasJuntoAlError = false;
   errorPorVerbo = {};
@@ -408,5 +411,61 @@ describe("la pantalla se refresca sólo cuando algo cambió", () => {
     const { mapProperty } = await acciones();
     await mapProperty({ organizationId: AJENA, surface: "ga4", propertyRef: "properties/1" });
     expect(revalidatePath).not.toHaveBeenCalled();
+  });
+});
+
+describe("quién mapea: el rol, no sólo la membresía (H4.1, D4)", () => {
+  // La corrección del crítico: todas las negativas son en la MISMA organización
+  // donde el admin sí mapea. Sin rol, un client de la organización movía la
+  // frontera entre clientes con `service_role`, que ninguna policy frena.
+  let salidas = 0;
+  beforeEach(() => {
+    salidas = 0;
+    // El espía del cliente de servicio acumula de los describe de arriba: sin
+    // limpiarlo, «no se construyó» no mediría este test.
+    createSupabaseAdminClient.mockClear();
+    vi.stubGlobal("fetch", async () => {
+      salidas += 1;
+      throw new Error("mapear no sale a la red");
+    });
+  });
+
+  for (const rol of ["client", "viewer", "editor", "manager"]) {
+    it(`un ${rol} de la organización no mapea ni desmapea: not-allowed y cero escrituras`, async () => {
+      membresias = [{ organization_id: ORG, role: rol, state: "active" }];
+      const { mapProperty, unmapProperty } = await acciones();
+
+      const mapeo = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+      const desmapeo = await unmapProperty({ organizationId: ORG, surface: "ga4" });
+
+      expect(mapeo).toEqual({ ok: false, code: "not-allowed", message: expect.any(String) });
+      expect(desmapeo).toEqual({ ok: false, code: "not-allowed", message: expect.any(String) });
+      expect(escrituras()).toHaveLength(0);
+      expect(createSupabaseAdminClient).not.toHaveBeenCalled();
+      expect(revalidatePath).not.toHaveBeenCalled();
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["admin", "owner"]) {
+    it(`un ${rol} de la misma organización mapea, por el servicio`, async () => {
+      membresias = [{ organization_id: ORG, role: rol, state: "active" }];
+      const { mapProperty } = await acciones();
+
+      const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+
+      expect(res).toEqual({ ok: true });
+      expect(escrituras().some((o) => o.verbo === "insert" && o.cliente === "servicio")).toBe(true);
+    });
+  }
+
+  it("un owner ARCHIVADO no mapea: la membresía tiene que estar activa", async () => {
+    membresias = [{ organization_id: ORG, role: "owner", state: "archived" }];
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-a-member" });
+    expect(escrituras()).toHaveLength(0);
   });
 });

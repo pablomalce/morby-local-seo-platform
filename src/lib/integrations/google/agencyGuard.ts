@@ -15,6 +15,13 @@
  * que separa a un desconocido de un usuario; lo que separa a un usuario de un
  * operador de la agencia es esta consulta.
  *
+ * Y DE ROL, desde la puerta H4.1 (decisión D4, 2026-10-07): owner o admin de la
+ * agencia. Un `viewer` de la agencia es personal en sólo lectura, y reemplazar el
+ * token con el que se sirven TODOS los clientes no es leer. Un miembro sin ese
+ * rol recibe su propio motivo, `not-allowed`, y las rutas contestan 403: él SÍ
+ * sabe que la ruta existe, así que el 404 de quien no es de la agencia no le
+ * corresponde.
+ *
  * SE LEE COMO EL USUARIO, A PROPÓSITO
  *
  * Con el cliente de sesión y no con el admin, por el mismo argumento que
@@ -25,6 +32,7 @@
  */
 
 import { quienLlama } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 import { resolveAgencyOrgId } from "./agency";
 
 /** Por qué alguien no puede operar la conexión de la agencia. */
@@ -33,6 +41,8 @@ export type GuardRejection =
   | "not-authenticated"
   /** Hay sesión, y no es de la agencia. */
   | "not-agency"
+  /** Es de la agencia, y su rol no alcanza para tocar la conexión (D4). */
+  | "not-allowed"
   /** `VULKAN_AGENCY_ORG_ID` falta o no es un uuid: no hay a quién comparar. */
   | "agency-unresolved";
 
@@ -63,16 +73,13 @@ export async function esOperadorDeLaAgencia(
   if (!sesion) return { ok: false, reason: "not-authenticated" };
   const { supabase, user } = sesion;
 
-  const { data, error } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("organization_id", agencia.organizationId)
-    .limit(1);
+  const permiso = await permisoEn(supabase, user.id, agencia.organizationId, "integrar");
 
   // Un fallo de lectura NO es una membresía. Devolver «es de la agencia» ante un
   // error de la base convertiría una caída de Supabase en un permiso.
-  if (error || !data || data.length === 0) return { ok: false, reason: "not-agency" };
+  if (!permiso.ok) {
+    return { ok: false, reason: permiso.motivo === "rol-insuficiente" ? "not-allowed" : "not-agency" };
+  }
 
   return { ok: true, organizationId: agencia.organizationId };
 }
