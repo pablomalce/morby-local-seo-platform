@@ -289,6 +289,17 @@ function slugify(value: string): string {
   );
 }
 
+/**
+ * Lo que ve quien no puede crear un negocio en la organización activa.
+ *
+ * Desde la 0031 (H4.1, D3) la base le rechaza el INSERT en `businesses` a un
+ * `viewer` o a un `client` con 42501, y el alta del onboarding lo mostraba tal
+ * cual: «new row violates row-level security policy "businesses_role_insert"»
+ * (crítico del 2026-10-08). Es una negativa de rol, y se dice como tal.
+ */
+export const SIN_ROL_PARA_CREAR_NEGOCIO =
+  "Tu rol en esta organización no crea negocios: eso lo hace un owner, admin, manager o editor. Elegí otra organización arriba, o pedíselo a alguien de la agencia.";
+
 export async function createTenantInDb(input: {
   organizationId: string;
   business: NewBusinessDbInput;
@@ -312,6 +323,9 @@ export async function createTenantInDb(input: {
     .select()
     .single();
 
+  // 42501 es la RLS —o el privilegio—: una negativa, no una falla. Cualquier
+  // otro error sigue saliendo con su mensaje.
+  if (bizErr && (bizErr as { code?: string }).code === "42501") throw new Error(SIN_ROL_PARA_CREAR_NEGOCIO);
   if (bizErr || !biz) throw new Error(bizErr?.message ?? "Failed to create business");
 
   if (input.firstLocation) {

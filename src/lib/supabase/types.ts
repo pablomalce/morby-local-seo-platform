@@ -31,7 +31,7 @@ export interface Database {
           id: string;
           organization_id: string;
           user_id: string;
-          role: "owner" | "admin" | "manager" | "editor" | "viewer";
+          role: "owner" | "admin" | "manager" | "editor" | "viewer" | "client";
           created_at: string;
         };
         Insert: Partial<Database["public"]["Tables"]["org_members"]["Row"]> & {

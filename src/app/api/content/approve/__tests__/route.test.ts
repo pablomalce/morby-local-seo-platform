@@ -15,37 +15,65 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const ASSET = "7d703707-4f9d-43bf-9305-6bc22eddf45f";
 const USUARIO = "9720b91a-0b6e-4b3d-8c09-2f926733c270";
+/** La organización DEL ASSET: es donde se pregunta el rol. */
+const ORG_DEL_ASSET = "df6743a9-6f98-400e-8efb-fdcc37b3cb45";
 /** El hash que la BASE calculó, en la columna generada. */
 const HUELLA_DE_LA_BASE = "9e107d9d372bb6826bd81d3542a419d6";
 
 let usuario: { id: string } | null = { id: USUARIO };
-let fila: { id: string; status: string; payload_hash: string | null } | null = null;
+let fila: { id: string; organization_id: string; status: string; payload_hash: string | null } | null = null;
 let errorLectura: { message: string } | null = null;
 let errorEscritura: { code?: string; message?: string } | null = null;
 let filaEscrita: Record<string, unknown> | null = null;
 /** Lo que la escritura devuelve. `null` sin error es la RLS negando el UPDATE. */
 let devuelveTrasEscribir: { id: string; status: string; approved_hash: string } | null = null;
 
+/**
+ * La membresía de quien llama, tal como la devuelve `org_members` leída como el
+ * usuario. Por defecto manager: el rol más bajo que aprueba (D4).
+ */
+let membresias: { role: string; state: string }[] = [];
+let errorMembresia: { message: string } | null = null;
+/** Con qué filtros se preguntó el rol: la organización tiene que ser la del ASSET. */
+let filtrosDeMembresia: Record<string, string> = {};
+
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerClient: async () => ({
     auth: { getUser: async () => ({ data: { user: usuario } }) },
-    from: () => ({
-      select: () => ({
-        eq: () => ({ maybeSingle: async () => ({ data: fila, error: errorLectura }) }),
-      }),
-      update: (valores: Record<string, unknown>) => {
-        filaEscrita = valores;
-        return {
-          eq: () => ({
+    from: (tabla: string) =>
+      tabla === "org_members"
+        ? {
+            select: () => {
+              const cadena = {
+                eq: (col: string, val: string) => {
+                  filtrosDeMembresia[col] = val;
+                  return cadena;
+                },
+                limit: async () => ({ data: errorMembresia ? null : membresias, error: errorMembresia }),
+              };
+              return cadena;
+            },
+          }
+        : {
             select: () => ({
-              maybeSingle: async () => ({ data: devuelveTrasEscribir, error: errorEscritura }),
+              eq: () => ({ maybeSingle: async () => ({ data: fila, error: errorLectura }) }),
             }),
-          }),
-        };
-      },
-    }),
+            update: (valores: Record<string, unknown>) => {
+              filaEscrita = valores;
+              return {
+                eq: () => ({
+                  select: () => ({
+                    maybeSingle: async () => ({ data: devuelveTrasEscribir, error: errorEscritura }),
+                  }),
+                }),
+              };
+            },
+          },
   }),
 }));
+
+/** Toda salida a la red. Aprobar no sale a ningún lado: tiene que quedar en cero. */
+let salidas = 0;
 
 const { POST } = await import("../route");
 
@@ -61,7 +89,15 @@ function pedido(cuerpo: unknown): Request {
 
 beforeEach(() => {
   usuario = { id: USUARIO };
-  fila = { id: ASSET, status: "draft", payload_hash: HUELLA_DE_LA_BASE };
+  fila = { id: ASSET, organization_id: ORG_DEL_ASSET, status: "draft", payload_hash: HUELLA_DE_LA_BASE };
+  membresias = [{ role: "manager", state: "active" }];
+  errorMembresia = null;
+  filtrosDeMembresia = {};
+  salidas = 0;
+  vi.stubGlobal("fetch", async () => {
+    salidas += 1;
+    throw new Error("aprobar no sale a la red");
+  });
   errorLectura = null;
   errorEscritura = null;
   filaEscrita = null;
@@ -121,7 +157,7 @@ describe("cuándo NO se escribe", () => {
   });
 
   it("sin huella no sella nada", async () => {
-    fila = { id: ASSET, status: "draft", payload_hash: null };
+    fila = { id: ASSET, organization_id: ORG_DEL_ASSET, status: "draft", payload_hash: null };
     const res = await POST(pedido({ assetId: ASSET }));
     expect(res.status).toBe(502);
     expect(filaEscrita).toBeNull();
@@ -159,5 +195,59 @@ describe("lo que contesta cuando la base dice que no", () => {
     devuelveTrasEscribir = null;
     const res = await POST(pedido({ assetId: ASSET }));
     expect(res.status).toBe(404);
+  });
+});
+
+describe("quién aprueba: el rol, en la organización del asset (H4.1, D4)", () => {
+  // La corrección del crítico: todas estas negativas son en la MISMA
+  // organización donde el manager sí aprueba. El asset es legible para todos —un
+  // client lee su contenido—, así que lo único que cambia entre un caso y otro
+  // es el rol.
+  for (const rol of ["client", "viewer", "editor"]) {
+    it(`un ${rol} de la organización recibe 403, y la fila no se toca ni se sale a la red`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido({ assetId: ASSET }));
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, motivo: "sin-permiso" });
+      expect(filaEscrita).toBeNull();
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["manager", "admin", "owner"]) {
+    it(`un ${rol} de la misma organización aprueba`, async () => {
+      membresias = [{ role: rol, state: "active" }];
+
+      const res = await POST(pedido({ assetId: ASSET }));
+
+      expect(res.status).toBe(200);
+      expect(filaEscrita).toMatchObject({ status: "approved", approved_hash: HUELLA_DE_LA_BASE });
+    });
+  }
+
+  it("el rol se pregunta en la organización DEL ASSET y por quien tiene la sesión", async () => {
+    await POST(pedido({ assetId: ASSET, organizationId: "00000000-0000-4000-8000-000000000000" }));
+
+    expect(filtrosDeMembresia).toEqual({ user_id: USUARIO, organization_id: ORG_DEL_ASSET });
+  });
+
+  it("una membresía archivada no aprueba, aunque su rol alcance", async () => {
+    membresias = [{ role: "owner", state: "archived" }];
+
+    const res = await POST(pedido({ assetId: ASSET }));
+
+    expect(res.status).toBe(403);
+    expect(filaEscrita).toBeNull();
+  });
+
+  it("si la membresía no se puede leer, 502 y nada escrito: una caída no es un permiso", async () => {
+    errorMembresia = { message: "connection reset" };
+
+    const res = await POST(pedido({ assetId: ASSET }));
+
+    expect(res.status).toBe(502);
+    expect(filaEscrita).toBeNull();
   });
 });

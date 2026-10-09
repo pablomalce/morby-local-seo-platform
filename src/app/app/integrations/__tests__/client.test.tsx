@@ -57,7 +57,7 @@ describe("el formulario escribe por la acción de servidor", () => {
   it("CONNECT manda la organización, la superficie y lo que se escribió", async () => {
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -81,7 +81,7 @@ describe("el formulario escribe por la acción de servidor", () => {
   it("DISCONNECT manda la organización y la superficie", async () => {
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -98,7 +98,7 @@ describe("el formulario escribe por la acción de servidor", () => {
   it("no se puede desconectar lo que no está mapeado", async () => {
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -114,7 +114,7 @@ describe("el formulario escribe por la acción de servidor", () => {
     // perdió el mapeo, y el primer reflejo es volver a escribirlo.
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -132,7 +132,7 @@ describe("el formulario escribe por la acción de servidor", () => {
     });
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -155,7 +155,7 @@ describe("las dos razones que comparten estado se leen distinto", () => {
   it("la de plataforma manda a Google Cloud y dice que no es por cliente", async () => {
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -169,7 +169,7 @@ describe("las dos razones que comparten estado se leen distinto", () => {
   it("la de cliente manda a esta pantalla, para este cliente", async () => {
     const { OrganizationIntegrations } = await componente();
     render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -187,7 +187,7 @@ describe("las dos razones que comparten estado se leen distinto", () => {
     const { OrganizationIntegrations } = await componente();
     const textoDe = (reason: string) => {
       const { container, unmount } = render(
-        <OrganizationIntegrations
+        <OrganizationIntegrations puedeMapear
           organizationId={ORG}
           organizationName="Cliente A"
           organizationSlug="cliente-a"
@@ -204,7 +204,7 @@ describe("las dos razones que comparten estado se leen distinto", () => {
   it("«conectado» no arrastra ninguna razón al lado", async () => {
     const { OrganizationIntegrations } = await componente();
     const { container } = render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -220,7 +220,7 @@ describe("las tres formas canónicas se le dicen al operador", () => {
   it("cada superficie muestra la suya", async () => {
     const { OrganizationIntegrations } = await componente();
     const { container } = render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Cliente A"
         organizationSlug="cliente-a"
@@ -241,7 +241,7 @@ describe("las tres formas canónicas se le dicen al operador", () => {
 describe("el estado de la plataforma", () => {
   it("dice cuál es el estado del token de la agencia", async () => {
     const { PlatformNotice } = await componente();
-    const { container } = render(<PlatformNotice connected={false} tokenState="absent" />);
+    const { container } = render(<PlatformNotice puedeConectar connected={false} tokenState="absent" />);
     expect(container.textContent).toContain("ABSENT");
     expect(container.textContent).toContain("NOT CONFIGURED");
   });
@@ -259,7 +259,7 @@ describe("el estado de la plataforma", () => {
       "malformed",
       "unreadable",
     ] as const) {
-      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      const { container } = render(<PlatformNotice puedeConectar connected tokenState={estado} />);
       expect(container.textContent, `con ${estado}`).toContain(estado.toUpperCase());
     }
   });
@@ -275,7 +275,7 @@ describe("el estado de la plataforma", () => {
     const { PlatformNotice } = await componente();
 
     for (const estado of ["absent", "revoked"] as const) {
-      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      const { container } = render(<PlatformNotice puedeConectar connected tokenState={estado} />);
       expect(
         container.querySelector('a[href="/api/auth/google/start"]'),
         `con ${estado} tendría que ofrecerlo`
@@ -286,7 +286,7 @@ describe("el estado de la plataforma", () => {
 
   it("no ofrece conectar sin credenciales de plataforma: el consentimiento no puede empezar", async () => {
     const { PlatformNotice } = await componente();
-    const { container } = render(<PlatformNotice connected={false} tokenState="absent" />);
+    const { container } = render(<PlatformNotice puedeConectar connected={false} tokenState="absent" />);
     expect(container.querySelector('a[href="/api/auth/google/start"]')).toBeNull();
   });
 
@@ -303,7 +303,7 @@ describe("el estado de la plataforma", () => {
     const { PlatformNotice } = await componente();
 
     for (const estado of ["active", "expired", "unset", "malformed", "unreadable"] as const) {
-      const { container } = render(<PlatformNotice connected tokenState={estado} />);
+      const { container } = render(<PlatformNotice puedeConectar connected tokenState={estado} />);
       expect(
         container.querySelector('a[href="/api/auth/google/start"]'),
         `con ${estado} NO tendría que ofrecerlo`
@@ -334,7 +334,7 @@ describe("el motivo del último fallo, en la fila", () => {
   it("muestra qué pasó y contra qué property", async () => {
     const { OrganizationIntegrations } = await componente();
     const { container } = render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Vulkan Studios"
         organizationSlug="vulkan-studios"
@@ -352,7 +352,7 @@ describe("el motivo del último fallo, en la fila", () => {
   it("no muestra nada cuando la última consulta salió bien", async () => {
     const { OrganizationIntegrations } = await componente();
     const { container } = render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Vulkan Studios"
         organizationSlug="vulkan-studios"
@@ -369,7 +369,7 @@ describe("el motivo del último fallo, en la fila", () => {
     // integración equivocada.
     const { OrganizationIntegrations } = await componente();
     const { container } = render(
-      <OrganizationIntegrations
+      <OrganizationIntegrations puedeMapear
         organizationId={ORG}
         organizationName="Vulkan Studios"
         organizationSlug="vulkan-studios"
@@ -378,5 +378,61 @@ describe("el motivo del último fallo, en la fila", () => {
       />
     );
     expect(container.querySelector('[data-testid="sonda-search_console"]')).toBeNull();
+  });
+});
+
+describe("lo que se ofrece, según el rol (H4.1, D4; crítico del 2026-10-08)", () => {
+  it("sin rol para mapear no hay campo ni botones, y se dice quién lo cambia", async () => {
+    const { OrganizationIntegrations } = await componente();
+    render(
+      <OrganizationIntegrations
+        puedeMapear={false}
+        organizationId={ORG}
+        organizationName="Cliente"
+        organizationSlug="cliente"
+        surfaces={[vista({ propertyRef: "properties/123456789", state: "connected", reason: null })]}
+      />
+    );
+
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByText("REMAP")).toBeNull();
+    expect(screen.queryByText("DISCONNECT")).toBeNull();
+    const linea = screen.getByTestId("mapeo-sin-rol").textContent ?? "";
+    expect(linea).toContain("properties/123456789");
+    expect(linea).toMatch(/OWNER\s+OR ADMIN OF THE AGENCY/);
+    expect(mapProperty).not.toHaveBeenCalled();
+  });
+
+  it("con rol para mapear, el campo está y la línea no", async () => {
+    const { OrganizationIntegrations } = await componente();
+    render(
+      <OrganizationIntegrations
+        puedeMapear
+        organizationId={ORG}
+        organizationName="Cliente"
+        organizationSlug="cliente"
+        surfaces={[vista()]}
+      />
+    );
+    expect(screen.getByRole("textbox")).toBeTruthy();
+    expect(screen.queryByTestId("mapeo-sin-rol")).toBeNull();
+  });
+
+  it("sin rol para conectar no hay enlace al OAuth, ni en los dos estados que lo ofrecen", async () => {
+    const { PlatformNotice } = await componente();
+    for (const estado of ["absent", "revoked"] as const) {
+      const { container } = render(<PlatformNotice puedeConectar={false} connected tokenState={estado} />);
+      expect(container.querySelector('a[href="/api/auth/google/start"]'), estado).toBeNull();
+      expect(screen.getByTestId("conectar-sin-rol").textContent).toMatch(/owner or admin of the agency/);
+      cleanup();
+    }
+  });
+
+  it("la organización que opera la agencia no muestra superficies, token ni formulario", async () => {
+    const { OperadaPorLaAgencia } = await componente();
+    const { container } = render(<OperadaPorLaAgencia organizationName="Cliente X" organizationSlug="cliente-x" />);
+    expect(screen.getByTestId("operada-por-la-agencia").textContent).toMatch(/agency/);
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(container.textContent).not.toMatch(/AGENCY TOKEN|NOT CONNECTED|CONNECTED/);
   });
 });

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -46,6 +47,18 @@ export const runtime = "nodejs";
  * `authenticated` ya tiene `SELECT` y `UPDATE` sobre `content_assets`, y la RLS
  * decide qué filas alcanza cada quien. Un no-miembro recibe lo mismo que quien
  * pide un id inventado: 404, y ninguna fila tocada.
+ *
+ * Y APROBAR PIDE ROL (decisión D4 de la puerta H4.1, 2026-10-07)
+ *
+ * owner, admin o manager de la organización DEL ASSET. Un miembro que puede leer
+ * el asset —un `client` lo lee: es contenido suyo— no por eso lo sella. La
+ * negativa es 403 y va ANTES de cualquier escritura: un 404 diría «no existe»
+ * sobre algo que la persona está viendo en pantalla.
+ *
+ * La base dice lo mismo por su lado desde la 0031 —el eje de aprobación frena el
+ * UPDATE de un editor, el de rol el de un client o un viewer—, así que llamar a
+ * PostgREST directo tampoco sella. Esta comprobación es la que convierte esa
+ * negativa en un 403 legible en vez de un 404 o un 502.
  */
 
 const schema = z.object({
@@ -71,7 +84,7 @@ export async function POST(req: Request) {
 
     const { data: asset, error: errorLectura } = await supabase
       .from("content_assets")
-      .select("id, status, payload_hash")
+      .select("id, organization_id, status, payload_hash")
       .eq("id", assetId)
       .maybeSingle();
 
@@ -79,6 +92,16 @@ export async function POST(req: Request) {
     // escribir: sin la fila no hay hash que sellar.
     if (errorLectura) return NextResponse.json({ error: "asset unreadable" }, { status: 502 });
     if (!asset) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+    // El rol, en la organización del ASSET y no en la que diga el pedido.
+    const permiso = await permisoEn(supabase, user.id, asset.organization_id, "aprobar");
+    if (!permiso.ok) {
+      // Una lectura de membresía que falló no es un «no podés»: es el servidor.
+      if (permiso.motivo === "ilegible") {
+        return NextResponse.json({ error: "membership unreadable" }, { status: 502 });
+      }
+      return NextResponse.json({ ok: false, motivo: "sin-permiso" }, { status: 403 });
+    }
 
     // Sin `payload_hash` no hay nada que sellar. La columna es generada y no
     // debería faltar nunca; si falta, aprobar a ciegas escribiría una aprobación

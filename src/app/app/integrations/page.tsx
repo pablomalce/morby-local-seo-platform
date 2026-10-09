@@ -3,13 +3,15 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { Card, HudLabel, PageHeader } from "@/components/ui";
 import { viewForOrganization } from "@/lib/integrations/google/screen";
 import { agencyTokenState } from "@/lib/integrations/google/agencyToken";
+import { resolveAgencyOrgId } from "@/lib/integrations/google/agency";
+import { rolPuede } from "@/lib/org/rol";
 import {
   type GoogleSurface,
   type PropertyMapping,
   platformIsConnected,
 } from "@/lib/integrations/google/sources";
 import type { SondaVista } from "@/lib/integrations/google/probeView";
-import { OrganizationIntegrations, PlatformNotice } from "./client";
+import { OperadaPorLaAgencia, OrganizationIntegrations, PlatformNotice } from "./client";
 
 export const dynamic = "force-dynamic";
 
@@ -33,7 +35,43 @@ export const dynamic = "force-dynamic";
  * Se pide UNA vez para todas las organizaciones y no una por cliente: el token
  * es de la plataforma, así que consultarlo por cliente daría la misma respuesta
  * N veces y sugeriría, a quien lea este archivo, que es un dato por cliente.
+ *
+ * ES UNA PANTALLA DE LA AGENCIA (puerta H4.1; crítico del 2026-10-08)
+ *
+ * Hasta acá cualquier miembro de cualquier organización la veía entera: el
+ * estado del token de la agencia —leído con `service_role`, sin mirar quién
+ * pregunta—, las tres superficies de cada organización y el formulario de mapeo.
+ * Para un `client` eso era tres cosas mal a la vez: veía un dato interno de la
+ * agencia; veía sus superficies «sin mapear» aunque estuvieran mapeadas, porque
+ * desde la 0031 `integration_properties` le queda oculta; y se le ofrecía un
+ * formulario que en SU organización personal —toda cuenta es owner de una—
+ * escribía con `service_role` (`property-actions.ts` lo cierra del lado del
+ * servidor).
+ *
+ * Ahora, con `VULKAN_AGENCY_ORG_ID` resuelta:
+ *
+ *   * quien no es personal de la agencia (owner, admin, manager, editor o
+ *     viewer de ELLA) no ve el aviso de plataforma ni las superficies: cada
+ *     organización suya sale como «la opera la agencia», y no se lee el token
+ *     ni el mapeo ni las sondas;
+ *   * el personal de la agencia ve todo como antes, salvo las organizaciones
+ *     donde su rol no ve lo interno;
+ *   * el formulario se dibuja sólo donde el mapeo se puede escribir: owner o
+ *     admin de la agencia Y de esa organización, lo mismo que exige
+ *     `property-actions.ts`; y el enlace de conectar Google, sólo para un owner
+ *     o admin de la agencia, lo mismo que exige `/api/auth/google/start`.
+ *
+ * Sin la variable, la pantalla sigue diciendo `unset` o `malformed` —que es el
+ * diagnóstico que hace falta, y no lee nada— y nadie ve el formulario: nadie
+ * puede mapear.
  */
+
+/** Una membresía, con lo que esta pantalla decide con ella. */
+interface Membresia {
+  organization_id: string;
+  role: string | null;
+  state: string | null;
+}
 
 /** Una fila de `integration_probe`, tal como vuelve de la base. */
 interface ProbeRow {
@@ -60,25 +98,43 @@ export default async function IntegrationsPage() {
 
   const { data: memberships } = await supabase
     .from("org_members")
-    .select("organization_id")
+    .select("organization_id, role, state")
     .eq("user_id", user.id);
 
-  const orgIds = (memberships ?? []).map((m) => m.organization_id as string);
+  const filas = (memberships ?? []) as Membresia[];
+  const orgIds = filas.map((m) => m.organization_id);
+
+  /** El rol ACTIVO en una organización, o null. */
+  const rolEn = (organizationId: string) =>
+    filas.find((m) => m.organization_id === organizationId && (m.state ?? "active") === "active")?.role ?? null;
+
+  const agencia = resolveAgencyOrgId();
+  const deLaAgencia = agencia.ok && rolPuede(rolEn(agencia.organizationId), "personal");
+  const operador = agencia.ok && rolPuede(rolEn(agencia.organizationId), "integrar");
+  // Sin la variable no hay a quién preguntarle: se muestra el diagnóstico.
+  const veLaPlataforma = deLaAgencia || !agencia.ok;
 
   const { data: orgRows } = orgIds.length
     ? await supabase.from("organizations").select("id, name, slug").in("id", orgIds)
     : { data: [] as Organizacion[] };
+
+  const organizaciones = (orgRows ?? []) as Organizacion[];
+  // Las que se dibujan con sus superficies: las de una persona que ve la
+  // plataforma y, en ESA organización, ve lo interno. Sólo de éstas se leen el
+  // mapeo y las sondas.
+  const conSuperficies = organizaciones.filter((o) => veLaPlataforma && rolPuede(rolEn(o.id), "personal"));
+  const idsConSuperficies = conSuperficies.map((o) => o.id);
 
   // Los mapeos VIVOS de todas las organizaciones del usuario, en una consulta.
   // `unmapped_at IS NULL` va escrito aunque el índice único sólo alcance a los
   // vivos: el índice impide que haya DOS vivos, no que se lea uno muerto — y un
   // mapeo muerto en pantalla le atribuye a un cliente una property que ya no es
   // suya.
-  const { data: mappingRows } = orgIds.length
+  const { data: mappingRows } = idsConSuperficies.length
     ? await supabase
         .from("integration_properties")
         .select("organization_id, provider, property_ref")
-        .in("organization_id", orgIds)
+        .in("organization_id", idsConSuperficies)
         .is("unmapped_at", null)
     : { data: [] as { organization_id: string; provider: string; property_ref: string }[] };
 
@@ -99,11 +155,11 @@ export default async function IntegrationsPage() {
   // Se lee con el cliente de SESIÓN y no con el admin, a diferencia del estado
   // del token: esto SÍ es un dato por cliente, y la RLS de la 0022 es justamente
   // la que impide que alguien vea contra qué property consulta otro.
-  const { data: probeRows } = orgIds.length
+  const { data: probeRows } = idsConSuperficies.length
     ? await supabase
         .from("integration_probe")
         .select("organization_id, provider, outcome, http_status, property_ref, checked_at")
-        .in("organization_id", orgIds)
+        .in("organization_id", idsConSuperficies)
     : { data: [] as ProbeRow[] };
 
   const sondasPorOrganizacion = new Map<string, SondaVista[]>();
@@ -119,9 +175,10 @@ export default async function IntegrationsPage() {
     sondasPorOrganizacion.set(row.organization_id, lista);
   }
 
-  const organizaciones = (orgRows ?? []) as Organizacion[];
   const plataformaConectada = platformIsConnected();
-  const estadoDelToken = await agencyTokenState();
+  // Con `service_role`: SÓLO para quien ve la plataforma. A cualquier otro, ni
+  // se le pregunta a la base.
+  const estadoDelToken = veLaPlataforma ? await agencyTokenState() : null;
 
   return (
     <>
@@ -132,7 +189,9 @@ export default async function IntegrationsPage() {
         description="One agency token, one mapping per client. The mapping is what separates one client's numbers from another's."
       />
 
-      <PlatformNotice connected={plataformaConectada} tokenState={estadoDelToken} />
+      {estadoDelToken !== null && (
+        <PlatformNotice connected={plataformaConectada} tokenState={estadoDelToken} puedeConectar={operador} />
+      )}
 
       {organizaciones.length === 0 ? (
         <Card className="mt-6">
@@ -143,19 +202,21 @@ export default async function IntegrationsPage() {
         </Card>
       ) : (
         <div className="mt-6 space-y-6">
-          {organizaciones.map((org) => (
-            <OrganizationIntegrations
-              key={org.id}
-              organizationId={org.id}
-              organizationName={org.name}
-              organizationSlug={org.slug}
-              surfaces={viewForOrganization(
-                porOrganizacion.get(org.id) ?? [],
-                estadoDelToken
-              )}
-              probes={sondasPorOrganizacion.get(org.id) ?? []}
-            />
-          ))}
+          {organizaciones.map((org) =>
+            estadoDelToken !== null && idsConSuperficies.includes(org.id) ? (
+              <OrganizationIntegrations
+                key={org.id}
+                organizationId={org.id}
+                organizationName={org.name}
+                organizationSlug={org.slug}
+                surfaces={viewForOrganization(porOrganizacion.get(org.id) ?? [], estadoDelToken)}
+                probes={sondasPorOrganizacion.get(org.id) ?? []}
+                puedeMapear={operador && rolPuede(rolEn(org.id), "integrar")}
+              />
+            ) : (
+              <OperadaPorLaAgencia key={org.id} organizationName={org.name} organizationSlug={org.slug} />
+            )
+          )}
         </div>
       )}
     </>

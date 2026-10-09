@@ -15,6 +15,13 @@
  * que separa a un desconocido de un usuario; lo que separa a un usuario de un
  * operador de la agencia es esta consulta.
  *
+ * Y DE ROL, desde la puerta H4.1 (decisión D4, 2026-10-07): owner o admin de la
+ * agencia. Un `viewer` de la agencia es personal en sólo lectura, y reemplazar el
+ * token con el que se sirven TODOS los clientes no es leer. Un miembro sin ese
+ * rol recibe su propio motivo, `not-allowed`, y las rutas contestan 403: él SÍ
+ * sabe que la ruta existe, así que el 404 de quien no es de la agencia no le
+ * corresponde.
+ *
  * SE LEE COMO EL USUARIO, A PROPÓSITO
  *
  * Con el cliente de sesión y no con el admin, por el mismo argumento que
@@ -24,7 +31,8 @@
  * TOKEN, que es uno solo y no es de quien mira.
  */
 
-import { quienLlama } from "@/lib/api/sesion";
+import { quienLlama, type ClienteDeServidor } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 import { resolveAgencyOrgId } from "./agency";
 
 /** Por qué alguien no puede operar la conexión de la agencia. */
@@ -33,6 +41,8 @@ export type GuardRejection =
   | "not-authenticated"
   /** Hay sesión, y no es de la agencia. */
   | "not-agency"
+  /** Es de la agencia, y su rol no alcanza para tocar la conexión (D4). */
+  | "not-allowed"
   /** `VULKAN_AGENCY_ORG_ID` falta o no es un uuid: no hay a quién comparar. */
   | "agency-unresolved";
 
@@ -51,8 +61,7 @@ export type GuardResult =
 export async function esOperadorDeLaAgencia(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<GuardResult> {
-  const agencia = resolveAgencyOrgId(env);
-  if (!agencia.ok) return { ok: false, reason: "agency-unresolved" };
+  if (!resolveAgencyOrgId(env).ok) return { ok: false, reason: "agency-unresolved" };
 
   // `quienLlama` y no `getUser()` a mano: en modo demo —sin las envs de
   // Supabase— construir el cliente TIRA, y este guardia no tenía try. MEDIDO el
@@ -61,18 +70,37 @@ export async function esOperadorDeLaAgencia(
   // va al login como cualquier otro `not-authenticated`.
   const sesion = await quienLlama();
   if (!sesion) return { ok: false, reason: "not-authenticated" };
-  const { supabase, user } = sesion;
 
-  const { data, error } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("organization_id", agencia.organizationId)
-    .limit(1);
+  return operadorDeLaAgencia(sesion.supabase, sesion.user.id, env);
+}
+
+/**
+ * La misma pregunta, para quien ya tiene la sesión en la mano.
+ *
+ * La usa también el mapeo de propiedades (`property-actions.ts`), y no por
+ * prolijidad: es lo que cierra el hallazgo del crítico del 2026-10-08. Toda
+ * cuenta es owner de una organización —la personal que crea `handle_new_user`
+ * (0001), y las que quiera crear con `create_client_organization` (0024)—, así
+ * que «owner o admin de la organización destino» lo cumple cualquiera que se
+ * registre. Y lo que se mapea ahí se lee con el token de la AGENCIA, que llega a
+ * las properties de todos los clientes. La llave es de la agencia; quién la
+ * apunta a una property lo decide la agencia, con esta función.
+ */
+export async function operadorDeLaAgencia(
+  supabase: ClienteDeServidor,
+  userId: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<GuardResult> {
+  const agencia = resolveAgencyOrgId(env);
+  if (!agencia.ok) return { ok: false, reason: "agency-unresolved" };
+
+  const permiso = await permisoEn(supabase, userId, agencia.organizationId, "integrar");
 
   // Un fallo de lectura NO es una membresía. Devolver «es de la agencia» ante un
   // error de la base convertiría una caída de Supabase en un permiso.
-  if (error || !data || data.length === 0) return { ok: false, reason: "not-agency" };
+  if (!permiso.ok) {
+    return { ok: false, reason: permiso.motivo === "rol-insuficiente" ? "not-allowed" : "not-agency" };
+  }
 
   return { ok: true, organizationId: agencia.organizationId };
 }

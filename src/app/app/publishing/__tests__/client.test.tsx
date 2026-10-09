@@ -110,7 +110,7 @@ describe("el botón de ensayar", () => {
     // mandaría el posteo a la ficha real de un cliente. Y un `modo` mandado
     // desde el navegador convertiría el ensayo en un envío: el modo es un
     // literal del servidor a propósito.
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     await waitFor(() => expect(llamadas).toHaveLength(1));
@@ -124,7 +124,7 @@ describe("el botón de ensayar", () => {
   it("manda el asset ELEGIDO, no siempre el primero", async () => {
     // El defecto que impide: un selector decorativo. Se vería idéntico.
     const otro: AssetEnsayable = { ...APROBADO, id: "66666666-6666-4666-8666-666666666666", title: "Otro" };
-    render(<EnsayoDePublicacion aprobados={[APROBADO, otro]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO, otro]} />);
     fireEvent.change(screen.getByTestId("elegir-asset"), { target: { value: otro.id } });
     fireEvent.click(screen.getByTestId("ensayar"));
 
@@ -135,7 +135,7 @@ describe("el botón de ensayar", () => {
   it("refresca el ledger cuando el ensayo salió, para que la fila nueva se vea sin recargar", async () => {
     // Sin esto el único testigo del ensayo es el cartel de esta pantalla, que es
     // exactamente lo que el ledger existe para no tener que creer.
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     await waitFor(() => expect(refrescar).toHaveBeenCalled());
@@ -146,13 +146,13 @@ describe("el botón de ensayar", () => {
     // El defecto que impide: el operador aprieta, la fila ya estaba, y sin frase
     // propia concluye que el botón no hace nada.
     respuesta = { ok: true, status: 200, cuerpo: { ok: true, estado: "ya-publicado", publicationId: "p", externalId: "gbp-9" } };
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     await waitFor(() => expect(screen.getByTestId("resultado-ensayo").dataset.clase).toBe("ya-publicado"));
   });
 
-  it("404, 409, 429 y 502 se LEEN, y con cuatro textos distintos", async () => {
+  it("403, 404, 409, 429 y 502 se LEEN, y con cinco textos distintos", async () => {
     // El defecto que impide: el `catch` que traga y el «no se pudo» único. Cada
     // uno de estos cuatro se arregla en otro lado: recargando, aprobando en
     // /app/content, esperando un minuto, o mirando la base.
@@ -161,12 +161,15 @@ describe("el botón de ensayar", () => {
       { status: 409, cuerpo: { ok: false, motivo: "no-aprobado" }, clase: "no-aprobado" },
       { status: 429, cuerpo: { error: "rate limited" }, clase: "demasiados" },
       { status: 502, cuerpo: { ok: false, motivo: "ledger-ilegible", detalle: "57P01" }, clase: "ledger-ilegible" },
+      // El 403 de la puerta H4.1: hasta el 2026-10-08 caía en «defecto del
+      // código, no reintentar» (crítico del 2026-10-08).
+      { status: 403, cuerpo: { ok: false, motivo: "sin-permiso" }, clase: "sin-permiso" },
     ];
 
     const textos = new Set<string>();
     for (const caso of casos) {
       respuesta = { ok: false, status: caso.status, cuerpo: caso.cuerpo };
-      render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+      render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
       fireEvent.click(screen.getByTestId("ensayar"));
 
       const visto = await waitFor(() => screen.getByTestId("error-ensayo"));
@@ -187,7 +190,7 @@ describe("el botón de ensayar", () => {
 
   it("un fallo NO refresca el ledger: no hay fila nueva que mostrar", async () => {
     respuesta = { ok: false, status: 409, cuerpo: { ok: false, motivo: "no-aprobado" } };
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     await waitFor(() => expect(screen.getByTestId("error-ensayo")).toBeTruthy());
@@ -199,7 +202,7 @@ describe("el botón de ensayar", () => {
     // que esta pantalla cree, y celebrarlo sería dibujar una publicación que
     // nadie pidió.
     respuesta = { ok: true, status: 200, cuerpo: { ok: true, estado: "publicado", externalId: "gbp-9" } };
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     await waitFor(() => expect(screen.getByTestId("error-ensayo").dataset.clase).toBe("defecto-del-servidor"));
@@ -209,7 +212,7 @@ describe("el botón de ensayar", () => {
   it("sin assets aprobados NO hay botón ni selector, y se dice por qué", async () => {
     // Un botón que sólo puede dar 409 es una capacidad anunciada que no existe,
     // y hoy `content_assets` en hosted está en 0: el vacío es el caso normal.
-    render(<EnsayoDePublicacion aprobados={[]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[]} />);
     expect(screen.queryByTestId("ensayar")).toBeNull();
     expect(screen.queryByTestId("elegir-asset")).toBeNull();
     expect(screen.getByTestId("sin-aprobados").textContent).toMatch(/aprobado/i);
@@ -221,7 +224,7 @@ describe("el botón de ensayar", () => {
     // `publicar()` inserta con `service_role` antes de mirar el modo, y desde la
     // UI esa fila no se puede borrar. Callarlo sería vender el ensayo como algo
     // sin consecuencias.
-    const { container } = render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    const { container } = render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     expect(container.textContent).toMatch(/reserva/i);
     expect(container.innerHTML).not.toMatch(/publishing\/publish|en-vivo/);
   });
@@ -249,7 +252,7 @@ describe("el botón de ensayar — lo que rompía antes", () => {
       return { ok: true, status: 200, json: async () => ({ ok: true, estado: "ensayado", publicationId: "p" }) } as Response;
     });
 
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     const boton = screen.getByTestId("ensayar");
     fireEvent.click(boton);
     // El segundo click ocurre con el primer pedido en vuelo, que es el caso.
@@ -267,7 +270,7 @@ describe("el botón de ensayar — lo que rompía antes", () => {
       throw new TypeError("Failed to fetch");
     });
 
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     const visto = await waitFor(() => screen.getByTestId("error-ensayo"));
@@ -280,11 +283,11 @@ describe("el botón de ensayar — lo que rompía antes", () => {
   });
 
   it("manda el asset que el selector MUESTRA, incluso si la lista cambió debajo (defecto: el id guardado en estado sobrevivía a un refresh que lo saca de la lista, y el select mostraba el primero mientras el botón mandaba el que se fue)", async () => {
-    const { rerender } = render(<EnsayoDePublicacion aprobados={[APROBADO, OTRO]} />);
+    const { rerender } = render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO, OTRO]} />);
     fireEvent.change(screen.getByTestId("elegir-asset"), { target: { value: OTRO.id } });
 
     // El refresh trae una lista sin el elegido — el caso que el escéptico midió.
-    rerender(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    rerender(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     expect((screen.getByTestId("elegir-asset") as HTMLSelectElement).value).toBe(APROBADO.id);
 
     fireEvent.click(screen.getByTestId("ensayar"));
@@ -293,7 +296,7 @@ describe("el botón de ensayar — lo que rompía antes", () => {
   });
 
   it("el cartel NOMBRA el asset que se ensayó, así que cambiar el selector no lo convierte en el de otro (defecto: el resultado sobrevivía al cambio sin decir de cuál era)", async () => {
-    render(<EnsayoDePublicacion aprobados={[APROBADO, OTRO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO, OTRO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     const visto = await waitFor(() => screen.getByTestId("resultado-ensayo"));
@@ -308,7 +311,7 @@ describe("el botón de ensayar — lo que rompía antes", () => {
 
   it("un 502 que no trae la marca de «no pude leer el asset» se lee como INCERTIDUMBRE (defecto: cualquier 502 sin `motivo` afirmaba que el ledger no se tocó, y un 502 de un proxy caía ahí)", async () => {
     respuesta = { ok: false, status: 502, cuerpo: { error: "Bad Gateway" } };
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     const visto = await waitFor(() => screen.getByTestId("error-ensayo"));
@@ -318,11 +321,28 @@ describe("el botón de ensayar — lo que rompía antes", () => {
 
   it("y el 502 que SÍ trae la marca dice que el ledger quedó intacto (cerrar de más también es un defecto: si todo 502 fuera incierto, nadie sabría cuándo se puede reintentar tranquilo)", async () => {
     respuesta = { ok: false, status: 502, cuerpo: { error: "asset unreadable" } };
-    render(<EnsayoDePublicacion aprobados={[APROBADO]} />);
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
     fireEvent.click(screen.getByTestId("ensayar"));
 
     const visto = await waitFor(() => screen.getByTestId("error-ensayo"));
     expect(visto.dataset.clase).toBe("asset-ilegible");
     expect(screen.getByTestId("ensayo-que-paso").textContent).toMatch(/no se tocó/);
+  });
+});
+
+describe("el botón, según el rol (H4.1, D4; crítico del 2026-10-08)", () => {
+  it("a quien no ensaya no se le ofrece REHEARSE ni el selector, y se le dice quién lo hace", () => {
+    render(<EnsayoDePublicacion puedeEnsayar={false} aprobados={[APROBADO]} />);
+
+    expect(screen.queryByTestId("ensayar")).toBeNull();
+    expect(screen.queryByTestId("elegir-asset")).toBeNull();
+    expect(screen.getByTestId("sin-rol-para-ensayar").textContent).toMatch(/owner, admin o\s+manager/);
+    expect(llamadas).toHaveLength(0);
+  });
+
+  it("y a quien ensaya no se le muestra esa línea", () => {
+    render(<EnsayoDePublicacion puedeEnsayar aprobados={[APROBADO]} />);
+    expect(screen.queryByTestId("sin-rol-para-ensayar")).toBeNull();
+    expect(screen.getByTestId("ensayar")).toBeTruthy();
   });
 });

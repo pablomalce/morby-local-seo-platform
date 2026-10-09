@@ -57,9 +57,17 @@ const RAZON: Record<IntegrationReason, string> = {
 export function PlatformNotice({
   connected,
   tokenState,
+  puedeConectar,
 }: {
   connected: boolean;
   tokenState: AgencyTokenState;
+  /**
+   * Si quien mira es owner o admin de la agencia: lo mismo que exige
+   * `/api/auth/google/start` (H4.1, D4). Sin esto, el enlace llevaba a un
+   * manager de la agencia —que antes conectaba— a un JSON pelado con
+   * `{ error: "forbidden" }` (crítico del 2026-10-08).
+   */
+  puedeConectar: boolean;
 }) {
   return (
     <Card className="mt-6">
@@ -111,7 +119,7 @@ export function PlatformNotice({
         Si de verdad falla algo, el motivo está por fuente en
         `integration_probe`, que es evidencia medida y no una marca de tiempo.
       */}
-      {connected && (tokenState === "absent" || tokenState === "revoked") && (
+      {connected && puedeConectar && (tokenState === "absent" || tokenState === "revoked") && (
           <a
             href="/api/auth/google/start"
             className="mt-4 inline-block rounded-vulkan border border-vulkan-orange bg-metal-950 px-4 py-2 font-display text-[12px] uppercase tracking-hud text-vulkan-orange"
@@ -119,6 +127,12 @@ export function PlatformNotice({
             {tokenState === "absent" ? "CONNECT GOOGLE" : "RECONNECT GOOGLE"}
           </a>
         )}
+
+      {connected && !puedeConectar && (tokenState === "absent" || tokenState === "revoked") && (
+        <p className="mt-4 text-[12px] text-metal-400" data-testid="conectar-sin-rol">
+          Connecting Google is done by an owner or admin of the agency.
+        </p>
+      )}
 
       <p className="mt-4 text-[12px] text-metal-400">
         Access to Google is delegated: one OAuth token, held by the Vulkan account, with permission
@@ -130,12 +144,42 @@ export function PlatformNotice({
   );
 }
 
+/**
+ * Una organización de quien no opera la plataforma: un `client`, o una cuenta
+ * que no es de la agencia. Sin superficies, sin estado del token y sin
+ * formulario: no hay nada de eso que pueda ver bien —el mapeo le queda oculto
+ * desde la 0031— ni que pueda hacer.
+ */
+export function OperadaPorLaAgencia({
+  organizationName,
+  organizationSlug,
+}: {
+  organizationName: string;
+  organizationSlug: string;
+}) {
+  return (
+    <Card>
+      <div className="flex items-baseline justify-between">
+        <HudLabel>{organizationName.toUpperCase()}</HudLabel>
+        <span className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+          {organizationSlug}
+        </span>
+      </div>
+      <p className="mt-4 text-[12px] text-metal-400" data-testid="operada-por-la-agencia">
+        Google for this organization is connected and mapped by the agency. Ask your agency contact
+        about it.
+      </p>
+    </Card>
+  );
+}
+
 export function OrganizationIntegrations({
   organizationId,
   organizationName,
   organizationSlug,
   surfaces,
   probes = [],
+  puedeMapear,
 }: {
   organizationId: string;
   organizationName: string;
@@ -143,6 +187,13 @@ export function OrganizationIntegrations({
   surfaces: SurfaceView[];
   /** La última respuesta de Google por superficie. Vacío cuando nadie consultó todavía. */
   probes?: SondaVista[];
+  /**
+   * Si quien mira puede escribir el mapeo de ESTA organización: owner o admin
+   * de la agencia y de ella, lo mismo que exige `property-actions.ts`. Sin
+   * esto, el formulario se ofrecía a cualquier miembro (crítico del
+   * 2026-10-08).
+   */
+  puedeMapear: boolean;
 }) {
   return (
     <Card>
@@ -159,6 +210,7 @@ export function OrganizationIntegrations({
             organizationId={organizationId}
             view={view}
             probe={probes.find((p) => p.surface === view.surface)}
+            puedeMapear={puedeMapear}
           />
         ))}
       </div>
@@ -170,10 +222,12 @@ function SurfaceRow({
   organizationId,
   view,
   probe,
+  puedeMapear,
 }: {
   organizationId: string;
   view: SurfaceView;
   probe?: SondaVista;
+  puedeMapear: boolean;
 }) {
   const [valor, setValor] = useState(view.propertyRef ?? "");
   const [error, setError] = useState<string | null>(null);
@@ -230,32 +284,50 @@ function SurfaceRow({
         </p>
       )}
 
-      <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-        <Input
-          value={valor}
-          onChange={(e) => setValor(e.target.value)}
-          placeholder={FORMA_ESPERADA[view.surface]}
-          aria-label={`${NOMBRE[view.surface]} property`}
-          className="flex-1"
-        />
-        <Button onClick={conectar} disabled={pending} variant="primary">
-          {view.propertyRef ? "REMAP" : "CONNECT"}
-        </Button>
-        <Button
-          onClick={desconectar}
-          disabled={pending || !view.propertyRef}
-          variant="secondary"
+      {/*
+        Sin rol para escribir el mapeo, no hay campo ni botones: se dice qué hay
+        mapeado y quién lo cambia. La acción de servidor lo negaría igual
+        (`property-actions.ts`), pero ofrecer un formulario que siempre contesta
+        «no» es anunciar una capacidad que no existe.
+      */}
+      {!puedeMapear ? (
+        <p
+          className="mt-4 font-mono text-[10px] uppercase tracking-hud text-metal-500"
+          data-testid="mapeo-sin-rol"
         >
-          DISCONNECT
-        </Button>
-      </div>
+          {view.propertyRef ? `MAPPED · ${view.propertyRef}` : "NOT MAPPED"} · CHANGED BY AN OWNER
+          OR ADMIN OF THE AGENCY
+        </p>
+      ) : (
+        <>
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            <Input
+              value={valor}
+              onChange={(e) => setValor(e.target.value)}
+              placeholder={FORMA_ESPERADA[view.surface]}
+              aria-label={`${NOMBRE[view.surface]} property`}
+              className="flex-1"
+            />
+            <Button onClick={conectar} disabled={pending} variant="primary">
+              {view.propertyRef ? "REMAP" : "CONNECT"}
+            </Button>
+            <Button
+              onClick={desconectar}
+              disabled={pending || !view.propertyRef}
+              variant="secondary"
+            >
+              DISCONNECT
+            </Button>
+          </div>
 
-      <p className="mt-2 font-mono text-[10px] uppercase tracking-hud text-metal-500">
-        EXPECTED · {FORMA_ESPERADA[view.surface]}
-      </p>
+          <p className="mt-2 font-mono text-[10px] uppercase tracking-hud text-metal-500">
+            EXPECTED · {FORMA_ESPERADA[view.surface]}
+          </p>
 
-      {error && (
-        <p className="mt-2 font-mono text-[10px] uppercase tracking-hud text-red-400">{error}</p>
+          {error && (
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-hud text-red-400">{error}</p>
+          )}
+        </>
       )}
     </div>
   );

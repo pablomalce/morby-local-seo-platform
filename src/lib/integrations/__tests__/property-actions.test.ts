@@ -21,19 +21,24 @@
  * `{ ok: true }` pasa con la escritura hecha desde la sesión, que es exactamente
  * el defecto. Lo que separa una cosa de la otra es QUIÉN escribió.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const revalidatePath = vi.fn();
 vi.mock("next/cache", () => ({ revalidatePath }));
 
 /** Hay sesión, y de quién. */
 let usuario: { id: string } | null = { id: "11111111-1111-4111-8111-111111111111" };
-/** Las membresías que la lectura de sesión devuelve. */
-let membresias: { organization_id: string }[] = [];
+/**
+ * Las membresías que la lectura de sesión devuelve. Con rol desde H4.1: mapear
+ * pide owner o admin (D4), y admin es el más bajo que alcanza.
+ */
+let membresias: { organization_id: string; role?: string; state?: string }[] = [];
 /** Un fallo de lectura de membresías, cuando el test lo pide. */
 let errorDeMembresia: { message: string } | null = null;
 /** Y si además del error el driver devuelve filas, que es lo que a veces hace. */
 let membresiasJuntoAlError = false;
+/** Un fallo de lectura SÓLO al preguntar por esta organización. */
+let errorDeMembresiaEn: string | null = null;
 /**
  * Lo que contesta cada escritura, POR VERBO.
  *
@@ -73,8 +78,19 @@ function clienteFalso(cliente: "sesion" | "servicio") {
           // ÚNICO donde la comprobación de `error` hace algo: con `data: null`
           // el `!data` la tapa y la rama queda sin medir. Lo dijo una mutación
           // que sobrevivió.
+          //
+          // Filtrado por organización, como la base: desde que el mapeo también
+          // pregunta por la AGENCIA, un doble que devolviera todas las
+          // membresías a cualquier pregunta contestaría «admin de la agencia»
+          // con la fila de otra organización.
+          const delFiltro = membresias.filter(
+            (m) => filtros.organization_id === undefined || m.organization_id === filtros.organization_id
+          );
+          if (errorDeMembresiaEn && filtros.organization_id === errorDeMembresiaEn) {
+            return { data: null, error: { message: "la lectura de la agencia falló" } };
+          }
           return {
-            data: errorDeMembresia && !membresiasJuntoAlError ? null : membresias,
+            data: errorDeMembresia && !membresiasJuntoAlError ? null : delFiltro,
             error: errorDeMembresia,
           };
         }
@@ -131,10 +147,22 @@ const escrituras = () => operaciones.filter((o) => o.verbo !== "select");
 /** Lo que se escribió desde el navegador. Tiene que estar vacío siempre. */
 const escrituraDeSesion = () => escrituras().filter((o) => o.cliente === "sesion");
 
+// El entorno y `fetch` se tocan por test: sin esto, la variable de la agencia
+// de un describe se filtra al siguiente.
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
+
 beforeEach(() => {
   usuario = { id: "11111111-1111-4111-8111-111111111111" };
-  membresias = [{ organization_id: ORG }];
+  membresias = [{ organization_id: ORG, role: "admin", state: "active" }];
+  // La agencia ES la organización que se mapea, salvo en el describe de la
+  // llave: así el admin de arriba es también operador de la agencia, y los
+  // tests que miden otra cosa no dependen de la segunda pregunta.
+  vi.stubEnv("VULKAN_AGENCY_ORG_ID", ORG);
   errorDeMembresia = null;
+  errorDeMembresiaEn = null;
   membresiasJuntoAlError = false;
   errorPorVerbo = {};
   operaciones = [];
@@ -409,4 +437,205 @@ describe("la pantalla se refresca sólo cuando algo cambió", () => {
     await mapProperty({ organizationId: AJENA, surface: "ga4", propertyRef: "properties/1" });
     expect(revalidatePath).not.toHaveBeenCalled();
   });
+});
+
+describe("quién mapea: el rol, no sólo la membresía (H4.1, D4)", () => {
+  // La corrección del crítico: todas las negativas son en la MISMA organización
+  // donde el admin sí mapea. Sin rol, un client de la organización movía la
+  // frontera entre clientes con `service_role`, que ninguna policy frena.
+  let salidas = 0;
+  beforeEach(() => {
+    salidas = 0;
+    // El espía del cliente de servicio acumula de los describe de arriba: sin
+    // limpiarlo, «no se construyó» no mediría este test.
+    createSupabaseAdminClient.mockClear();
+    vi.stubGlobal("fetch", async () => {
+      salidas += 1;
+      throw new Error("mapear no sale a la red");
+    });
+  });
+
+  for (const rol of ["client", "viewer", "editor", "manager"]) {
+    it(`un ${rol} de la organización no mapea ni desmapea: not-allowed y cero escrituras`, async () => {
+      membresias = [{ organization_id: ORG, role: rol, state: "active" }];
+      const { mapProperty, unmapProperty } = await acciones();
+
+      const mapeo = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+      const desmapeo = await unmapProperty({ organizationId: ORG, surface: "ga4" });
+
+      expect(mapeo).toEqual({ ok: false, code: "not-allowed", message: expect.any(String) });
+      expect(desmapeo).toEqual({ ok: false, code: "not-allowed", message: expect.any(String) });
+      expect(escrituras()).toHaveLength(0);
+      expect(createSupabaseAdminClient).not.toHaveBeenCalled();
+      expect(revalidatePath).not.toHaveBeenCalled();
+      expect(salidas).toBe(0);
+    });
+  }
+
+  for (const rol of ["admin", "owner"]) {
+    it(`un ${rol} de la misma organización mapea, por el servicio`, async () => {
+      membresias = [{ organization_id: ORG, role: rol, state: "active" }];
+      const { mapProperty } = await acciones();
+
+      const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+
+      expect(res).toEqual({ ok: true });
+      expect(escrituras().some((o) => o.verbo === "insert" && o.cliente === "servicio")).toBe(true);
+    });
+  }
+
+  it("un owner ARCHIVADO no mapea: la membresía tiene que estar activa", async () => {
+    membresias = [{ organization_id: ORG, role: "owner", state: "archived" }];
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-a-member" });
+    expect(escrituras()).toHaveLength(0);
+  });
+});
+
+describe("la llave es de la agencia: owner de la organización destino no alcanza (H4.1, crítico del 2026-10-08)", () => {
+  // Toda cuenta es owner de su organización personal (handle_new_user, 0001) y
+  // de las que cree con create_client_organization (0024). Con sólo el rol en la
+  // organización destino, clara —client de X— mapeaba en SU organización P una
+  // property ajena, y el reporte de P la leía con el token de la agencia.
+  const AGENCIA = "44444444-4444-4444-8444-444444444444";
+  const X = "55555555-5555-4555-8555-555555555555";
+  const P = "66666666-6666-4666-8666-666666666666";
+  let salidas = 0;
+
+  beforeEach(() => {
+    vi.stubEnv("VULKAN_AGENCY_ORG_ID", AGENCIA);
+    createSupabaseAdminClient.mockClear();
+    salidas = 0;
+    vi.stubGlobal("fetch", async () => {
+      salidas += 1;
+      throw new Error("mapear no sale a la red");
+    });
+  });
+
+  /** clara, como es de verdad: client de X y owner de su organización personal. */
+  const clara = () => [
+    { organization_id: X, role: "client", state: "active" },
+    { organization_id: P, role: "owner", state: "active" },
+  ];
+
+  function sinEfecto() {
+    expect(escrituras()).toHaveLength(0);
+    expect(createSupabaseAdminClient).not.toHaveBeenCalled();
+    expect(revalidatePath).not.toHaveBeenCalled();
+    expect(salidas).toBe(0);
+  }
+
+  it("clara, owner de su organización personal, no mapea ahí: not-agency y cero escrituras", async () => {
+    membresias = clara();
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({
+      organizationId: P,
+      surface: "search_console",
+      propertyRef: "sc-domain:otro-cliente-de-la-agencia.example",
+    });
+
+    expect(res).toEqual({ ok: false, code: "not-agency", message: expect.stringContaining("agencia") });
+    sinEfecto();
+  });
+
+  it("ni desmapea ahí", async () => {
+    membresias = clara();
+    const { unmapProperty } = await acciones();
+
+    const res = await unmapProperty({ organizationId: P, surface: "search_console" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-agency" });
+    sinEfecto();
+  });
+
+  it("y en X sigue siendo not-allowed: la primera pregunta no cambió", async () => {
+    membresias = clara();
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({ organizationId: X, surface: "ga4", propertyRef: "properties/123456789" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-allowed" });
+    sinEfecto();
+  });
+
+  it("la segunda pregunta es por la AGENCIA, con la sesión, y por ese usuario", async () => {
+    membresias = clara();
+    const { mapProperty } = await acciones();
+    await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+    const lecturas = operaciones.filter((o) => o.tabla === "org_members");
+    expect(lecturas.map((o) => o.filtros.organization_id)).toEqual([P, AGENCIA]);
+    expect(lecturas.every((o) => o.cliente === "sesion")).toBe(true);
+    expect(lecturas.every((o) => o.filtros.user_id === "11111111-1111-4111-8111-111111111111")).toBe(true);
+  });
+
+  for (const rol of ["manager", "editor", "viewer", "client"]) {
+    it(`owner de P y ${rol} de la agencia: not-agency`, async () => {
+      membresias = [...clara(), { organization_id: AGENCIA, role: rol, state: "active" }];
+      const { mapProperty } = await acciones();
+
+      const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+      expect(res).toMatchObject({ ok: false, code: "not-agency" });
+      sinEfecto();
+    });
+  }
+
+  it("admin de la agencia ARCHIVADO: not-agency", async () => {
+    membresias = [...clara(), { organization_id: AGENCIA, role: "admin", state: "archived" }];
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-agency" });
+    sinEfecto();
+  });
+
+  it("un fallo al leer la membresía en la agencia NO es un permiso", async () => {
+    membresias = [...clara(), { organization_id: AGENCIA, role: "admin", state: "active" }];
+    errorDeMembresiaEn = AGENCIA;
+    const { mapProperty } = await acciones();
+
+    const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+    expect(res).toMatchObject({ ok: false, code: "not-agency" });
+    sinEfecto();
+  });
+
+  for (const [nombre, valor] of [
+    ["sin VULKAN_AGENCY_ORG_ID", ""],
+    ["con VULKAN_AGENCY_ORG_ID mal escrita", "no-es-un-uuid"],
+  ] as const) {
+    it(`${nombre}, nadie mapea: agency-unresolved`, async () => {
+      vi.stubEnv("VULKAN_AGENCY_ORG_ID", valor);
+      membresias = [{ organization_id: P, role: "owner", state: "active" }];
+      const { mapProperty } = await acciones();
+
+      const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+      expect(res).toMatchObject({ ok: false, code: "agency-unresolved" });
+      sinEfecto();
+    });
+  }
+
+  for (const rol of ["owner", "admin"]) {
+    it(`la contraprueba: owner de la organización destino y ${rol} de la agencia mapea, por el servicio`, async () => {
+      membresias = [
+        { organization_id: P, role: "owner", state: "active" },
+        { organization_id: AGENCIA, role: rol, state: "active" },
+      ];
+      const { mapProperty } = await acciones();
+
+      const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
+
+      expect(res).toEqual({ ok: true });
+      const insert = escrituras().find((o) => o.verbo === "insert");
+      expect(insert?.cliente).toBe("servicio");
+      expect(insert?.valores).toMatchObject({ organization_id: P, property_ref: "properties/123456789" });
+    });
+  }
 });

@@ -18,6 +18,12 @@ export interface OrganizacionActiva {
   name: string;
   /** Todas las que el usuario puede elegir, para dibujar el selector. */
   disponibles: { id: string; name: string }[];
+  /**
+   * El rol del usuario en ESTA organización, tal como está en `org_members`.
+   * Para que la pantalla no ofrezca lo que la ruta va a negar (H4.1): decide
+   * qué botón se dibuja, no qué se permite — eso lo deciden la ruta y la base.
+   */
+  rol: string | null;
 }
 
 /**
@@ -66,5 +72,6 @@ export async function organizacionActiva(): Promise<OrganizacionActiva | null> {
   // vacío y consultas que no traen nada.
   if (!actual) return null;
 
-  return { id: actual.id, name: actual.name, disponibles };
+  const rol = activas.find((m) => m.organization_id === id)?.role ?? null;
+  return { id: actual.id, name: actual.name, disponibles, rol };
 }

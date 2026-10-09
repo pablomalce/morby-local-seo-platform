@@ -42,6 +42,11 @@ export async function GET(request: Request) {
     if (quien.reason === "not-authenticated") {
       return NextResponse.redirect(new URL("/login?redirectTo=/app/integrations", request.url));
     }
+    // Es de la agencia y su rol no alcanza (D4 de H4.1): 403, con cero efecto.
+    // Sabe que la ruta existe, así que el 404 de abajo no le corresponde.
+    if (quien.reason === "not-allowed") {
+      return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    }
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
 

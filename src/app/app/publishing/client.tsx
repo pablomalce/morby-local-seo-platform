@@ -39,7 +39,20 @@ import {
  * la ficha de un cliente. La pantalla no ofrece lo que el producto no puede
  * hacer todavía.
  */
-export function EnsayoDePublicacion({ aprobados }: { aprobados: AssetEnsayable[] }) {
+export function EnsayoDePublicacion({
+  aprobados,
+  puedeEnsayar,
+}: {
+  aprobados: AssetEnsayable[];
+  /**
+   * Si el rol de quien mira ensaya en esta organización (D4: owner, admin o
+   * manager, los mismos que aprueban). Decide si se DIBUJA el botón; la ruta
+   * contesta 403 igual. Hasta el 2026-10-08 el botón se le ofrecía a cualquier
+   * miembro, y el 403 se leía como «defecto del código» (crítico del
+   * 2026-10-08): `ensayoVisto.ts` tiene ahora su lectura.
+   */
+  puedeEnsayar: boolean;
+}) {
   const router = useRouter();
   const [pendiente, startTransition] = useTransition();
   const [elegido, setElegido] = useState(aprobados[0]?.id ?? "");
@@ -103,7 +116,12 @@ export function EnsayoDePublicacion({ aprobados }: { aprobados: AssetEnsayable[]
       <HudLabel>REHEARSAL</HudLabel>
       <p className="mt-3 text-[12px] text-metal-400">{EL_ENSAYO_ESCRIBE}</p>
 
-      {aprobados.length === 0 ? (
+      {!puedeEnsayar ? (
+        <p className="mt-4 text-[12px] text-metal-400" data-testid="sin-rol-para-ensayar">
+          Con tu rol en esta organización ves el ledger; ensayar y publicar lo hace un owner, admin o
+          manager.
+        </p>
+      ) : aprobados.length === 0 ? (
         <div
           className="mt-4 rounded-vulkan border border-metal-800 bg-metal-950 p-4"
           data-testid="sin-aprobados"

@@ -51,6 +51,10 @@ describe("de dónde salen los datos de esta pantalla", () => {
     expect(PAGINA).toMatch(/assetsRes\.error/);
   });
 
+  it("el botón de aprobar lo decide el rol de la organización activa, con la lista de rol.ts (H4.1, D4)", () => {
+    expect(PAGINA).toMatch(/puedeAprobar=\{rolPuede\(organizacion\.rol, "aprobar"\)\}/);
+  });
+
   it("trae el `payload_hash`, que es lo único que distingue un sello vivo de uno viejo", () => {
     // Sin esa columna, `leerAsset` no puede comparar y un sello viejo se
     // dibujaría como aprobado.
