@@ -24,8 +24,14 @@
 #               hand-run bypasses the cache the product relies on.
 #   Reached over HTTP through POST /api/reports/generate (the orchestrator, which
 #   fans out to Places + PageSpeed), /api/integrations/images/generate,
-#   /api/integrations/places/search, /api/content/generate, /api/seo/audit and
-#   /api/agents/run{,-all}.
+#   /api/integrations/places/search, /api/content/generate, /api/seo/audit,
+#   /api/agents/run{,-all} and /api/geo/grid (H2-GO-3: one billed Places Text
+#   Search per grid point, up to nine per run).
+#   /api/geo/grid is blocked for every verb, GET included. Its GET only reads,
+#   but it lives on the same path as the paid POST, and telling the two apart
+#   from a command line means parsing curl's flags (-d implies POST, -X can come
+#   after the URL). A guard that misreads one flag lets the spend through; one
+#   that blocks a read costs a browser tab.
 #
 # NOT blocked, and why:
 #   - GET /api/integrations/gbp/profile. Verified read-only: the route exports
@@ -78,6 +84,7 @@ PATTERNS=(
   "$NET[^|;]*$URL/api/content/generate"
   "$NET[^|;]*$URL/api/seo/audit"
   "$NET[^|;]*$URL/api/agents/run"
+  "$NET[^|;]*$URL/api/geo/grid"
   "$RUN[^|;]*(integrations/)?imageProvider"
   "$RUN[^|;]*integrations/openai"
   "$RUN[^|;]*(google/)?places"
@@ -95,6 +102,7 @@ REASONS=(
   "POST /api/content/generate, which spends on model calls"
   "POST /api/seo/audit, which runs the paid audit chain"
   "POST /api/agents/run or /run-all, which spends once per agent in the batch"
+  "/api/geo/grid, whose POST bills one Places Text Search per grid point (blocked for every verb: see the header)"
   "executing imageProvider.ts, whose only job is the paid OpenAI image call"
   "executing the OpenAI wrapper, which spends on the same key"
   "executing the Places client, which bills per lookup"

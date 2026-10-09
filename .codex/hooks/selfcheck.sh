@@ -46,6 +46,8 @@ chk "POST images/generate"    'curl -X POST http://localhost:3000/api/integratio
 chk "POST agents/run-all"     'curl -X POST $BASE/api/agents/run-all'                                blocked
 chk "POST content/generate"   'curl -X POST $BASE/api/content/generate'                              blocked
 chk "POST seo/audit"          'curl -X POST $BASE/api/seo/audit'                                     blocked
+chk "POST geo/grid"           'curl -X POST -d @grilla.json $BASE/api/geo/grid'                      blocked
+chk "geo/grid, flags after"   'curl https://app.example.com/api/geo/grid -d @grilla.json'            blocked
 chk "run imageProvider"       'npx tsx src/lib/integrations/imageProvider.ts'                        blocked
 chk "run orchestrator"        'node src/lib/reports/orchestrator.ts'                                 blocked
 chk "run pagespeed client"    'npx tsx src/lib/integrations/google/pagespeed.ts'                     blocked
