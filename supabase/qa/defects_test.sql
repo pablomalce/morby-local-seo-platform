@@ -1,4 +1,4 @@
--- A hundred and sixty isolation checks against the Growth OS schema — executable.
+-- A hundred and sixty-seven isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -8489,16 +8489,464 @@ END
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 0033 — el sello lo firma quien sella, a la hora de la base (bloques 220 a 226)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- EL DEFECTO, medido el 2026-10-09 en un stack local con la 0031: el manager de
+-- X hizo `PATCH /rest/v1/content_assets` con `approved_by` = el uid del CLIENT de
+-- X y `approved_at = '2026-10-09T12:00:00Z'`, y recibió 200. El sello quedó a
+-- nombre del client, a una hora que eligió quien escribía. La 0031 dice QUIÉN
+-- sella; nada decía que la firma fuera de quien sella ni que la hora fuera la de
+-- la base.
+--
+-- Corren sobre la fixture de H4.1, que los bloques 200 a 216 dejan como estaba
+-- (todo se mide con `h41_como`, que deshace): en X, k = 10 es el borrador, k = 11
+-- el sellado por omar (owner) CON publicación, k = 29 el sellado por omar SIN
+-- publicación. Como `authenticated`, con el uid puesto: es lo que PostgREST hace
+-- con una sesión, y lo que hace `/api/content/approve`, que escribe con la
+-- sesión y no con `service_role` (medido en `src/` el 2026-10-09).
+--
+-- Cada medición devuelve las filas tocadas, QUIÉN quedó firmando y A QUÉ HORA:
+-- `hora=base` es `now()`, la hora de la transacción, o sea la de la base. Las
+-- horas que se mandan son todas distintas de `now()` —la del ataque medido, la
+-- del reloj de una ruta, una vieja, una futura—, así que una hora que pasa
+-- derecho se ve como lo que es.
+RESET ROLE;
+
+-- Anti-vacío de la fixture: si los estados de partida no son éstos, los bloques
+-- de abajo miden otra cosa.
+DO $$
+DECLARE
+    borrador  text;
+    sellado   text;
+    publicado text;
+BEGIN
+    SELECT status || '/' || coalesce(approved_hash, 'sin-sello') INTO borrador
+      FROM content_assets WHERE id = pg_temp.h41_id(1, 10);
+    SELECT status || '/' || (approved_by = pg_temp.h41_id(0, 1))::text INTO sellado
+      FROM content_assets WHERE id = pg_temp.h41_id(1, 29);
+    SELECT a.status || '/' || (a.approved_by = pg_temp.h41_id(0, 1))::text || '/' || count(p.id)
+      INTO publicado
+      FROM content_assets a LEFT JOIN publications p ON p.asset_id = a.id
+     WHERE a.id = pg_temp.h41_id(1, 11)
+     GROUP BY a.status, a.approved_by;
+    IF borrador IS DISTINCT FROM 'draft/sin-sello'
+       OR sellado IS DISTINCT FROM 'approved/true'
+       OR publicado IS DISTINCT FROM 'approved/true/1' THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 220 a 226 no está como se espera: '
+                        'k=10 %, k=29 %, k=11 % (esperado draft/sin-sello, approved/true, approved/true/1)',
+                        borrador, sellado, publicado;
+    END IF;
+END
+$$;
+
+-- Corre `p_sql` como `p_rol` con el uid `p_uid` puesto (vacío si es NULL), DESPUÉS
+-- de `p_prep` como `postgres`, y lo deshace todo. Devuelve lo que la consulta
+-- devuelve, o el error clasificado. Es `h41_como` con dos cosas más: el rol, para
+-- medir al servidor, y la preparación, para darle a una fila sellada una hora
+-- distinta de `now()` sin dejar huella.
+CREATE OR REPLACE FUNCTION pg_temp.s33_como(p_uid uuid, p_sql text, p_prep text DEFAULT NULL,
+                                           p_rol text DEFAULT 'authenticated')
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    salida text;
+BEGIN
+    BEGIN
+        IF p_prep IS NOT NULL THEN
+            EXECUTE p_prep;
+        END IF;
+        PERFORM set_config('request.jwt.claim.sub', coalesce(p_uid::text, ''), true);
+        EXECUTE format('SET LOCAL ROLE %I', p_rol);
+        EXECUTE p_sql INTO salida;
+        RESET ROLE;
+        RAISE EXCEPTION 'qa: deshacer la medición' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN coalesce(salida, '(nada)');
+    END;
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'ERR ' || SQLSTATE || ' ' ||
+           CASE WHEN SQLERRM LIKE 'new row violates row-level security policy%' THEN 'rls'
+                WHEN SQLERRM LIKE 'permission denied for table%'                 THEN 'priv'
+                WHEN SQLERRM LIKE 'el sello lo firma quien sella%'               THEN 'firma'
+                ELSE left(SQLERRM, 160) END;
+END
+$$;
+
+-- La escritura, envuelta para que devuelva filas, firma y hora.
+CREATE OR REPLACE FUNCTION pg_temp.s33_leida(p_escritura text) RETURNS text
+LANGUAGE sql AS $f$
+    SELECT format($q$
+        WITH u AS (%s RETURNING approved_by, approved_at)
+        SELECT 'n=' || count(*)
+               || coalesce(' por=' || string_agg(approved_by::text, ','), '')
+               || coalesce(' hora=' || string_agg(CASE WHEN approved_at = now() THEN 'base'
+                                                       ELSE to_char(approved_at AT TIME ZONE 'UTC',
+                                                                    'YYYY-MM-DD"T"HH24:MI:SS"Z"') END, ','), '')
+          FROM u$q$, p_escritura);
+$f$;
+
+-- Sellar el asset `p_id` firmando como `p_firma`, a la hora `p_hora`: la
+-- sentencia de `/api/content/approve`, con la firma y la hora como parámetros.
+CREATE OR REPLACE FUNCTION pg_temp.s33_sellar(p_id uuid, p_firma uuid, p_hora text,
+                                             p_estado text DEFAULT 'approved') RETURNS text
+LANGUAGE sql AS $$
+    SELECT pg_temp.s33_leida(format(
+        'UPDATE public.content_assets SET status = %L, approved_hash = payload_hash, '
+        'approved_by = %L, approved_at = %L WHERE id = %L',
+        p_estado, p_firma, p_hora, p_id));
+$$;
+
+-- Un asset que NACE sellado en X, firmado como `p_firma` a la hora `p_hora`. El
+-- hash se calcula acá, como `postgres`, con la función de la columna generada.
+CREATE OR REPLACE FUNCTION pg_temp.s33_nace(p_firma uuid, p_hora text) RETURNS text
+LANGUAGE sql AS $$
+    SELECT pg_temp.s33_leida(format(
+        'INSERT INTO public.content_assets (organization_id, business_id, kind, body, locale, status, '
+        'approved_hash, approved_by, approved_at) '
+        'VALUES (%L, %L, ''post'', ''Nace sellado 0033'', ''en'', ''approved'', %L, %L, %L)',
+        (SELECT x FROM h41), pg_temp.h41_id(1, 2),
+        public.content_payload_hash(NULL, 'Nace sellado 0033', 'en', 'post', NULL), p_firma, p_hora));
+$$;
+
+-- Los uid, con el nombre del rol, para que la evidencia se lea.
+CREATE OR REPLACE FUNCTION pg_temp.s33_nombres(p text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+    s text := p;
+BEGIN
+    FOR r IN SELECT actor, uid FROM h41_actores LOOP
+        s := replace(s, r.uid::text, r.actor);
+    END LOOP;
+    RETURN s;
+END
+$$;
+
+CREATE TEMP TABLE s33 (
+    bloque   int  NOT NULL,
+    caso     text NOT NULL,
+    esperado text NOT NULL,
+    medido   text NOT NULL,
+    PRIMARY KEY (bloque, caso)
+);
+
+-- ── 220 ──────────────────────────────────────────────────────────────────────
+-- FIRMAR A NOMBRE DE OTRO. El defecto medido, y sus primos:
+--
+--   a. marta (manager) sella el borrador firmando como clara (client), a la hora
+--      del ataque medido: 45005;
+--   b. lo mismo naciendo sellado (INSERT): 45005. Sin esto, un trigger sólo de
+--      UPDATE dejaba la puerta abierta por el otro lado;
+--   c. marta firmando como omar, que también aprueba: 45005. La regla no es «no
+--      firmes como el cliente», es «firmás vos»;
+--   d. marta sin firma (`approved_by` NULL): 45005, y no un 23514 del CHECK. La
+--      base no RELLENA la firma: la rechaza (ver el encabezado de la 0033);
+--   e. eva (editor) firmando como marta, para pasar por alguien que aprueba:
+--      45005. El trigger corre antes que la policy de la 0031;
+--   f. UN ROL QUE NO EXISTE HOY —`futuro_0033`, miembro de `authenticated`,
+--      creado y deshecho dentro de la medición— con el uid de marta, firmando
+--      como clara: 45005. La exención de la 0033 es una lista de EXENTOS; escrita
+--      como lista de alcanzados (`current_user = 'authenticated'`), a este rol lo
+--      eximiría, y ningún otro caso lo ve.
+INSERT INTO s33 VALUES
+    (220, 'a', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 5), '2026-10-09T12:00:00Z')))),
+    (220, 'b', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_nace(pg_temp.h41_id(0, 5), '2026-10-09T12:00:00Z')))),
+    (220, 'c', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2026-10-09T12:00:00Z')))),
+    (220, 'd', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), NULL, '2026-10-09T12:00:00Z')))),
+    (220, 'e', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 2), '2026-10-09T12:00:00Z')))),
+    (220, 'f', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 5), '2026-10-09T12:00:00Z'),
+         $prep$DO $do$
+         BEGIN
+             CREATE ROLE futuro_0033 NOLOGIN NOBYPASSRLS IN ROLE authenticated;
+             GRANT futuro_0033 TO postgres WITH SET TRUE;
+         END
+         $do$$prep$,
+         'futuro_0033')));
+
+INSERT INTO defect_report
+SELECT 220, 'quien aprueba firma el sello a nombre de otro por PostgREST',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 6,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 6
+            THEN 'marta (manager) no sella firmando como clara (client) a las 12:00 del ataque, ni como omar, ' ||
+                 'ni sin firma, ni hace nacer un asset sellado por clara; eva (editor) no firma como marta; ' ||
+                 'un rol nuevo, miembro de authenticated, no firma como clara: 45005 en los seis'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 220;
+
+-- ── 221 ──────────────────────────────────────────────────────────────────────
+-- LA CONTRAPRUEBA DEL 220, Y LA HORA. Sin esto, un trigger que rechazara TODA
+-- firma por sesión pondría verde el 220 y rompería la aprobación.
+--
+--   a. LA ESCRITURA EXACTA DE `/api/content/approve` —status, el hash de la
+--      fila, `approved_by` = la sesión, `approved_at` = el reloj de la ruta (un
+--      literal que no es el de la base)— hecha por marta: 1 fila, firmada por
+--      marta, a la hora de la BASE;
+--   b. marta haciendo nacer un asset sellado por ella, con una hora de hace 30
+--      días: firmado por marta, a la hora de la base;
+--   c. omar (owner) sellando como él con una hora del futuro: lo mismo.
+INSERT INTO s33 VALUES
+    (221, 'a', 'n=1 por=manager hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 2), '2026-10-09T18:00:00.000Z')))),
+    (221, 'b', 'n=1 por=manager hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_nace(pg_temp.h41_id(0, 2), (now() - interval '30 days')::text)))),
+    (221, 'c', 'n=1 por=owner hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 1),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2099-01-01T00:00:00Z'))));
+
+INSERT INTO defect_report
+SELECT 221, 'quien aprueba no sella firmando como él, o la hora del sello la elige quien escribe',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 3,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 3
+            THEN 'la escritura de /api/content/approve, hecha por marta con el reloj de la ruta, sella ' ||
+                 '(1 fila) firmada por marta a la hora de la base; marta naciendo sellado con una hora ' ||
+                 'de hace 30 días y omar sellando con una del 2099, lo mismo: firma propia, hora de la base'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 221;
+
+-- ── 222 ──────────────────────────────────────────────────────────────────────
+-- UN SELLO VIGENTE NO SE RE-FIRMA COMO OTRO NI SE LE CAMBIA LA HORA. El 220 mira
+-- el momento de sellar; esto, una fila ya sellada por omar, con el MISMO hash:
+--
+--   a. marta le cambia la firma a clara: 45005;
+--   b. marta le atrasa la hora, dejando la firma de omar: 45005. La firma es de
+--      omar y quien escribe es marta;
+--   c. omar le atrasa la hora a su propio sello: 1 fila, firmada por omar, y la
+--      hora queda la de la base, no la atrasada;
+--   d. marta le cambia la firma a clara al sellado QUE TIENE PUBLICACIÓN
+--      (k = 11): 45005. Es el registro de «quién aprobó lo que se publicó».
+--
+-- Lo que esto NO mide, a propósito: que marta re-firme un sello vigente a SU
+-- nombre. Pasa —es verdad: aprueba ese texto ahora— y reemplaza al firmante
+-- anterior; está declarado en el encabezado de la 0033 como lo que no cierra.
+INSERT INTO s33 VALUES
+    (222, 'a', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET approved_by = %L WHERE id = %L',
+         pg_temp.h41_id(0, 5), pg_temp.h41_id(1, 29)))))),
+    (222, 'b', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET approved_at = %L WHERE id = %L',
+         (now() - interval '30 days')::text, pg_temp.h41_id(1, 29)))))),
+    (222, 'c', 'n=1 por=owner hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 1), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET approved_at = %L WHERE id = %L',
+         (now() - interval '30 days')::text, pg_temp.h41_id(1, 29)))))),
+    (222, 'd', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET approved_by = %L WHERE id = %L',
+         pg_temp.h41_id(0, 5), pg_temp.h41_id(1, 11))))));
+
+INSERT INTO defect_report
+SELECT 222, 'un sello vigente se re-firma a nombre de otro, o se le cambia la hora',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 4,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 4
+            THEN 'marta no le pasa a clara la firma de un sello de omar, ni la del sellado con publicación, ' ||
+                 'ni le atrasa la hora (45005 x3); omar atrasa su propio sello y la hora queda la de la base'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 222;
+
+-- ── 223 ──────────────────────────────────────────────────────────────────────
+-- LO QUE NO TOCA LA FIRMA LA CONSERVA. marta agenda (`scheduled`) el sello de
+-- omar sin tocar las tres columnas: 1 fila, firmada por omar, a SU hora. Para que
+-- la hora se distinga de `now()`, una preparación como `postgres` —el servidor,
+-- exento— se la pone en el 1 de octubre antes de medir, y se deshace con todo.
+--
+-- Sin esto, una regla que re-firmara todo UPDATE de una fila sellada pondría
+-- verdes el 220 y el 222, y agendar lo que aprobó otro daría 45005 (o, si
+-- reescribiera, diría que lo aprobó quien agendó).
+INSERT INTO s33 VALUES
+    (223, 'a', 'n=1 por=owner hora=2026-10-01T09:00:00Z',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_leida(format('UPDATE public.content_assets SET status = ''scheduled'' WHERE id = %L',
+                                  pg_temp.h41_id(1, 29))),
+         format('UPDATE public.content_assets SET approved_at = ''2026-10-01T09:00:00Z'' WHERE id = %L',
+                pg_temp.h41_id(1, 29)))));
+
+INSERT INTO defect_report
+SELECT 223, 'agendar lo que selló otro le cambia la firma, o la regla del sello lo bloquea',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 1,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 1
+            THEN 'marta agenda el sello de omar (1 fila) y la firma sigue siendo de omar, a su hora (1 de octubre)'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 223;
+
+-- ── 224 ──────────────────────────────────────────────────────────────────────
+-- EL SERVIDOR DECLARA LA FIRMA. `service_role` —sin uid, como lo manda PostgREST
+-- con la clave de servicio— y `postgres` no pasan por la regla: sellan el
+-- borrador firmando como omar a la hora que dicen, y queda eso. Es la
+-- contraprueba de la exención: una regla que alcanzara también al servidor
+-- pondría verdes los cinco de arriba y rompería toda ruta que mañana selle con
+-- `service_role`.
+--
+--   a. `service_role`, sin uid;
+--   b. `postgres` CON el uid de clara puesto. Es la razón de que la exención sea
+--      por ROL y no por «no hay uid»: la suite deja uids puestos en la
+--      transacción, y el dueño del esquema no deja de serlo por eso.
+INSERT INTO s33 VALUES
+    (224, 'a', 'n=1 por=owner hora=2026-10-01T09:00:00Z',
+     pg_temp.s33_nombres(pg_temp.s33_como(NULL,
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2026-10-01T09:00:00Z'),
+         NULL, 'service_role'))),
+    (224, 'b', 'n=1 por=owner hora=2026-10-01T09:00:00Z',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 5),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2026-10-01T09:00:00Z'),
+         NULL, 'postgres')));
+
+INSERT INTO defect_report
+SELECT 224, 'la regla del sello alcanza al servidor: service_role o postgres no pueden declarar la firma',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 2,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 2
+            THEN 'service_role sin uid y postgres con el uid de clara puesto sellan firmando como omar, a la ' ||
+                 'hora que declaran (1 fila cada uno)'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 224;
+
+-- ── 225 ──────────────────────────────────────────────────────────────────────
+-- QUIEN NO APRUEBA SIGUE SIN SELLAR, AUNQUE FIRME COMO ÉL. La firma propia es
+-- condición necesaria, no suficiente: la 0031 sigue decidiendo quién sella.
+--
+--   a. clara (client) firmando como ella: 0 filas, por el eje de rol;
+--   b. clara firmando como marta: 0 filas. La fila ya no le es visible para
+--      escribir, así que el trigger ni corre;
+--   c. vito (viewer) firmando como él: 0 filas;
+--   d. eva (editor) firmando como ella: 42501 de la RLS, por el eje de
+--      aprobación. El trigger la deja pasar —la firma es suya— y la policy la
+--      frena;
+--   e. eva haciendo nacer un asset sellado por ella: 42501 de la RLS;
+--   f. clara, lo mismo: 42501 de la RLS, por el eje de rol.
+INSERT INTO s33 VALUES
+    (225, 'a', 'n=0',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 5),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 5), '2026-10-09T18:00:00.000Z')))),
+    (225, 'b', 'n=0',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 5),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 2), '2026-10-09T18:00:00.000Z')))),
+    (225, 'c', 'n=0',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 4),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 4), '2026-10-09T18:00:00.000Z')))),
+    (225, 'd', 'ERR 42501 rls',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 3), '2026-10-09T18:00:00.000Z')))),
+    (225, 'e', 'ERR 42501 rls',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3),
+         pg_temp.s33_nace(pg_temp.h41_id(0, 3), '2026-10-09T18:00:00.000Z')))),
+    (225, 'f', 'ERR 42501 rls',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 5),
+         pg_temp.s33_nace(pg_temp.h41_id(0, 5), '2026-10-09T18:00:00.000Z'))));
+
+INSERT INTO defect_report
+SELECT 225, 'un client, un viewer o un editor sella por PostgREST firmando como él',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 6,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 6
+            THEN 'clara (client) no sella firmando como ella ni como marta, vito (viewer) tampoco (0 filas); ' ||
+                 'eva (editor) no sella firmando como ella ni hace nacer un sellado, clara tampoco (42501 rls x3)'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 225;
+
+-- ── 226 ──────────────────────────────────────────────────────────────────────
+-- POR CATÁLOGO, tres cosas que la conducta de arriba no ve entera:
+--
+--   1. el firmante es el de la 0033: BEFORE, FOR EACH ROW, INSERT y UPDATE
+--      (y nada más: tgtype = 1 + 2 + 4 + 16 = 23), `ENABLE ALWAYS` ('A'), y su
+--      función SECURITY INVOKER —como DEFINER vería siempre a `postgres` y
+--      eximiría a todos—;
+--   2. TODA tabla de `public` con `approved_by` que una sesión (`anon` o
+--      `authenticated`) puede INSERTAR o ACTUALIZAR —en esa columna, por tabla
+--      o por columna— lleva un trigger con esa función. Hoy son dos tablas con
+--      `approved_by` —`content_assets` y `board_cards`— y una escribible por
+--      sesión. El día que `board_cards` reciba UPDATE para `authenticated`, esto
+--      se pone rojo hasta que tenga su firmante. Anti-vacío: `content_assets`
+--      tiene que estar entre las escribibles;
+--   3. ninguna función SECURITY DEFINER de `public` nombra `content_assets` en
+--      su cuerpo. Una función así corre como `postgres`, que está exento: sería
+--      código del servidor declarando firmas, y tiene que mirarse.
+--
+-- `to_regprocedure` y no un cast: si la función no está, esto tiene que dar
+-- rojo con su evidencia, no tirar la corrida.
+CREATE TEMP TABLE s33_tablas AS
+SELECT c.relname::text AS tabla,
+       (   has_column_privilege('anon',          c.oid, 'approved_by', 'INSERT')
+        OR has_column_privilege('anon',          c.oid, 'approved_by', 'UPDATE')
+        OR has_column_privilege('authenticated', c.oid, 'approved_by', 'INSERT')
+        OR has_column_privilege('authenticated', c.oid, 'approved_by', 'UPDATE')) AS escribible,
+       EXISTS (SELECT 1 FROM pg_trigger t
+                WHERE t.tgrelid = c.oid AND NOT t.tgisinternal AND t.tgenabled <> 'D'
+                  AND t.tgfoid = to_regprocedure('public.content_assets_seal_signer()')) AS firmante
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'approved_by' AND NOT a.attisdropped
+ WHERE c.relkind IN ('r', 'p');
+
+INSERT INTO defect_report
+SELECT 226, 'una tabla con approved_by que una sesión escribe no tiene firmante, o el firmante no es el de la 0033',
+       NOT (forma = 1 AND escribibles >= 1 AND con_content_assets AND sin_firmante IS NULL AND definer = 0),
+       CASE WHEN forma = 1 AND escribibles >= 1 AND con_content_assets AND sin_firmante IS NULL AND definer = 0
+            THEN 'el firmante es BEFORE INSERT OR UPDATE, por fila, ENABLE ALWAYS e INVOKER; de las ' ||
+                 con_approved_by || ' tablas de public con approved_by, ' || escribibles ||
+                 ' escribible por sesión (content_assets) y las ' || escribibles || ' llevan firmante; ' ||
+                 'ninguna función SECURITY DEFINER de public nombra content_assets'
+            ELSE 'firmante con la forma de la 0033: ' || forma || ' de 1 / escribibles por sesión: ' ||
+                 escribibles || ' (content_assets entre ellas: ' || con_content_assets || ') / sin firmante: ' ||
+                 coalesce(sin_firmante, '-') || ' / funciones DEFINER que nombran content_assets: ' || definer
+            END
+  FROM (SELECT
+          (SELECT count(*) FROM pg_trigger t
+             JOIN pg_proc p ON p.oid = t.tgfoid
+            WHERE t.tgrelid = 'public.content_assets'::regclass
+              AND t.tgname = 'trg_content_assets_seal_signer'
+              AND p.oid = to_regprocedure('public.content_assets_seal_signer()')
+              AND t.tgtype = 23
+              AND t.tgenabled = 'A'
+              AND NOT p.prosecdef) AS forma,
+          (SELECT count(*) FROM s33_tablas) AS con_approved_by,
+          (SELECT count(*) FROM s33_tablas WHERE escribible) AS escribibles,
+          EXISTS (SELECT 1 FROM s33_tablas WHERE escribible AND tabla = 'content_assets') AS con_content_assets,
+          (SELECT string_agg(tabla, ', ' ORDER BY tabla) FROM s33_tablas WHERE escribible AND NOT firmante)
+              AS sin_firmante,
+          (SELECT count(*) FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+            WHERE p.prosecdef AND p.prosrc ILIKE '%content\_assets%') AS definer
+       ) x;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and sixty checks were written, so a hundred
--- and sixty rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and sixty-seven checks were written, so a hundred
+-- and sixty-seven rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
 -- arrancaron en 200 cuando la 0029 (121 a 135) y la 0030 (136 en adelante)
 -- todavía estaban en PRs abiertos, para que los tres frentes no chocaran al
--- mergearse. El conteo de abajo es de FILAS, no el número más alto: 143 + 17.
+-- mergearse. Los de la 0033 siguen la misma regla desde el 220 —la 0032, la
+-- grilla GEO, numera los suyos desde el 300 en su propio PR—. El conteo de abajo
+-- es de FILAS, no el número más alto: 143 + 17 + 7.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -8513,8 +8961,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 160 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 160 checks recorded a result.', checks;
+    IF checks <> 167 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 167 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -8525,11 +8973,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 160 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 167 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 160 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 167 checks green: the schema prevents every one of them.';
 END
 $$;
 

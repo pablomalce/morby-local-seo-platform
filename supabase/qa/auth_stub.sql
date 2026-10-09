@@ -55,6 +55,34 @@ BEGIN
 END
 $$;
 
+-- Que una sesión pueda LLAMAR a `auth.uid()` con su propio rol, como en hosted.
+--
+-- Medido el 2026-10-09 sobre la imagen que corre esta réplica
+-- (supabase/postgres:17.4.1.075), en la base `postgres`, donde su init dejó el
+-- esquema `auth` de verdad: `nspacl` da USAGE a `anon`, `authenticated`,
+-- `service_role` y `postgres`, y `auth.uid()` es ejecutable por PUBLIC. Este stub
+-- creaba el esquema sin ese USAGE, así que acá
+--
+--     SET ROLE authenticated; SELECT auth.uid();
+--     ERROR:  permission denied for schema auth
+--
+-- y en hosted devuelve el uid. Nadie lo notaba, y no por casualidad: una policy
+-- guarda la función por OID, así que evaluarla no BUSCA `auth.uid()` por nombre
+-- y no pide USAGE sobre el esquema. Medido el mismo día, sin el USAGE: el owner
+-- renombra su organización como `authenticated` —`orgs_update_owner`, de la
+-- 0001, la única de `pg_policies` que nombra `auth.uid()`— y da `UPDATE 1`. Lo
+-- que sí lo pide es código que resuelve el nombre al correr con el rol de quien
+-- llama: un PL/pgSQL SECURITY INVOKER. El primero es el trigger de la 0033, que
+-- es INVOKER a propósito —tiene que ver el rol de quien escribe—. Sin esta línea
+-- la réplica le rechazaba con 42501 toda aprobación por sesión, una negativa que
+-- hosted no tiene: más estricta que producción, en el sentido que hace pasar a
+-- una aserción de negativa por el motivo equivocado (medido: sin el USAGE se
+-- ponen rojos el 211 —marta ya no sella—, el 220, el 221, el 222 y el 225).
+--
+-- Sólo el USAGE del esquema: `auth.users` sigue sin privilegios para las
+-- sesiones, igual que en hosted.
+GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
+
 -- Los default privileges que Supabase deja puestos sobre `public`, que es la
 -- diferencia que hacía a la réplica MÁS SEGURA que la base real.
 --

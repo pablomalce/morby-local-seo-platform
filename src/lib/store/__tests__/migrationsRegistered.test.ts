@@ -41,6 +41,34 @@ const files = readdirSync(MIGRATIONS)
  */
 const REGISTRY_MIGRATION = "0008_schema_migrations";
 
+/**
+ * NÚMEROS RESERVADOS POR UN PR ABIERTO, CON SU DUEÑO ESCRITO.
+ *
+ * Dos frentes pueden escribir migraciones a la vez, y el número se reparte
+ * antes de mergear para que el orden de aplicación lo decida el NOMBRE y no
+ * quién llegó primero. Hasta que el dueño del número mergea, la rama que tomó
+ * el siguiente tiene un hueco, y el hueco es exactamente lo que el test de
+ * abajo prohíbe. Una reserva lo declara: dice qué número, de quién, y por qué.
+ *
+ * Lo que una reserva NO puede tapar: un hueco que no está en esta lista sigue
+ * en rojo, y un número reservado que YA existe como archivo no tapa nada —el
+ * número está—, así que una reserva vieja es inofensiva: no se pone roja a
+ * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
+ * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
+ *
+ * Es el mismo mecanismo que trae la rama de la `0032`
+ * (`feat/la-grilla-mide-geografia`, que reserva la `0031`): la que mergee
+ * segunda junta las dos listas, y las dos reservas quedan viejas.
+ *
+ * La `0032` es de la grilla GEO (H2-GO-3, `0032_geo_grid.sql`,
+ * `feat/la-grilla-mide-geografia`), en un PR abierto el 2026-10-09 cuando la
+ * `0033_seal_is_signed_by_sealer` se escribió con ese número por indicación de
+ * la sesión directora.
+ */
+const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [
+  { numero: 32, porque: "0032_geo_grid, H2-GO-3 (feat/la-grilla-mide-geografia)" },
+];
+
 describe("migration registry", () => {
   // Anti-vacuity. An empty or missing directory would make every assertion
   // below pass over nothing.
@@ -50,8 +78,16 @@ describe("migration registry", () => {
   });
 
   it("numbers them consecutively from 0001", () => {
-    const numbers = files.map((f) => Number(f.slice(0, 4)));
-    const expected = Array.from({ length: files.length }, (_, i) => i + 1);
+    const presentes = files.map((f) => Number(f.slice(0, 4)));
+    // Un número reservado cuenta como presente SÓLO para cerrar su propio
+    // hueco: si el archivo ya existe, no agrega nada (ver RESERVADOS). Un
+    // duplicado entre archivos sigue viéndose, porque los reservados se suman
+    // sin repetir.
+    const numbers = [
+      ...presentes,
+      ...RESERVADOS.map((r) => r.numero).filter((n) => !presentes.includes(n)),
+    ].sort((a, b) => a - b);
+    const expected = Array.from({ length: numbers.length }, (_, i) => i + 1);
 
     expect(
       numbers,
