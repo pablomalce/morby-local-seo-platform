@@ -59,6 +59,18 @@ export const runtime = "nodejs";
  * UPDATE de un editor, el de rol el de un client o un viewer—, así que llamar a
  * PostgREST directo tampoco sella. Esta comprobación es la que convierte esa
  * negativa en un 403 legible en vez de un 404 o un 502.
+ *
+ * LA FIRMA Y LA HORA LAS ATA LA BASE (0033, 2026-10-09)
+ *
+ * Medido ese día: un manager sellaba por PostgREST con `approved_by` = el uid
+ * del client y `approved_at` = la hora que quisiera, y la base lo aceptaba. Desde
+ * la 0033, un sello que escribe una SESIÓN —esta ruta escribe con la sesión, no
+ * con `service_role`— tiene que ir firmado por `auth.uid()` o muere con 45005, y
+ * su `approved_at` lo pone la base con `now()`. Así que `approved_by: user.id`
+ * de abajo no es una cortesía: otro valor no sella. Y el `approved_at` que se
+ * manda se pisa; se sigue mandando porque, sin el trigger, el CHECK de la 0015
+ * lo exige, y la ruta no tiene por qué depender de que el trigger exista. Un
+ * 45005 acá sería un defecto de esta ruta: cae en el 502 genérico de abajo.
  */
 
 const schema = z.object({

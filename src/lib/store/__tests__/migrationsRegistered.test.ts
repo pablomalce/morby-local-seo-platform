@@ -56,10 +56,15 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * Hoy no hay ninguna. La última fue la `0031` de H4.1 (PR #114), reservada
- * mientras la `0032_geo_grid` (H2-GO-3) se escribía con el número siguiente;
- * se borró al integrar `main` en la rama de la grilla, el 2026-10-09, con el
- * archivo ya presente.
+ * Hoy no hay ninguna. Las dos últimas se cruzaron: la `0031` de H4.1 (PR
+ * #114), reservada mientras la `0032_geo_grid` (H2-GO-3,
+ * `feat/la-grilla-mide-geografia`, PR #115) se escribía con el número
+ * siguiente; y la `0032`, reservada por la rama del sello
+ * (`fix/el-sello-lo-firma-quien-aprueba`, PR #116) mientras la
+ * `0033_seal_is_signed_by_sealer` se escribía con el número siguiente por
+ * indicación de la sesión directora. Las dos se borraron el 2026-10-09: la
+ * primera al integrar `main` en la rama de la grilla, la segunda al integrar
+ * la rama de la grilla en la del sello, con los archivos ya presentes.
  */
 const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [];
 
