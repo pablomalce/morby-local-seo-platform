@@ -16,7 +16,7 @@
 # es indistinguible de una que pasa".
 #
 # Queda un límite más chico y vale decirlo: esto verifica el guard, no el gasto.
-# Si el guard deja de invocarse desde los hooks, estos 21 casos siguen pasando.
+# Si el guard deja de invocarse desde los hooks, estos 28 casos siguen pasando.
 
 HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/block-money-spend.sh"
 pass=0; fail=0
@@ -46,6 +46,13 @@ chk "POST images/generate"    'curl -X POST http://localhost:3000/api/integratio
 chk "POST agents/run-all"     'curl -X POST $BASE/api/agents/run-all'                                blocked
 chk "POST content/generate"   'curl -X POST $BASE/api/content/generate'                              blocked
 chk "POST seo/audit"          'curl -X POST $BASE/api/seo/audit'                                     blocked
+chk "POST geo/grid"           'curl -X POST -d @grilla.json $BASE/api/geo/grid'                      blocked
+chk "geo/grid, flags after"   'curl https://app.example.com/api/geo/grid -d @grilla.json'            blocked
+# Las tres de abajo pasaban con exit 0 hasta el 2026-10-09: el patrón de la
+# grilla sólo miraba curl, wget, xh y nc.
+chk "geo/grid from node -e"   'node -e "fetch(\"http://localhost:3000/api/geo/grid\",{method:\"POST\",body:\"{}\"})"' blocked
+chk "geo/grid from python -c" 'python3 -c "import urllib.request as u; u.urlopen(u.Request(\"http://localhost:3000/api/geo/grid\", data=b\"{}\"))"' blocked
+chk "run the grid inline"     'npx tsx -e "import(\"./src/lib/geo/corrida\")"'                        blocked
 chk "run imageProvider"       'npx tsx src/lib/integrations/imageProvider.ts'                        blocked
 chk "run orchestrator"        'node src/lib/reports/orchestrator.ts'                                 blocked
 chk "run pagespeed client"    'npx tsx src/lib/integrations/google/pagespeed.ts'                     blocked
@@ -59,6 +66,8 @@ chk "grep for the host"       'grep -rn "https://api.openai.com" src/'          
 chk "read the paid module"    'cat src/lib/integrations/imageProvider.ts'                            allowed
 chk "prose naming the route"  'git commit -m "docs: explain POST /api/reports/generate"'             allowed
 chk "GET gbp profile (read)"  'curl $BASE/api/integrations/gbp/profile'                              allowed
+chk "the grid route's tests"  'npx vitest run src/app/api/geo/grid/__tests__/route.test.ts'           allowed
+chk "the grid runner's tests" 'npx vitest run src/lib/geo/__tests__/corrida.test.ts'                  allowed
 chk "git status"              'git status --short'                                                   allowed
 
 echo "──  $pass ok, $fail failed  ──"

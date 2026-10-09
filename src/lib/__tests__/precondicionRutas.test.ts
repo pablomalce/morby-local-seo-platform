@@ -576,6 +576,24 @@ const FORMA_DE_LLAMADA: Record<string, Forma> = {
   // en cero, también en `node:http`/`node:https` y `node:dns`, que es por donde
   // sale.
   "/api/profile/evidence-check": { cuerpo: { businessId: "66666666-6666-4666-8666-666666666666" } },
+  // H2-GO-3: el POST sale a Places una vez por punto de la grilla, y cada
+  // llamada se paga. Un cuerpo VÁLIDO —nueve puntos, el tope— para que zod no
+  // conteste antes del guardia; el GET lleva su `runId` en la query. Medido sin
+  // sesión el 2026-10-09: 401 en los dos verbos y en las cinco variantes,
+  // espía en cero y cuerpo sin tocar.
+  "/api/geo/grid": {
+    cuerpo: {
+      businessId: "88888888-8888-4888-8888-888888888888",
+      keyword: "fotvård Stockholm",
+      targetPlaceId: "ChIJbarridoDeLaGrilla01",
+      center: { lat: 59.3293, lng: 18.0686 },
+      radiusM: 1000,
+      stepM: 1500,
+      gridSize: 3,
+      declaredShiftM: 8000,
+    },
+    query: { runId: "88888888-8888-4888-8888-888888888889" },
+  },
   // Sin `code`, que es el caso del que entra a mano a la URL. El caso CON code
   // —el mecanismo ejercitado del otro lado— tiene su propio test más abajo.
   "/auth/callback": {},
