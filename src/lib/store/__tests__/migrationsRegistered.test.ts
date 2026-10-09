@@ -56,14 +56,12 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * La `0031` es de H4.1 (`0031_client_role.sql`, PR #114,
- * `feat/el-rol-de-cliente-no-es-cosmetico`), abierto el 2026-10-08 cuando la
- * `0032_geo_grid` (H2-GO-3) se escribió con ese número por indicación de la
- * sesión directora.
+ * Hoy no hay ninguna. La última fue la `0031` de H4.1 (PR #114), reservada
+ * mientras la `0032_geo_grid` (H2-GO-3) se escribía con el número siguiente;
+ * se borró al integrar `main` en la rama de la grilla, el 2026-10-09, con el
+ * archivo ya presente.
  */
-const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [
-  { numero: 31, porque: "0031_client_role, H4.1, PR #114 (feat/el-rol-de-cliente-no-es-cosmetico)" },
-];
+const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [];
 
 describe("migration registry", () => {
   // Anti-vacuity. An empty or missing directory would make every assertion

@@ -35,9 +35,14 @@ vi.mock("next/headers", () => ({
   }),
 }));
 
-/** Quién dice ser el usuario, y de qué organización es miembro. */
+/**
+ * Quién dice ser el usuario, y su membresía en la agencia. Con rol desde H4.1:
+ * conectar Google pide owner o admin de la agencia (D4).
+ */
 let usuario: { id: string } | null = { id: "11111111-1111-4111-8111-111111111111" };
-let membresias: { organization_id: string }[] = [{ organization_id: ORG }];
+let membresias: { organization_id: string; role?: string; state?: string }[] = [
+  { organization_id: ORG, role: "owner", state: "active" },
+];
 /**
  * Y si la consulta de membresía falló. Va aparte de `membresias` a propósito: un
  * doble que devolviera `data: null` JUNTO con el error no mediría esta rama —
@@ -90,7 +95,7 @@ beforeEach(() => {
   cookieGuardada = ESTADO;
   cookieBorrada = false;
   usuario = { id: "11111111-1111-4111-8111-111111111111" };
-  membresias = [{ organization_id: ORG }];
+  membresias = [{ organization_id: ORG, role: "owner", state: "active" }];
   errorMembresia = null;
   rpcs = [];
   canjes = 0;
@@ -253,5 +258,45 @@ describe("sin credenciales de plataforma", () => {
 
     expect(canjes).toBe(0);
     expect(destino(r)).toBe("/app/integrations?google=not-configured");
+  });
+});
+
+describe("quién vuelve, por rol (H4.1, D4)", () => {
+  // Miembro de la agencia no alcanza: el token sirve a TODOS los clientes, y
+  // reemplazarlo no es una acción de quien sólo lee o redacta. Las negativas son
+  // dentro de la agencia misma —donde el admin sí conecta—, así que es el rol y
+  // no la organización lo que decide. 403 y no 404: este miembro sabe que la
+  // ruta existe.
+  for (const rol of ["client", "viewer", "editor", "manager"]) {
+    it(`un ${rol} de la agencia recibe 403: no canjea, no guarda`, async () => {
+      membresias = [{ organization_id: ORG, role: rol, state: "active" }];
+
+      const r = await GET(pedido(`code=el-codigo&state=${ESTADO}`));
+
+      expect(r.status).toBe(403);
+      expect(canjes).toBe(0);
+      expect(rpcs).toHaveLength(0);
+      expect(cookieBorrada).toBe(true);
+    });
+  }
+
+  it("un admin de la agencia sí conecta", async () => {
+    membresias = [{ organization_id: ORG, role: "admin", state: "active" }];
+
+    const r = await GET(pedido(`code=el-codigo&state=${ESTADO}`));
+
+    expect(canjes).toBe(1);
+    expect(rpcs).toHaveLength(1);
+    expect(destino(r)).toBe("/app/integrations?google=connected");
+  });
+
+  it("un owner ARCHIVADO de la agencia es un no-miembro: 404, nada guardado", async () => {
+    membresias = [{ organization_id: ORG, role: "owner", state: "archived" }];
+
+    const r = await GET(pedido(`code=el-codigo&state=${ESTADO}`));
+
+    expect(r.status).toBe(404);
+    expect(canjes).toBe(0);
+    expect(rpcs).toHaveLength(0);
   });
 });

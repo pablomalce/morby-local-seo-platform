@@ -42,7 +42,16 @@ export interface MembresiaElegible {
   state?: string | null;
 }
 
-const PESO: Record<string, number> = { owner: 0, admin: 1, member: 2 };
+/**
+ * `client` PRIMERO, desde la puerta H4.1. Medido por un crítico el 2026-10-08:
+ * un usuario con rol `client` en X es además owner de su organización personal
+ * —la que `handle_new_user` (0001) crea al darse de alta—, y con `owner` primero
+ * la organización activa por defecto era ESA, vacía, y no la del cliente. Una
+ * membresía `client` la da la agencia para que esa persona vea SU organización;
+ * la personal es un efecto del alta. El personal de la agencia nunca tiene
+ * `client`, así que su orden no cambia.
+ */
+const PESO: Record<string, number> = { client: -1, owner: 0, admin: 1, member: 2 };
 
 /**
  * Las tres reglas del orden, que siguen valiendo como DEFAULT:
@@ -50,7 +59,8 @@ const PESO: Record<string, number> = { owner: 0, admin: 1, member: 2 };
  *   1. las archivadas no cuentan. Se filtra acá y no se confía en que la RLS lo
  *      haga: la baja archiva desde la 0013, y un cliente que dependa de que la
  *      policy lo esconda deja de funcionar el día que la policy cambie;
- *   2. `owner` antes que `admin` antes que `member`;
+ *   2. `client` antes que `owner` antes que `admin` antes que `member` (ver
+ *      `PESO`);
  *   3. a igual rol, el uuid más chico. No es «mejor»: es DETERMINISTA, y eso es
  *      lo único que impide que dos cargas de la misma pantalla elijan distinto.
  */

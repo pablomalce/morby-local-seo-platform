@@ -16,6 +16,7 @@ import {
   type Resultado,
 } from "@/lib/geo/grilla";
 import { posicionEnPunto } from "@/lib/integrations/google/places";
+import { rolPuede } from "@/lib/org/rol";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const dynamic = "force-dynamic";
@@ -131,8 +132,13 @@ export const maxDuration = 60;
  * sale a la red.
  */
 
-/** Quién puede disparar gasto. Los mismos tres que aprueban en H4.1. */
-const ROLES_QUE_CORREN: ReadonlySet<string> = new Set(["owner", "admin", "manager"]);
+/**
+ * Quién puede disparar gasto: los que APRUEBAN (`QUIEN_PUEDE.aprobar` de
+ * `src/lib/org/rol.ts`, H4.1: owner, admin y manager). Hasta la integración con
+ * `main` esta ruta tenía su propia lista con los mismos tres; dos copias de una
+ * regla se separan, así que ahora pregunta al mismo lugar que aprobar y publicar.
+ */
+const correGasto = (rol: string | null | undefined) => rolPuede(rol, "aprobar");
 
 const esquemaPost = z.object({
   businessId: z.string().uuid(),
@@ -315,7 +321,7 @@ export async function POST(req: Request) {
     const activas = ((membresias ?? []) as Array<{ organization_id: string; role: string; state: string | null }>).filter(
       (m) => (m.state ?? "active") === "active"
     );
-    if (!activas.some((m) => ROLES_QUE_CORREN.has(m.role))) {
+    if (!activas.some((m) => correGasto(m.role))) {
       return NextResponse.json({ error: "forbidden", motivo: "rol-insuficiente" }, { status: 403 });
     }
 
@@ -346,7 +352,7 @@ export async function POST(req: Request) {
     // Paso 6: la organización, en código.
     const membresia = activas.find((m) => m.organization_id === organizacion);
     if (!membresia) return NextResponse.json({ error: "not found" }, { status: 404 });
-    if (!ROLES_QUE_CORREN.has(membresia.role)) {
+    if (!correGasto(membresia.role)) {
       return NextResponse.json({ error: "forbidden", motivo: "rol-insuficiente" }, { status: 403 });
     }
 

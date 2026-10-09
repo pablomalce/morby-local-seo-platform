@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { quienLlama } from "@/lib/api/sesion";
+import { quienLlama, type ClienteDeServidor } from "@/lib/api/sesion";
+import { permisoEn } from "@/lib/org/rol";
 import { z } from "zod";
 import { generateReport } from "@/lib/reports/orchestrator";
 import type { ClientSnapshotInput } from "@/lib/reports/orchestrator";
@@ -86,6 +87,27 @@ const schema = z.object({
  * (Supabase con sesión, semilla sin ella); éste decide si hay permiso, que es
  * otra pregunta. El barrido (`precondicionRutas.test.ts`) mide las dos cosas:
  * 401 sin sesión y cero fetch.
+ *
+ * Y EL ROL, ANTES DEL ORQUESTADOR (puerta H4.1, D3; crítico del 2026-10-08)
+ *
+ * Generar un reporte de un negocio de la base GUARDA una fila en `reports`, y
+ * guardar es escribir: owner, admin, manager o editor (D3). La base ya le
+ * rechaza ese INSERT a un `viewer` o a un `client` (0031), pero el INSERT es lo
+ * ÚLTIMO que hace el orquestador. Medido sobre la réplica con PostgREST real:
+ * antes de esa negativa, un client de X disparaba con `service_role` un upsert
+ * en `integration_probe` —superficie INTERNA según D2, que ni puede leer—, otro
+ * en `pagespeed_cache`, y el refresco del token de la AGENCIA (POST a
+ * oauth2.googleapis.com y `refresh_integration_token`); un viewer, además,
+ * consultaba Search Console y GA4 con ese token. Después, un 400. O sea que «el
+ * client no escribe nada» valía por PostgREST y no por esta ruta.
+ *
+ * Por eso el rol se pregunta ACÁ, con la organización del negocio leída como el
+ * usuario, y la negativa es un 403 sin tocar el orquestador: cero salidas a la
+ * red, cero escrituras con `service_role`. Lo que NO se pregunta: un negocio de
+ * la semilla o uno que la sesión no alcanza —el reporte de demostración y el de
+ * `clientSnapshot`— no tienen organización, y el orquestador no escribe nada con
+ * ellos (`authenticated: false`). Siguen gastando Places y PageSpeed para
+ * cualquier sesión, como antes de esta puerta: eso es del rate limit, no del rol.
  */
 export async function POST(req: Request) {
   // El guardia va fuera del try del trabajo, y no es decoración. En "modo
@@ -97,7 +119,8 @@ export async function POST(req: Request) {
   // 2026-10-07 ese try vive en `quienLlama` (`src/lib/api/sesion.ts`) y lo usa
   // cada ruta con sesión: falla CERRADO, sin proveedor es nadie, y nadie es un
   // 401.
-  if (!(await quienLlama())) {
+  const sesion = await quienLlama();
+  if (!sesion) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
 
@@ -109,6 +132,10 @@ export async function POST(req: Request) {
   try {
     const body = req.body ? schema.parse(await req.json().catch(() => ({}))) : { businessId: undefined, clientSnapshot: undefined };
     const businessId = body.businessId ?? businesses[0].id;
+
+    const negativa = await negativaDeRol(sesion.supabase, sesion.user.id, businessId);
+    if (negativa) return negativa;
+
     const report = await generateReport({
       businessId,
       clientSnapshot: body.clientSnapshot as ClientSnapshotInput | undefined,
@@ -120,4 +147,42 @@ export async function POST(req: Request) {
   } catch (error) {
     return apiError(error);
   }
+}
+
+/** `businesses.id` es uuid: lo que no tiene esa forma no está en la base. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * La respuesta de negativa, o `null` si el reporte puede seguir.
+ *
+ * Un fallo de lectura NO es «no lo alcanza»: con el negocio ilegible no se sabe
+ * de qué organización es, y seguir dejaría al orquestador escribir sin que nadie
+ * haya preguntado el rol. 502, como las otras rutas.
+ */
+async function negativaDeRol(
+  supabase: ClienteDeServidor,
+  userId: string,
+  businessId: string
+): Promise<NextResponse | null> {
+  // Ids de la semilla (`biz-morby`) y de negocios locales: no hay fila, no hay
+  // organización, y el orquestador no escribe nada. Preguntarle a PostgREST por
+  // ellos daría un 22P02 que no es un fallo de nada.
+  if (!UUID.test(businessId)) return null;
+
+  const { data: negocio, error } = await supabase
+    .from("businesses")
+    .select("organization_id")
+    .eq("id", businessId)
+    .maybeSingle();
+  if (error) return NextResponse.json({ error: "business unreadable" }, { status: 502 });
+  // La sesión no lo alcanza: el orquestador tampoco, y cae a la semilla o al
+  // `clientSnapshot`, sin organización y sin escribir.
+  if (!negocio) return null;
+
+  const permiso = await permisoEn(supabase, userId, negocio.organization_id as string, "escribir");
+  if (permiso.ok) return null;
+  if (permiso.motivo === "ilegible") {
+    return NextResponse.json({ error: "membership unreadable" }, { status: 502 });
+  }
+  return NextResponse.json({ ok: false, motivo: "sin-permiso" }, { status: 403 });
 }

@@ -59,7 +59,11 @@ export type SocialPlatform =
 
 export type AspectRatio = "1:1" | "4:5" | "9:16" | "16:9" | "3:2" | "2:3";
 
-export type UserRole = "owner" | "admin" | "manager" | "editor" | "viewer";
+/**
+ * `client` desde la 0031 (puerta H4.1): el cliente en SU organización. Lee lo
+ * que es de cara al cliente y no escribe nada. Ver `src/lib/org/rol.ts`.
+ */
+export type UserRole = "owner" | "admin" | "manager" | "editor" | "viewer" | "client";
 
 export interface Organization {
   id: string;

@@ -23,7 +23,7 @@ const redirect = vi.fn((destino: string) => {
 vi.mock("next/navigation", () => ({ redirect }));
 
 let usuario: { id: string } | null = { id: "11111111-1111-4111-8111-111111111111" };
-let membresias: { organization_id: string }[] = [];
+let membresias: { organization_id: string; role?: string; state?: string }[] = [];
 let organizaciones: { id: string; name: string; slug: string }[] = [];
 let mapeos: { organization_id: string; provider: string; property_ref: string }[] = [];
 
@@ -77,6 +77,9 @@ vi.mock("@/lib/supabase/server", () => ({ createSupabaseServerClient }));
 
 /** La organización de Vulkan, la que `VULKAN_AGENCY_ORG_ID` nombra. */
 const AGENCIA = "44444444-4444-4444-8444-444444444444";
+
+const deA = (role: string) => ({ organization_id: ORG_A, role, state: "active" });
+const deLaAgencia = (role: string) => ({ organization_id: AGENCIA, role, state: "active" });
 
 /**
  * El token de la agencia, y si la consulta o la clasificación fallan.
@@ -166,7 +169,10 @@ const consultaAlMapeo = () => {
 
 beforeEach(() => {
   usuario = { id: "11111111-1111-4111-8111-111111111111" };
-  membresias = [{ organization_id: ORG_A }];
+  // Por defecto, quien mira es owner de A y admin de la agencia: la pantalla
+  // entera es de la agencia desde H4.1, y los tests de cableado de abajo miden
+  // lo que ve quien la opera. El describe del rol mide a los demás.
+  membresias = [deA("owner"), deLaAgencia("admin")];
   organizaciones = [{ id: ORG_A, name: "Cliente A", slug: "cliente-a" }];
   mapeos = [];
   consultas = [];
@@ -229,7 +235,7 @@ describe("lo que llega a la pantalla sale de esas filas", () => {
     // primer paso de pedirle a Google los números ajenos.
     process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
     process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
-    membresias = [{ organization_id: ORG_A }, { organization_id: ORG_B }];
+    membresias = [deA("owner"), { organization_id: ORG_B, role: "owner", state: "active" }, deLaAgencia("admin")];
     organizaciones = [
       { id: ORG_A, name: "Cliente A", slug: "cliente-a" },
       { id: ORG_B, name: "Cliente B", slug: "cliente-b" },
@@ -387,7 +393,7 @@ describe("el estado de la plataforma se muestra medido, no supuesto", () => {
       { id: ORG_A, name: "Cliente A", slug: "cliente-a" },
       { id: ORG_B, name: "Cliente B", slug: "cliente-b" },
     ];
-    membresias = [{ organization_id: ORG_A }, { organization_id: ORG_B }];
+    membresias = [deA("owner"), { organization_id: ORG_B, role: "owner", state: "active" }, deLaAgencia("admin")];
     filaDelToken = { expires_at: "2099-01-01T00:00:00.000Z", revoked_at: null };
     clasificacion = "revoked";
 
@@ -403,5 +409,101 @@ describe("el estado de la plataforma se muestra medido, no supuesto", () => {
         expect(s.reason).toBe("platform-token-revoked");
       }
     }
+  });
+});
+
+/**
+ * ES UNA PANTALLA DE LA AGENCIA (H4.1; crítico del 2026-10-08)
+ *
+ * A un client se le mostraba el estado del token de la agencia —leído con
+ * `service_role`—, sus superficies «sin mapear» aunque estuvieran mapeadas (la
+ * 0031 le esconde el mapeo) y un formulario que en su organización personal
+ * escribía. Lo que se mide: qué se le PREGUNTA a la base por cada persona, y qué
+ * llega a los componentes.
+ */
+describe("quién ve qué, según el rol en la agencia y en cada organización", () => {
+  const X = ORG_A;
+  const P = ORG_B;
+
+  beforeEach(() => {
+    process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
+    process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
+    filaDelToken = { expires_at: "2099-01-01T00:00:00.000Z", revoked_at: null };
+    clasificacion = "revoked";
+    createSupabaseAdminClient.mockClear();
+    organizaciones = [
+      { id: X, name: "Cliente X", slug: "cliente-x" },
+      { id: P, name: "clara", slug: "clara" },
+    ];
+    mapeos = [{ organization_id: X, provider: "ga4", property_ref: "properties/111" }];
+  });
+
+  it("clara —client de X, owner de su personal, fuera de la agencia— no ve plataforma, token, mapeo ni sondas", async () => {
+    membresias = [
+      { organization_id: X, role: "client", state: "active" },
+      { organization_id: P, role: "owner", state: "active" },
+    ];
+
+    const arbol = await pantalla();
+
+    expect(nodos(arbol, "PlatformNotice")).toHaveLength(0);
+    expect(nodos(arbol, "OrganizationIntegrations")).toHaveLength(0);
+    expect(nodos(arbol, "OperadaPorLaAgencia").map((n) => n.props.organizationName)).toEqual(["Cliente X", "clara"]);
+    // Ni se le pregunta a la base: ni el token con la llave de servicio, ni el
+    // mapeo ni las sondas con la sesión.
+    expect(createSupabaseAdminClient).not.toHaveBeenCalled();
+    const tablas = consultas.map((c) => c.tabla);
+    expect(tablas).not.toContain("integration_tokens");
+    expect(tablas).not.toContain("integration_properties");
+    expect(tablas).not.toContain("integration_probe");
+  });
+
+  it("un admin ARCHIVADO de la agencia tampoco es de la agencia", async () => {
+    membresias = [deA("owner"), { organization_id: AGENCIA, role: "admin", state: "archived" }];
+
+    const arbol = await pantalla();
+
+    expect(nodos(arbol, "PlatformNotice")).toHaveLength(0);
+    expect(createSupabaseAdminClient).not.toHaveBeenCalled();
+  });
+
+  it("un viewer de la agencia ve todo y no puede conectar ni mapear", async () => {
+    membresias = [deA("owner"), deLaAgencia("viewer")];
+
+    const arbol = await pantalla();
+
+    const aviso = nodos(arbol, "PlatformNotice");
+    expect(aviso).toHaveLength(1);
+    expect(aviso[0].props.tokenState).toBe("revoked");
+    expect(aviso[0].props.puedeConectar).toBe(false);
+    const tarjetas = nodos(arbol, "OrganizationIntegrations");
+    expect(tarjetas.map((t) => t.props.organizationId)).toEqual([X]);
+    expect(tarjetas[0].props.puedeMapear).toBe(false);
+    // P no es suya en este caso: la pide la fixture, la base no la devolvería.
+    expect(nodos(arbol, "OperadaPorLaAgencia").map((n) => n.props.organizationName)).toEqual(["clara"]);
+  });
+
+  it("un admin de la agencia conecta, y mapea sólo donde ES owner o admin", async () => {
+    membresias = [deA("owner"), { organization_id: P, role: "manager", state: "active" }, deLaAgencia("admin")];
+
+    const arbol = await pantalla();
+
+    expect(nodos(arbol, "PlatformNotice")[0].props.puedeConectar).toBe(true);
+    const tarjetas = nodos(arbol, "OrganizationIntegrations");
+    const puede = Object.fromEntries(tarjetas.map((t) => [t.props.organizationId, t.props.puedeMapear]));
+    expect(puede).toEqual({ [X]: true, [P]: false });
+  });
+
+  it("sin la variable de la agencia se ve el diagnóstico y nadie mapea ni conecta", async () => {
+    delete process.env.VULKAN_AGENCY_ORG_ID;
+    membresias = [deA("owner")];
+    organizaciones = [{ id: X, name: "Cliente X", slug: "cliente-x" }];
+
+    const arbol = await pantalla();
+
+    const aviso = nodos(arbol, "PlatformNotice");
+    expect(aviso[0].props.tokenState).toBe("unset");
+    expect(aviso[0].props.puedeConectar).toBe(false);
+    expect(nodos(arbol, "OrganizationIntegrations")[0].props.puedeMapear).toBe(false);
   });
 });

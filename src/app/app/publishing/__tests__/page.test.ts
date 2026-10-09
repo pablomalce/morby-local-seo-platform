@@ -67,6 +67,11 @@ describe("de dónde salen los assets que se pueden ensayar", () => {
     }
   });
 
+  it("el botón de ensayar lo decide el rol de la organización activa, con la lista de rol.ts (H4.1, D4)", () => {
+    // Ensayar pide lo mismo que aprobar: owner, admin o manager.
+    expect(PAGINA).toMatch(/puedeEnsayar=\{rolPuede\(organizacion\.rol, "aprobar"\)\}/);
+  });
+
   it("delega la organización activa en UN solo lugar", () => {
     expect(PAGINA).toContain("organizacionActiva()");
     expect(PAGINA).not.toMatch(/\.eq\("user_id", user\.id\)/);

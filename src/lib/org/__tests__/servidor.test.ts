@@ -32,6 +32,13 @@ describe("cómo resuelve la organización activa", () => {
     expect(AYUDANTE).toMatch(/elegirOrganizacion\(activas, elegida\)/);
   });
 
+  it("devuelve el rol de la membresía ELEGIDA, no el de otra (H4.1)", () => {
+    // Las pantallas deciden con él qué botón dibujar: el rol de otra
+    // organización le ofrecería a un client de X lo que puede en su personal.
+    expect(AYUDANTE).toMatch(/activas\.find\(\(m\) => m\.organization_id === id\)\?\.role/);
+    expect(AYUDANTE).toMatch(/return \{ id: actual\.id, name: actual\.name, disponibles, rol \}/);
+  });
+
   it("si la elegida no se puede leer, devuelve null en vez de un id suelto", () => {
     // Devolver el id igual dibujaría un encabezado sin nombre y consultas que no
     // traen nada — un cliente vacío que parece un cliente.

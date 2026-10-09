@@ -55,6 +55,10 @@ const CARLA = "33333333-3333-4333-8333-333333333333";
 const DIEGO = "44444444-4444-4444-8444-444444444444";
 /** manager de A, ARCHIVADA */
 const ELENA = "55555555-5555-4555-8555-555555555555";
+/** editor de A: escribe, pero no aprueba (D4 de la 0031) */
+const FEDE = "66666666-6666-4666-8666-666666666666";
+/** client de A (0031): lee lo suyo y no escribe nada */
+const GALA = "77777777-7777-4777-8777-777777777777";
 /** se registró ayer: owner de SU organización, con SU negocio, y nadie le aprobó nada */
 const EXTRANO = "99999999-9999-4999-8999-999999999999";
 
@@ -301,6 +305,8 @@ function sembrar() {
       { organization_id: ORG_B, user_id: DIEGO, role: "owner", state: "active" },
       { organization_id: ORG_A, user_id: DIEGO, role: "viewer", state: "active" },
       { organization_id: ORG_A, user_id: ELENA, role: "manager", state: "archived" },
+      { organization_id: ORG_A, user_id: FEDE, role: "editor", state: "active" },
+      { organization_id: ORG_A, user_id: GALA, role: "client", state: "active" },
       // Lo que deja el alta abierta (medido en la réplica el 2026-10-09):
       // owner/active de su organización, y el negocio que inserta él.
       { organization_id: ORG_X, user_id: EXTRANO, role: "owner", state: "active" },
@@ -399,6 +405,17 @@ describe("POST /api/geo/grid: quién puede gastar", () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ motivo: "rol-insuficiente" });
     expect(pedido.bodyUsed).toBe(false);
+    expect(google.pedidos).toHaveLength(0);
+    expect(estado.escrituras).toHaveLength(0);
+  });
+
+  it("un editor —escribe pero no aprueba— y un client: 403 sin red, por el rol de `aprobar` de rol.ts", async () => {
+    for (const quien of [FEDE, GALA]) {
+      estado.usuario = { id: quien };
+      const res = await POST(pedirPost(cuerpoValido()));
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ motivo: "rol-insuficiente" });
+    }
     expect(google.pedidos).toHaveLength(0);
     expect(estado.escrituras).toHaveLength(0);
   });

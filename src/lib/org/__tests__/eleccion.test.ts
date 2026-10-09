@@ -56,3 +56,29 @@ describe("la elección explícita", () => {
     expect(elegirOrganizacion(ninguna, AGENCIA)).toBeNull();
   });
 });
+
+describe("un client cae en la organización del cliente, no en su personal (H4.1)", () => {
+  // Toda cuenta es owner de una organización personal (handle_new_user, 0001).
+  // Con `owner` primero, la activa por defecto de un client era esa, vacía.
+  const X = "c4100000-0031-4031-8031-200000000001";
+  // La personal con el uuid MÁS CHICO, para que el desempate no la tape.
+  const P = "00000000-0000-4000-8000-000000000001";
+  const clara: MembresiaElegible[] = [
+    { organization_id: P, role: "owner", state: "active" },
+    { organization_id: X, role: "client", state: "active" },
+  ];
+
+  it("sin elección, la de client gana a la personal de owner", () => {
+    expect(elegirOrganizacion(clara, null)).toBe(X);
+  });
+
+  it("si la membresía client está archivada, cae en la personal", () => {
+    expect(
+      elegirOrganizacion([clara[0], { ...clara[1], state: "archived" }], null)
+    ).toBe(P);
+  });
+
+  it("y la elección explícita sigue ganando", () => {
+    expect(elegirOrganizacion(clara, P)).toBe(P);
+  });
+});

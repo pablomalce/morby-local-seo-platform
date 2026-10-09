@@ -127,7 +127,8 @@
 -- 10. IDENTIFICADORES EN INGLÉS, como la decisión 13 de la `0026`.
 --
 -- 11. EL EJE DE ROL DE LA `0031`, SI ESTÁ. La `0031_client_role` (H4.1, PR #114)
---     era un PR abierto cuando esto se escribió, y su encabezado dice qué le
+--     era un PR abierto cuando esto se escribió —hoy está en `main`, y esta
+--     migración corre después—, y su encabezado dice qué le
 --     toca a una migración POSTERIOR: las migraciones corren en orden de nombre,
 --     su bucle le pone el eje de rol a toda tabla con `organization_id` que YA
 --     existe, y una tabla creada después tiene que ponérselo ella misma. Eso
@@ -143,11 +144,12 @@
 --     Por eso no llevan la restrictiva de lectura de personal (`_role_read`).
 --     Si la decisión es la otra, es una línea en `is_internal_surface()` de la
 --     `0031`.
---     Y LO QUE NO SE PUEDE HACER DESDE ACÁ: la suite de la `0031` se pone roja
+--     Y LO QUE NO SE PODÍA HACER DESDE ACÁ: la suite de la `0031` se pone roja
 --     por vacuidad hasta que su fixture tenga una fila de cada tabla nueva en
---     sus dos organizaciones (su encabezado lo dice). Esa fixture vive en el
---     PR #114; integrar los dos PR es sumar ahí una aprobación, una corrida y
---     una observación.
+--     sus dos organizaciones (su encabezado lo dice). Esa fixture vivía en el
+--     PR #114; al integrar `main` en esta rama (2026-10-09, #114 ya mergeado)
+--     se sumó ahí una aprobación, una corrida y una observación por
+--     organización.
 --
 -- 12. EL LUGAR QUE SE BUSCA ES UN ID PÚBLICO DE PLACES, NO LA FICHA PROPIA.
 --     `target_place_id` es texto con la forma de un id de Places, sin FK a nada

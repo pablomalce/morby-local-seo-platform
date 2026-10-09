@@ -27,11 +27,39 @@
  * La membresía se comprueba con el cliente de sesión, no con el de servicio: la
  * pregunta es «¿qué alcanza ESTE usuario?», y hacerla con una llave que lo
  * alcanza todo la contesta siempre que sí.
+ *
+ * Y NO ALCANZA CON SER MIEMBRO (decisión D4 de la puerta H4.1, 2026-10-07)
+ *
+ * Mapear y desmapear exigen owner o admin de esa organización. Hasta acá
+ * alcanzaba con una membresía cualquiera, así que un `viewer` —o el cliente
+ * mismo, con el rol `client` de la 0031— movía la frontera entre clientes con
+ * `service_role`. Ninguna policy lo puede frenar: la escritura de abajo no pasa
+ * por la RLS. Es esta comprobación o nada, y `permisoEn()` es quien la hace.
+ *
+ * Y TAMPOCO ALCANZA CON SER OWNER DE LA ORGANIZACIÓN DESTINO
+ *
+ * Medido por un crítico el 2026-10-08, de punta a punta sobre la réplica con
+ * PostgREST: el rol se preguntaba sólo en la organización destino, y TODA cuenta
+ * es owner de alguna —la personal que `handle_new_user` (0001) crea al darse de
+ * alta, y las que quiera con `create_client_organization` (0024)—. Un client de
+ * X recibía `not-allowed` en X y `{ ok: true }` en su organización personal P,
+ * mapeaba ahí una property que no estuviera mapeada en vivo —o un alias de
+ * prefijo de URL de una que sí: la unicidad de la 0017 compara texto—, creaba un
+ * negocio en P y `POST /api/reports/generate` le devolvía los clics de Search
+ * Console del otro cliente, leídos con el token de la AGENCIA.
+ *
+ * El token es de la agencia, así que quién lo apunta a una property también:
+ * además del rol en la organización destino, owner o admin de la agencia
+ * (`operadorDeLaAgencia`, la misma pregunta que el OAuth). Un client nunca lo es;
+ * una cuenta que se registró sola, tampoco. Y sin `VULKAN_AGENCY_ORG_ID` nadie
+ * mapea: falla cerrado, como el OAuth.
  */
 
 import { revalidatePath } from "next/cache";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { permisoEn } from "@/lib/org/rol";
+import { operadorDeLaAgencia } from "@/lib/integrations/google/agencyGuard";
 import { validarPropertyRef, FORMA_ESPERADA } from "@/lib/integrations/google/mapping";
 import type { GoogleSurface } from "@/lib/integrations/google/sources";
 
@@ -44,6 +72,15 @@ export type PropertyActionError =
   | "not-authenticated"
   /** Hay sesión, y no es de esta organización. */
   | "not-a-member"
+  /** Es de esta organización, y su rol no alcanza para tocar integraciones (D4). */
+  | "not-allowed"
+  /**
+   * Su rol en la organización alcanza, y no opera la agencia: el mapeo apunta el
+   * token de la AGENCIA, y eso lo decide un owner o admin de la agencia.
+   */
+  | "not-agency"
+  /** `VULKAN_AGENCY_ORG_ID` falta o no es un uuid: no hay agencia a quién preguntarle. */
+  | "agency-unresolved"
   /** La superficie no es una de las tres. */
   | "unknown-surface"
   /** El identificador no tiene la forma que la 0017 exige. */
@@ -57,9 +94,10 @@ export type PropertyActionError =
 const PANTALLA = "/app/integrations";
 
 /**
- * Que el usuario de la sesión sea miembro de la organización que dice.
+ * Que el usuario de la sesión pueda tocar las integraciones de la organización
+ * que dice: miembro ACTIVO, con un rol que integra.
  *
- * Devuelve el id sólo si lo es. Sin esto, la mitad de arriba de este archivo no
+ * Devuelve `null` sólo si puede. Sin esto, la mitad de arriba de este archivo no
  * sirve de nada: el privilegio quedaría del lado del servidor y el servidor
  * escribiría lo que le pidan.
  */
@@ -70,17 +108,17 @@ async function organizacionDelUsuario(organizationId: string): Promise<PropertyA
   } = await supabase.auth.getUser();
   if (!user) return "not-authenticated";
 
-  const { data, error } = await supabase
-    .from("org_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .eq("organization_id", organizationId)
-    .limit(1);
-
+  const permiso = await permisoEn(supabase, user.id, organizationId, "integrar");
   // Un fallo de lectura NO es una membresía. Devolver «miembro» ante un error de
-  // la base convertiría una caída de Supabase en un permiso.
-  if (error || !data || data.length === 0) return "not-a-member";
-  return null;
+  // la base convertiría una caída de Supabase en un permiso — así que falla
+  // cerrado, como antes de que hubiera roles.
+  if (!permiso.ok) return permiso.motivo === "rol-insuficiente" ? "not-allowed" : "not-a-member";
+
+  // La segunda pregunta, la de la llave. Ver el encabezado: owner de la
+  // organización destino lo es cualquiera.
+  const operador = await operadorDeLaAgencia(supabase, user.id);
+  if (operador.ok) return null;
+  return operador.reason === "agency-unresolved" ? "agency-unresolved" : "not-agency";
 }
 
 /**
@@ -189,6 +227,12 @@ function mensaje(code: PropertyActionError): string {
       return "Hay que iniciar sesión.";
     case "not-a-member":
       return "Esa organización no es tuya.";
+    case "not-allowed":
+      return "Tu rol en esta organización no permite cambiar sus integraciones.";
+    case "not-agency":
+      return "El mapeo apunta el token de Google de la agencia: lo cambia un owner o admin de la agencia.";
+    case "agency-unresolved":
+      return "VULKAN_AGENCY_ORG_ID no está configurada, así que nadie puede mapear hasta que lo esté.";
     case "unknown-surface":
       return "Esa superficie de Google no existe.";
     case "bad-shape":

@@ -22,9 +22,18 @@ const ETIQUETA: Record<ClaseDeAsset, string> = {
 export function ContenidoDeLaOrganizacion({
   assets,
   businessId,
+  puedeAprobar,
 }: {
   assets: AssetVisto[];
   businessId: string | null;
+  /**
+   * Si el rol de quien mira aprueba en esta organización (D4: owner, admin o
+   * manager). Decide si se DIBUJA el botón; quien decide si se aprueba es la
+   * ruta, que contesta 403 igual. Sin esto, a un editor, un viewer o un client
+   * se le ofrecía APPROVE y el clic terminaba en «No se pudo aprobar (403)»,
+   * que el comentario de abajo lee como «mirá la base» (crítico del 2026-10-08).
+   */
+  puedeAprobar: boolean;
 }) {
   const router = useRouter();
   const [pendiente, startTransition] = useTransition();
@@ -45,7 +54,9 @@ export function ContenidoDeLaOrganizacion({
       setError(
         cuerpo.motivo === "el-texto-cambio"
           ? "El texto cambió mientras tanto, así que el sello no se pudo poner. Recargá y volvé a aprobar."
-          : `No se pudo aprobar (${res.status}).`
+          : res.status === 403
+            ? "Tu rol en esta organización no aprueba: eso lo hace un owner, admin o manager. No es una falla, y no se tocó nada."
+            : `No se pudo aprobar (${res.status}).`
       );
       return;
     }
@@ -70,6 +81,12 @@ export function ContenidoDeLaOrganizacion({
           asset vuelve a borrador — por eso la publicación no puede salir con un texto que nadie
           leyó.
         </p>
+        {!puedeAprobar && (
+          <p className="mt-2 text-[12px] text-metal-400" data-testid="sin-rol-para-aprobar">
+            Con tu rol en esta organización ves el contenido y su estado; aprobar lo hace un owner,
+            admin o manager.
+          </p>
+        )}
 
         {assets.length === 0 ? (
           <p className="mt-4 text-[12px] text-metal-400" data-testid="sin-contenido">
@@ -95,7 +112,7 @@ export function ContenidoDeLaOrganizacion({
                     <Badge variant={TONO[lectura.clase]}>{ETIQUETA[lectura.clase]}</Badge>
                   </div>
                   <p className="mt-2 text-[12px] text-metal-400">{lectura.quePasa}</p>
-                  {lectura.sePuedeAprobar && (
+                  {lectura.sePuedeAprobar && puedeAprobar && (
                     <button
                       type="button"
                       data-testid="aprobar"

@@ -15,18 +15,37 @@ export function ProductoResumen({
   organizacion,
   negocios,
   estado,
+  opera,
+  veLoInterno,
 }: {
   organizacion: string;
   negocios: NegocioResumen[];
   estado: EstadoDelProducto;
+  /**
+   * Si el rol de quien mira escribe en esta organización (D3). Los próximos
+   * pasos son todos de operador —crear un negocio, mapear, generar un reporte,
+   * aprobar—: a un `viewer` o a un `client` se le daba como próximo paso algo
+   * que la ruta le niega (crítico del 2026-10-08).
+   */
+  opera: boolean;
+  /**
+   * Si ve lo interno (D2). A un `client` la 0031 le esconde el mapeo y las
+   * sondas, así que sus cifras salen en cero aunque no lo estén: no se dibujan.
+   */
+  veLoInterno: boolean;
 }) {
-  const paso = proximoPaso(estado);
+  const paso = opera ? proximoPaso(estado) : null;
 
   return (
     <>
       <Card className="mt-6">
         <HudLabel>NEXT STEP</HudLabel>
-        {paso ? (
+        {!opera ? (
+          <p className="mt-3 text-[13px] text-metal-300" data-testid="opera-la-agencia">
+            Esta organización la opera la agencia: acá ves su estado. Los próximos pasos los da el
+            personal que la trabaja.
+          </p>
+        ) : paso ? (
           <div data-testid="proximo-paso" data-donde={paso.donde}>
             <p className="mt-3 font-display text-lg uppercase tracking-hud text-vulkan-white">
               {paso.que}
@@ -75,12 +94,12 @@ export function ProductoResumen({
       <Card className="mt-4">
         <HudLabel>WHAT THIS ORGANIZATION HAS</HudLabel>
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <Cifra etiqueta="MAPPINGS" valor={estado.mapeos} />
+          {veLoInterno && <Cifra etiqueta="MAPPINGS" valor={estado.mapeos} />}
           <Cifra etiqueta="REPORTS" valor={estado.reportes} />
           <Cifra etiqueta="APPROVED" valor={estado.contenidoAprobado} />
           <Cifra etiqueta="PUBLICATIONS" valor={estado.publicaciones} />
         </div>
-        {estado.fuentesFallando > 0 && (
+        {veLoInterno && estado.fuentesFallando > 0 && (
           <p className="mt-3 text-[12px] text-metal-400" data-testid="fuentes-fallando">
             <Badge variant="critical">{estado.fuentesFallando} FAILING</Badge> — el motivo de cada
             una está en /app/integrations.

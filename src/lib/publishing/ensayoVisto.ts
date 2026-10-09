@@ -4,12 +4,18 @@
  * Que el fallo de un ensayo se muestre como un único «no se pudo», fundiendo
  * situaciones que se arreglan en lugares distintos y por personas distintas.
  *
- * `POST /api/publishing/rehearse` contesta SIETE códigos —200, 400, 401, 404,
- * 409, 429, 500 y 502—, ocho lecturas contando el 200 que no es un ensayo, y
+ * `POST /api/publishing/rehearse` contesta NUEVE códigos —200, 400, 401, 403,
+ * 404, 409, 429, 500 y 502—, diez lecturas contando el 200 que no es un ensayo, y
  * dos de ellos llegan por caminos que no se distinguen por el status sino por
  * el cuerpo. Hay una novena clase que no viene de ningún status: cuando el
  * `fetch` no llega a contestar. Medido sobre `route.ts` al 2026-09-26:
  *
+ *   * 403 es «tu rol no ensaya»: desde la puerta H4.1 (D4) ensayar pide owner,
+ *     admin o manager de la organización del asset, y un editor, un viewer o un
+ *     client que lo ve no lo ensaya. Es una negativa CORRECTA, no un defecto:
+ *     hasta el 2026-10-08 caía en «defecto del servidor, no reintentar», que le
+ *     decía a un editor —que ayer ensayaba— que mirara el código (crítico del
+ *     2026-10-08). Se arregla con otra persona, no reintentando;
  *   * 404 es «este usuario no alcanza ese asset», y la RLS de la `0014` le da el
  *     MISMO 404 a un id inventado y a un asset de otra organización. Se arregla
  *     recargando o cambiando de organización, y NO se reservó nada;
@@ -74,6 +80,7 @@ export const CLASES_DE_ENSAYO = [
   "asset-ilegible",
   "defecto-del-servidor",
   "pedido-invalido",
+  "sin-permiso",
   // No viene de un status: es el `fetch` que rechazó —red caída, DNS, la
   // pestaña que se duerme—. Un escéptico midió que sin esta clase la pantalla
   // no mostraba NADA y el click se leía como si no hubiera pasado, que es la
@@ -164,6 +171,12 @@ export const LECTURAS: Record<ClaseDeEnsayo, LecturaDeEnsayo> = {
     quePaso: "La ruta rechazó el pedido: el id del asset no llegó, o no es un uuid.",
     queHacer: "No es algo que se arregle apretando de nuevo: es un defecto de esta pantalla.",
   },
+  "sin-permiso": {
+    clase: "sin-permiso",
+    quePaso:
+      "Tu rol en esta organización no ensaya ni publica: eso lo hace un owner, admin o manager. No es una falla, y no se reservó nada en el ledger.",
+    queHacer: "Pedíselo a alguien con ese rol. Reintentar con esta cuenta va a dar lo mismo.",
+  },
   "sin-respuesta": {
     clase: "sin-respuesta",
     quePaso:
@@ -205,6 +218,7 @@ export function lecturaDeEnsayo(status: number, cuerpo: unknown): LecturaDeEnsay
 
   if (status === 400) return LECTURAS["pedido-invalido"];
   if (status === 401) return LECTURAS["sin-sesion"];
+  if (status === 403) return LECTURAS["sin-permiso"];
   if (status === 404) return LECTURAS["asset-ausente"];
   if (status === 409) return LECTURAS["no-aprobado"];
   if (status === 429) return LECTURAS.demasiados;
