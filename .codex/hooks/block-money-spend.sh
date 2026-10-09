@@ -24,8 +24,36 @@
 #               hand-run bypasses the cache the product relies on.
 #   Reached over HTTP through POST /api/reports/generate (the orchestrator, which
 #   fans out to Places + PageSpeed), /api/integrations/images/generate,
-#   /api/integrations/places/search, /api/content/generate, /api/seo/audit and
-#   /api/agents/run{,-all}.
+#   /api/integrations/places/search, /api/content/generate, /api/seo/audit,
+#   /api/agents/run{,-all} and /api/geo/grid (H2-GO-3: one billed Places Text
+#   Search per grid point, up to nine per run).
+#   /api/geo/grid is blocked for every verb, GET included. Its GET only reads,
+#   but it lives on the same path as the paid POST, and telling the two apart
+#   from a command line means parsing curl's flags (-d implies POST, -X can come
+#   after the URL). A guard that misreads one flag lets the spend through; one
+#   that blocks a read costs a browser tab.
+#   And it is blocked from ANY client, not only curl/wget/xh/nc: a URL to the
+#   route on the command line of node, python, tsx, bun, deno, ruby or perl is
+#   blocked too (`node -e "fetch('http://localhost:3000/api/geo/grid', ...)"`,
+#   `python3 -c "...urlopen(...)"`). Until 2026-10-09 this header said "every
+#   verb" while the pattern only looked at the four network tools: both of
+#   those one-liners went through with exit 0, measured. Unlike the other route
+#   patterns, this one may cross `;` and `|` between the client and the URL:
+#   inline code is full of them (`import urllib.request as u; u.urlopen(...)`),
+#   and with `[^|;]*` the python one-liner still went through. The price is a
+#   rare false positive —a command that runs node AND, later, merely names a URL
+#   to the route— which costs a retype, not a bill. Running the grid's own
+#   code inline (`npx tsx -e "import('./src/lib/geo/corrida')"`) is blocked as
+#   well. Running the TESTS of that code is not: they hang off no URL token and
+#   no `geo/corrida` path (`src/lib/geo/__tests__/corrida.test.ts`).
+#
+# What this guard CANNOT see, said plainly: a script FILE that imports the grid
+# or the Places client and is then run by name (`npx tsx scripts/x.ts`). The hook
+# reads the command line, not the file. What stops THAT spend is not here: the
+# route refuses to run a grid without a spend approval row that only
+# service_role can write (0032, decision 13), and a script that calls
+# `posicionEnPunto` directly still needs GOOGLE_PLACES_API_KEY. This guard is the
+# first fence, not the only one.
 #
 # NOT blocked, and why:
 #   - GET /api/integrations/gbp/profile. Verified read-only: the route exports
@@ -78,6 +106,8 @@ PATTERNS=(
   "$NET[^|;]*$URL/api/content/generate"
   "$NET[^|;]*$URL/api/seo/audit"
   "$NET[^|;]*$URL/api/agents/run"
+  "$ANY.*$URL/api/geo/grid"
+  "$RUN[^|;]*geo/corrida"
   "$RUN[^|;]*(integrations/)?imageProvider"
   "$RUN[^|;]*integrations/openai"
   "$RUN[^|;]*(google/)?places"
@@ -95,6 +125,8 @@ REASONS=(
   "POST /api/content/generate, which spends on model calls"
   "POST /api/seo/audit, which runs the paid audit chain"
   "POST /api/agents/run or /run-all, which spends once per agent in the batch"
+  "/api/geo/grid, whose POST bills one Places Text Search per grid point (blocked for every verb and every client: see the header)"
+  "executing the grid runner (src/lib/geo/corrida.ts), which bills one Places Text Search per grid point"
   "executing imageProvider.ts, whose only job is the paid OpenAI image call"
   "executing the OpenAI wrapper, which spends on the same key"
   "executing the Places client, which bills per lookup"

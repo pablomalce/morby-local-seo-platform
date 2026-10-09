@@ -50,8 +50,12 @@ const SRC = path.join(ROOT, "src");
  * `src/lib/profile` entró con H1.4: el chequeo de evidencia sale a la red por
  * cada fuente de la ficha, y un chequeo con tests que ninguna ruta corre es
  * exactamente «la puerta está hecha» sin que nadie pueda cruzarla.
+ *
+ * `src/lib/geo` entró con H2-GO-3, por el mismo motivo: la grilla sale a
+ * Places una vez por punto, y una grilla con tests que ninguna ruta corre se
+ * leería como «la puerta se puede cruzar».
  */
-const VIGILADOS = ["src/lib/publishing", "src/lib/integrations", "src/lib/profile"];
+const VIGILADOS = ["src/lib/publishing", "src/lib/integrations", "src/lib/profile", "src/lib/geo"];
 
 /**
  * Lo que se acepta que no tenga llamadores de producción, con su razón.
