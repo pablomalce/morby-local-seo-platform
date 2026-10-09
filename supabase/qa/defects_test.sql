@@ -1,4 +1,4 @@
--- A hundred and forty-three isolation checks against the Growth OS schema — executable.
+-- A hundred and fifty-two isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -7391,10 +7391,502 @@ SELECT 143, 'la baja de una organización deja sus URLs en la caché de PageSpee
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 300 a 308. La grilla geográfica — la puerta de H2-GO-3, CERRADO por la 0032
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que una corrida de una organización no pueda colgar del negocio,
+-- de la persona ni de la corrida de otra; que una observación diga UNO de tres
+-- resultados con lo suyo y nada más —un fallo nunca se escribe como «no
+-- aparece», que es el modo de fallo que la puerta nombra—; que el tope de nueve
+-- puntos esté también en la base; que nadie fuera de la organización lea una
+-- corrida; que sólo el servidor escriba; y, por catálogo, que toda FK del
+-- subárbol lleve el tenant.
+--
+-- NUMERACIÓN: desde 300, y no a continuación del 143, a propósito. La `0031`
+-- (H4.1, PR #114) usa del 144 en adelante y era un PR abierto cuando estos se
+-- escribieron: numerar desde 300 deja los dos rangos sin pisarse, y el conteo
+-- de abajo es lo único que hay que sumar al integrar.
+--
+-- FIXTURES PROPIAS: gina y hugo, dados de alta por el alta real
+-- (`handle_new_user`), cada uno dueño de su organización (G y H) con un negocio.
+-- Una corrida de G con dos observaciones —una posición y un «no aparece»— y una
+-- de H con un fallo. Todo como `postgres`, que tiene BYPASSRLS en la imagen de
+-- Supabase: en los bloques 300 a 303 ninguna policy puede ser lo que rechaza, y
+-- el nombre de la constraint en el mensaje dice cuál fue.
+
+RESET ROLE;
+
+INSERT INTO auth.users (id, email) VALUES
+    ('d0320000-0032-4032-8032-000000000a01', 'gina-grilla@example.test'),
+    ('d0320000-0032-4032-8032-000000000a02', 'hugo-grilla@example.test');
+
+SELECT set_config('qa.gg_org_g', (SELECT organization_id::text FROM org_members
+         WHERE user_id = 'd0320000-0032-4032-8032-000000000a01' AND role = 'owner'), true);
+SELECT set_config('qa.gg_org_h', (SELECT organization_id::text FROM org_members
+         WHERE user_id = 'd0320000-0032-4032-8032-000000000a02' AND role = 'owner'), true);
+
+INSERT INTO businesses (id, organization_id, name) VALUES
+    ('d0320000-0032-4032-8032-000000000b01', current_setting('qa.gg_org_g')::uuid, 'Gina Peluquería'),
+    ('d0320000-0032-4032-8032-000000000b02', current_setting('qa.gg_org_h')::uuid, 'Hugo Barbería');
+
+INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                           center_lat, center_lng, radius_m, step_m, n_points,
+                           declared_shift_m, created_by)
+VALUES ('d0320000-0032-4032-8032-000000000c01', current_setting('qa.gg_org_g')::uuid,
+        'd0320000-0032-4032-8032-000000000b01', 'peluquería Södermalm', 'ChIJginaGrillaQA000001',
+        59.3150, 18.0700, 1000, 1500, 9, 8000, 'd0320000-0032-4032-8032-000000000a01'),
+       ('d0320000-0032-4032-8032-000000000c02', current_setting('qa.gg_org_h')::uuid,
+        'd0320000-0032-4032-8032-000000000b02', 'barbería Vasastan', 'ChIJhugoGrillaQA000002',
+        59.3450, 18.0500, 1000, 1500, 9, NULL, 'd0320000-0032-4032-8032-000000000a02');
+
+INSERT INTO geo_grid_observations (organization_id, run_id, grid_row, grid_col, lat, lng,
+                                   observed_at, outcome, position, error_code)
+VALUES (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 0, 0,
+        59.3285, 18.0436, now(), 'position', 3, NULL),
+       (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 0, 1,
+        59.3285, 18.0700, now(), 'absent', NULL, NULL),
+       (current_setting('qa.gg_org_h')::uuid, 'd0320000-0032-4032-8032-000000000c02', 1, 1,
+        59.3450, 18.0500, now(), 'failed', NULL, 'http_429');
+
+-- Anti-vacuidad: dos organizaciones DISTINTAS, cada una con su corrida y sus
+-- observaciones. Sin eso, «otra identidad lee cero» y «no quedó nada» se
+-- cumplen sobre tablas vacías.
+DO $$
+BEGIN
+    IF current_setting('qa.gg_org_g', true) IS NULL OR current_setting('qa.gg_org_h', true) IS NULL
+       OR current_setting('qa.gg_org_g') = current_setting('qa.gg_org_h') THEN
+        RAISE EXCEPTION 'Vacuous run: gina y hugo no pasaron por el alta real, o comparten organización.';
+    END IF;
+    IF (SELECT count(*) FROM geo_grid_runs WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 1
+       OR (SELECT count(*) FROM geo_grid_observations WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 2
+       OR (SELECT count(*) FROM geo_grid_runs WHERE organization_id = current_setting('qa.gg_org_h')::uuid) <> 1
+       OR (SELECT count(*) FROM geo_grid_observations WHERE organization_id = current_setting('qa.gg_org_h')::uuid) <> 1 THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 300 a 308 no dejó 1+2 filas en G y 1+1 en H.';
+    END IF;
+END
+$$;
+
+-- Las sentencias de los bloques 300 y 301, armadas una vez: el 301 corre las
+-- MISMAS con la organización coherente, para que la única diferencia entre un
+-- rechazo y una aceptación sea el cruce.
+CREATE OR REPLACE FUNCTION pg_temp.gg_corrida(p_org text, p_negocio text, p_creador text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT format($s$INSERT INTO geo_grid_runs (organization_id, business_id, keyword, target_place_id,
+                         center_lat, center_lng, radius_m, step_m, n_points, created_by)
+                     VALUES (%L, %L, 'QA cruce', 'ChIJcruceGrillaQA00003', 59.33, 18.06, 1000, 1500, 9, %L)$s$,
+                  p_org, p_negocio, p_creador);
+$$;
+
+CREATE OR REPLACE FUNCTION pg_temp.gg_observacion(p_org text, p_corrida text, p_fila int, p_col int,
+                                                  p_resultado text, p_posicion int, p_codigo text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT format($s$INSERT INTO geo_grid_observations (organization_id, run_id, grid_row, grid_col, lat, lng,
+                         observed_at, outcome, position, error_code)
+                     VALUES (%L, %L, %s, %s, 59.33, 18.06, now(), %L, %s, %s)$s$,
+                  p_org, p_corrida, p_fila, p_col, p_resultado,
+                  coalesce(p_posicion::text, 'NULL'), coalesce(quote_literal(p_codigo), 'NULL'));
+$$;
+
+-- ── 300 ──────────────────────────────────────────────────────────────────────
+-- CRUCE ENTRE ORGANIZACIONES → 23503 NOMBRANDO CADA FK COMPUESTA. Cuatro
+-- intentos, como `postgres`:
+--   a. una corrida de G sobre el negocio de H;
+--   b. una corrida de G «corrida por» hugo, que no es miembro de G —existe en
+--      `auth.users`, así que una FK simple contra `auth.users` lo dejaría
+--      pasar: es la mutación que distingue el par de la FK simple—;
+--   c. una observación de G colgada de la corrida de H;
+--   d. la corrida de G MUDADA al negocio de H con un UPDATE.
+SELECT set_config('qa.b300a', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b02', NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b300b', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01',
+           'd0320000-0032-4032-8032-000000000a02')), 'ACEPTADO'), true);
+SELECT set_config('qa.b300c', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c02', 2, 2,
+           'absent', NULL, NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b300d', coalesce(pg_temp.error_sin_huella(
+           $s$UPDATE geo_grid_runs SET business_id = 'd0320000-0032-4032-8032-000000000b02'
+               WHERE id = 'd0320000-0032-4032-8032-000000000c01'$s$), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 300, 'una corrida o una observación de la grilla cuelga del negocio, la persona o la corrida de otra organización',
+       NOT (a LIKE '23503 |%"geo_grid_runs_business_fkey"%'
+            AND b LIKE '23503 |%"geo_grid_runs_creator_member_fkey"%'
+            AND c LIKE '23503 |%"geo_grid_observations_run_fkey"%'
+            AND d LIKE '23503 |%"geo_grid_runs_business_fkey"%'),
+       'negocio de otra: ' || a || ' / persona de otra: ' || b ||
+       ' / corrida de otra: ' || c || ' / mudanza al negocio de otra: ' || d ||
+       ' (se espera 23503 nombrando geo_grid_runs_business_fkey, geo_grid_runs_creator_member_fkey, ' ||
+       'geo_grid_observations_run_fkey y geo_grid_runs_business_fkey)'
+  FROM (SELECT current_setting('qa.b300a') AS a, current_setting('qa.b300b') AS b,
+               current_setting('qa.b300c') AS c, current_setting('qa.b300d') AS d) x;
+
+-- ── 301 ──────────────────────────────────────────────────────────────────────
+-- EL CONTROL POSITIVO DEL 300: las MISMAS sentencias, con la organización
+-- coherente, pasan —sin dejar huella—. Sin él, un esquema que rechazara toda
+-- corrida pondría el 300 en verde con la grilla muerta.
+SELECT set_config('qa.b301a', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b301b', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01',
+           'd0320000-0032-4032-8032-000000000a01')), 'ACEPTADO'), true);
+SELECT set_config('qa.b301c', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2,
+           'absent', NULL, NULL)), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 301, 'la grilla rechaza también la corrida y la observación coherentes (el 300 sería vacuo)',
+       NOT (a = 'ACEPTADO' AND b = 'ACEPTADO' AND c = 'ACEPTADO'),
+       'corrida de G sobre su negocio: ' || a || ' / la misma corrida por gina: ' || b ||
+       ' / observación de G en su corrida: ' || c || ' (se espera ACEPTADO en las tres)'
+  FROM (SELECT current_setting('qa.b301a') AS a, current_setting('qa.b301b') AS b,
+               current_setting('qa.b301c') AS c) x;
+
+-- ── 302 ──────────────────────────────────────────────────────────────────────
+-- LOS TRES RESULTADOS, CADA UNO CON LO SUYO → 23514. Ocho combinaciones
+-- incoherentes —la quinta es el modo de fallo de la puerta escrito en la base:
+-- un fallo sin código, o sea un fallo que se puede leer como cualquier otra
+-- cosa— y un código de error con texto libre del proveedor. Cada una tiene que
+-- morir NOMBRANDO su CHECK. Los cinco controles —posición 1 y 20, «no
+-- aparece», fallo con `http_429` y con `timeout`— tienen que pasar: sin ellos,
+-- un CHECK que rechazara todo pondría las ocho en verde.
+CREATE TEMP TABLE gg_coherencia (caso text, sql text, espera text) ON COMMIT DROP;
+INSERT INTO gg_coherencia VALUES
+    ('position sin posición',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', NULL, NULL),
+     'geo_grid_observations_outcome_coherent'),
+    ('position con código',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', 3, 'http_429'),
+     'geo_grid_observations_outcome_coherent'),
+    ('absent con posición',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'absent', 3, NULL),
+     'geo_grid_observations_outcome_coherent'),
+    ('absent con código',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'absent', NULL, 'timeout'),
+     'geo_grid_observations_outcome_coherent'),
+    ('failed sin código',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'failed', NULL, NULL),
+     'geo_grid_observations_outcome_coherent'),
+    ('failed con posición',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'failed', 2, 'timeout'),
+     'geo_grid_observations_outcome_coherent'),
+    ('posición 21',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', 21, NULL),
+     'geo_grid_observations_outcome_coherent'),
+    ('posición 0',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', 0, NULL),
+     'geo_grid_observations_outcome_coherent'),
+    ('código con el texto del proveedor',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'failed', NULL,
+                            'Quota exceeded for quota metric of service places.googleapis.com'),
+     'geo_grid_observations_error_code_shape'),
+    ('control: posición 1',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', 1, NULL),
+     NULL),
+    ('control: posición 20',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'position', 20, NULL),
+     NULL),
+    ('control: absent',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'absent', NULL, NULL),
+     NULL),
+    ('control: failed http_429',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'failed', NULL, 'http_429'),
+     NULL),
+    ('control: failed timeout',
+     pg_temp.gg_observacion(current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2, 'failed', NULL, 'timeout'),
+     NULL);
+
+CREATE TEMP TABLE gg_coherencia_visto ON COMMIT DROP AS
+SELECT caso, espera, coalesce(pg_temp.error_sin_huella(sql), 'ACEPTADO') AS visto FROM gg_coherencia;
+
+INSERT INTO defect_report
+SELECT 302, 'una observación de la grilla dice un resultado con lo de otro: un fallo sin código, un «no aparece» con posición',
+       count(*) <> 14 OR count(*) FILTER (WHERE NOT bien) > 0,
+       CASE WHEN count(*) = 14 AND count(*) FILTER (WHERE NOT bien) = 0
+            THEN 'las 9 incoherentes mueren con 23514 nombrando su CHECK y los 5 controles pasan'
+            ELSE string_agg(caso || ': ' || visto, ' / ' ORDER BY caso) FILTER (WHERE NOT bien) END
+  FROM (SELECT caso, visto,
+               CASE WHEN espera IS NULL THEN visto = 'ACEPTADO'
+                    ELSE visto LIKE '23514 |%"' || espera || '"%' END AS bien
+          FROM gg_coherencia_visto) x;
+
+-- ── 303 ──────────────────────────────────────────────────────────────────────
+-- EL TOPE DE PUNTOS, EN LA BASE (decisión 4 de la `0032`). Una corrida de 16 y
+-- una de 10 puntos, una celda fuera de la grilla de 3x3 y una celda repetida no
+-- entran; y un «no aparece» mapeado a 20 —dentro del rango de las posiciones—
+-- tampoco. El control: la corrida de 9 entra.
+SELECT set_config('qa.b303a', coalesce(pg_temp.error_sin_huella(replace(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL), ', 9, ', ', 16, ')), 'ACEPTADO'), true);
+SELECT set_config('qa.b303b', coalesce(pg_temp.error_sin_huella(replace(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL), ', 9, ', ', 10, ')), 'ACEPTADO'), true);
+SELECT set_config('qa.b303c', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 3, 0,
+           'absent', NULL, NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b303d', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 0, 0,
+           'absent', NULL, NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b303e', coalesce(pg_temp.error_sin_huella(
+           $s$UPDATE geo_grid_runs SET unmatched_value = 20
+               WHERE id = 'd0320000-0032-4032-8032-000000000c01'$s$), 'ACEPTADO'), true);
+SELECT set_config('qa.b303f', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL)), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 303, 'la base acepta una corrida de más de nueve puntos, una celda fuera de 3x3 o repetida, o un «no aparece» con valor de posición',
+       NOT (a LIKE '23514 |%"geo_grid_runs_n_points_check"%'
+            AND b LIKE '23514 |%"geo_grid_runs_n_points_check"%'
+            AND c LIKE '23514 |%"geo_grid_observations_cell_check"%'
+            AND d LIKE '23505 |%"geo_grid_observations_cell_key"%'
+            AND e LIKE '23514 |%"geo_grid_runs_unmatched_value_check"%'
+            AND f = 'ACEPTADO'),
+       '16 puntos: ' || a || ' / 10 puntos: ' || b || ' / celda (3,0): ' || c ||
+       ' / celda (0,0) repetida: ' || d || ' / no aparece = 20: ' || e ||
+       ' / control, 9 puntos: ' || f
+  FROM (SELECT current_setting('qa.b303a') AS a, current_setting('qa.b303b') AS b,
+               current_setting('qa.b303c') AS c, current_setting('qa.b303d') AS d,
+               current_setting('qa.b303e') AS e, current_setting('qa.b303f') AS f) x;
+
+-- ── 304 ──────────────────────────────────────────────────────────────────────
+-- AISLAMIENTO DE LECTURA BAJO OTRA IDENTIDAD → 0 FILAS. Como `authenticated`
+-- con el `auth.uid()` de hugo, lo que PostgREST ejecutaría con su sesión: las
+-- filas de las dos tablas que NO son de H. Cero, y no por error: `escalar()`
+-- devuelve el error como texto, y un «ERROR 42501» no es «no ve nada».
+SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a02');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b304a', pg_temp.escalar(format(
+           'SELECT count(*) FROM geo_grid_runs WHERE organization_id IS DISTINCT FROM %L',
+           current_setting('qa.gg_org_h'))), true);
+SELECT set_config('qa.b304b', pg_temp.escalar(format(
+           'SELECT count(*) FROM geo_grid_observations WHERE organization_id IS DISTINCT FROM %L',
+           current_setting('qa.gg_org_h'))), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 304, 'una sesión de otra organización lee corridas u observaciones de la grilla ajenas',
+       NOT (current_setting('qa.b304a') = '0' AND current_setting('qa.b304b') = '0'),
+       'hugo, como authenticated, ve corridas ajenas: ' || current_setting('qa.b304a') ||
+       ' / observaciones ajenas: ' || current_setting('qa.b304b') ||
+       ' (se espera 0 y 0; G tiene 1 corrida y 2 observaciones)';
+
+-- ── 305 ──────────────────────────────────────────────────────────────────────
+-- LA CONTRAPRUEBA DEL 304: gina lee las de G —1 corrida y 2 observaciones— y
+-- hugo las de H —1 y 1—. Sin esto, una tabla que nadie puede leer pone el 304
+-- en verde.
+SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a01');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b305g', pg_temp.escalar(
+           'SELECT (SELECT count(*) FROM geo_grid_runs) || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
+RESET ROLE;
+SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a02');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b305h', pg_temp.escalar(
+           'SELECT (SELECT count(*) FROM geo_grid_runs) || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 305, 'la dueña de una corrida no la lee (el 304 sería vacuo)',
+       NOT (current_setting('qa.b305g') = '1+2' AND current_setting('qa.b305h') = '1+1'),
+       'gina ve corridas+observaciones: ' || current_setting('qa.b305g') ||
+       ' (se espera 1+2) / hugo: ' || current_setting('qa.b305h') || ' (se espera 1+1)';
+
+-- ── 306 ──────────────────────────────────────────────────────────────────────
+-- SÓLO EL SERVIDOR ESCRIBE (decisión 9 de la `0032`). Por PRIVILEGIO, de tabla y
+-- de columna, en las dos tablas: `anon` no tiene ninguno —tampoco SELECT— y
+-- `authenticated` sólo SELECT. Y por INTENTO: gina, en SU organización, como
+-- `authenticated`, no puede escribir una corrida —muere con el 42501 del
+-- PRIVILEGIO, no con el de una policy—, y `anon` no puede ni leer. El control:
+-- `service_role` escribe la misma corrida. Sin él, una grilla que nadie puede
+-- escribir pone las demás en verde.
+CREATE TEMP TABLE gg_privilegios (privilegio text) ON COMMIT DROP;
+INSERT INTO gg_privilegios VALUES
+    ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN');
+
+CREATE TEMP TABLE gg_sobran ON COMMIT DROP AS
+SELECT r.rol, t.tabla, p.privilegio
+  FROM (VALUES ('anon'), ('authenticated')) r(rol)
+ CROSS JOIN (VALUES ('public.geo_grid_runs'), ('public.geo_grid_observations')) t(tabla)
+ CROSS JOIN gg_privilegios p
+ WHERE NOT (r.rol = 'authenticated' AND p.privilegio = 'SELECT')
+   AND (has_table_privilege(r.rol, t.tabla, p.privilegio)
+        OR (p.privilegio IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+            AND has_any_column_privilege(r.rol, t.tabla, p.privilegio)));
+
+SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a01');
+SET LOCAL ROLE authenticated;
+SELECT set_config('qa.b306a', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01',
+           'd0320000-0032-4032-8032-000000000a01')), 'ACEPTADO'), true);
+SELECT set_config('qa.b306b', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2,
+           'position', 1, NULL)), 'ACEPTADO'), true);
+RESET ROLE;
+SET LOCAL ROLE anon;
+SELECT set_config('qa.b306c', pg_temp.escalar('SELECT count(*) FROM geo_grid_runs'), true);
+RESET ROLE;
+SET LOCAL ROLE service_role;
+SELECT set_config('qa.b306d', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01',
+           'd0320000-0032-4032-8032-000000000a01')), 'ACEPTADO'), true);
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 306, 'algo que no es el servidor escribe la grilla, o anon la lee',
+       coalesce(sobran, '') <> ''
+         OR current_setting('qa.b306a') <> '42501 | permission denied for table geo_grid_runs'
+         OR current_setting('qa.b306b') <> '42501 | permission denied for table geo_grid_observations'
+         OR current_setting('qa.b306c') <> 'ERROR 42501 | permission denied for table geo_grid_runs'
+         OR current_setting('qa.b306d') <> 'ACEPTADO',
+       'privilegios de más: [' || coalesce(sobran, '') ||
+       '] / gina escribe una corrida de G como authenticated: ' || current_setting('qa.b306a') ||
+       ' / una observación: ' || current_setting('qa.b306b') ||
+       ' / anon lee: ' || current_setting('qa.b306c') ||
+       ' / control, service_role escribe la corrida: ' || current_setting('qa.b306d')
+  FROM (SELECT string_agg(rol || ' ' || privilegio || ' en ' || tabla, ', ' ORDER BY rol, tabla, privilegio)
+               AS sobran FROM gg_sobran) x;
+
+-- ── 307 ──────────────────────────────────────────────────────────────────────
+-- POR CATÁLOGO, SOBRE EL SUBÁRBOL DE LA GRILLA. El subárbol no es una lista: es
+-- toda relación de `public` con el prefijo `geo_grid_` MÁS, transitivamente,
+-- toda tabla que referencia por FK a una de ellas —una hija nueva sin el prefijo
+-- entra igual—. Sobre él:
+--
+--   * TODA FK lleva `organization_id` emparejado con el tenant del otro lado:
+--     con `organization_id` del padre, o con `organizations.id`. Una FK simple
+--     a la corrida o al negocio —la mutación que el 300 ve por conducta— acá se
+--     ve sin fixture, también para la tabla que todavía no existe;
+--   * toda tabla lleva `organization_id` uuid NOT NULL, RLS ENABLE y FORCE, una
+--     restrictiva `FOR ALL TO authenticated` y una permisiva de lectura
+--     `TO authenticated` IGUALES a la forma canónica, y ninguna permisiva con
+--     otra expresión. Por igualdad y no por texto parecido: es el método del
+--     bloque 129, con su forma canónica deparseada en esta sesión. Restrictivas
+--     de más se permiten —sólo achican—, y es lo que deja entrar el eje de rol
+--     de la `0031` (decisión 11 de la `0032`).
+--
+-- Imprime cuántas tablas y cuántas FK miró, también en verde, y exige que sean
+-- más de cero.
+CREATE TEMP TABLE gg_canon (organization_id uuid) ON COMMIT DROP;
+CREATE POLICY gg_canon ON gg_canon USING (organization_id IN (SELECT public.current_user_org_ids()));
+SELECT set_config('qa.gg_canon',
+                  (SELECT pg_get_expr(p.polqual, p.polrelid) FROM pg_policy p
+                    WHERE p.polrelid = 'gg_canon'::regclass), true);
+
+CREATE TEMP TABLE gg_subarbol ON COMMIT DROP AS
+WITH RECURSIVE sub(oid) AS (
+    SELECT c.oid
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+     WHERE c.relkind IN ('r', 'p') AND c.relname LIKE 'geo\_grid\_%'
+    UNION
+    SELECT fk.conrelid
+      FROM pg_constraint fk
+      JOIN sub ON fk.confrelid = sub.oid
+     WHERE fk.contype = 'f'
+)
+SELECT DISTINCT oid FROM sub;
+
+CREATE TEMP TABLE gg_fks ON COMMIT DROP AS
+SELECT fk.conrelid::regclass::text AS tabla, fk.conname,
+       EXISTS (SELECT 1
+                 FROM unnest(fk.conkey, fk.confkey) AS k(local, remota)
+                 JOIN pg_attribute al ON al.attrelid = fk.conrelid AND al.attnum = k.local
+                 JOIN pg_attribute ar ON ar.attrelid = fk.confrelid AND ar.attnum = k.remota
+                WHERE al.attname = 'organization_id'
+                  AND (ar.attname = 'organization_id'
+                       OR (fk.confrelid = 'public.organizations'::regclass AND ar.attname = 'id'))) AS con_tenant
+  FROM pg_constraint fk
+  JOIN gg_subarbol s ON s.oid = fk.conrelid
+ WHERE fk.contype = 'f';
+
+CREATE TEMP TABLE gg_tablas ON COMMIT DROP AS
+SELECT c.relname,
+       coalesce((SELECT a.atttypid = 'uuid'::regtype AND a.attnotnull
+                   FROM pg_attribute a
+                  WHERE a.attrelid = c.oid AND a.attname = 'organization_id' AND NOT a.attisdropped), false)
+           AS tenant_ok,
+       c.relrowsecurity AND c.relforcerowsecurity AS rls_ok,
+       EXISTS (SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = c.oid AND NOT p.polpermissive AND p.polcmd = '*'
+                  AND 'authenticated'::regrole::oid = ANY (p.polroles)
+                  AND pg_get_expr(p.polqual, p.polrelid) = current_setting('qa.gg_canon')
+                  AND pg_get_expr(p.polwithcheck, p.polrelid) = current_setting('qa.gg_canon'))
+           AS restrictiva_ok,
+       EXISTS (SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = c.oid AND p.polpermissive AND p.polcmd IN ('r', '*')
+                  AND 'authenticated'::regrole::oid = ANY (p.polroles)
+                  AND pg_get_expr(p.polqual, p.polrelid) = current_setting('qa.gg_canon'))
+           AS lectura_ok,
+       NOT EXISTS (SELECT 1 FROM pg_policy p
+                    WHERE p.polrelid = c.oid AND p.polpermissive
+                      AND ((p.polcmd <> 'a'
+                            AND pg_get_expr(p.polqual, p.polrelid) IS DISTINCT FROM current_setting('qa.gg_canon'))
+                           OR (p.polcmd = 'a'
+                               AND pg_get_expr(p.polwithcheck, p.polrelid) IS DISTINCT FROM current_setting('qa.gg_canon'))
+                           OR (p.polwithcheck IS NOT NULL
+                               AND pg_get_expr(p.polwithcheck, p.polrelid) <> current_setting('qa.gg_canon'))))
+           AS sin_permisiva_floja
+  FROM pg_class c
+  JOIN gg_subarbol s ON s.oid = c.oid;
+
+INSERT INTO defect_report
+SELECT 307, 'una FK del subárbol de la grilla no lleva el tenant, o una tabla suya no tiene RLS ENABLE y FORCE con sus dos policies canónicas',
+       tablas = 0 OR fks = 0 OR malas_fk <> '' OR malas_tablas <> ''
+         OR coalesce(current_setting('qa.gg_canon'), '') !~ 'current_user_org_ids',
+       CASE WHEN tablas > 0 AND fks > 0 AND malas_fk = '' AND malas_tablas = ''
+            THEN tablas || ' tablas en el subárbol (' || nombres || '), ' || fks ||
+                 ' FK, todas con organization_id emparejado con el tenant; cada tabla con organization_id ' ||
+                 'uuid NOT NULL, ENABLE + FORCE, una restrictiva y una permisiva de lectura IGUALES a ' ||
+                 current_setting('qa.gg_canon') || ' y ninguna permisiva distinta'
+            ELSE 'tablas=' || tablas || ' fks=' || fks || '; FK sin el tenant: [' || malas_fk ||
+                 ']; tablas fuera de forma: [' || malas_tablas || ']' END
+  FROM (SELECT (SELECT count(*) FROM gg_tablas) AS tablas,
+               (SELECT string_agg(relname, ', ' ORDER BY relname) FROM gg_tablas) AS nombres,
+               (SELECT count(*) FROM gg_fks) AS fks,
+               coalesce((SELECT string_agg(tabla || '.' || conname, ', ' ORDER BY tabla, conname)
+                           FROM gg_fks WHERE NOT con_tenant), '') AS malas_fk,
+               coalesce((SELECT string_agg(format('%s: tenant=%s rls=%s restrictiva=%s lectura=%s sin_floja=%s',
+                                                  relname, tenant_ok, rls_ok, restrictiva_ok, lectura_ok,
+                                                  sin_permisiva_floja), ' / ' ORDER BY relname)
+                           FROM gg_tablas
+                          WHERE NOT (tenant_ok AND rls_ok AND restrictiva_ok AND lectura_ok AND sin_permisiva_floja)),
+                        '') AS malas_tablas) x;
+
+-- ── 308 ──────────────────────────────────────────────────────────────────────
+-- LAS DOS BAJAS. La de la organización entera —el paso 1 de `deleteMyAccount`,
+-- como `service_role`— tiene que pasar al COMMIT y no dejar NINGUNA fila de G en
+-- ninguna tabla con `organization_id` (`al_commit`, por catálogo). Y la baja de
+-- la membresía de quien corrió —el paso 2, también como `service_role`— tiene
+-- que pasar, dejar la corrida y sus observaciones EN PIE y anular `created_by`
+-- (decisión 2 de la `0032`): la medición es de la organización, no de la
+-- persona. Si alguien cambia el SET NULL por una negativa o por una cascada,
+-- esto se pone rojo.
+SELECT set_config('qa.b308a', pg_temp.al_commit(
+           format('DELETE FROM organizations WHERE id = %L', current_setting('qa.gg_org_g')),
+           'service_role', current_setting('qa.gg_org_g')::uuid), true);
+SELECT set_config('qa.b308b', pg_temp.al_commit_y_mira(
+           format('DELETE FROM org_members WHERE organization_id = %L AND user_id = %L',
+                  current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000a01'),
+           'service_role',
+           $sql$SELECT format('corridas=%s creador=%s observaciones=%s',
+                   (SELECT count(*) FROM geo_grid_runs WHERE id = 'd0320000-0032-4032-8032-000000000c01'),
+                   (SELECT count(*) FROM geo_grid_runs
+                     WHERE id = 'd0320000-0032-4032-8032-000000000c01' AND created_by IS NOT NULL),
+                   (SELECT count(*) FROM geo_grid_observations
+                     WHERE run_id = 'd0320000-0032-4032-8032-000000000c01'))$sql$), true);
+
+INSERT INTO defect_report
+SELECT 308, 'la baja de una organización con grilla no pasa o deja filas, o la baja de quien corrió borra o traba la corrida',
+       NOT (a ~ '^paso; [0-9]+ tablas; quedaron: \[\]$'
+            AND b = 'paso; corridas=1 creador=0 observaciones=2'),
+       'baja de G: ' || a || ' / baja de la membresía de gina: ' || b ||
+       ' (se espera «quedaron: []» y «corridas=1 creador=0 observaciones=2»)'
+  FROM (SELECT current_setting('qa.b308a') AS a, current_setting('qa.b308b') AS b) x;
+
+RESET ROLE;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and forty-three checks were written, so a hundred
--- and forty-three rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and fifty-two checks were written, so a hundred
+-- and fifty-two rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -7410,8 +7902,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 143 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 143 checks recorded a result.', checks;
+    IF checks <> 152 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 152 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -7422,11 +7914,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 143 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 152 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 143 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 152 checks green: the schema prevents every one of them.';
 END
 $$;
 
