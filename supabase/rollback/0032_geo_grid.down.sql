@@ -2,8 +2,9 @@
 --
 -- QUÉ SE PIERDE
 --
--- Las dos tablas de la grilla y con ellas TODAS las corridas de todas las
--- organizaciones, con cada observación. No se regeneran: una posición en Google
+-- Las tres tablas de la grilla y con ellas TODAS las corridas de todas las
+-- organizaciones, con cada observación, y las aprobaciones de gasto. Las
+-- corridas no se regeneran: una posición en Google
 -- es un hecho de un momento —correr la misma grilla mañana da otro mapa, que es
 -- justamente lo que la puerta H2-GO-3 mide— y cada punto costó una llamada paga
 -- a Places Text Search. Es el mismo caso que el tablero de la `0029`: trabajo,
@@ -14,13 +15,17 @@
 -- única red que hay (§12.15 del director).
 --
 -- Y POR ESO SE NIEGA A CORRER mientras exista UNA corrida, salvo que quien lo
--- corre lo pida con todas las letras, en la MISMA sesión:
+-- corre lo pida con todas las letras, en la MISMA sesión. Una aprobación de
+-- gasto SIN corridas no frena el .down: es un permiso que no se usó, perderla
+-- es fallar cerrado —se gasta menos, no más— y volver a aprobar es el mismo
+-- acto humano. Una aprobación CON corridas se va con ellas, así que ya la cubre
+-- la negativa:
 --
 --     psql ... -c "SET vulkan.perder_las_grillas = 'si'" -f 0032_geo_grid.down.sql
 --
 -- El camino, con datos:
 --
---   1. exportar las dos tablas, por ejemplo
+--   1. exportar las tres tablas, por ejemplo
 --      `pg_dump --data-only -t 'public.geo_grid_*'`, y comprobar que el export
 --      se puede leer de vuelta (§12.15);
 --   2. correr esto con el SET de arriba.
@@ -39,7 +44,8 @@
 -- transacción, y el lock va ANTES de contar, para que nadie cree una corrida
 -- entre que se miró y que se borró. Un lock sobre `geo_grid_runs` alcanza para
 -- las dos: ninguna observación entra sin que su FK lea la fila de la corrida, y
--- esa lectura espera al lock.
+-- esa lectura espera al lock. Una aprobación nueva no espera ese lock, pero sin
+-- una corrida no frena nada (ver arriba).
 --
 -- QUÉ NO SE PIERDE
 --
@@ -50,9 +56,10 @@
 --
 -- EL ORDEN IMPORTA
 --
--- La hija primero. `DROP TABLE` sin CASCADE es la comprobación: si algo que esta
--- migración no creó quedó colgado de una corrida, el rollback FALLA nombrándolo,
--- en vez de borrarlo en silencio.
+-- La hija primero y la aprobación al final: observaciones, corridas,
+-- aprobaciones. `DROP TABLE` sin CASCADE es la comprobación: si algo que esta
+-- migración no creó quedó colgado de una corrida o de una aprobación, el
+-- rollback FALLA nombrándolo, en vez de borrarlo en silencio.
 
 \set ON_ERROR_STOP on
 
@@ -93,6 +100,7 @@ END $$;
 
 DROP TABLE IF EXISTS public.geo_grid_observations;
 DROP TABLE IF EXISTS public.geo_grid_runs;
+DROP TABLE IF EXISTS public.geo_grid_spend_approvals;
 
 -- Aparte de la huella, y no es redundante: `schema_fingerprint.sql` compara
 -- OBJETOS, no contenido de tablas, así que un .down que se olvide esta línea

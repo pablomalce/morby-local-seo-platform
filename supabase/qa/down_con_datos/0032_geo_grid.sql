@@ -11,8 +11,9 @@
 -- persona y su propio negocio.
 --
 -- UNA corrida alcanza —la negativa del .down es «mientras exista una»—, con UNA
--- observación para que el DROP de la hija también tenga algo. Datos de prueba,
--- con «QA» en el nombre, en una base descartable.
+-- observación para que el DROP de la hija también tenga algo, y la aprobación de
+-- gasto que la paga, sin la cual la corrida no se puede escribir (decisión 13 de
+-- la 0032). Datos de prueba, con «QA» en el nombre, en una base descartable.
 --
 -- permiso: vulkan.perder_las_grillas
 
@@ -25,25 +26,36 @@ SELECT 'd0320000-0032-4032-8032-0000000000b1', organization_id, 'QA negocio de l
   FROM public.org_members
  WHERE user_id = 'd0320000-0032-4032-8032-0000000000d1' AND role = 'owner';
 
-INSERT INTO public.geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
-                                  center_lat, center_lng, radius_m, step_m, n_points, created_by)
-SELECT 'd0320000-0032-4032-8032-0000000000c1', organization_id, 'd0320000-0032-4032-8032-0000000000b1',
-       'QA corrida que el .down tiene que negarse a borrar', 'ChIJqaDown0032aaaaaaaaaa',
-       59.3293, 18.0686, 1000, 1500, 1, user_id
+INSERT INTO public.geo_grid_spend_approvals (id, organization_id, max_runs, approved_by, expires_at)
+SELECT 'd0320000-0032-4032-8032-0000000000a1', organization_id, 3, 'QA .down de la 0032', now() + interval '3 hours'
   FROM public.org_members
  WHERE user_id = 'd0320000-0032-4032-8032-0000000000d1' AND role = 'owner';
 
-INSERT INTO public.geo_grid_observations (organization_id, run_id, grid_row, grid_col,
+INSERT INTO public.geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                  center_lat, center_lng, radius_m, step_m, n_points,
+                                  approval_id, approval_max_runs, approval_slot, created_by)
+SELECT 'd0320000-0032-4032-8032-0000000000c1', organization_id, 'd0320000-0032-4032-8032-0000000000b1',
+       'QA corrida que el .down tiene que negarse a borrar', 'ChIJqaDown0032aaaaaaaaaa',
+       59.3293, 18.0686, 1000, 1500, 1,
+       'd0320000-0032-4032-8032-0000000000a1', 3, 1, user_id
+  FROM public.org_members
+ WHERE user_id = 'd0320000-0032-4032-8032-0000000000d1' AND role = 'owner';
+
+-- Una grilla de UN punto: su única celda es el centro.
+INSERT INTO public.geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                          run_center_lng, run_step_m, grid_row, grid_col,
                                           lat, lng, observed_at, outcome, position)
-SELECT organization_id, id, 0, 0, center_lat, center_lng, now(), 'position', 3
+SELECT organization_id, id, n_points, center_lat, center_lng, step_m, 0, 0,
+       center_lat, center_lng, now(), 'position', 3
   FROM public.geo_grid_runs
  WHERE id = 'd0320000-0032-4032-8032-0000000000c1';
 
 DO $$
 BEGIN
-    IF (SELECT count(*) FROM public.geo_grid_runs) <> 1
+    IF (SELECT count(*) FROM public.geo_grid_spend_approvals) <> 1
+       OR (SELECT count(*) FROM public.geo_grid_runs) <> 1
        OR (SELECT count(*) FROM public.geo_grid_observations) <> 1 THEN
-        RAISE EXCEPTION 'la siembra del .down de la 0032 no dejó UNA corrida con UNA observación: la prueba sería vacua';
+        RAISE EXCEPTION 'la siembra del .down de la 0032 no dejó UNA aprobación, UNA corrida y UNA observación: la prueba sería vacua';
     END IF;
 END
 $$;

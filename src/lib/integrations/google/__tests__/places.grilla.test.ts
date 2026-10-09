@@ -163,6 +163,27 @@ describe("posicionEnPunto: un fallo es failed con su código, NUNCA absent", () 
     expect(google.pedidos[0].init.signal?.aborted).toBe(true);
   });
 
+  it("un 200 SIN `places` que no es `{}` es invalid_response: un sobre de error, un token solo, otra mayúscula", async () => {
+    // Hasta el 2026-10-09 los tres salían `absent`: cualquier objeto sin la
+    // clave `places` se leía como «cero lugares», y un RESOURCE_EXHAUSTED con
+    // status 200 subía «no aparece» en vez de «fallaron».
+    const formas = [
+      '{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}',
+      '{"nextPageToken":"abc"}',
+      `{"Places":[{"id":"${OBJETIVO}"}]}`,
+      '{"places": null}',
+    ];
+    for (const cuerpo of formas) {
+      const google = googleGeografico([], {
+        responder: () => new Response(cuerpo, { status: 200, headers: { "content-type": "application/json" } }),
+      });
+      await expect(posicionEnPunto(consulta, google.transporte), cuerpo).resolves.toEqual({
+        outcome: "failed",
+        errorCode: "invalid_response",
+      });
+    }
+  });
+
   it("una respuesta 200 que no es una lista de lugares es invalid_response", async () => {
     const formas = [
       "esto no es json {",

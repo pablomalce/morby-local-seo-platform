@@ -16,6 +16,13 @@
  * que A y A' (la repetición) dan el mismo mapa: el ruido de Google lo mide la
  * corrida con gasto, no esto.
  *
+ * SALVO CON `ruido`: unos pocos intercambios de vecinos en el orden de cada
+ * respuesta, sorteados con una semilla que avanza pedido a pedido. Así A' sale
+ * PARECIDA a A y no igual —d(A,A') > 0—, que es lo que hace falta para que un
+ * veredicto que ignorara A' (o que aceptara A' = A) se vea en un test: con el
+ * doble determinista, d(A,A') ya era cero y las dos trampas pasaban (medido el
+ * 2026-10-09).
+ *
  * RECORRE LA SECUENCIA (R13): registra cada pedido en el orden en que llegó, con
  * su cuerpo y sus cabeceras, y deja programar qué contesta el pedido N —un 429,
  * una red cortada desde el pedido N en adelante, un pedido que cuelga hasta que
@@ -64,6 +71,17 @@ export interface OpcionesDelGoogleFalso {
   retener?: boolean;
   /** Si se pasa, un evento por pedido en esta lista compartida (para ordenar con la base). */
   eventos?: string[];
+  /** Intercambios de vecinos sorteados en cada respuesta: el ruido de repetir (ver el encabezado). */
+  ruido?: { semilla: number; intercambios: number };
+}
+
+/** Un generador lineal congruente: determinista, para que el test sea el mismo en cada corrida. */
+export function sorteo(semilla: number): () => number {
+  let estado = semilla >>> 0;
+  return () => {
+    estado = (Math.imul(estado, 1103515245) + 12345) >>> 0;
+    return estado / 2 ** 32;
+  };
 }
 
 export function lugaresAlrededor(centro: { lat: number; lng: number }, cantidad: number, pasoGrados = 0.01): LugarFalso[] {
@@ -100,6 +118,7 @@ export function googleGeografico(lugares: readonly LugarFalso[], opciones: Opcio
   const colgados: Array<() => void> = [];
   let enVuelo = 0;
   let maximoEnVuelo = 0;
+  const azar = opciones.ruido ? sorteo(opciones.ruido.semilla) : null;
 
   const contestar = (pedido: PedidoVisto): Response => {
     const centro = pedido.cuerpo.locationBias?.circle?.center;
@@ -110,6 +129,12 @@ export function googleGeografico(lugares: readonly LugarFalso[], opciones: Opcio
               lejania({ lat: centro.latitude, lng: centro.longitude }, b) || a.id.localeCompare(b.id)
         )
       : [...lugares];
+    if (azar && opciones.ruido) {
+      for (let i = 0; i < opciones.ruido.intercambios; i++) {
+        const k = Math.floor(azar() * Math.min(19, orden.length - 1));
+        [orden[k], orden[k + 1]] = [orden[k + 1], orden[k]];
+      }
+    }
     const cuantos = pedido.cuerpo.pageSize ?? pedido.cuerpo.maxResultCount ?? 20;
     const elegidos = orden.slice(0, Math.min(cuantos, 20));
     const cuerpo = elegidos.length

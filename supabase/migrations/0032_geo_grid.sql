@@ -14,17 +14,23 @@
 --
 -- QUÉ AGREGA
 --
--- Dos tablas con el prefijo `geo_grid_`, y nada sobre algo que ya existía:
+-- Tres tablas con el prefijo `geo_grid_`, y nada sobre algo que ya existía:
 -- ninguna columna nueva en otra tabla, ninguna función, ningún trigger.
 --
+--   geo_grid_spend_approvals  una fila por APROBACIÓN DE GASTO: la organización,
+--                          cuántas corridas (1 a 3), quién aprobó y hasta
+--                          cuándo vale. El acto humano de la puerta, escrito
+--                          (decisión 13).
 --   geo_grid_runs          una fila por corrida: la grilla DECLARADA (centro,
 --                          radio, paso, N), la palabra clave, el lugar que se
 --                          busca, el valor fijo de «no aparece», el
---                          desplazamiento declarado, quién la corrió y cuándo
---                          empezó y terminó.
+--                          desplazamiento declarado, el CUPO de la aprobación
+--                          que la paga, quién la corrió y cuándo empezó y
+--                          terminó.
 --   geo_grid_observations  una fila por punto: la celda (fila, columna), la
---                          coordenada que se le mandó a Google, la hora, la
---                          fuente, y UNO de tres resultados.
+--                          coordenada que se le mandó a Google —que tiene que
+--                          ser la de esa celda en esa grilla (decisión 14)—, la
+--                          hora, la fuente, y UNO de tres resultados.
 --
 -- LOS TRES RESULTADOS, Y POR QUÉ SON TRES
 --
@@ -74,11 +80,13 @@
 --    por la sesión directora (recomendación 11a): máximo 9 puntos por corrida
 --    (3x3). El servidor lo hace cumplir antes de salir a la red
 --    (`TOPE_DE_PUNTOS` en `src/lib/geo/grilla.ts`) y la base lo repite, por dos
---    lados: `n_points IN (1, 4, 9)` —grillas cuadradas de lado 1, 2 o 3— y
---    `grid_row`/`grid_col` entre 0 y 2, con la celda única: una corrida no puede
---    TENER más de nueve observaciones aunque alguien escriba sin pasar por la
---    ruta. Subir el tope es una decisión de gasto, y pasa por una migración a
---    propósito.
+--    lados: `n_points IN (1, 4, 9)` —grillas cuadradas de lado 1, 2 o 3— y la
+--    celda de cada observación DENTRO DEL LADO DE SU CORRIDA, con la celda
+--    única: una corrida no puede TENER más observaciones que puntos declarados
+--    aunque alguien escriba sin pasar por la ruta. Hasta el 2026-10-09 la celda
+--    se acotaba a 0..2 sin mirar la corrida, y una de UN punto aceptaba nueve
+--    observaciones (medido en la réplica: `INSERT 0 9`). Subir el tope es una
+--    decisión de gasto, y pasa por una migración a propósito.
 --
 -- 5. «NO APARECE» SE MAPEA A UN VALOR FIJO DECLARADO EN LA CORRIDA.
 --    `unmatched_value`, 21 por defecto, entre 21 y 100: FUERA del rango de las
@@ -105,7 +113,7 @@
 --    el texto del proveedor: un mensaje de Google puede traer la clave
 --    enmascarada o el proyecto, y no hace falta para distinguir un 429 de un 403.
 --
--- 9. RLS `ENABLE` Y `FORCE` EN LAS DOS; `authenticated` SÓLO LEE. Las dos
+-- 9. RLS `ENABLE` Y `FORCE` EN LAS TRES; `authenticated` SÓLO LEE. Las dos
 --    policies por tabla de la `0029` (decisión 11): una permisiva de lectura y
 --    una RESTRICTIVA del eje, las dos por `current_user_org_ids()`, que filtra
 --    las membresías archivadas desde la `0013`. `REVOKE ALL` explícito a los
@@ -113,7 +121,8 @@
 --    nueva— y después `SELECT` a `authenticated`, CRUD a `service_role`, NADA a
 --    `anon`. Escribe el servidor (`POST /api/geo/grid`), que verifica la
 --    organización EN CÓDIGO antes, porque `service_role` saltea la RLS (§12.3
---    del director).
+--    del director). La aprobación de gasto no la escribe ni la ruta: una
+--    persona con `service_role`, a mano (decisión 13).
 --
 -- 10. IDENTIFICADORES EN INGLÉS, como la decisión 13 de la `0026`.
 --
@@ -127,15 +136,18 @@
 --     dos órdenes de aplicación el resultado es el mismo —0031 y después 0032:
 --     lo pone la sección 4; 0032 y después la 0031: lo pone el bucle de la
 --     0031—.
---     LA CLASIFICACIÓN, DICHA: las dos tablas son DE CARA AL CLIENTE (D2 de la
+--     LA CLASIFICACIÓN, DICHA: las tres tablas son DE CARA AL CLIENTE (D2 de la
 --     `0031`), no internas. El mapa de posiciones es lo que se le entrega al
---     cliente, y un `client` de su organización lo lee. Por eso no llevan la
---     restrictiva de lectura de personal (`_role_read`). Si la decisión es la
---     otra, es una línea en `is_internal_surface()` de la `0031`.
+--     cliente, y un `client` de su organización lo lee; la aprobación dice
+--     cuánto se aprobó gastar midiéndolo, y no hay motivo para esconderle eso.
+--     Por eso no llevan la restrictiva de lectura de personal (`_role_read`).
+--     Si la decisión es la otra, es una línea en `is_internal_surface()` de la
+--     `0031`.
 --     Y LO QUE NO SE PUEDE HACER DESDE ACÁ: la suite de la `0031` se pone roja
 --     por vacuidad hasta que su fixture tenga una fila de cada tabla nueva en
 --     sus dos organizaciones (su encabezado lo dice). Esa fixture vive en el
---     PR #114; integrar los dos PR es sumar ahí una corrida y una observación.
+--     PR #114; integrar los dos PR es sumar ahí una aprobación, una corrida y
+--     una observación.
 --
 -- 12. EL LUGAR QUE SE BUSCA ES UN ID PÚBLICO DE PLACES, NO LA FICHA PROPIA.
 --     `target_place_id` es texto con la forma de un id de Places, sin FK a nada
@@ -146,6 +158,57 @@
 --     puerta se cruza midiendo una ficha pública ajena. `business_id` es el
 --     negocio de Growth OS bajo el que la corrida queda archivada, que es lo
 --     que ata la medición a un tenant.
+--
+-- 13. EL GASTO LO APRUEBA UNA PERSONA, EN UNA FILA, Y LA BASE CUENTA LOS CUPOS.
+--     El acto humano de la puerta —«aprobación del gasto y tope de puntos por
+--     corrida»— no existía en el código hasta el 2026-10-09, y dos revisiones
+--     midieron lo que costaba: cualquiera que se registrara (el alta está
+--     abierta y `handle_new_user` le da una organización con rol `owner`)
+--     corría grillas con la clave de Places de la plataforma, y el único freno
+--     de corridas era un rate limit en memoria, por IP y por instancia.
+--     Ahora:
+--       * `geo_grid_spend_approvals` es la aprobación: organización, `max_runs`
+--         entre 1 y 3 (las tres corridas de la recomendación 11a), quién aprobó
+--         —texto, porque quien aprueba el gasto de la agencia no tiene por qué
+--         ser miembro de la organización que se mide— y una ventana de a lo
+--         sumo 24 h. La escribe SÓLO `service_role` (decisión 9): una persona
+--         con la llave del proyecto, nunca una sesión de la aplicación;
+--       * cada corrida lleva `approval_id` y un CUPO `approval_slot`, entre 1 y
+--         el `max_runs` de SU aprobación —por eso la FK compuesta trae
+--         `max_runs` consigo— y ÚNICO por aprobación. Una cuarta corrida sobre
+--         una aprobación de tres no entra: ni con 4 (CHECK), ni repitiendo un
+--         cupo (UNIQUE), ni contra la aprobación de otra organización (FK por el
+--         par). Y como la corrida se escribe ANTES de salir a la red, el cupo se
+--         toma antes del primer peso;
+--       * la aprobación no se puede achicar ni borrar con corridas colgadas
+--         (`NO ACTION` en la FK): queda como el registro de quién autorizó esa
+--         plata. La baja de la organización se lleva todo junto.
+--     Que la ventana venza la mira la ruta, no la base: lo que la base garantiza
+--     es la PLATA —nunca más de `max_runs` corridas por aprobación—; la ventana
+--     es frescura.
+--
+-- 14. CADA OBSERVACIÓN ESTÁ EN EL PUNTO QUE EL PLAN LE DA A SU CELDA. La puerta
+--     pide N observaciones «con coordenada» de una grilla DECLARADA, y hasta el
+--     2026-10-09 nada ataba una cosa con la otra: la réplica aceptó una corrida
+--     con centro en (59.3293, 18.0686) y nueve observaciones en (0, 0), y un
+--     mutante de la ruta que consultaba el centro en los nueve puntos —la
+--     grilla decorativa— pasaba la suite entera. Ahora la observación trae la
+--     grilla de su corrida —`run_n_points`, `run_center_lat`, `run_center_lng`,
+--     `run_step_m`— por la MISMA FK compuesta que la ata a la corrida (no hay
+--     cómo copiar mal: la FK exige que el par exista tal cual), y dos CHECK:
+--       * `geo_grid_observations_cell_check`: la celda dentro del lado de SU
+--         corrida (decisión 4);
+--       * `geo_grid_observations_coordinate_on_grid`: `lat`/`lng` a menos de
+--         1e-6 grados (~0,1 m) del punto que `planificarGrilla`
+--         (`src/lib/geo/grilla.ts`) le da a esa celda: desplazar el centro
+--         `((lado − 1)/2 − fila) × paso` al norte y `(columna − (lado − 1)/2) ×
+--         paso` al este sobre la esfera de radio 6 371 008,8 m, la longitud
+--         comparada módulo 360. Es la misma cuenta, escrita en SQL; el bloque
+--         309 la mide contra coordenadas que CALCULÓ el código de la ruta, no
+--         contra una copia de esta fórmula.
+--     Y como la FK no tiene `ON UPDATE`, mover el centro, el paso o N de una
+--     corrida con observaciones muere: el mapa no se puede reubicar después de
+--     medido.
 --
 -- QUÉ NO HACE
 --
@@ -161,7 +224,7 @@
 --
 -- CÓMO FALLA
 --
--- Rojo en los bloques 300 a 308 de `supabase/qa/defects_test.sql`:
+-- Rojo en los bloques 300 a 311 de `supabase/qa/defects_test.sql`:
 --
 --   300  cruce entre organizaciones: negocio, persona y corrida de otra → 23503
 --        nombrando cada FK compuesta;
@@ -179,7 +242,17 @@
 --        tenant del otro lado, toda tabla tiene `organization_id` NOT NULL,
 --        ENABLE y FORCE y sus dos policies IGUALES a la forma canónica;
 --   308  la baja de la organización con la grilla poblada pasa y no deja nada, y
---        la baja de quien corrió anula `created_by` y deja la corrida.
+--        la baja de quien corrió anula `created_by` y deja la corrida;
+--   309  la coordenada: las nueve que calculó `planificarGrilla` entran; el
+--        centro escrito en una esquina, un punto corrido 10 m y la corrida
+--        movida con observaciones colgadas, no (decisión 14);
+--   310  la celda contra el N de SU corrida: una corrida de 1 y una de 4 no
+--        aceptan celdas de la de 9, y la grilla de la corrida no se puede
+--        copiar mal en la observación (decisiones 4 y 14);
+--   311  el cupo: sin aprobación, sobre la de otra organización, con el cupo 4
+--        de una de 3, con un cupo repetido, una aprobación de 4 corridas o de
+--        48 h, achicarla o borrarla con corridas colgadas → rechazo nombrando
+--        su constraint; y el control, un cupo libre, entra (decisión 13).
 --
 -- MEDIDO ROMPIÉNDOLO (2026-10-08, y vuelto a medir entero el 2026-10-09 en la
 -- réplica `growthos-replica-h2go3`, con los mismos resultados), una mutación por
@@ -215,14 +288,77 @@
 -- sin borrar su fila de `schema_migrations`, sin consumir el permiso, sin mirar
 -- si el permiso viene de PGOPTIONS, y sin la negativa.
 --
+-- LA RONDA DE ARREGLOS DEL 2026-10-09 (decisiones 13 y 14, y la celda de la 4),
+-- medida igual en la réplica `growthos-replica-h2go3` —plantilla con la `0001`
+-- a la `0030`, esta migración mutada, `app_role.sql` y el archivo entero de
+-- aserciones (155)—. Ninguna sobrevivió:
+--
+--   sin mutar (el control) . . . . . . . . . . . . . . verde, 155
+--   sin el CHECK de la coordenada . . . . . . . . . . . rojo 309
+--   la fila con el signo al revés en ese CHECK  . . . . la fixture del 300 muere:
+--                                                       23514 sobre coordenadas
+--                                                       de `planificarGrilla`
+--   la longitud sin el módulo 360 . . . . . . . . . . . rojo 309 (antimeridiano)
+--   la celda en 0..2 sin mirar N (la versión vieja) . . rojo 310
+--   la FK de la observación sólo por el par . . . . . . rojo 309, 310
+--   sin la única del cupo . . . . . . . . . . . . . . . rojo 311
+--   el cupo contra un 4 fijo  . . . . . . . . . . . . . rojo 311
+--   la FK de la aprobación sin `max_runs` . . . . . . . rojo 311
+--   `max_runs` hasta 10 . . . . . . . . . . . . . . . . rojo 311
+--   la ventana de la aprobación sin tope  . . . . . . . rojo 311
+--   `GRANT INSERT` de la aprobación a `authenticated` . rojo 306
+--   la aprobación borrada en cascada con sus corridas . rojo 311
+--
+-- Y `rollback.sh 0032_geo_grid` otra vez, con la siembra nueva —aprobación,
+-- corrida de un punto y su observación—: los cinco pasos en verde.
+--
 -- Con la `0031` (PR #114, todavía abierto), aplicada antes Y después de ésta
 -- sobre bases nuevas (2026-10-09): en los dos órdenes cada tabla de la grilla
 -- termina con las mismas cinco policies —`_read_member`, `_tenant_axis` y las
--- tres `_role_*` restrictivas—, que es lo que promete la decisión 11.
+-- tres `_role_*` restrictivas—, que es lo que promete la decisión 11. Vuelto a
+-- medir el mismo día con la `0031` de `main` (#114 ya mergeado) y las TRES
+-- tablas: cinco policies en cada una, con el mismo texto en los dos órdenes.
 
 \set ON_ERROR_STOP on
 
 BEGIN;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 0. La aprobación de gasto (decisión 13)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.geo_grid_spend_approvals (
+    id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id  uuid NOT NULL,
+
+    -- Cuántas corridas paga esta aprobación. Recomendación 11a: tres.
+    max_runs         integer NOT NULL,
+
+    -- Quién aprobó, en palabras: una persona, no una sesión (decisión 13).
+    approved_by      text NOT NULL,
+    approved_at      timestamptz NOT NULL DEFAULT now(),
+    expires_at       timestamptz NOT NULL,
+
+    CONSTRAINT geo_grid_spend_approvals_max_runs_check
+        CHECK (max_runs BETWEEN 1 AND 3),
+
+    CONSTRAINT geo_grid_spend_approvals_approved_by_not_blank
+        CHECK (btrim(approved_by) <> '' AND char_length(approved_by) <= 200),
+
+    -- Una aprobación es para una sesión de trabajo, no un permiso permanente.
+    CONSTRAINT geo_grid_spend_approvals_window_check
+        CHECK (expires_at > approved_at AND expires_at <= approved_at + interval '24 hours'),
+
+    -- Destino de la FK de las corridas: el par y `max_runs`, para que el CHECK
+    -- del cupo de la corrida lea el tope de SU aprobación.
+    CONSTRAINT geo_grid_spend_approvals_runs_key UNIQUE (organization_id, id, max_runs),
+
+    CONSTRAINT geo_grid_spend_approvals_organization_fkey
+        FOREIGN KEY (organization_id)
+        REFERENCES public.organizations (id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE public.geo_grid_spend_approvals IS
+    'Aprobación de gasto de la grilla (H2-GO-3): cuántas corridas (1 a 3) puede pagar una organización, quién lo aprobó y hasta cuándo. La escribe sólo service_role (decisión 13 de la 0032).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1. La corrida
@@ -245,6 +381,11 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_runs (
     -- Decisiones 5 y 6.
     unmatched_value   integer NOT NULL DEFAULT 21,
     declared_shift_m  integer,
+
+    -- Decisión 13: la aprobación que la paga, su tope y el cupo que toma.
+    approval_id       uuid NOT NULL,
+    approval_max_runs integer NOT NULL,
+    approval_slot     integer NOT NULL,
 
     started_at        timestamptz NOT NULL DEFAULT now(),
     finished_at       timestamptz,
@@ -283,9 +424,16 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_runs (
     CONSTRAINT geo_grid_runs_finished_after_start
         CHECK (finished_at IS NULL OR finished_at >= started_at),
 
-    -- Destino de la FK de las observaciones. `id` ya es PK; esto existe porque
-    -- una FK compuesta necesita una única sobre exactamente sus columnas.
-    CONSTRAINT geo_grid_runs_organization_id_id_key UNIQUE (organization_id, id),
+    -- Decisión 13: el cupo, entre 1 y el tope de SU aprobación, y uno por cupo.
+    CONSTRAINT geo_grid_runs_approval_slot_check
+        CHECK (approval_slot BETWEEN 1 AND approval_max_runs),
+    CONSTRAINT geo_grid_runs_approval_slot_key UNIQUE (approval_id, approval_slot),
+
+    -- Destino de la FK de las observaciones, con la grilla declarada (decisión
+    -- 14). `id` ya es PK; esto existe porque una FK compuesta necesita una única
+    -- sobre exactamente sus columnas.
+    CONSTRAINT geo_grid_runs_grid_key
+        UNIQUE (organization_id, id, n_points, center_lat, center_lng, step_m),
 
     CONSTRAINT geo_grid_runs_organization_fkey
         FOREIGN KEY (organization_id)
@@ -301,7 +449,13 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_runs (
     CONSTRAINT geo_grid_runs_creator_member_fkey
         FOREIGN KEY (organization_id, created_by)
         REFERENCES public.org_members (organization_id, user_id)
-        ON DELETE SET NULL (created_by)
+        ON DELETE SET NULL (created_by),
+
+    -- Decisión 13. Sin ON DELETE ni ON UPDATE: una aprobación con corridas no
+    -- se borra ni se achica. La baja de la organización se lleva las dos.
+    CONSTRAINT geo_grid_runs_approval_fkey
+        FOREIGN KEY (organization_id, approval_id, approval_max_runs)
+        REFERENCES public.geo_grid_spend_approvals (organization_id, id, max_runs)
 );
 
 COMMENT ON TABLE public.geo_grid_runs IS
@@ -314,6 +468,8 @@ CREATE INDEX IF NOT EXISTS geo_grid_runs_org_business_started_idx
     ON public.geo_grid_runs (organization_id, business_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS geo_grid_runs_org_creator_idx
     ON public.geo_grid_runs (organization_id, created_by);
+CREATE INDEX IF NOT EXISTS geo_grid_runs_org_approval_idx
+    ON public.geo_grid_runs (organization_id, approval_id, approval_max_runs);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. La observación
@@ -322,6 +478,12 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_observations (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id  uuid NOT NULL,
     run_id           uuid NOT NULL,
+
+    -- La grilla de su corrida, traída por la FK compuesta (decisión 14).
+    run_n_points     integer NOT NULL,
+    run_center_lat   double precision NOT NULL,
+    run_center_lng   double precision NOT NULL,
+    run_step_m       integer NOT NULL,
 
     -- La celda, fila 0 al norte y columna 0 al oeste.
     grid_row         integer NOT NULL,
@@ -338,11 +500,33 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_observations (
     position         integer,
     error_code       text,
 
+    -- Decisión 4: la celda dentro del lado de SU corrida. Con N en {1, 4, 9},
+    -- «fila < √N» es «(fila + 1)² ≤ N», en enteros.
     CONSTRAINT geo_grid_observations_cell_check
-        CHECK (grid_row BETWEEN 0 AND 2 AND grid_col BETWEEN 0 AND 2),
+        CHECK (grid_row >= 0 AND grid_col >= 0
+               AND (grid_row + 1) * (grid_row + 1) <= run_n_points
+               AND (grid_col + 1) * (grid_col + 1) <= run_n_points),
 
     CONSTRAINT geo_grid_observations_coordinate_check
         CHECK (lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180),
+
+    -- Decisión 14: el punto que `planificarGrilla` le da a esta celda, a menos
+    -- de 1e-6 grados. Norte: ((lado − 1)/2 − fila) × paso; este: (columna −
+    -- (lado − 1)/2) × paso, dividido por el coseno de la latitud del centro.
+    -- La longitud se compara módulo 360: el código la normaliza a [-180, 180).
+    CONSTRAINT geo_grid_observations_coordinate_on_grid
+        CHECK (
+            abs(lat - (run_center_lat
+                       + degrees(((sqrt(run_n_points::double precision) - 1) / 2 - grid_row)
+                                 * run_step_m / 6371008.8)))
+                <= 1e-6
+            AND abs(mod((lng - (run_center_lng
+                                + degrees((grid_col - (sqrt(run_n_points::double precision) - 1) / 2)
+                                          * run_step_m
+                                          / (6371008.8 * cos(radians(run_center_lat))))))::numeric
+                        + 540, 360) - 180)
+                <= 1e-6
+        ),
 
     -- Decisión 7.
     CONSTRAINT geo_grid_observations_source_check
@@ -374,27 +558,29 @@ CREATE TABLE IF NOT EXISTS public.geo_grid_observations (
     CONSTRAINT geo_grid_observations_cell_key
         UNIQUE (organization_id, run_id, grid_row, grid_col),
 
-    -- Decisión 3.
+    -- Decisiones 3 y 14: el par, y con él la grilla de la corrida. Sin ON
+    -- UPDATE: una corrida con observaciones no se mueve.
     CONSTRAINT geo_grid_observations_run_fkey
-        FOREIGN KEY (organization_id, run_id)
-        REFERENCES public.geo_grid_runs (organization_id, id) ON DELETE CASCADE
+        FOREIGN KEY (organization_id, run_id, run_n_points, run_center_lat, run_center_lng, run_step_m)
+        REFERENCES public.geo_grid_runs (organization_id, id, n_points, center_lat, center_lng, step_m)
+        ON DELETE CASCADE
 );
 
 COMMENT ON TABLE public.geo_grid_observations IS
     'Una observación por punto de una corrida de grilla: coordenada, hora, fuente, y position (1..20), absent o failed con su código. Un fallo nunca se escribe como absent (0032).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 3. RLS: ENABLE y FORCE en las dos, y los privilegios (decisión 9)
+-- 3. RLS: ENABLE y FORCE en las tres, y los privilegios (decisión 9)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Un bucle, por el motivo de la §5 de la `0026`: dos copias del mismo par de
 -- policies es el caso donde una se separa de su hermana sin que nada lo diga.
--- Lo que prueba que corrió sobre las DOS no es esta lista: es el bloque 307,
+-- Lo que prueba que corrió sobre las TRES no es esta lista: es el bloque 307,
 -- que descubre las tablas por catálogo.
 DO $$
 DECLARE
     t text;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['geo_grid_runs', 'geo_grid_observations']
+    FOREACH t IN ARRAY ARRAY['geo_grid_spend_approvals', 'geo_grid_runs', 'geo_grid_observations']
     LOOP
         EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', t);
@@ -432,7 +618,7 @@ $$;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Las mismas tres restrictivas que el bucle de la `0031` le pone a toda tabla
 -- con `organization_id` que una sesión alcanza, con su texto. Sin `_role_read`:
--- las dos tablas son de cara al cliente.
+-- las tres tablas son de cara al cliente.
 DO $$
 DECLARE
     t text;
@@ -441,7 +627,7 @@ BEGIN
         RETURN;
     END IF;
 
-    FOREACH t IN ARRAY ARRAY['geo_grid_runs', 'geo_grid_observations']
+    FOREACH t IN ARRAY ARRAY['geo_grid_spend_approvals', 'geo_grid_runs', 'geo_grid_observations']
     LOOP
         EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_role_insert', t);
         EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_role_update', t);

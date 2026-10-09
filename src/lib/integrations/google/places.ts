@@ -227,10 +227,15 @@ interface GooglePlacesResult {
  *     radio en metros dentro de [0.0, 50000.0];
  *   * la respuesta es `{ places: [...] }`. Lo que contesta SIN resultados la
  *     referencia no lo dice; el cliente de arriba ya lo trata como `places`
- *     ausente (`payload.places ?? []`), y acá también: `{}` es una respuesta
- *     viva sin el lugar —`absent`—, y cualquier otra forma es
- *     `invalid_response`. La corrida con gasto de la sesión directora es la que
- *     mide ese borde contra Google.
+ *     ausente (`payload.places ?? []`), y acá también, pero SÓLO para `{}`, el
+ *     objeto vacío: ésa es una respuesta viva sin el lugar —`absent`—. Un 200
+ *     con cualquier otra cosa y sin `places` —un sobre `{"error": ...}` de
+ *     RESOURCE_EXHAUSTED, `{"nextPageToken": ...}` solo, `{"Places": [...]}`
+ *     con otra mayúscula— es `invalid_response`, o sea `failed`. Hasta el
+ *     2026-10-09 los tres salían `absent`: el código no cumplía lo que este
+ *     párrafo ya decía, y un fallo se publicaba como «no aparece», que es el
+ *     modo de fallo que la puerta nombra. La corrida con gasto de la sesión
+ *     directora es la que mide ese borde contra Google.
  *
  * LA MÁSCARA ES `places.id,places.displayName`, decidida por la sesión
  * directora. La posición sólo necesita `places.id`; según la misma
@@ -264,11 +269,16 @@ export interface ConsultaDePunto {
   radiusM: number;
 }
 
-/** Los ids de la respuesta, en orden, o `null` si la respuesta no tiene esa forma. */
+/**
+ * Los ids de la respuesta, en orden, o `null` si la respuesta no tiene esa forma.
+ * Sin `places`, sólo `{}` —nada más que el objeto vacío— es «cero lugares».
+ */
 function idsDeLaRespuesta(payload: unknown): string[] | null {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (!Object.prototype.hasOwnProperty.call(payload, "places")) {
+    return Object.keys(payload).length === 0 ? [] : null;
+  }
   const lugares = (payload as { places?: unknown }).places;
-  if (lugares === undefined) return [];
   if (!Array.isArray(lugares)) return null;
   const ids: string[] = [];
   for (const lugar of lugares) {

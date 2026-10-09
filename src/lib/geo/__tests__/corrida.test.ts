@@ -45,6 +45,9 @@ function puntos(centro = C): PuntoDeGrilla[] {
 
 const encargo = (centro = C) => ({ keyword: "fotvård", targetPlaceId: OBJETIVO, radiusM: 1000, puntos: puntos(centro) });
 
+/** La corrida declarada de nueve puntos con centro en `centro`, para el denominador. */
+const declarada = (observaciones: Observacion[], centro = C) => ({ centro, radioM: 1000, pasoM: 1500, puntos: 9, observaciones });
+
 const envPrevio = process.env.GOOGLE_PLACES_API_KEY;
 beforeEach(() => {
   process.env.GOOGLE_PLACES_API_KEY = "clave-falsa-de-places";
@@ -154,8 +157,8 @@ describe("LA RED SE CORTA A MITAD DE CORRIDA: sube «fallaron», no «no aparece
     const entera = await correrCon(googleGeografico(LUGARES));
     const cortada = await correrCon(googleGeografico(LUGARES, { cortarDesde: 5 }));
 
-    const antes = denominador(9, entera);
-    const despues = denominador(9, cortada);
+    const antes = denominador(declarada(entera));
+    const despues = denominador(declarada(cortada));
     expect(antes.fallaron).toBe(0);
     expect(despues.fallaron).toBe(5);
     expect(despues.noAparece).toBeLessThanOrEqual(antes.noAparece);
@@ -176,7 +179,7 @@ describe("LA RED SE CORTA A MITAD DE CORRIDA: sube «fallaron», no «no aparece
     });
     const obs = await correrCon(google);
     expect(obs[1]).toMatchObject({ resultado: "failed", codigoDeError: "http_429", posicion: null });
-    expect(denominador(9, obs).fallaron).toBe(1);
+    expect(denominador(declarada(obs)).fallaron).toBe(1);
   });
 
   it("si consultar TIRA, el punto es failed, nunca absent", async () => {
@@ -195,6 +198,11 @@ describe("LA RED SE CORTA A MITAD DE CORRIDA: sube «fallaron», no «no aparece
 });
 
 describe("la cadena entera de la puerta, sin Google: A, A' y B", () => {
+  const INICIO: Record<string, string> = {
+    A: "2026-10-08T10:00:00.000Z",
+    A2: "2026-10-08T10:05:00.000Z",
+    B: "2026-10-08T10:10:00.000Z",
+  };
   const comoPrueba = (id: string, centro: { lat: number; lng: number }, observaciones: Observacion[]): CorridaDeLaPrueba => ({
     id,
     palabraClave: "fotvård",
@@ -205,7 +213,8 @@ describe("la cadena entera de la puerta, sin Google: A, A' y B", () => {
     puntos: 9,
     valorNoAparece: 21,
     desplazamientoDeclaradoM: 8000,
-    empezoEn: "2026-10-08T10:00:00.000Z",
+    empezoEn: INICIO[id],
+    aprobacion: "aprobacion-de-la-puerta",
     observaciones,
   });
 

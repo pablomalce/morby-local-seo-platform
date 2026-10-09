@@ -1,4 +1,4 @@
--- A hundred and fifty-two isolation checks against the Growth OS schema — executable.
+-- A hundred and fifty-five isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -7391,15 +7391,17 @@ SELECT 143, 'la baja de una organización deja sus URLs en la caché de PageSpee
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 300 a 308. La grilla geográfica — la puerta de H2-GO-3, CERRADO por la 0032
+-- 300 a 311. La grilla geográfica — la puerta de H2-GO-3, CERRADO por la 0032
 -- ─────────────────────────────────────────────────────────────────────────────
 -- QUÉ CUIDAN: que una corrida de una organización no pueda colgar del negocio,
--- de la persona ni de la corrida de otra; que una observación diga UNO de tres
--- resultados con lo suyo y nada más —un fallo nunca se escribe como «no
--- aparece», que es el modo de fallo que la puerta nombra—; que el tope de nueve
--- puntos esté también en la base; que nadie fuera de la organización lea una
--- corrida; que sólo el servidor escriba; y, por catálogo, que toda FK del
--- subárbol lleve el tenant.
+-- de la persona, de la corrida ni de la aprobación de gasto de otra; que una
+-- observación diga UNO de tres resultados con lo suyo y nada más —un fallo nunca
+-- se escribe como «no aparece», que es el modo de fallo que la puerta nombra—;
+-- que el tope de nueve puntos esté también en la base, y que cada observación
+-- esté en una celda de SU grilla y en la coordenada que el plan le da a esa
+-- celda; que una aprobación pague a lo sumo sus corridas; que nadie fuera de la
+-- organización lea una corrida; que sólo el servidor escriba; y, por catálogo,
+-- que toda FK del subárbol lleve el tenant.
 --
 -- NUMERACIÓN: desde 300, y no a continuación del 143, a propósito. La `0031`
 -- (H4.1, PR #114) usa del 144 en adelante y era un PR abierto cuando estos se
@@ -7407,11 +7409,21 @@ RESET ROLE;
 -- de abajo es lo único que hay que sumar al integrar.
 --
 -- FIXTURES PROPIAS: gina y hugo, dados de alta por el alta real
--- (`handle_new_user`), cada uno dueño de su organización (G y H) con un negocio.
--- Una corrida de G con dos observaciones —una posición y un «no aparece»— y una
--- de H con un fallo. Todo como `postgres`, que tiene BYPASSRLS en la imagen de
--- Supabase: en los bloques 300 a 303 ninguna policy puede ser lo que rechaza, y
+-- (`handle_new_user`), cada uno dueño de su organización (G y H) con un negocio
+-- y una aprobación de gasto de tres corridas. Una corrida de G —cupo 1— con dos
+-- observaciones —una posición y un «no aparece»— y una de H —cupo 1— con un
+-- fallo. Todo como `postgres`, que tiene BYPASSRLS en la imagen de Supabase: en
+-- los bloques 300 a 303 y 309 a 311 ninguna policy puede ser lo que rechaza, y
 -- el nombre de la constraint en el mensaje dice cuál fue.
+--
+-- LAS COORDENADAS LAS CALCULÓ EL CÓDIGO DE LA RUTA, no esta suite:
+-- `planificarGrilla` (`src/lib/geo/grilla.ts`), corrida con `npx tsx` el
+-- 2026-10-09 sobre las grillas de `gg_punto`, y pegadas con todas sus cifras.
+-- Es a propósito: la `0032` repite la cuenta de `planificarGrilla` en SQL
+-- (decisión 14), y lo que importa es que la base ACEPTE lo que la ruta escribe.
+-- Si las fixtures salieran de la misma fórmula SQL que el CHECK, un CHECK con el
+-- signo de la fila al revés aceptaría sus propias fixtures y rechazaría, en
+-- hosted, las nueve observaciones de una corrida ya pagada.
 
 RESET ROLE;
 
@@ -7428,24 +7440,35 @@ INSERT INTO businesses (id, organization_id, name) VALUES
     ('d0320000-0032-4032-8032-000000000b01', current_setting('qa.gg_org_g')::uuid, 'Gina Peluquería'),
     ('d0320000-0032-4032-8032-000000000b02', current_setting('qa.gg_org_h')::uuid, 'Hugo Barbería');
 
+-- Decisión 13 de la `0032`: el gasto de cada una, aprobado por una persona.
+INSERT INTO geo_grid_spend_approvals (id, organization_id, max_runs, approved_by, expires_at) VALUES
+    ('d0320000-0032-4032-8032-000000000e01', current_setting('qa.gg_org_g')::uuid, 3,
+     'QA, el gasto de gina', now() + interval '3 hours'),
+    ('d0320000-0032-4032-8032-000000000e02', current_setting('qa.gg_org_h')::uuid, 3,
+     'QA, el gasto de hugo', now() + interval '3 hours');
+
 INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
                            center_lat, center_lng, radius_m, step_m, n_points,
-                           declared_shift_m, created_by)
+                           declared_shift_m, approval_id, approval_max_runs, approval_slot, created_by)
 VALUES ('d0320000-0032-4032-8032-000000000c01', current_setting('qa.gg_org_g')::uuid,
         'd0320000-0032-4032-8032-000000000b01', 'peluquería Södermalm', 'ChIJginaGrillaQA000001',
-        59.3150, 18.0700, 1000, 1500, 9, 8000, 'd0320000-0032-4032-8032-000000000a01'),
+        59.3150, 18.0700, 1000, 1500, 9, 8000,
+        'd0320000-0032-4032-8032-000000000e01', 3, 1, 'd0320000-0032-4032-8032-000000000a01'),
        ('d0320000-0032-4032-8032-000000000c02', current_setting('qa.gg_org_h')::uuid,
         'd0320000-0032-4032-8032-000000000b02', 'barbería Vasastan', 'ChIJhugoGrillaQA000002',
-        59.3450, 18.0500, 1000, 1500, 9, NULL, 'd0320000-0032-4032-8032-000000000a02');
+        59.3450, 18.0500, 1000, 1500, 9, NULL,
+        'd0320000-0032-4032-8032-000000000e02', 3, 1, 'd0320000-0032-4032-8032-000000000a02');
 
-INSERT INTO geo_grid_observations (organization_id, run_id, grid_row, grid_col, lat, lng,
+-- Las coordenadas, de `planificarGrilla` (ver el encabezado del bloque).
+INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat, run_center_lng,
+                                   run_step_m, grid_row, grid_col, lat, lng,
                                    observed_at, outcome, position, error_code)
-VALUES (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 0, 0,
-        59.3285, 18.0436, now(), 'position', 3, NULL),
-       (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 0, 1,
-        59.3285, 18.0700, now(), 'absent', NULL, NULL),
-       (current_setting('qa.gg_org_h')::uuid, 'd0320000-0032-4032-8032-000000000c02', 1, 1,
-        59.3450, 18.0500, now(), 'failed', NULL, 'http_429');
+VALUES (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 9, 59.3150, 18.0700,
+        1500, 0, 0, 59.32848980545587, 18.04356587272207, now(), 'position', 3, NULL),
+       (current_setting('qa.gg_org_g')::uuid, 'd0320000-0032-4032-8032-000000000c01', 9, 59.3150, 18.0700,
+        1500, 0, 1, 59.32848980545587, 18.069999999999936, now(), 'absent', NULL, NULL),
+       (current_setting('qa.gg_org_h')::uuid, 'd0320000-0032-4032-8032-000000000c02', 9, 59.3450, 18.0500,
+        1500, 1, 1, 59.345, 18.049999999999955, now(), 'failed', NULL, 'http_429');
 
 -- Anti-vacuidad: dos organizaciones DISTINTAS, cada una con su corrida y sus
 -- observaciones. Sin eso, «otra identidad lee cero» y «no quedó nada» se
@@ -7456,11 +7479,13 @@ BEGIN
        OR current_setting('qa.gg_org_g') = current_setting('qa.gg_org_h') THEN
         RAISE EXCEPTION 'Vacuous run: gina y hugo no pasaron por el alta real, o comparten organización.';
     END IF;
-    IF (SELECT count(*) FROM geo_grid_runs WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 1
+    IF (SELECT count(*) FROM geo_grid_spend_approvals WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 1
+       OR (SELECT count(*) FROM geo_grid_runs WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 1
        OR (SELECT count(*) FROM geo_grid_observations WHERE organization_id = current_setting('qa.gg_org_g')::uuid) <> 2
+       OR (SELECT count(*) FROM geo_grid_spend_approvals WHERE organization_id = current_setting('qa.gg_org_h')::uuid) <> 1
        OR (SELECT count(*) FROM geo_grid_runs WHERE organization_id = current_setting('qa.gg_org_h')::uuid) <> 1
        OR (SELECT count(*) FROM geo_grid_observations WHERE organization_id = current_setting('qa.gg_org_h')::uuid) <> 1 THEN
-        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 300 a 308 no dejó 1+2 filas en G y 1+1 en H.';
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 300 a 311 no dejó 1+1+2 filas en G y 1+1+1 en H.';
     END IF;
 END
 $$;
@@ -7468,22 +7493,84 @@ $$;
 -- Las sentencias de los bloques 300 y 301, armadas una vez: el 301 corre las
 -- MISMAS con la organización coherente, para que la única diferencia entre un
 -- rechazo y una aceptación sea el cruce.
-CREATE OR REPLACE FUNCTION pg_temp.gg_corrida(p_org text, p_negocio text, p_creador text)
+-- La corrida va, por defecto, con la aprobación de G y su cupo 2 —el 1 lo tiene
+-- la corrida de la fixture—: cada intento corre sin dejar huella, así que el 2
+-- está libre para todos. Los bloques 311 cambian la aprobación, su tope y el cupo.
+CREATE OR REPLACE FUNCTION pg_temp.gg_corrida(p_org text, p_negocio text, p_creador text,
+                                              p_aprobacion text DEFAULT 'd0320000-0032-4032-8032-000000000e01',
+                                              p_tope int DEFAULT 3, p_cupo int DEFAULT 2)
 RETURNS text LANGUAGE sql IMMUTABLE AS $$
     SELECT format($s$INSERT INTO geo_grid_runs (organization_id, business_id, keyword, target_place_id,
-                         center_lat, center_lng, radius_m, step_m, n_points, created_by)
-                     VALUES (%L, %L, 'QA cruce', 'ChIJcruceGrillaQA00003', 59.33, 18.06, 1000, 1500, 9, %L)$s$,
-                  p_org, p_negocio, p_creador);
+                         center_lat, center_lng, radius_m, step_m, n_points,
+                         approval_id, approval_max_runs, approval_slot, created_by)
+                     VALUES (%L, %L, 'QA cruce', 'ChIJcruceGrillaQA00003', 59.33, 18.06, 1000, 1500, 9, %L, %s, %s, %L)$s$,
+                  p_org, p_negocio, p_aprobacion, p_tope, p_cupo, p_creador);
 $$;
 
+-- Las coordenadas de `planificarGrilla` para las grillas de estos bloques, como
+-- texto 'lat, lng' (ver el encabezado). `c01` y `c02` son las corridas de la
+-- fixture; `c01x4` es la grilla de 2x2 con el centro de `c01`; `anti`, una de
+-- 3x3 con paso de 2 km centrada en (-16.5, 179.99), que cruza el antimeridiano.
+-- Dos celdas que el plan NO tiene —(3,0) de `c01` y (2,0) de `c01x4`— salen de
+-- `desplazar` con la misma cuenta, para que lo único que las rechace sea la
+-- celda.
+CREATE OR REPLACE FUNCTION pg_temp.gg_punto(p_grilla text, p_fila int, p_col int)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT v.lat || ', ' || v.lng
+      FROM (VALUES
+          ('c01', 0, 0, '59.32848980545587', '18.04356587272207'),
+          ('c01', 0, 1, '59.32848980545587', '18.069999999999936'),
+          ('c01', 0, 2, '59.32848980545587', '18.096434127277917'),
+          ('c01', 1, 0, '59.315', '18.04356587272207'),
+          ('c01', 1, 1, '59.315', '18.069999999999936'),
+          ('c01', 1, 2, '59.315', '18.096434127277917'),
+          ('c01', 2, 0, '59.30151019454413', '18.04356587272207'),
+          ('c01', 2, 1, '59.30151019454413', '18.069999999999936'),
+          ('c01', 2, 2, '59.30151019454413', '18.096434127277917'),
+          ('c01', 3, 0, '59.28802038908826', '18.04356587272207'),
+          ('c02', 0, 0, '59.35848980545587', '18.023542523893298'),
+          ('c02', 0, 1, '59.35848980545587', '18.049999999999955'),
+          ('c02', 0, 2, '59.35848980545587', '18.076457476106725'),
+          ('c02', 1, 0, '59.345', '18.023542523893298'),
+          ('c02', 1, 1, '59.345', '18.049999999999955'),
+          ('c02', 1, 2, '59.345', '18.076457476106725'),
+          ('c02', 2, 0, '59.33151019454413', '18.023542523893298'),
+          ('c02', 2, 1, '59.33151019454413', '18.049999999999955'),
+          ('c02', 2, 2, '59.33151019454413', '18.076457476106725'),
+          ('c01x4', 0, 0, '59.32174490272793', '18.05678293636106'),
+          ('c01x4', 0, 1, '59.32174490272793', '18.083217063638926'),
+          ('c01x4', 1, 0, '59.30825509727207', '18.05678293636106'),
+          ('c01x4', 1, 1, '59.30825509727207', '18.083217063638926'),
+          ('c01x4', 2, 0, '59.2947652918162', '18.05678293636106'),
+          ('anti', 0, 0, '-16.482013592725508', '179.97124109608887'),
+          ('anti', 0, 1, '-16.482013592725508', '179.99'),
+          ('anti', 0, 2, '-16.482013592725508', '-179.99124109608886'),
+          ('anti', 1, 0, '-16.5', '179.97124109608887'),
+          ('anti', 1, 1, '-16.5', '179.99'),
+          ('anti', 1, 2, '-16.5', '-179.99124109608886'),
+          ('anti', 2, 0, '-16.517986407274492', '179.97124109608887'),
+          ('anti', 2, 1, '-16.517986407274492', '179.99'),
+          ('anti', 2, 2, '-16.517986407274492', '-179.99124109608886')
+      ) v(grilla, fila, col, lat, lng)
+     WHERE v.grilla = p_grilla AND v.fila = p_fila AND v.col = p_col;
+$$;
+
+-- La observación lleva la grilla de SU corrida (decisión 14) y la coordenada
+-- que el plan le da a su celda: lo único que cambia entre un caso y otro es lo
+-- que el caso mide.
 CREATE OR REPLACE FUNCTION pg_temp.gg_observacion(p_org text, p_corrida text, p_fila int, p_col int,
                                                   p_resultado text, p_posicion int, p_codigo text)
 RETURNS text LANGUAGE sql IMMUTABLE AS $$
-    SELECT format($s$INSERT INTO geo_grid_observations (organization_id, run_id, grid_row, grid_col, lat, lng,
+    SELECT format($s$INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                         run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
                          observed_at, outcome, position, error_code)
-                     VALUES (%L, %L, %s, %s, 59.33, 18.06, now(), %L, %s, %s)$s$,
-                  p_org, p_corrida, p_fila, p_col, p_resultado,
-                  coalesce(p_posicion::text, 'NULL'), coalesce(quote_literal(p_codigo), 'NULL'));
+                     VALUES (%L, %L, %s, %s, %s, %s, now(), %L, %s, %s)$s$,
+                  p_org, p_corrida, g.geometria, p_fila, p_col, pg_temp.gg_punto(g.grilla, p_fila, p_col),
+                  p_resultado, coalesce(p_posicion::text, 'NULL'), coalesce(quote_literal(p_codigo), 'NULL'))
+      FROM (VALUES ('d0320000-0032-4032-8032-000000000c01', 'c01', '9, 59.3150, 18.0700, 1500'),
+                   ('d0320000-0032-4032-8032-000000000c02', 'c02', '9, 59.3450, 18.0500, 1500')
+           ) g(corrida, grilla, geometria)
+     WHERE g.corrida = p_corrida;
 $$;
 
 -- ── 300 ──────────────────────────────────────────────────────────────────────
@@ -7613,7 +7700,10 @@ SELECT 302, 'una observación de la grilla dice un resultado con lo de otro: un 
 -- EL TOPE DE PUNTOS, EN LA BASE (decisión 4 de la `0032`). Una corrida de 16 y
 -- una de 10 puntos, una celda fuera de la grilla de 3x3 y una celda repetida no
 -- entran; y un «no aparece» mapeado a 20 —dentro del rango de las posiciones—
--- tampoco. El control: la corrida de 9 entra.
+-- tampoco. El control: la corrida de 9 entra. Los 16 y 10 puntos salen de
+-- reemplazar ', 9, ' en la sentencia de `gg_corrida`, que por eso lleva su lista
+-- de VALUES en UNA línea: con un salto después del 9 el reemplazo no ocurría y
+-- las dos corridas «de 16 y de 10» eran la de 9 (medido el 2026-10-09).
 SELECT set_config('qa.b303a', coalesce(pg_temp.error_sin_huella(replace(pg_temp.gg_corrida(
            current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL), ', 9, ', ', 16, ')), 'ACEPTADO'), true);
 SELECT set_config('qa.b303b', coalesce(pg_temp.error_sin_huella(replace(pg_temp.gg_corrida(
@@ -7658,44 +7748,53 @@ SELECT set_config('qa.b304a', pg_temp.escalar(format(
 SELECT set_config('qa.b304b', pg_temp.escalar(format(
            'SELECT count(*) FROM geo_grid_observations WHERE organization_id IS DISTINCT FROM %L',
            current_setting('qa.gg_org_h'))), true);
+SELECT set_config('qa.b304c', pg_temp.escalar(format(
+           'SELECT count(*) FROM geo_grid_spend_approvals WHERE organization_id IS DISTINCT FROM %L',
+           current_setting('qa.gg_org_h'))), true);
 RESET ROLE;
 
 INSERT INTO defect_report
-SELECT 304, 'una sesión de otra organización lee corridas u observaciones de la grilla ajenas',
-       NOT (current_setting('qa.b304a') = '0' AND current_setting('qa.b304b') = '0'),
+SELECT 304, 'una sesión de otra organización lee corridas, observaciones o aprobaciones de la grilla ajenas',
+       NOT (current_setting('qa.b304a') = '0' AND current_setting('qa.b304b') = '0'
+            AND current_setting('qa.b304c') = '0'),
        'hugo, como authenticated, ve corridas ajenas: ' || current_setting('qa.b304a') ||
        ' / observaciones ajenas: ' || current_setting('qa.b304b') ||
-       ' (se espera 0 y 0; G tiene 1 corrida y 2 observaciones)';
+       ' / aprobaciones ajenas: ' || current_setting('qa.b304c') ||
+       ' (se espera 0, 0 y 0; G tiene 1 aprobación, 1 corrida y 2 observaciones)';
 
 -- ── 305 ──────────────────────────────────────────────────────────────────────
--- LA CONTRAPRUEBA DEL 304: gina lee las de G —1 corrida y 2 observaciones— y
--- hugo las de H —1 y 1—. Sin esto, una tabla que nadie puede leer pone el 304
--- en verde.
+-- LA CONTRAPRUEBA DEL 304: gina lee las de G —1 aprobación, 1 corrida y 2
+-- observaciones— y hugo las de H —1, 1 y 1—. Sin esto, una tabla que nadie
+-- puede leer pone el 304 en verde.
 SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a01');
 SET LOCAL ROLE authenticated;
 SELECT set_config('qa.b305g', pg_temp.escalar(
-           'SELECT (SELECT count(*) FROM geo_grid_runs) || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
+           'SELECT (SELECT count(*) FROM geo_grid_spend_approvals) || ''+'' || (SELECT count(*) FROM geo_grid_runs)'
+           || ' || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
 RESET ROLE;
 SELECT pg_temp.be('d0320000-0032-4032-8032-000000000a02');
 SET LOCAL ROLE authenticated;
 SELECT set_config('qa.b305h', pg_temp.escalar(
-           'SELECT (SELECT count(*) FROM geo_grid_runs) || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
+           'SELECT (SELECT count(*) FROM geo_grid_spend_approvals) || ''+'' || (SELECT count(*) FROM geo_grid_runs)'
+           || ' || ''+'' || (SELECT count(*) FROM geo_grid_observations)'), true);
 RESET ROLE;
 
 INSERT INTO defect_report
 SELECT 305, 'la dueña de una corrida no la lee (el 304 sería vacuo)',
-       NOT (current_setting('qa.b305g') = '1+2' AND current_setting('qa.b305h') = '1+1'),
-       'gina ve corridas+observaciones: ' || current_setting('qa.b305g') ||
-       ' (se espera 1+2) / hugo: ' || current_setting('qa.b305h') || ' (se espera 1+1)';
+       NOT (current_setting('qa.b305g') = '1+1+2' AND current_setting('qa.b305h') = '1+1+1'),
+       'gina ve aprobaciones+corridas+observaciones: ' || current_setting('qa.b305g') ||
+       ' (se espera 1+1+2) / hugo: ' || current_setting('qa.b305h') || ' (se espera 1+1+1)';
 
 -- ── 306 ──────────────────────────────────────────────────────────────────────
 -- SÓLO EL SERVIDOR ESCRIBE (decisión 9 de la `0032`). Por PRIVILEGIO, de tabla y
--- de columna, en las dos tablas: `anon` no tiene ninguno —tampoco SELECT— y
+-- de columna, en las tres tablas: `anon` no tiene ninguno —tampoco SELECT— y
 -- `authenticated` sólo SELECT. Y por INTENTO: gina, en SU organización, como
--- `authenticated`, no puede escribir una corrida —muere con el 42501 del
--- PRIVILEGIO, no con el de una policy—, y `anon` no puede ni leer. El control:
--- `service_role` escribe la misma corrida. Sin él, una grilla que nadie puede
--- escribir pone las demás en verde.
+-- `authenticated`, no puede escribir una corrida ni APROBARSE el gasto —muere
+-- con el 42501 del PRIVILEGIO, no con el de una policy: es la dueña que dejó el
+-- alta abierta, la que hasta el 2026-10-09 gastaba sin que nadie lo aprobara—,
+-- y `anon` no puede ni leer. Los controles: `service_role` escribe la misma
+-- corrida y la misma aprobación. Sin ellos, una grilla que nadie puede escribir
+-- pone las demás en verde.
 CREATE TEMP TABLE gg_privilegios (privilegio text) ON COMMIT DROP;
 INSERT INTO gg_privilegios VALUES
     ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN');
@@ -7703,7 +7802,8 @@ INSERT INTO gg_privilegios VALUES
 CREATE TEMP TABLE gg_sobran ON COMMIT DROP AS
 SELECT r.rol, t.tabla, p.privilegio
   FROM (VALUES ('anon'), ('authenticated')) r(rol)
- CROSS JOIN (VALUES ('public.geo_grid_runs'), ('public.geo_grid_observations')) t(tabla)
+ CROSS JOIN (VALUES ('public.geo_grid_spend_approvals'), ('public.geo_grid_runs'),
+                    ('public.geo_grid_observations')) t(tabla)
  CROSS JOIN gg_privilegios p
  WHERE NOT (r.rol = 'authenticated' AND p.privilegio = 'SELECT')
    AND (has_table_privilege(r.rol, t.tabla, p.privilegio)
@@ -7718,6 +7818,10 @@ SELECT set_config('qa.b306a', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corri
 SELECT set_config('qa.b306b', coalesce(pg_temp.error_sin_huella(pg_temp.gg_observacion(
            current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01', 2, 2,
            'position', 1, NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b306e', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_spend_approvals (organization_id, max_runs, approved_by, expires_at)
+              VALUES (%L, 3, 'gina, a sí misma', now() + interval '1 hour')$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
 RESET ROLE;
 SET LOCAL ROLE anon;
 SELECT set_config('qa.b306c', pg_temp.escalar('SELECT count(*) FROM geo_grid_runs'), true);
@@ -7726,20 +7830,28 @@ SET LOCAL ROLE service_role;
 SELECT set_config('qa.b306d', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
            current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01',
            'd0320000-0032-4032-8032-000000000a01')), 'ACEPTADO'), true);
+SELECT set_config('qa.b306f', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_spend_approvals (organization_id, max_runs, approved_by, expires_at)
+              VALUES (%L, 3, 'QA, una persona con la llave', now() + interval '1 hour')$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
 RESET ROLE;
 
 INSERT INTO defect_report
-SELECT 306, 'algo que no es el servidor escribe la grilla, o anon la lee',
+SELECT 306, 'algo que no es el servidor escribe la grilla o se aprueba el gasto, o anon la lee',
        coalesce(sobran, '') <> ''
          OR current_setting('qa.b306a') <> '42501 | permission denied for table geo_grid_runs'
          OR current_setting('qa.b306b') <> '42501 | permission denied for table geo_grid_observations'
          OR current_setting('qa.b306c') <> 'ERROR 42501 | permission denied for table geo_grid_runs'
-         OR current_setting('qa.b306d') <> 'ACEPTADO',
+         OR current_setting('qa.b306d') <> 'ACEPTADO'
+         OR current_setting('qa.b306e') <> '42501 | permission denied for table geo_grid_spend_approvals'
+         OR current_setting('qa.b306f') <> 'ACEPTADO',
        'privilegios de más: [' || coalesce(sobran, '') ||
        '] / gina escribe una corrida de G como authenticated: ' || current_setting('qa.b306a') ||
        ' / una observación: ' || current_setting('qa.b306b') ||
+       ' / se aprueba el gasto: ' || current_setting('qa.b306e') ||
        ' / anon lee: ' || current_setting('qa.b306c') ||
-       ' / control, service_role escribe la corrida: ' || current_setting('qa.b306d')
+       ' / control, service_role escribe la corrida: ' || current_setting('qa.b306d') ||
+       ' / y la aprobación: ' || current_setting('qa.b306f')
   FROM (SELECT string_agg(rol || ' ' || privilegio || ' en ' || tabla, ', ' ORDER BY rol, tabla, privilegio)
                AS sobran FROM gg_sobran) x;
 
@@ -7880,13 +7992,253 @@ SELECT 308, 'la baja de una organización con grilla no pasa o deja filas, o la 
        ' (se espera «quedaron: []» y «corridas=1 creador=0 observaciones=2»)'
   FROM (SELECT current_setting('qa.b308a') AS a, current_setting('qa.b308b') AS b) x;
 
+-- ── 309 ──────────────────────────────────────────────────────────────────────
+-- LA COORDENADA ES LA DE SU CELDA (decisión 14 de la `0032`). Como `postgres`:
+--   a. las siete celdas que le faltan a la corrida de G, con las coordenadas que
+--      calculó `planificarGrilla`, entran. Es el control —sin él, un CHECK que
+--      rechazara todo pondría el resto en verde— y la prueba de que la cuenta de
+--      la base es la del código;
+--   b. lo mismo cruzando el antimeridiano: una corrida nueva centrada en
+--      (-16.5, 179.99) con sus nueve observaciones; la columna este sale a
+--      -179.99, normalizada como la normaliza el código. Entra;
+--   c. LA GRILLA DECORATIVA: una corrida nueva de nueve puntos con las nueve
+--      observaciones en el centro. Es lo que escribía el mutante de la ruta que
+--      consultaba el centro en los nueve puntos y sobrevivía a la suite entera
+--      (2026-10-09) → 23514 nombrando el CHECK;
+--   d. un punto corrido 10 m al norte de su celda → 23514 nombrando el CHECK;
+--   e. la corrida de G movida 0,1° al norte con sus observaciones colgadas →
+--      23503 nombrando la FK de la observación: el mapa no se reubica.
+SELECT set_config('qa.b309a', coalesce(pg_temp.error_sin_huella(
+           'INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat, '
+           || 'run_center_lng, run_step_m, grid_row, grid_col, lat, lng, observed_at, outcome) VALUES '
+           || (SELECT string_agg(format('(%L, %L, 9, 59.3150, 18.0700, 1500, %s, %s, %s, now(), ''absent'')',
+                                        current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000c01',
+                                        f, c, pg_temp.gg_punto('c01', f, c)), ', ' ORDER BY f, c)
+                 FROM generate_series(0, 2) f, generate_series(0, 2) c
+                WHERE (f, c) NOT IN ((0, 0), (0, 1)))), 'ACEPTADO'), true);
+SELECT set_config('qa.b309b', coalesce(pg_temp.error_sin_huella(format(
+           $s$WITH corrida AS (
+                  INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                             center_lat, center_lng, radius_m, step_m, n_points,
+                                             approval_id, approval_max_runs, approval_slot)
+                  VALUES ('d0320000-0032-4032-8032-000000000c09', %L, 'd0320000-0032-4032-8032-000000000b01',
+                          'QA antimeridiano', 'ChIJantimeridianoQA001', -16.5, 179.99, 1000, 2000, 9,
+                          'd0320000-0032-4032-8032-000000000e01', 3, 2)
+                  RETURNING organization_id, id)
+              INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              SELECT corrida.organization_id, corrida.id, 9, -16.5, 179.99, 2000, v.f, v.c, v.lat, v.lng,
+                     now(), 'absent'
+                FROM corrida, (VALUES %s) v(f, c, lat, lng)$s$,
+           current_setting('qa.gg_org_g'),
+           (SELECT string_agg(format('(%s, %s, %s)', f, c, pg_temp.gg_punto('anti', f, c)), ', ' ORDER BY f, c)
+              FROM generate_series(0, 2) f, generate_series(0, 2) c))), 'ACEPTADO'), true);
+SELECT set_config('qa.b309c', coalesce(pg_temp.error_sin_huella(format(
+           $s$WITH corrida AS (
+                  INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                             center_lat, center_lng, radius_m, step_m, n_points,
+                                             approval_id, approval_max_runs, approval_slot)
+                  VALUES ('d0320000-0032-4032-8032-000000000c10', %L, 'd0320000-0032-4032-8032-000000000b01',
+                          'QA grilla decorativa', 'ChIJdecorativaQA000001', 59.33, 18.06, 1000, 1500, 9,
+                          'd0320000-0032-4032-8032-000000000e01', 3, 2)
+                  RETURNING organization_id, id)
+              INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              SELECT corrida.organization_id, corrida.id, 9, 59.33, 18.06, 1500, f, c, 59.33, 18.06,
+                     now(), 'absent'
+                FROM corrida, generate_series(0, 2) f, generate_series(0, 2) c$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b309d', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              VALUES (%L, 'd0320000-0032-4032-8032-000000000c01', 9, 59.3150, 18.0700, 1500, 2, 2,
+                      59.3016001265805, 18.096434127277917, now(), 'absent')$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b309e', coalesce(pg_temp.error_sin_huella(
+           $s$UPDATE geo_grid_runs SET center_lat = center_lat + 0.1
+               WHERE id = 'd0320000-0032-4032-8032-000000000c01'$s$), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 309, 'una observación de la grilla está en otra coordenada que la de su celda, o la corrida se mueve después de medida',
+       NOT (a = 'ACEPTADO' AND b = 'ACEPTADO'
+            AND c LIKE '23514 |%"geo_grid_observations_coordinate_on_grid"%'
+            AND d LIKE '23514 |%"geo_grid_observations_coordinate_on_grid"%'
+            AND e LIKE '23503 |%"geo_grid_observations_run_fkey"%'),
+       'control, las siete celdas de planificarGrilla: ' || a ||
+       ' / control, una grilla sobre el antimeridiano: ' || b ||
+       ' / la grilla decorativa, nueve veces el centro: ' || c ||
+       ' / un punto corrido 10 m: ' || d ||
+       ' / la corrida movida con observaciones: ' || e ||
+       ' (se espera ACEPTADO, ACEPTADO, 23514 y 23514 nombrando geo_grid_observations_coordinate_on_grid,' ||
+       ' y 23503 nombrando geo_grid_observations_run_fkey)'
+  FROM (SELECT current_setting('qa.b309a') AS a, current_setting('qa.b309b') AS b,
+               current_setting('qa.b309c') AS c, current_setting('qa.b309d') AS d,
+               current_setting('qa.b309e') AS e) x;
+
+-- ── 310 ──────────────────────────────────────────────────────────────────────
+-- LA CELDA, CONTRA EL N DE SU CORRIDA (decisiones 4 y 14 de la `0032`):
+--   a. el caso que midió la revisión del 2026-10-09: una corrida de UN punto con
+--      nueve observaciones —la réplica contestaba `INSERT 0 9`— → 23514
+--      nombrando la celda;
+--   b. una corrida de cuatro puntos con una observación en la fila 2 → 23514;
+--   c. la grilla de la corrida COPIADA MAL en la observación: una observación de
+--      la corrida de nueve puntos de G que dice ser de una grilla de cuatro —con
+--      la coordenada coherente con esa grilla de cuatro, así que los CHECK
+--      pasan— → 23503 nombrando la FK: lo que la observación dice de su
+--      corrida tiene que ser lo que la corrida es;
+--   d. el control: una corrida de cuatro puntos con sus cuatro observaciones,
+--      de `planificarGrilla`, entra.
+SELECT set_config('qa.b310a', coalesce(pg_temp.error_sin_huella(format(
+           $s$WITH corrida AS (
+                  INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                             center_lat, center_lng, radius_m, step_m, n_points,
+                                             approval_id, approval_max_runs, approval_slot)
+                  VALUES ('d0320000-0032-4032-8032-000000000c11', %L, 'd0320000-0032-4032-8032-000000000b01',
+                          'QA un punto', 'ChIJunPuntoGrillaQA001', 59.3293, 18.0686, 1000, 1500, 1,
+                          'd0320000-0032-4032-8032-000000000e01', 3, 2)
+                  RETURNING organization_id, id)
+              INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome, position)
+              SELECT corrida.organization_id, corrida.id, 1, 59.3293, 18.0686, 1500, f, c, 59.3293, 18.0686,
+                     now(), 'position', 1
+                FROM corrida, generate_series(0, 2) f, generate_series(0, 2) c$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b310b', coalesce(pg_temp.error_sin_huella(format(
+           $s$WITH corrida AS (
+                  INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                             center_lat, center_lng, radius_m, step_m, n_points,
+                                             approval_id, approval_max_runs, approval_slot)
+                  VALUES ('d0320000-0032-4032-8032-000000000c12', %L, 'd0320000-0032-4032-8032-000000000b01',
+                          'QA cuatro puntos', 'ChIJcuatroPuntosQA0001', 59.3150, 18.0700, 1000, 1500, 4,
+                          'd0320000-0032-4032-8032-000000000e01', 3, 2)
+                  RETURNING organization_id, id)
+              INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              SELECT corrida.organization_id, corrida.id, 4, 59.3150, 18.0700, 1500, 2, 0, %s, now(), 'absent'
+                FROM corrida$s$,
+           current_setting('qa.gg_org_g'), pg_temp.gg_punto('c01x4', 2, 0))), 'ACEPTADO'), true);
+SELECT set_config('qa.b310c', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              VALUES (%L, 'd0320000-0032-4032-8032-000000000c01', 4, 59.3150, 18.0700, 1500, 1, 1, %s,
+                      now(), 'absent')$s$,
+           current_setting('qa.gg_org_g'), pg_temp.gg_punto('c01x4', 1, 1))), 'ACEPTADO'), true);
+SELECT set_config('qa.b310d', coalesce(pg_temp.error_sin_huella(format(
+           $s$WITH corrida AS (
+                  INSERT INTO geo_grid_runs (id, organization_id, business_id, keyword, target_place_id,
+                                             center_lat, center_lng, radius_m, step_m, n_points,
+                                             approval_id, approval_max_runs, approval_slot)
+                  VALUES ('d0320000-0032-4032-8032-000000000c12', %L, 'd0320000-0032-4032-8032-000000000b01',
+                          'QA cuatro puntos', 'ChIJcuatroPuntosQA0001', 59.3150, 18.0700, 1000, 1500, 4,
+                          'd0320000-0032-4032-8032-000000000e01', 3, 2)
+                  RETURNING organization_id, id)
+              INSERT INTO geo_grid_observations (organization_id, run_id, run_n_points, run_center_lat,
+                                                 run_center_lng, run_step_m, grid_row, grid_col, lat, lng,
+                                                 observed_at, outcome)
+              SELECT corrida.organization_id, corrida.id, 4, 59.3150, 18.0700, 1500, v.f, v.c, v.lat, v.lng,
+                     now(), 'absent'
+                FROM corrida, (VALUES %s) v(f, c, lat, lng)$s$,
+           current_setting('qa.gg_org_g'),
+           (SELECT string_agg(format('(%s, %s, %s)', f, c, pg_temp.gg_punto('c01x4', f, c)), ', ' ORDER BY f, c)
+              FROM generate_series(0, 1) f, generate_series(0, 1) c))), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 310, 'una corrida de la grilla tiene observaciones en celdas que su N no tiene, o una observación dice otra grilla que la de su corrida',
+       NOT (a LIKE '23514 |%"geo_grid_observations_cell_check"%'
+            AND b LIKE '23514 |%"geo_grid_observations_cell_check"%'
+            AND c LIKE '23503 |%"geo_grid_observations_run_fkey"%'
+            AND d = 'ACEPTADO'),
+       'nueve observaciones en una corrida de un punto: ' || a ||
+       ' / la fila 2 en una de cuatro: ' || b ||
+       ' / la grilla de la corrida copiada mal: ' || c ||
+       ' / control, una de cuatro con sus cuatro: ' || d ||
+       ' (se espera 23514 y 23514 nombrando geo_grid_observations_cell_check, 23503 nombrando' ||
+       ' geo_grid_observations_run_fkey, y ACEPTADO)'
+  FROM (SELECT current_setting('qa.b310a') AS a, current_setting('qa.b310b') AS b,
+               current_setting('qa.b310c') AS c, current_setting('qa.b310d') AS d) x;
+
+-- ── 311 ──────────────────────────────────────────────────────────────────────
+-- EL CUPO DE LA APROBACIÓN DE GASTO (decisión 13 de la `0032`). El acto humano
+-- de la puerta —tres corridas, ~27 llamadas, menos de USD 1— escrito en la
+-- base, para quien escriba sin pasar por la ruta. Como `postgres`:
+--   a. una corrida SIN aprobación → 23502;
+--   b. una corrida de G pagada con la aprobación de H → 23503 nombrando la FK;
+--   c. el cupo 4 de una aprobación de 3 → 23514 nombrando el CHECK del cupo;
+--   d. el cupo 1 otra vez —lo tiene la corrida de la fixture— → 23505;
+--   e. el cupo 4 diciendo que la aprobación es de 4 —el CHECK del cupo pasa—
+--      → 23503: el tope sale de la aprobación, no de lo que diga la corrida;
+--   f. una aprobación de 4 corridas → 23514;
+--   g. una aprobación que vale 48 h → 23514;
+--   h. la aprobación de G achicada a 2 con una corrida colgada → 23503;
+--   i. la aprobación de G borrada con una corrida colgada → 23503: queda como el
+--      registro de quién autorizó esa plata;
+--   j. el control: el cupo 2 de la aprobación de G entra.
+SELECT set_config('qa.b311a', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL, NULL)), 'ACEPTADO'), true);
+SELECT set_config('qa.b311b', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL,
+           'd0320000-0032-4032-8032-000000000e02')), 'ACEPTADO'), true);
+SELECT set_config('qa.b311c', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL,
+           'd0320000-0032-4032-8032-000000000e01', 3, 4)), 'ACEPTADO'), true);
+SELECT set_config('qa.b311d', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL,
+           'd0320000-0032-4032-8032-000000000e01', 3, 1)), 'ACEPTADO'), true);
+SELECT set_config('qa.b311e', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL,
+           'd0320000-0032-4032-8032-000000000e01', 4, 4)), 'ACEPTADO'), true);
+SELECT set_config('qa.b311f', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_spend_approvals (organization_id, max_runs, approved_by, expires_at)
+              VALUES (%L, 4, 'QA, cuatro corridas', now() + interval '1 hour')$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b311g', coalesce(pg_temp.error_sin_huella(format(
+           $s$INSERT INTO geo_grid_spend_approvals (organization_id, max_runs, approved_by, expires_at)
+              VALUES (%L, 3, 'QA, dos días', now() + interval '48 hours')$s$,
+           current_setting('qa.gg_org_g'))), 'ACEPTADO'), true);
+SELECT set_config('qa.b311h', coalesce(pg_temp.error_sin_huella(
+           $s$UPDATE geo_grid_spend_approvals SET max_runs = 2
+               WHERE id = 'd0320000-0032-4032-8032-000000000e01'$s$), 'ACEPTADO'), true);
+SELECT set_config('qa.b311i', coalesce(pg_temp.error_sin_huella(
+           $s$DELETE FROM geo_grid_spend_approvals
+               WHERE id = 'd0320000-0032-4032-8032-000000000e01'$s$), 'ACEPTADO'), true);
+SELECT set_config('qa.b311j', coalesce(pg_temp.error_sin_huella(pg_temp.gg_corrida(
+           current_setting('qa.gg_org_g'), 'd0320000-0032-4032-8032-000000000b01', NULL)), 'ACEPTADO'), true);
+
+INSERT INTO defect_report
+SELECT 311, 'una corrida de la grilla se paga sin aprobación, con la de otra organización o por encima de su cupo, o la aprobación se achica o se borra con corridas',
+       NOT (a LIKE '23502 |%"approval_id"%'
+            AND b LIKE '23503 |%"geo_grid_runs_approval_fkey"%'
+            AND c LIKE '23514 |%"geo_grid_runs_approval_slot_check"%'
+            AND d LIKE '23505 |%"geo_grid_runs_approval_slot_key"%'
+            AND e LIKE '23503 |%"geo_grid_runs_approval_fkey"%'
+            AND f LIKE '23514 |%"geo_grid_spend_approvals_max_runs_check"%'
+            AND g LIKE '23514 |%"geo_grid_spend_approvals_window_check"%'
+            AND h LIKE '23503 |%"geo_grid_runs_approval_fkey"%'
+            AND i LIKE '23503 |%"geo_grid_runs_approval_fkey"%'
+            AND j = 'ACEPTADO'),
+       'sin aprobación: ' || a || ' / con la de otra: ' || b || ' / cupo 4 de 3: ' || c ||
+       ' / cupo repetido: ' || d || ' / diciendo que es de 4: ' || e ||
+       ' / aprobación de 4: ' || f || ' / de 48 h: ' || g || ' / achicada: ' || h ||
+       ' / borrada: ' || i || ' / control, cupo 2: ' || j
+  FROM (SELECT current_setting('qa.b311a') AS a, current_setting('qa.b311b') AS b,
+               current_setting('qa.b311c') AS c, current_setting('qa.b311d') AS d,
+               current_setting('qa.b311e') AS e, current_setting('qa.b311f') AS f,
+               current_setting('qa.b311g') AS g, current_setting('qa.b311h') AS h,
+               current_setting('qa.b311i') AS i, current_setting('qa.b311j') AS j) x;
+
 RESET ROLE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and fifty-two checks were written, so a hundred
--- and fifty-two rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and fifty-five checks were written, so a hundred
+-- and fifty-five rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
@@ -7902,8 +8254,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 152 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 152 checks recorded a result.', checks;
+    IF checks <> 155 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 155 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -7914,11 +8266,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 152 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 155 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 152 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 155 checks green: the schema prevents every one of them.';
 END
 $$;
 
