@@ -6,9 +6,9 @@
 -- schema.
 --
 -- auth.uid() reads the JWT subject. Supabase fills it per request; here it
--- reads a GUC, so a test can say "now I am this user" and have every policy in
--- the schema believe it. That is the point: the policies run exactly as
--- written, with the identity swapped underneath them.
+-- reads the same GUCs PostgREST would set, so a test can say "now I am this
+-- user" and have every policy in the schema believe it. That is the point: the
+-- policies run exactly as written, with the identity swapped underneath them.
 --
 -- Used by both supabase/qa/replica.sh and the schema job in CI. One file rather
 -- than two copies: a stub that drifts between the local run and the CI run
@@ -23,12 +23,38 @@ CREATE TABLE IF NOT EXISTS auth.users (
     created_at         timestamptz NOT NULL DEFAULT now()
 );
 
+-- La definición de GoTrue, no la del init de la imagen.
+--
+-- Hasta el 2026-10-09 este stub leía sólo `request.jwt.claim.sub`, el GUC por
+-- claim que PostgREST ya no pone. Medido ese día sobre las imágenes locales del
+-- stack de Supabase, sin correrlas (`docker create` + `docker cp`):
+--
+--   * PostgREST (`public.ecr.aws/supabase/postgrest:v16.4`): el binario nombra un
+--     solo GUC de identidad, `request.jwt.claims` —el JSON entero del JWT—. El
+--     `request.jwt.claim.sub` no aparece: con una sesión de verdad está vacío;
+--   * GoTrue (`public.ecr.aws/supabase/gotrue:v2.197.0`), migración
+--     `20220224000811_update_auth_functions`: `auth.uid()` es el coalesce de
+--     abajo, el GUC viejo primero y el `sub` del JSON después. Es la que queda
+--     en un proyecto de Supabase una vez que GoTrue corre sus migraciones. Contra
+--     hosted no se midió: esta réplica existe para no tocarlo.
+--
+-- La imagen de esta réplica (`supabase/postgres`) trae la del init, la del GUC
+-- viejo, porque acá GoTrue no corre. Con ella, una función que leyera
+-- `request.jwt.claim.sub` en vez de llamar a `auth.uid()` pasaba la suite entera
+-- y, con PostgREST v16 delante, vería NULL en toda sesión: medido con el trigger
+-- de la 0033, 167 de 167 en verde y, por el camino de PostgREST, 45005 a la
+-- escritura exacta de `/api/content/approve` (que la ruta contesta con 502). Con esta definición, los bloques
+-- 220 a 227 entran por el JSON, como PostgREST, y los anteriores por el GUC
+-- viejo, que sigue andando: los dos caminos de la misma función.
 CREATE OR REPLACE FUNCTION auth.uid()
 RETURNS uuid
 LANGUAGE sql
 STABLE
 AS $$
-    SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid
+    SELECT coalesce(
+        NULLIF(current_setting('request.jwt.claim.sub', true), ''),
+        (NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+    )::uuid
 $$;
 
 -- Los roles que Supabase trae de fábrica y que las policies nombran desde

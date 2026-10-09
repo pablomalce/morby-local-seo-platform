@@ -1,4 +1,4 @@
--- A hundred and sixty-seven isolation checks against the Growth OS schema — executable.
+-- A hundred and sixty-eight isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -8489,7 +8489,7 @@ END
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 0033 — el sello lo firma quien sella, a la hora de la base (bloques 220 a 226)
+-- 0033 — el sello lo firma quien sella, a la hora de la base, y no se muda (bloques 220 a 227)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- EL DEFECTO, medido el 2026-10-09 en un stack local con la 0031: el manager de
 -- X hizo `PATCH /rest/v1/content_assets` con `approved_by` = el uid del CLIENT de
@@ -8501,9 +8501,10 @@ $$;
 -- Corren sobre la fixture de H4.1, que los bloques 200 a 216 dejan como estaba
 -- (todo se mide con `h41_como`, que deshace): en X, k = 10 es el borrador, k = 11
 -- el sellado por omar (owner) CON publicación, k = 29 el sellado por omar SIN
--- publicación. Como `authenticated`, con el uid puesto: es lo que PostgREST hace
--- con una sesión, y lo que hace `/api/content/approve`, que escribe con la
--- sesión y no con `service_role` (medido en `src/` el 2026-10-09).
+-- publicación. Como `authenticated`, con el uid en `request.jwt.claims`: es lo
+-- que PostgREST v16 hace con una sesión (ver `s33_como`), y lo que hace
+-- `/api/content/approve`, que escribe con la sesión y no con `service_role`
+-- (medido en `src/` el 2026-10-09).
 --
 -- Cada medición devuelve las filas tocadas, QUIÉN quedó firmando y A QUÉ HORA:
 -- `hora=base` es `now()`, la hora de la transacción, o sea la de la base. Las
@@ -8532,7 +8533,7 @@ BEGIN
     IF borrador IS DISTINCT FROM 'draft/sin-sello'
        OR sellado IS DISTINCT FROM 'approved/true'
        OR publicado IS DISTINCT FROM 'approved/true/1' THEN
-        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 220 a 226 no está como se espera: '
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 220 a 227 no está como se espera: '
                         'k=10 %, k=29 %, k=11 % (esperado draft/sin-sello, approved/true, approved/true/1)',
                         borrador, sellado, publicado;
     END IF;
@@ -8541,9 +8542,19 @@ $$;
 
 -- Corre `p_sql` como `p_rol` con el uid `p_uid` puesto (vacío si es NULL), DESPUÉS
 -- de `p_prep` como `postgres`, y lo deshace todo. Devuelve lo que la consulta
--- devuelve, o el error clasificado. Es `h41_como` con dos cosas más: el rol, para
--- medir al servidor, y la preparación, para darle a una fila sellada una hora
--- distinta de `now()` sin dejar huella.
+-- devuelve, o el error clasificado. Es `h41_como` con tres cosas más: el rol, para
+-- medir al servidor; la preparación, para darle a una fila sellada una hora
+-- distinta de `now()` sin dejar huella; y la identidad puesta COMO LA PONE
+-- PostgREST.
+--
+-- ESO ÚLTIMO, por qué. PostgREST v16 pone un solo GUC, `request.jwt.claims`, el
+-- JSON del JWT; el `request.jwt.claim.sub` que usa `h41_como` es el de antes de
+-- la v10, y con una sesión de verdad está vacío (medido sobre el binario, ver
+-- `auth_stub.sql`). Así que acá va el JSON —`sub` y `role`, como el JWT de una
+-- sesión o el de la clave de servicio— y el GUC viejo se VACÍA, porque los
+-- bloques de arriba lo dejan puesto en la transacción. Un firmante que leyera el
+-- GUC viejo en vez de llamar a `auth.uid()` vería NULL acá, como detrás de
+-- PostgREST v16, y el 221 se pone rojo (mutación S15 de la 0033).
 CREATE OR REPLACE FUNCTION pg_temp.s33_como(p_uid uuid, p_sql text, p_prep text DEFAULT NULL,
                                            p_rol text DEFAULT 'authenticated')
 RETURNS text
@@ -8555,7 +8566,9 @@ BEGIN
         IF p_prep IS NOT NULL THEN
             EXECUTE p_prep;
         END IF;
-        PERFORM set_config('request.jwt.claim.sub', coalesce(p_uid::text, ''), true);
+        PERFORM set_config('request.jwt.claim.sub', '', true);
+        PERFORM set_config('request.jwt.claims',
+                           jsonb_strip_nulls(jsonb_build_object('sub', p_uid, 'role', p_rol))::text, true);
         EXECUTE format('SET LOCAL ROLE %I', p_rol);
         EXECUTE p_sql INTO salida;
         RESET ROLE;
@@ -8568,6 +8581,9 @@ EXCEPTION WHEN OTHERS THEN
            CASE WHEN SQLERRM LIKE 'new row violates row-level security policy%' THEN 'rls'
                 WHEN SQLERRM LIKE 'permission denied for table%'                 THEN 'priv'
                 WHEN SQLERRM LIKE 'el sello lo firma quien sella%'               THEN 'firma'
+                WHEN SQLERRM LIKE 'un sello no se muda%'                         THEN 'muda'
+                WHEN SQLERRM LIKE '%violates foreign key constraint "publications_asset_fkey"%'
+                                                                                 THEN 'ledger'
                 ELSE left(SQLERRM, 160) END;
 END
 $$;
@@ -8647,7 +8663,16 @@ CREATE TEMP TABLE s33 (
 --      creado y deshecho dentro de la medición— con el uid de marta, firmando
 --      como clara: 45005. La exención de la 0033 es una lista de EXENTOS; escrita
 --      como lista de alcanzados (`current_user = 'authenticated'`), a este rol lo
---      eximiría, y ningún otro caso lo ve.
+--      eximiría, y ningún otro caso lo ve;
+--   g. marta sella el borrador DIRECTO COMO `scheduled`, firmando como clara:
+--      45005;
+--   h. lo mismo como `published`: 45005. Es la trampa que la 0031 documenta para
+--      su policy —y que su bloque 211 mide con los tres estados—: una fila está
+--      sellada por su `approved_hash`, no por su `status`, y el CHECK de la 0015
+--      acepta un sello en los tres. Hasta la segunda ronda todos los casos
+--      sellaban como `approved`, y un firmante que decidiera «sellada» por
+--      `status = 'approved'` dejaba firmar como otro al sellar como `scheduled` o
+--      `published`, con la suite en verde (mutación S13 de la 0033).
 INSERT INTO s33 VALUES
     (220, 'a', 'ERR 45005 firma',
      pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
@@ -8673,15 +8698,22 @@ INSERT INTO s33 VALUES
              GRANT futuro_0033 TO postgres WITH SET TRUE;
          END
          $do$$prep$,
-         'futuro_0033')));
+         'futuro_0033'))),
+    (220, 'g', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 5), '2026-10-09T12:00:00Z', 'scheduled')))),
+    (220, 'h', 'ERR 45005 firma',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 5), '2026-10-09T12:00:00Z', 'published'))));
 
 INSERT INTO defect_report
 SELECT 220, 'quien aprueba firma el sello a nombre de otro por PostgREST',
-       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 6,
-       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 6
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 8,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 8
             THEN 'marta (manager) no sella firmando como clara (client) a las 12:00 del ataque, ni como omar, ' ||
-                 'ni sin firma, ni hace nacer un asset sellado por clara; eva (editor) no firma como marta; ' ||
-                 'un rol nuevo, miembro de authenticated, no firma como clara: 45005 en los seis'
+                 'ni sin firma, ni hace nacer un asset sellado por clara, ni sella directo como scheduled o ' ||
+                 'published firmando como clara; eva (editor) no firma como marta; un rol nuevo, miembro de ' ||
+                 'authenticated, no firma como clara: 45005 en los ocho'
             ELSE 'medido (esperado): ' ||
                  string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
             END
@@ -8697,7 +8729,20 @@ SELECT 220, 'quien aprueba firma el sello a nombre de otro por PostgREST',
 --      marta, a la hora de la BASE;
 --   b. marta haciendo nacer un asset sellado por ella, con una hora de hace 30
 --      días: firmado por marta, a la hora de la base;
---   c. omar (owner) sellando como él con una hora del futuro: lo mismo.
+--   c. omar (owner) sellando como él con una hora del futuro: lo mismo;
+--   d. marta sellando el borrador SIN MANDAR `approved_at`: firmado por marta, a
+--      la hora de la base. El encabezado de la 0033 promete la hora «venga lo
+--      que venga», y eso incluye que no venga: un firmante que fijara la hora
+--      sólo cuando cambia (`NEW.approved_at IS DISTINCT FROM OLD.approved_at`)
+--      dejaba el NULL del borrador y moría en el CHECK de la 0015 (23514);
+--   e. marta RE-FIRMANDO A SU NOMBRE el sello de omar (k = 29), sin mandar
+--      `approved_at`. La preparación, como `postgres`, le pone a ese sello las
+--      9:00 del 1 de octubre: el resultado tiene que ser marta a la hora de la
+--      base, no marta a la hora en que firmó omar. Con el mismo firmante de
+--      «sólo cuando cambia», marta quedaba firmando el 1 de octubre, un momento
+--      en que nunca aprobó: un atraso sin tocar la hora (mutación S14 de la
+--      0033). Que la re-firma propia PASE es lo que la 0033 declara que no
+--      cierra; lo que esto fija es su hora.
 INSERT INTO s33 VALUES
     (221, 'a', 'n=1 por=manager hora=base',
      pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2),
@@ -8707,15 +8752,28 @@ INSERT INTO s33 VALUES
          pg_temp.s33_nace(pg_temp.h41_id(0, 2), (now() - interval '30 days')::text)))),
     (221, 'c', 'n=1 por=owner hora=base',
      pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 1),
-         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2099-01-01T00:00:00Z'))));
+         pg_temp.s33_sellar(pg_temp.h41_id(1, 10), pg_temp.h41_id(0, 1), '2099-01-01T00:00:00Z')))),
+    (221, 'd', 'n=1 por=manager hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET status = ''approved'', approved_hash = payload_hash, '
+         'approved_by = %L WHERE id = %L',
+         pg_temp.h41_id(0, 2), pg_temp.h41_id(1, 10)))))),
+    (221, 'e', 'n=1 por=manager hora=base',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET approved_by = %L WHERE id = %L',
+         pg_temp.h41_id(0, 2), pg_temp.h41_id(1, 29))),
+         format('UPDATE public.content_assets SET approved_at = ''2026-10-01T09:00:00Z'' WHERE id = %L',
+                pg_temp.h41_id(1, 29)))));
 
 INSERT INTO defect_report
 SELECT 221, 'quien aprueba no sella firmando como él, o la hora del sello la elige quien escribe',
-       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 3,
-       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 3
-            THEN 'la escritura de /api/content/approve, hecha por marta con el reloj de la ruta, sella ' ||
-                 '(1 fila) firmada por marta a la hora de la base; marta naciendo sellado con una hora ' ||
-                 'de hace 30 días y omar sellando con una del 2099, lo mismo: firma propia, hora de la base'
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 5,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 5
+            THEN 'la escritura de /api/content/approve, hecha por marta con el reloj de la ruta y la identidad ' ||
+                 'como la pone PostgREST, sella (1 fila) firmada por marta a la hora de la base; marta naciendo ' ||
+                 'sellado con una hora de hace 30 días, omar sellando con una del 2099, marta sellando sin ' ||
+                 'mandar hora y marta re-firmando a su nombre el sello de omar del 1 de octubre, lo mismo: ' ||
+                 'firma propia, hora de la base'
             ELSE 'medido (esperado): ' ||
                  string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
             END
@@ -8735,7 +8793,8 @@ SELECT 221, 'quien aprueba no sella firmando como él, o la hora del sello la el
 --
 -- Lo que esto NO mide, a propósito: que marta re-firme un sello vigente a SU
 -- nombre. Pasa —es verdad: aprueba ese texto ahora— y reemplaza al firmante
--- anterior; está declarado en el encabezado de la 0033 como lo que no cierra.
+-- anterior; está declarado en el encabezado de la 0033 como lo que no cierra. Lo
+-- que sí se mide de esa re-firma es su HORA, en el 221 (caso e).
 INSERT INTO s33 VALUES
     (222, 'a', 'ERR 45005 firma',
      pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
@@ -8934,11 +8993,118 @@ SELECT 226, 'una tabla con approved_by que una sesión escribe no tiene firmante
             WHERE p.prosecdef AND p.prosrc ILIKE '%content\_assets%') AS definer
        ) x;
 
+-- ── 227 ──────────────────────────────────────────────────────────────────────
+-- UN SELLO NO SE MUDA. Lo encontró la revisión de la 0033 (segunda ronda,
+-- 2026-10-09), y es anterior a ella: medido igual sobre `main` sin la 0033.
+--
+-- eva es editor en X y nada más en X; pero `handle_new_user()` le da a toda
+-- usuaria una organización propia donde es owner, así que eva APRUEBA en la
+-- suya. Como `authenticated`, con su uid, creó un negocio en su organización y
+-- `UPDATE content_assets SET organization_id = <la suya>, business_id = <ése>
+-- WHERE id = <k = 11 de X>`: 1 fila. k = 11 quedó en la organización de eva,
+-- `approved`, firmado por omar —que no es miembro de esa organización— a la hora
+-- de omar; la publicación de X siguió en X apuntando a un asset de otro tenant;
+-- omar dejó de verlo, y eva no lo podía devolver. Un editor que no puede ni
+-- AGENDAR k = 11 dentro de X (42501) lo sacaba de X. Y marta, que aprueba en X y
+-- en Y, mudaba k = 29 a Y, o a otro negocio de X, con la firma de omar puesta.
+--
+-- Por qué pasaba: el firmante devolvía la fila tal cual cuando las tres columnas
+-- del sello no cambiaban, sin mirar `organization_id` ni `business_id`; el hash
+-- de la 0015 cubre el texto y no el lugar; y la `approver_update` de la 0031 es
+-- `USING (true)` y mira sólo la organización NUEVA.
+--
+--   a. el ataque medido: eva muda k = 11 a su organización: 45006;
+--   b. eva, lo mismo, FIRMANDO COMO ELLA: 45006. Es la razón de rechazar en vez
+--      de tratar la mudanza como un sello nuevo: con la re-firma, la firma pasa
+--      el 45005, la 0031 mira la organización de destino —donde eva aprueba— y
+--      k = 11 salía de X igual, firmado por eva;
+--   c. marta, manager en X y (por la preparación) en Y, muda k = 29 a Y: 45006;
+--   d. marta muda k = 29 a otro negocio de X: 45006. El sello es de un texto EN
+--      un negocio: es la ficha de ese negocio donde se publica;
+--   e. `service_role` muda k = 29 a otro negocio de X: 45006. La regla alcanza al
+--      servidor, que para todo lo demás de la 0033 está exento (ver el
+--      encabezado);
+--   f. `postgres`, lo mismo: 45006;
+--   g. eva muda k = 11 a su organización SOLTANDO EL SELLO en la misma
+--      sentencia: 23503 de `publications_asset_fkey`. La regla de la 0033 no
+--      corre —sin sello no hay nada que mudar— y la FK de la 0016 no deja soltar
+--      un sello que cita una publicación: lo publicado no sale de X ni así;
+--   h. la contraprueba: marta muda el BORRADOR k = 10 a otro negocio de X: 1
+--      fila. La regla es del sello, no del tenant de cualquier fila: un borrador
+--      se mueve bajo la 0031, como se edita o se borra.
+CREATE TEMP TABLE s33_muda AS
+SELECT 'c4100000-0033-4033-8033-000000000001'::uuid AS negocio_eva,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = pg_temp.h41_id(0, 3) AND role = 'owner') AS org_eva;
+
+CREATE OR REPLACE FUNCTION pg_temp.s33_negocio_eva() RETURNS text
+LANGUAGE sql AS $$
+    SELECT format('INSERT INTO public.businesses (id, organization_id, name) VALUES (%L, %L, ''Negocio de eva 0033'')',
+                  negocio_eva, org_eva)
+      FROM s33_muda;
+$$;
+
+INSERT INTO s33 VALUES
+    (227, 'a', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET organization_id = %L, business_id = %L WHERE id = %L',
+         (SELECT org_eva FROM s33_muda), (SELECT negocio_eva FROM s33_muda), pg_temp.h41_id(1, 11))),
+         pg_temp.s33_negocio_eva()))),
+    (227, 'b', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET organization_id = %L, business_id = %L, approved_by = %L WHERE id = %L',
+         (SELECT org_eva FROM s33_muda), (SELECT negocio_eva FROM s33_muda), pg_temp.h41_id(0, 3),
+         pg_temp.h41_id(1, 11))),
+         pg_temp.s33_negocio_eva()))),
+    (227, 'c', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET organization_id = %L, business_id = %L WHERE id = %L',
+         (SELECT y FROM h41), pg_temp.h41_id(2, 2), pg_temp.h41_id(1, 29))),
+         format('INSERT INTO public.org_members (organization_id, user_id, role, state) '
+                'VALUES (%L, %L, ''manager'', ''active'')', (SELECT y FROM h41), pg_temp.h41_id(0, 2))))),
+    (227, 'd', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET business_id = %L WHERE id = %L',
+         pg_temp.h41_id(1, 1), pg_temp.h41_id(1, 29)))))),
+    (227, 'e', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(NULL, pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET business_id = %L WHERE id = %L',
+         pg_temp.h41_id(1, 1), pg_temp.h41_id(1, 29))),
+         NULL, 'service_role'))),
+    (227, 'f', 'ERR 45006 muda',
+     pg_temp.s33_nombres(pg_temp.s33_como(NULL, pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET business_id = %L WHERE id = %L',
+         pg_temp.h41_id(1, 1), pg_temp.h41_id(1, 29))),
+         NULL, 'postgres'))),
+    (227, 'g', 'ERR 23503 ledger',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 3), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET organization_id = %L, business_id = %L, status = ''draft'', '
+         'approved_hash = NULL, approved_by = NULL, approved_at = NULL WHERE id = %L',
+         (SELECT org_eva FROM s33_muda), (SELECT negocio_eva FROM s33_muda), pg_temp.h41_id(1, 11))),
+         pg_temp.s33_negocio_eva()))),
+    (227, 'h', 'n=1',
+     pg_temp.s33_nombres(pg_temp.s33_como(pg_temp.h41_id(0, 2), pg_temp.s33_leida(format(
+         'UPDATE public.content_assets SET business_id = %L WHERE id = %L',
+         pg_temp.h41_id(1, 1), pg_temp.h41_id(1, 10))))));
+
+INSERT INTO defect_report
+SELECT 227, 'un asset sellado se muda de organización o de negocio con la firma de otro puesta',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 8,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 8
+            THEN 'eva (editor en X, owner de la suya) no muda a su organización el sellado con publicación, ' ||
+                 'ni firmando como ella; marta no muda el sellado de omar a Y ni a otro negocio de X; ' ||
+                 'service_role y postgres tampoco (45006 x6); soltando el sello, lo publicado no sale de X ' ||
+                 '(23503 de la FK del ledger); un borrador sí se mueve de negocio (1 fila)'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s33 WHERE bloque = 227;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and sixty-seven checks were written, so a hundred
--- and sixty-seven rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and sixty-eight checks were written, so a hundred
+-- and sixty-eight rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
@@ -8946,7 +9112,7 @@ SELECT 226, 'una tabla con approved_by que una sesión escribe no tiene firmante
 -- todavía estaban en PRs abiertos, para que los tres frentes no chocaran al
 -- mergearse. Los de la 0033 siguen la misma regla desde el 220 —la 0032, la
 -- grilla GEO, numera los suyos desde el 300 en su propio PR—. El conteo de abajo
--- es de FILAS, no el número más alto: 143 + 17 + 7.
+-- es de FILAS, no el número más alto: 143 + 17 + 8.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -8961,8 +9127,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 167 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 167 checks recorded a result.', checks;
+    IF checks <> 168 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 168 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -8973,11 +9139,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 167 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 168 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 167 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 168 checks green: the schema prevents every one of them.';
 END
 $$;
 

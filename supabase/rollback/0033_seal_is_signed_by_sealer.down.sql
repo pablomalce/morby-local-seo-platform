@@ -9,6 +9,12 @@
 -- mandando `approved_by: user.id`, así que lo que escribe la ruta sigue siendo
 -- correcto; la hora vuelve a ser la del servidor de Next y no la de la base.
 --
+-- Y que un sello se mude: un asset sellado vuelve a poder cambiar de
+-- organización o de negocio con la firma vieja puesta —el editor de X que es
+-- owner de la suya se lleva el asset publicado de X, y la publicación de X queda
+-- citando a otro tenant—. Eso es anterior a la 0033 (medido igual sobre `main`),
+-- así que el .down vuelve exactamente a como estaba.
+--
 -- QUÉ NO TOCA
 --
 -- Los datos. Toda firma que se escribió con la 0033 puesta es una fila válida
