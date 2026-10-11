@@ -12,6 +12,13 @@
  * sus organizaciones propias y la pantalla le contestaba que la cuenta no se
  * había borrado.
  *
+ * DESDE LA 0035, TRES ESTADOS Y NO SEIS. Las organizaciones se resuelven en UNA
+ * transacción de la base (`delete_account_organizations`), así que ya no hay
+ * «salió de las ajenas pero no borró las propias»: o pasó todo, o la base lo
+ * deshizo y lo dijo con un código (no se borró nada), o no contestó y no se
+ * sabe (`yaBorrado` en `null`, que no es cero). El único «a medias» que queda
+ * es el login, que GoTrue borra después en su propia transacción.
+ *
  * POR QUÉ ES PURO, Y POR QUÉ VIVE APARTE
  *
  * `account-actions.ts` es un módulo `"use server"`, y uno de esos sólo puede
@@ -35,12 +42,18 @@ export type MotivoDeBaja =
    * No se sabe de quién es la cuenta. No se borró nada.
    */
   | "sin-sesion"
-  /** No se pudo leer qué implica borrarla (sus organizaciones, sus sellos). No se borró nada. */
+  /**
+   * No se pudo establecer qué implica borrarla: no hubo cliente de servidor, o
+   * la base contestó que no puede clasificar sin riesgo —una membresía que no
+   * sabe leer (45009), una que cambió mientras corría (40001, 40P01) o un lock
+   * que no llegó (55P03)—. La base deshizo todo. No se borró nada.
+   */
   | "no-se-pudo-verificar"
   /**
-   * Aprobó contenido en una organización que no es sólo suya. Su firma está en ese
-   * sello, y la base no deja borrar a quien firmó (el CHECK de la 0015 no acepta
-   * un sello sin firmante). No se borró nada.
+   * Aprobó contenido en una organización que no es sólo suya y donde OTRA
+   * persona activa aprueba. Su firma está en ese sello, y la base no deja borrar
+   * a quien firmó (el CHECK de la 0015 no acepta un sello sin firmante). Donde
+   * nadie más aprueba, la 0035 suelta el sello y esto no pasa. No se borró nada.
    */
   | "sello-en-otra-organizacion"
   /**
@@ -49,16 +62,21 @@ export type MotivoDeBaja =
    * organización (0026 decisión 4, 0029 decisión 3). No se borró nada.
    */
   | "firma-en-otra-organizacion"
-  /** No se pudo salir de las organizaciones que no son sólo suyas, por otro motivo. No se borró nada. */
-  | "no-se-pudo-salir"
-  /** Salió de las demás, y las propias no se pudieron borrar. A medias. */
-  | "no-se-pudieron-borrar-las-propias"
-  /** Salió de las demás y las propias se borraron; el acceso no. A medias. */
+  /** La base contestó otro error al borrar o dejar sus organizaciones, y deshizo todo. No se borró nada. */
+  | "no-se-pudieron-borrar-las-organizaciones"
+  /**
+   * La base no contestó, o contestó algo que no se puede leer: la transacción
+   * pudo confirmarse o no. No se sabe qué ya no está; el login sigue.
+   */
+  | "no-se-sabe-que-se-borro"
+  /** Sus organizaciones ya quedaron resueltas; el acceso no se borró. A medias. */
   | "no-se-pudo-borrar-el-acceso";
 
 /**
- * Lo que ya no está cuando la cadena se corta. `null` es «pasó, pero no se sabe
- * cuántas»: no es lo mismo que cero, y la frase no inventa un número.
+ * Lo que ya no está cuando la cadena se corta. `null` en un campo es «pasó, pero
+ * no se sabe cuántas»: no es lo mismo que cero, y la frase no inventa un número.
+ * `null` en vez del objeto entero es otra cosa: no se sabe SI pasó (ver
+ * `no-se-sabe-que-se-borro`).
  */
 export interface YaBorrado {
   /**
@@ -69,9 +87,14 @@ export interface YaBorrado {
   ajenas: number | null;
   /** Organizaciones sólo suyas (owner activa, sin otro owner activo), ya borradas con todo. */
   propias: number | null;
+  /**
+   * Sellos suyos que volvieron a borrador en organizaciones donde nadie más
+   * aprueba (0035): nadie podía re-firmarlos.
+   */
+  sellos: number | null;
 }
 
-export const NADA_BORRADO: YaBorrado = Object.freeze({ ajenas: 0, propias: 0 });
+export const NADA_BORRADO: YaBorrado = Object.freeze({ ajenas: 0, propias: 0, sellos: 0 });
 
 const CABECERA: Record<MotivoDeBaja, string> = {
   "sin-sesion": "Your account was not deleted: we could not confirm that you are signed in.",
@@ -81,10 +104,10 @@ const CABECERA: Record<MotivoDeBaja, string> = {
     "Your account was not deleted: you approved content in an organization that is not only yours, and that approval is signed with your name.",
   "firma-en-otra-organizacion":
     "Your account was not deleted: you published a company profile version, verified evidence or approved a task in an organization that is not only yours, and that record is signed with your name.",
-  "no-se-pudo-salir":
-    "Your account was not deleted: we could not remove you from the organizations that are not only yours.",
-  "no-se-pudieron-borrar-las-propias":
-    "Your account was not fully deleted: we could not delete the organizations that are only yours.",
+  "no-se-pudieron-borrar-las-organizaciones":
+    "Your account was not deleted: we could not delete the organizations that are only yours or remove you from the others.",
+  "no-se-sabe-que-se-borro":
+    "Your account was not deleted: we could not confirm whether your organizations were deleted.",
   "no-se-pudo-borrar-el-acceso": "Your account was not fully deleted: we could not delete your login.",
 };
 
@@ -95,8 +118,8 @@ const QUE_HACER: Record<MotivoDeBaja, string> = {
     "Ask that organization to re-approve that content under another name or return it to draft, then try again.",
   "firma-en-otra-organizacion":
     "That organization has to decide first what happens with that record; then try again.",
-  "no-se-pudo-salir": "Try again in a moment.",
-  "no-se-pudieron-borrar-las-propias": "Try again: the deletion resumes where it stopped.",
+  "no-se-pudieron-borrar-las-organizaciones": "Try again in a moment.",
+  "no-se-sabe-que-se-borro": "Try again: the deletion resumes where it stopped.",
   "no-se-pudo-borrar-el-acceso": "Try again: the deletion resumes where it stopped.",
 };
 
@@ -106,7 +129,12 @@ function cuantas(n: number | null, una: string, varias: string): string {
 }
 
 /** Qué ya no está, en una frase. Lo decide el estado, no el motivo. */
-export function loQueYaNoEsta(ya: YaBorrado): string {
+export function loQueYaNoEsta(ya: YaBorrado | null): string {
+  // No se sabe SI pasó: ni «nothing» ni un número. Lo único seguro es que el
+  // login no se tocó, porque se borra después.
+  if (ya === null) {
+    return "We cannot tell whether they are already gone; your login is still there.";
+  }
   const partes: string[] = [];
   if (ya.ajenas !== 0) {
     partes.push(
@@ -120,12 +148,17 @@ export function loQueYaNoEsta(ya: YaBorrado): string {
         : `${cuantas(ya.propias, "organization that was only yours", "organizations that were only yours")} ${ya.propias === 1 ? "was" : "were"} deleted with everything in ${ya.propias === 1 ? "it" : "them"}`,
     );
   }
+  if (ya.sellos !== 0) {
+    partes.push(
+      `${cuantas(ya.sellos, "approval of yours", "approvals of yours")} ${ya.sellos === 1 ? "was" : "were"} withdrawn, back to draft, where no one else could approve`,
+    );
+  }
   if (partes.length === 0) return "Nothing was deleted.";
   return `Already done: ${partes.join("; ")}. Your login is still there.`;
 }
 
 /** La frase entera que ve la persona: por qué, qué ya no está, qué hacer. */
-export function explicarBaja(motivo: MotivoDeBaja, ya: YaBorrado): string {
+export function explicarBaja(motivo: MotivoDeBaja, ya: YaBorrado | null): string {
   return `${CABECERA[motivo]} ${loQueYaNoEsta(ya)} ${QUE_HACER[motivo]}`;
 }
 
