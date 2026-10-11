@@ -5,12 +5,13 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
 import {
   accesoDeLasIA,
+  AGENTES_IA,
   erroresDeSchema,
   textoSinJavaScript,
   tiposDeSchema,
 } from "@/lib/aeo/lectura";
 import { statusPorAgente } from "@/lib/aeo/peticion";
-import { hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { esLegiblePorIA, hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
 import { medirRenderizado } from "@/lib/aeo/renderizado";
 import { crearRedExaminada, MOTIVOS_DE_BLOQUEO, traerExaminado, type RedExaminada } from "@/lib/aeo/red";
@@ -55,7 +56,11 @@ export const maxDuration = 60;
  *
  * Si el `robots.txt` no se pudo traer, eso NO es «permite a todos»: es que no se
  * sabe. Se informa con su motivo, como `integration_probe`, en vez de rellenarlo
- * con un optimismo que después alguien lee como un hecho.
+ * con un optimismo que después alguien lee como un hecho. RFC 9309 separa los
+ * dos casos y acá se separan igual: un 4xx es «no hay robots» y deja entrar a
+ * todos; un 5xx, un timeout o una red que no contesta dejan el acceso SIN
+ * MEDIR, y así sale —`no-medido`, nunca verde—. Lo mismo un agente cuyo pedido
+ * no volvió.
  */
 
 const schema = z.object({ businessId: z.string().uuid() });
@@ -70,15 +75,27 @@ const AGENTE = "VulkanGrowthOS/1.0 (auditoria AEO)";
 
 type Traido =
   | { ok: true; texto: string; /** La URL del último salto. */ url: string }
-  | { ok: false; motivo: string; bloqueado: boolean };
+  | { ok: false; motivo: string; bloqueado: boolean; /** El status, si hubo respuesta. */ status: number | null };
 
 async function traer(red: RedExaminada, url: string): Promise<Traido> {
   const t = await traerExaminado(red, url, { userAgent: AGENTE, timeoutMs: TIMEOUT_MS, maxBytes: MAX_BYTES });
-  if (!t.ok) return { ok: false, motivo: t.motivo, bloqueado: MOTIVOS_DE_BLOQUEO.has(t.motivo) };
+  if (!t.ok) return { ok: false, motivo: t.motivo, bloqueado: MOTIVOS_DE_BLOQUEO.has(t.motivo), status: null };
   // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
   // significa que el archivo no está, que es exactamente lo que se pregunta.
-  if (t.status < 200 || t.status >= 300) return { ok: false, motivo: `http ${t.status}`, bloqueado: false };
+  if (t.status < 200 || t.status >= 300) {
+    return { ok: false, motivo: `http ${t.status}`, bloqueado: false, status: t.status };
+  }
   return { ok: true, texto: t.cuerpo.toString("utf8"), url: t.url };
+}
+
+/**
+ * Qué dice el robots, según RFC 9309: 2xx se lee; 4xx es «no está» y deja
+ * entrar a todos; todo lo demás —5xx, timeout, red, una redirección que no se
+ * pudo seguir— no dice nada, y el acceso por robots queda sin medir.
+ */
+function estadoDelRobots(robots: Traido): "leido" | "ausente" | "no-medido" {
+  if (robots.ok) return "leido";
+  return robots.status !== null && robots.status >= 400 && robots.status < 500 ? "ausente" : "no-medido";
 }
 
 export async function POST(req: Request) {
@@ -171,13 +188,19 @@ export async function POST(req: Request) {
       medirRenderizado(base.toString(), deps),
     ]);
 
-    // Un `robots.txt` que no se pudo traer se trata como AUSENTE, que es lo que
-    // el estándar dice: sin robots, se permite. Y se informa que no se leyó, para
-    // que nadie confunda «permite» con «no se pudo mirar».
-    const textoRobots = robots.ok ? robots.texto : "";
+    // Un `robots.txt` que NO ESTÁ (4xx) se lee como vacío, que es lo que el
+    // estándar dice: sin robots, se permite. Uno que no se pudo traer deja el
+    // acceso en `null` por agente —«no se sabe»—, y el hallazgo lo dice como
+    // no medido. Antes los dos se leían «permite a todos» (P3).
+    const estadoRobots = estadoDelRobots(robots);
+    const acceso =
+      estadoRobots === "no-medido"
+        ? (Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as LecturaDelSitio["acceso"])
+        : accesoDeLasIA(robots.ok ? robots.texto : "", rutaFinal);
 
     const lectura: LecturaDelSitio = {
-      acceso: accesoDeLasIA(textoRobots, rutaFinal),
+      acceso,
+      ...(estadoRobots === "no-medido" && !robots.ok ? { robotsNoMedido: robots.motivo } : {}),
       statusPorAgente: statusAgentes,
       caracteresSinJs: textoSinJavaScript(portada.texto),
       caracteresRenderizados,
@@ -207,16 +230,21 @@ export async function POST(req: Request) {
       llms_txt: llms.ok,
     });
 
+    const lista = hallazgos(lectura);
     return NextResponse.json(
       {
         ok: true,
         url: base.toString(),
         urlFinal: final.toString(),
         robotsLeido: robots.ok,
+        estadoRobots,
         motivoRobots: robots.ok ? null : robots.motivo,
         guardada: !errorGuardado,
         lectura,
-        hallazgos: hallazgos(lectura),
+        hallazgos: lista,
+        // `true` sólo sin bloqueantes Y con todo medido; `null` es «no se
+        // sabe». La pantalla dice «sin hallazgos» sólo con `true`.
+        legible: esLegiblePorIA(lista),
       },
       { status: 200 }
     );

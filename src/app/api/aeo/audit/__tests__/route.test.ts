@@ -27,8 +27,11 @@ let negocio: { id: string; organization_id: string; website: string | null } | n
 let errorLectura: { message: string } | null = null;
 /** Los archivos que la ruta pidió con su propio user-agent: robots, portada, llms. */
 let pedidos: string[] = [];
-/** Qué contesta cada URL a la ruta. `null` = 404. Un objeto, una redirección. */
-let respuestas: Record<string, string | null | { status: number; location: string }> = {};
+/** Qué contesta cada URL a la ruta. `null` = 404. Un objeto, un status (con o sin redirección) o un error de red. */
+let respuestas: Record<
+  string,
+  string | null | { status: number; location?: string } | { error: "timeout" | "sin-respuesta" }
+> = {};
 /**
  * TODO pedido que salió por el transporte, de quien sea —la ruta, los agentes o
  * el navegador—, con la dirección a la que se conectó. Es lo que los casos de
@@ -68,6 +71,8 @@ let porAgente: string[] = [];
 let statusParaAgente: (ua: string) => number = () => 200;
 /** Para un agente, una redirección en vez de un status: `null` = no redirige. */
 let redireccionParaAgente: (ua: string) => string | null = () => null;
+/** Un WAF que deja colgados a los rastreadores: ningún agente recibe respuesta. */
+let agentesSinRespuesta = false;
 
 const AGENTE_DE_LA_RUTA = "VulkanGrowthOS/1.0 (auditoria AEO)";
 
@@ -83,11 +88,15 @@ async function transporte(pedido: PedidoHttp): Promise<RespuestaHttp> {
     pedidos.push(pedido.url);
     const r = respuestas[pedido.url];
     if (r === null || r === undefined) return { tipo: "respuesta", status: 404, encabezados: {}, cuerpo: Buffer.from("") };
-    if (typeof r === "object") return { tipo: "respuesta", status: r.status, encabezados: { location: r.location }, cuerpo: Buffer.from("") };
-    return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(r) };
+    if (typeof r === "string") {
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(r) };
+    }
+    if ("error" in r) return { tipo: "error", motivo: r.error };
+    return { tipo: "respuesta", status: r.status, encabezados: r.location ? { location: r.location } : {}, cuerpo: Buffer.from("") };
   }
   if (ua !== "doble") {
     porAgente.push(ua);
+    if (agentesSinRespuesta) return { tipo: "error", motivo: "timeout" };
     const destino = redireccionParaAgente(ua);
     if (destino) return { tipo: "respuesta", status: 302, encabezados: { location: destino }, cuerpo: Buffer.from("") };
     return { tipo: "respuesta", status: statusParaAgente(ua), encabezados: {}, cuerpo: Buffer.from("") };
@@ -147,6 +156,7 @@ beforeEach(() => {
   porAgente = [];
   statusParaAgente = () => 200;
   redireccionParaAgente = () => null;
+  agentesSinRespuesta = false;
   respuestas = {
     "https://ejemplo.com/robots.txt": "User-agent: *\nDisallow:",
     "https://ejemplo.com/": HTML_SANO,
@@ -482,5 +492,49 @@ describe("P1: el acceso se decide para la URL final, con el robots de su origen"
       expect.arrayContaining(["https://www.ejemplo.com/robots.txt", "https://www.ejemplo.com/llms.txt"])
     );
     expect(pedidos).not.toContain("https://ejemplo.com/robots.txt");
+  });
+});
+
+/**
+ * P3, por la ruta. Reproducido: con los cinco pedidos por agente caídos y el
+ * robots en timeout, la ruta devolvía `hallazgos: []` y la pantalla decía «los
+ * rastreadores entran».
+ */
+describe("P3: lo que no se midió en el acceso sale «no medido», por la ruta", () => {
+  type Cuerpo = {
+    estadoRobots: string;
+    legible: boolean | null;
+    lectura: { acceso: Record<string, boolean | null> };
+    hallazgos: Array<{ gravedad: string; quePasa: string }>;
+  };
+
+  it("el reproducido: agentes sin respuesta y robots en timeout — no medido, y `legible` es null", async () => {
+    agentesSinRespuesta = true;
+    respuestas["https://ejemplo.com/robots.txt"] = { error: "timeout" };
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as Cuerpo;
+    expect(cuerpo.estadoRobots).toBe("no-medido");
+    expect(Object.values(cuerpo.lectura.acceso)).toEqual([null, null, null, null, null]);
+    expect(cuerpo.hallazgos.length).toBeGreaterThan(0);
+    expect(cuerpo.hallazgos.every((h) => h.gravedad === "no-medido")).toBe(true);
+    expect(cuerpo.hallazgos.some((h) => h.quePasa.includes("timeout"))).toBe(true);
+    expect(cuerpo.legible).toBeNull();
+  });
+
+  it("un robots con 5xx es «no medido», no «permite»", async () => {
+    respuestas["https://ejemplo.com/robots.txt"] = { status: 503 };
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as Cuerpo;
+    expect(cuerpo.estadoRobots).toBe("no-medido");
+    expect(cuerpo.hallazgos.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(cuerpo.hallazgos[0].quePasa).toContain("http 503");
+    expect(cuerpo.legible).toBeNull();
+  });
+
+  it("un robots con 404 SÍ es una respuesta: «no hay robots», deja entrar a todos, y el sitio sano queda verde", async () => {
+    respuestas["https://ejemplo.com/robots.txt"] = null;
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as Cuerpo;
+    expect(cuerpo.estadoRobots).toBe("ausente");
+    expect(Object.values(cuerpo.lectura.acceso).every((v) => v === true)).toBe(true);
+    expect(cuerpo.hallazgos).toEqual([]);
+    expect(cuerpo.legible).toBe(true);
   });
 });

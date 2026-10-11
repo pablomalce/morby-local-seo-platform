@@ -22,14 +22,23 @@ import type { ResultadoRenderizado } from "./renderizado";
  */
 
 export interface LecturaDelSitio {
-  /** Lo que `robots.txt` DECLARA por agente. */
-  acceso: Record<AgenteIA, boolean>;
+  /**
+   * Lo que `robots.txt` DECLARA por agente. `null` es «no se sabe»: el robots
+   * no se pudo leer por un timeout, un 5xx o una red que no contestó. No es un
+   * permiso —RFC 9309 dice que ante un 5xx el rastreador asume que NO puede
+   * entrar a nada— ni una prohibición que se pueda afirmar: es no medido. Un
+   * 4xx sí es una respuesta («no hay robots») y vale como permiso.
+   */
+  acceso: Record<AgenteIA, boolean | null>;
+  /** Por qué el robots quedó sin medir, cuando `acceso` trae `null`. */
+  robotsNoMedido?: string;
   /**
    * Lo que el sitio HACE por agente: el código HTTP de una petición real con
    * ese user-agent, o `null` si no contestó. Es la mitad que faltaba: un CDN
    * puede devolver 403 a GPTBot con un `robots.txt` que lo permite, y leer sólo
    * el robots dejaba esa página en verde. Opcional para que las lecturas viejas
-   * sigan valiendo; cuando está, manda sobre `acceso`.
+   * sigan valiendo, y su AUSENCIA —como cada `null`— se lee «no medido», nunca
+   * «entra»: es la misma regla que `caracteresRenderizados`.
    */
   statusPorAgente?: Record<AgenteIA, number | null>;
   /** Caracteres de texto del HTML SERVIDO, sin ejecutar JavaScript. */
@@ -78,10 +87,10 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
   // petición real con su user-agent. La segunda condición es la que la puerta
   // H2-GO-1 exige, y la que ninguna lista escrita a mano puede satisfacer.
   const bloqueados = AGENTES_IA.filter(
-    (a) => !lectura.acceso[a] || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+    (a) => lectura.acceso[a] === false || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
   );
   const bloqueadosSoloPorHttp = AGENTES_IA.filter(
-    (a) => lectura.acceso[a] && bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+    (a) => lectura.acceso[a] === true && bloqueadoPorHttp(lectura.statusPorAgente?.[a])
   );
   if (bloqueadosSoloPorHttp.length > 0) {
     salida.push({
@@ -108,6 +117,38 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
       queHacer:
         "Bloquear a algunos y no a otros suele ser un descuido heredado de una plantilla, no una decisión. Si es deliberado, conviene que esté escrito.",
       donde: "robots.txt",
+    });
+  }
+
+  // Lo que NO se midió, de los que no están ya bloqueados: un agente
+  // bloqueado no necesita la otra mitad para saberse rojo. Antes, un `null`
+  // —el servidor no contestó a ese user-agent— se leía como «entra», y un
+  // robots que dio timeout como «permite a todos»: con los cinco pedidos
+  // caídos y el robots sin leer, la ruta devolvía cero hallazgos y la
+  // pantalla decía «los rastreadores entran» (P3).
+  const sinHttp = AGENTES_IA.filter(
+    (a) => !bloqueados.includes(a) && (lectura.statusPorAgente?.[a] ?? null) === null
+  );
+  if (sinHttp.length > 0) {
+    salida.push({
+      gravedad: "no-medido",
+      quePasa:
+        lectura.statusPorAgente === undefined
+          ? "La lectura no trae la petición con el user-agent de cada rastreador: no se sabe cómo los trata el servidor."
+          : `El sitio no le contestó a ${sinHttp.join(", ")} cuando llegó con su user-agent (timeout, red, o una redirección que no se pudo seguir): no se sabe si entra.`,
+      queHacer:
+        "Volver a correr la auditoría. Esto NO es un verde: un WAF que corta o deja colgados a los rastreadores se ve exactamente así, y no se puede distinguir de un fallo de red pasajero sin otra medición.",
+      donde: "la auditoría, no el sitio",
+    });
+  }
+  const sinRobots = AGENTES_IA.filter((a) => !bloqueados.includes(a) && lectura.acceso[a] === null);
+  if (sinRobots.length > 0) {
+    salida.push({
+      gravedad: "no-medido",
+      quePasa: `No se pudo leer el robots.txt${lectura.robotsNoMedido ? ` (${lectura.robotsNoMedido})` : ""}: no se sabe qué les declara a ${sinRobots.join(", ")}.`,
+      queHacer:
+        "Volver a correr la auditoría. Si el robots.txt contesta 5xx de forma persistente, los rastreadores asumen que no pueden entrar a NADA (RFC 9309): ahí sí sería un bloqueo.",
+      donde: "la auditoría, y el servidor si el 5xx se repite",
     });
   }
 

@@ -39,8 +39,16 @@ const ETIQUETA: Record<Gravedad, string> = {
 interface Resultado {
   url: string;
   robotsLeido: boolean;
+  /** RFC 9309: leído, «no hay» (4xx, deja entrar a todos) o sin medir (5xx, timeout, red). */
+  estadoRobots?: "leido" | "ausente" | "no-medido";
   motivoRobots: string | null;
   hallazgos: Hallazgo[];
+  /**
+   * `true` sólo sin bloqueantes y con los tres ejes medidos; `null` es «no se
+   * sabe». Es lo único que habilita la frase de «sin hallazgos» (P3): una
+   * lista vacía sola no la habilita.
+   */
+  legible?: boolean | null;
   /** Opcional: una respuesta sin lectura no rompe la pantalla, y no muestra números. */
   lectura?: {
     caracteresSinJs: number;
@@ -162,18 +170,29 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
 
           {resultado.lectura && <TextoComparado lectura={resultado.lectura} />}
 
-          {!resultado.robotsLeido && (
-            <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido">
-              No se pudo leer el <code>robots.txt</code> ({resultado.motivoRobots}). El acceso de
-              abajo se calculó como si no hubiera reglas — que es lo que el estándar dice, pero no
-              es lo mismo que haberlo comprobado.
-            </p>
-          )}
+          {!resultado.robotsLeido &&
+            (resultado.estadoRobots === "ausente" ? (
+              <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido" data-estado="ausente">
+                No hay <code>robots.txt</code> ({resultado.motivoRobots}). Según el estándar, eso deja
+                entrar a todos los rastreadores, y así se calculó el acceso.
+              </p>
+            ) : (
+              <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido" data-estado="no-medido">
+                No se pudo leer el <code>robots.txt</code> ({resultado.motivoRobots}). El acceso por
+                robots quedó SIN MEDIR: no es «permite», y un 5xx que se repite hace que los
+                rastreadores asuman que no pueden entrar a nada.
+              </p>
+            ))}
 
-          {resultado.hallazgos.length === 0 ? (
+          {resultado.hallazgos.length === 0 && resultado.legible === true ? (
             <p className="mt-3 text-[13px] text-metal-300" data-testid="sin-hallazgos">
               Los rastreadores entran, el contenido existe sin JavaScript y el schema que importa
               está declarado.
+            </p>
+          ) : resultado.hallazgos.length === 0 ? (
+            <p className="mt-3 text-[13px] text-metal-400" data-testid="sin-veredicto">
+              La auditoría no trae un veredicto: sin hallazgos y sin la confirmación de que los tres
+              ejes se midieron, no se puede decir que el sitio esté bien.
             </p>
           ) : (
             <div className="mt-3 space-y-2">

@@ -19,7 +19,7 @@ let llamadas: { url: string; body: unknown }[] = [];
 let respuesta: { ok: boolean; status: number; cuerpo: unknown } = {
   ok: true,
   status: 200,
-  cuerpo: { ok: true, url: "https://ejemplo.com/", robotsLeido: true, motivoRobots: null, hallazgos: [] },
+  cuerpo: { ok: true, url: "https://ejemplo.com/", robotsLeido: true, motivoRobots: null, hallazgos: [], legible: true },
 };
 
 beforeEach(() => {
@@ -36,7 +36,7 @@ afterEach(() => {
   respuesta = {
     ok: true,
     status: 200,
-    cuerpo: { ok: true, url: "https://ejemplo.com/", robotsLeido: true, motivoRobots: null, hallazgos: [] },
+    cuerpo: { ok: true, url: "https://ejemplo.com/", robotsLeido: true, motivoRobots: null, hallazgos: [], legible: true },
   };
 });
 
@@ -176,7 +176,7 @@ describe("la auditoría desde la pantalla", () => {
     expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
   });
 
-  it("avisa cuando el robots.txt no se pudo leer, aunque la auditoría salga bien", async () => {
+  it("avisa cuando el robots.txt no se pudo leer: SIN MEDIR, no «permite»", async () => {
     // «Permite» y «no se pudo comprobar» no son lo mismo, y la pantalla lo dice.
     respuesta = {
       ok: true,
@@ -185,12 +185,50 @@ describe("la auditoría desde la pantalla", () => {
         ok: true,
         url: "https://ejemplo.com/",
         robotsLeido: false,
+        estadoRobots: "no-medido",
         motivoRobots: "timeout",
-        hallazgos: [],
+        hallazgos: [{ gravedad: "no-medido", quePasa: "No se pudo leer el robots.txt (timeout).", queHacer: "Volver a correr.", donde: "la auditoría" }],
+        legible: null,
       },
     };
     render(<AuditoriaAeo businessId={NEGOCIO} />);
     fireEvent.click(screen.getByTestId("auditar"));
     await waitFor(() => expect(screen.getByTestId("robots-no-leido")).toBeTruthy());
+    expect(screen.getByTestId("robots-no-leido").textContent).toMatch(/SIN MEDIR/);
+    expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
+  });
+
+  it("un robots que NO EXISTE (404) dice que deja entrar a todos, que es lo que el estándar dice", async () => {
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: false,
+        estadoRobots: "ausente",
+        motivoRobots: "http 404",
+        hallazgos: [],
+        legible: true,
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("robots-no-leido").dataset.estado).toBe("ausente"));
+    expect(screen.getByTestId("sin-hallazgos")).toBeTruthy();
+  });
+
+  it("P3: cero hallazgos SIN `legible: true` no dice «los rastreadores entran»", async () => {
+    // La frase verde la habilita la ruta diciendo que todo se midió, no una
+    // lista vacía: una respuesta que no lo confirma no es un sitio sano.
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: { ok: true, url: "https://ejemplo.com/", robotsLeido: true, motivoRobots: null, hallazgos: [], legible: null },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("sin-veredicto")).toBeTruthy());
+    expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
   });
 });

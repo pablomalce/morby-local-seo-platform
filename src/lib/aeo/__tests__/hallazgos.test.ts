@@ -23,8 +23,13 @@ const TODOS_ENTRAN = Object.fromEntries(AGENTES_IA.map((a) => [a, true])) as Lec
  * una lectura sin el número renderizado es «no medido» en el punto del texto
  * (ver `contenidoSinJs`), y un sitio sano no puede serlo por no haber mirado.
  */
+const TODOS_200 = Object.fromEntries(AGENTES_IA.map((a) => [a, 200])) as NonNullable<LecturaDelSitio["statusPorAgente"]>;
+
 const SANO: LecturaDelSitio = {
   acceso: TODOS_ENTRAN,
+  // Y lo mismo con el acceso: «sin problemas» es que cada agente recibió una
+  // respuesta, no que nadie preguntó (P3).
+  statusPorAgente: TODOS_200,
   caracteresSinJs: 4000,
   caracteresRenderizados: { estado: "medido", caracteres: 4000 },
   schema: ["Organization", "LocalBusiness", "FAQPage"],
@@ -106,6 +111,77 @@ describe("qué encuentra la auditoría", () => {
       expect(h.donde.length, h.quePasa).toBeGreaterThan(0);
       expect(h.queHacer.length, h.quePasa).toBeGreaterThan(0);
     }
+  });
+});
+
+/**
+ * P3. «No medido» en el eje de ACCESO. El render ya decía «no medido» cuando
+ * fallaba; el acceso no: un agente cuyo pedido no volvió (`null`) se leía como
+ * «entra», y un robots que dio timeout como «permite a todos». Con los cinco
+ * pedidos caídos —un WAF que corta a los bots se ve así— y el robots sin leer,
+ * la ruta devolvía cero hallazgos y `esLegiblePorIA` daba `true`.
+ */
+describe("P3: en el eje de acceso, lo que no se midió no es un verde", () => {
+  const SIN_RESPUESTA = Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as NonNullable<
+    LecturaDelSitio["statusPorAgente"]
+  >;
+  const ROBOTS_SIN_LEER = Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as LecturaDelSitio["acceso"];
+
+  it("los cinco agentes sin respuesta: un hallazgo «no medido» que los nombra, y la respuesta es «no se sabe»", () => {
+    const lista = hallazgos({ ...SANO, statusPorAgente: SIN_RESPUESTA });
+    expect(lista.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    for (const a of AGENTES_IA) expect(lista[0].quePasa).toContain(a);
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("UN agente sin respuesta alcanza: no es «entra», y nombra sólo a ése", () => {
+    const lista = hallazgos({ ...SANO, statusPorAgente: { ...TODOS_200, perplexitybot: null } });
+    expect(lista.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(lista[0].quePasa).toContain("perplexitybot");
+    expect(lista[0].quePasa).not.toContain("gptbot");
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("una lectura VIEJA, sin los pedidos por agente, es «no medido» igual que el render", () => {
+    const vieja: LecturaDelSitio = { ...SANO };
+    delete vieja.statusPorAgente;
+    const lista = hallazgos(vieja);
+    expect(lista.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("un robots que no se pudo leer (timeout, 5xx) es «no medido», con el motivo, y cita la RFC 9309", () => {
+    const lista = hallazgos({ ...SANO, acceso: ROBOTS_SIN_LEER, robotsNoMedido: "http 503" });
+    expect(lista.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(lista[0].quePasa).toContain("http 503");
+    expect(lista[0].queHacer).toMatch(/RFC 9309/);
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("el reproducido: robots sin leer Y los cinco sin respuesta — nunca cero hallazgos", () => {
+    const lista = hallazgos({ ...SANO, acceso: ROBOTS_SIN_LEER, robotsNoMedido: "timeout", statusPorAgente: SIN_RESPUESTA });
+    expect(lista.length).toBe(2);
+    expect(lista.every((h) => h.gravedad === "no-medido")).toBe(true);
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("un 403 manda aunque el robots no se haya leído: eso sí se sabe, y es bloqueante", () => {
+    const lista = hallazgos({ ...SANO, acceso: ROBOTS_SIN_LEER, statusPorAgente: { ...TODOS_200, gptbot: 403 } });
+    const bloqueante = lista.find((h) => h.gravedad === "bloqueante");
+    expect(bloqueante?.quePasa).toMatch(/Bloqueados: gptbot/);
+    // Y el no medido del robots no lo vuelve a nombrar: ya está bloqueado.
+    const noMedido = lista.find((h) => h.gravedad === "no-medido");
+    expect(noMedido?.quePasa).not.toContain("gptbot");
+    expect(esLegiblePorIA(lista)).toBe(false);
+  });
+
+  it("un agente bloqueado por el robots no pide además un «no medido» por su pedido caído", () => {
+    const lista = hallazgos({
+      ...SANO,
+      acceso: { ...TODOS_ENTRAN, claudebot: false },
+      statusPorAgente: { ...TODOS_200, claudebot: null },
+    });
+    expect(lista.map((h) => h.gravedad)).toEqual(["bloqueante"]);
   });
 });
 
