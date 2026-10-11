@@ -1,52 +1,89 @@
 /**
  * QUÉ IMPIDE ESTE ARCHIVO — LA PARED DEL TOKEN DE LA AGENCIA
  *
- * Que una ruta de DATOS llegue a la organización de la agencia por un costado.
+ * Que un módulo de DATOS llegue a la credencial de la agencia por un costado.
  *
  * El token de Google es uno, el de la organización que nombra
  * `VULKAN_AGENCY_ORG_ID`, y sirve a todos los clientes. La regla que decide a
  * quién se le presta vive en UN lugar, `servicioCompartido.ts`: sólo a una
  * organización con mapeo vivo, sólo sobre sus properties. Esa regla no vale nada
- * si al lado existe otro camino al token o a la variable — y el defecto que la
- * Espina nombra, «el fallback silencioso al token de la agencia», es justamente
- * ese otro camino: un `?? process.env.VULKAN_AGENCY_ORG_ID`, un
- * `agencyAccessToken()` llamado directo, un mapeo leído de la organización de la
- * agencia cuando el cliente no tiene. Cada uno es una línea, y ninguno rompe un
+ * si al lado existe otro camino a la credencial — y el defecto que la Espina
+ * nombra, «el fallback silencioso al token de la agencia», es justamente ese otro
+ * camino: un `?? process.env.VULKAN_AGENCY_ORG_ID`, un `agencyAccessToken()`
+ * llamado directo, un `integration_token_secret` pedido con `service_role` para
+ * «la organización que tenga token». Cada uno es una línea, y ninguno rompe un
  * test que mire el camino feliz.
  *
- * LO QUE MIDE, Y CÓMO
+ * LA CREDENCIAL SON DOS COSAS, Y LA PARED MIRA LAS DOS
  *
- * 1. QUIÉN LEE LA VARIABLE. Por AST, no por texto: un acceso
- *    `x.VULKAN_AGENCY_ORG_ID`, `x["VULKAN_AGENCY_ORG_ID"]`, un destructuring de
- *    ese nombre, o `x[CONST]` con una constante que vale ese literal (local o
- *    importada). Los mensajes de error y los comentarios que la NOMBRAN no son
- *    lecturas, y un `grep` no los distingue (R14). Tiene que ser exactamente un
- *    archivo, `agency.ts`. Y las tres properties de la agencia que
- *    `.env.example` declara (`GA4_PROPERTY_ID`,
- *    `GOOGLE_SEARCH_CONSOLE_SITE_URL`, `GOOGLE_BUSINESS_LOCATION_ID`) no las
- *    lee ninguno: son el valor por defecto de cualquier fallback.
+ *   1. LA VARIABLE. Quién lee `VULKAN_AGENCY_ORG_ID`: exactamente `agency.ts`. Y
+ *      las tres properties de la agencia que `.env.example` todavía declara
+ *      (`GA4_PROPERTY_ID`, `GOOGLE_SEARCH_CONSOLE_SITE_URL`,
+ *      `GOOGLE_BUSINESS_LOCATION_ID`), nadie: son el valor por defecto de
+ *      cualquier fallback.
+ *   2. LA CUSTODIA. Quién nombra las RPC de la `0021`
+ *      (`integration_token_secret`, `refresh_integration_token`,
+ *      `store_integration_token`), la tabla `integration_tokens` y la vista del
+ *      Vault: exactamente `tokenStore.ts` y `agencyToken.ts`, cada uno lo suyo.
+ *      Medido el 2026-10-11 en la revisión del #118: un `secretoDeQuienTengaToken()`
+ *      escrito en `orchestrator.ts` —«usá el token que haya», el fallback en su
+ *      forma más pura— leía el secreto con `service_role` sin nombrar la variable
+ *      ni importar nada de la agencia, y la suite entera seguía en verde.
  *
- * 2. QUÉ ENTRADAS LLEGAN A ESA LECTURA. El inventario de entradas se lee del
- *    disco —todo `route.ts`, `page.tsx` y `layout.tsx` bajo `src/app`, todo
- *    módulo con la directiva `"use server"`, y el middleware—, nunca de una
- *    lista. El grafo es el de los imports de VALOR: un `import type` se borra al
- *    compilar y no ejecuta nada, así que no es un camino.
+ * QUIÉN ESTÁ SUJETO: TODOS LOS MÓDULOS, NO UNA LISTA DE CONVENCIONES
  *
- * 3. LA PARED: con `servicioCompartido.ts` sacado del grafo, NINGUNA entrada de
- *    datos llega a `agency.ts`. Las únicas que pueden llegar directo son las de
- *    CONEXIÓN, declaradas abajo con su razón — y cada una tiene que seguir
- *    llegando, o la exención está vencida y esconde la próxima.
+ * La versión anterior descubría las «entradas» con `route|page|layout`, que es
+ * una lista escrita a mano de las convenciones de Next. Medido en la misma
+ * revisión: un `template.tsx` que llamaba `agencyAccessToken()` pasaba la pared,
+ * y el mismo código como `page.tsx` no. Next ejecuta en el servidor `template`,
+ * `default`, `not-found`, `sitemap`, `opengraph-image`, `instrumentation.ts`, y
+ * la lista no se termina nunca. Ahora no hay lista: CADA módulo de producción
+ * —también los `.js`, que `allowJs: true` deja compilar— que llegue a la
+ * credencial sin pasar por la puerta es una fuga, salvo que esté exento abajo
+ * con su razón. Un módulo de datos que importe una exención no hereda la
+ * exención: llega a la credencial sin la puerta, y es una fuga él.
+ *
+ * Y CÓMO SE MIDE: CON EL COMPILADOR, NO CON LA FORMA DEL TEXTO (R14)
+ *
+ * El análisis es de `tsc` entero, con el verificador de tipos
+ * (`credencialDeLaAgencia.analisis.ts`). Una lectura del entorno se reconoce
+ * porque la clave tiene TIPO literal, no porque se parezca a un literal: así se
+ * ven el `as const`, la constante local y la importada. El mundo es cerrado: una
+ * lectura del entorno cuya clave el compilador no puede enumerar, un
+ * `process.env` que se escapa a algo que no lo tipa como entorno, una llamada de
+ * Supabase con un nombre armado en ejecución, o un `import()` de destino no
+ * literal, son fallas por sí mismas — por ahí pasaría la próxima.
+ *
+ * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
+ *
+ * Un detector ciego da el mismo verde que un árbol limpio. Antes de mirar `src`,
+ * el mismo análisis corre sobre fuentes escritas en memoria que reproducen cada
+ * forma de saltarse la pared que se conoce —las cinco de la revisión del #118
+ * entre ellas—, con controles negativos al lado, y tiene que encontrar
+ * exactamente esas.
  *
  * QUÉ NO DICE
  *
  * No dice que la regla de `servicioCompartido.ts` sea correcta: eso lo miden
- * `servicioCompartido.test.ts` y los dos tests de dos organizaciones (el reporte
- * y la publicación). Dice que no hay otra puerta.
+ * `servicioCompartido.test.ts` y los dos tests de varias organizaciones (el
+ * reporte y la publicación). Dice que no hay otra puerta.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+  type Analisis,
+  analizar,
+  camino,
+  esTest,
+  fuentesEn,
+  hostEnMemoria,
+  juzgar,
+  opcionesDelProyecto,
+  type Politica,
+  type Veredicto,
+} from "./credencialDeLaAgencia.analisis";
 
 const ROOT = process.cwd();
 const SRC = path.join(ROOT, "src");
@@ -57,340 +94,442 @@ const VARIABLE = "VULKAN_AGENCY_ORG_ID";
 /**
  * Las properties de la AGENCIA, en el entorno. `.env.example` todavía las
  * declara y NADA las lee: el mapeo de cada cliente vive en
- * `integration_properties`. Son el valor por defecto que un fallback usaría —
- * «si el cliente no tiene Search Console mapeado, consultá el sitio de la
- * agencia»—, y con el token de la agencia eso sirve los datos de la agencia en
- * el reporte de otro. Que nadie las lea es la garantía, no un dato.
+ * `integration_properties`. Son el valor por defecto que un fallback usaría.
  */
 const PROPERTIES_DE_LA_AGENCIA = ["GA4_PROPERTY_ID", "GOOGLE_SEARCH_CONSOLE_SITE_URL", "GOOGLE_BUSINESS_LOCATION_ID"];
 
-const VIGILADAS = [VARIABLE, ...PROPERTIES_DE_LA_AGENCIA];
-
-/** El único archivo que puede leerla. */
 const LECTOR = "src/lib/integrations/google/agency.ts";
-
-/** La regla del servicio compartido: el único camino de una ruta de datos al token. */
 const PUERTA = "src/lib/integrations/google/servicioCompartido.ts";
+const TOKEN_STORE = "src/lib/integrations/google/tokenStore.ts";
+const AGENCY_TOKEN = "src/lib/integrations/google/agencyToken.ts";
 
 /**
- * Las entradas de CONEXIÓN: las que operan la credencial de la agencia, no
- * leen datos de un cliente con ella. Pueden llegar a la variable sin pasar por
- * la puerta, porque su pregunta ES «¿quién es la agencia?».
+ * Los módulos de CONEXIÓN: los que operan la credencial de la agencia, no leen
+ * datos de un cliente con ella. Pueden llegar a la credencial sin pasar por la
+ * puerta, porque su pregunta ES «¿quién es la agencia?» o «¿está conectada?».
  *
- * Agregar una entrada acá es una decisión, no un trámite: dice que esa entrada
- * no sirve datos de nadie con el token. Una ruta de datos no entra acá; entra
- * por `servicioCompartido.ts`.
+ * Agregar una entrada acá es una decisión, no un trámite: dice que ese módulo
+ * no sirve datos de nadie con el token. Un módulo de datos no entra acá; entra
+ * por `servicioCompartido.ts`. Y una exención no se hereda: quien importe uno de
+ * éstos para leer datos es una fuga.
  */
-const CONEXION: Array<{ entrada: string; porque: string }> = [
+const CONEXION: Array<{ modulo: string; porque: string }> = [
   {
-    entrada: "src/app/api/auth/google/start/route.ts",
+    modulo: "src/app/api/auth/google/start/route.ts",
     porque: "arranca el OAuth de la agencia, y sólo deja entrar a su operador (agencyGuard)",
   },
   {
-    entrada: "src/app/api/auth/google/callback/route.ts",
+    modulo: "src/app/api/auth/google/callback/route.ts",
     porque: "guarda el token bajo la organización de la agencia (saveAgencyToken)",
   },
   {
-    entrada: "src/app/app/integrations/page.tsx",
+    modulo: "src/app/app/integrations/page.tsx",
     porque: "la pantalla de conexión: muestra el estado del token de la agencia, no datos de un cliente",
   },
   {
-    entrada: "src/lib/integrations/property-actions.ts",
+    modulo: "src/app/app/integrations/client.tsx",
+    porque: "la mitad de cliente de la misma pantalla: llama a la server action del mapeo, no lee datos",
+  },
+  {
+    modulo: "src/lib/integrations/property-actions.ts",
     porque: "server action del mapeo: sólo un operador de la agencia apunta una property a un cliente",
+  },
+  {
+    modulo: "src/lib/integrations/google/agencyGuard.ts",
+    porque: "el guardián de «sólo el operador de la agencia»: pregunta quién es la agencia para AUTORIZAR, no para elegir datos",
   },
 ];
 
+const POLITICA: Politica = {
+  variable: VARIABLE,
+  lector: LECTOR,
+  nadieLee: PROPERTIES_DE_LA_AGENCIA,
+  puerta: PUERTA,
+  custodia: {
+    integration_token_secret: [TOKEN_STORE],
+    refresh_integration_token: [TOKEN_STORE],
+    store_integration_token: [TOKEN_STORE],
+    integration_tokens: [AGENCY_TOKEN],
+    decrypted_secrets: [],
+  },
+  conexion: CONEXION.map((c) => c.modulo),
+};
+
 // ---------------------------------------------------------------------------
-// El árbol, leído del disco
+// 1. El detector, contra cada forma conocida de saltarse la pared
 // ---------------------------------------------------------------------------
-
-function fuentes(dir: string): string[] {
-  const salida: string[] = [];
-  for (const entrada of readdirSync(dir)) {
-    const completo = path.join(dir, entrada);
-    if (statSync(completo).isDirectory()) salida.push(...fuentes(completo));
-    else if (/\.tsx?$/.test(entrada) && !/\.d\.ts$/.test(entrada)) salida.push(completo);
-  }
-  return salida;
-}
-
-const rel = (abs: string) => path.relative(ROOT, abs).replace(/\\/g, "/");
-const esTest = (r: string) => r.includes("__tests__") || /\.(test|spec)\.tsx?$/.test(r) || r.startsWith("src/test/");
-
-const archivos = fuentes(SRC)
-  .map(rel)
-  .filter((r) => !esTest(r));
-
-const arboles = new Map<string, ts.SourceFile>(
-  archivos.map((r) => [
-    r,
-    ts.createSourceFile(r, readFileSync(path.join(ROOT, r), "utf8"), ts.ScriptTarget.Latest, true),
-  ])
-);
-
-/** `@/x` y `./x` a un archivo de `src`, o `null` si es un paquete. */
-function resolver(desde: string, especificador: string): string | null {
-  let base: string;
-  if (especificador.startsWith("@/")) base = path.join(SRC, especificador.slice(2));
-  else if (especificador.startsWith(".")) base = path.resolve(path.dirname(path.join(ROOT, desde)), especificador);
-  else return null;
-  for (const candidato of [base, `${base}.ts`, `${base}.tsx`, path.join(base, "index.ts"), path.join(base, "index.tsx")]) {
-    if (existsSync(candidato) && statSync(candidato).isFile()) return rel(candidato);
-  }
-  return null;
-}
-
-/** Un import que se borra al compilar no ejecuta nada: no es un camino. */
-function soloTipos(nodo: ts.ImportDeclaration): boolean {
-  const clausula = nodo.importClause;
-  if (!clausula) return false; // `import "x"` ejecuta x
-  if (clausula.isTypeOnly) return true;
-  if (clausula.name) return false;
-  const nombres = clausula.namedBindings;
-  if (!nombres) return false;
-  if (ts.isNamespaceImport(nombres)) return false;
-  return nombres.elements.length > 0 && nombres.elements.every((e) => e.isTypeOnly);
-}
-
-interface Lectura {
-  /** Los imports de VALOR de cada archivo, resueltos dentro de `src`. */
-  importa: string[];
-  /** Cuáles de las variables vigiladas lee el archivo. */
-  lee: Set<string>;
-  /** Si abre con `"use server"`. */
-  usaServidor: boolean;
-}
 
 /**
- * Las constantes que valen el literal de una variable vigilada, por archivo:
- * nombre de la constante → nombre de la variable. Primera pasada, para poder
- * ver `env[AGENCY_ORG_ID_ENV]` — en el mismo archivo o importada.
+ * Un árbol escrito en memoria, bajo `src/pared-virtual/`, que no existe en el
+ * disco. Tiene lo mismo que el de verdad —la variable, la custodia, la puerta,
+ * una ruta de datos legítima y una de conexión— y al lado, un módulo por cada
+ * manera de saltarse la pared. Los que se llaman `control*` son lo que NO
+ * tiene que verse: un detector que marca todo también «encuentra» las fugas.
  */
-function constantesVigiladas(arbol: ts.SourceFile): { locales: Map<string, string>; exportadas: Map<string, string> } {
-  const locales = new Map<string, string>();
-  const exportadas = new Map<string, string>();
-  for (const sentencia of arbol.statements) {
-    if (!ts.isVariableStatement(sentencia)) continue;
-    const exporta = sentencia.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
-    for (const d of sentencia.declarationList.declarations) {
-      if (
-        ts.isIdentifier(d.name) &&
-        d.initializer &&
-        (ts.isStringLiteral(d.initializer) || ts.isNoSubstitutionTemplateLiteral(d.initializer)) &&
-        VIGILADAS.includes(d.initializer.text)
-      ) {
-        locales.set(d.name.text, d.initializer.text);
-        if (exporta) exportadas.set(d.name.text, d.initializer.text);
+const V = "src/pared-virtual";
+const VIRTUALES: Record<string, string> = {
+  "agency.ts": `
+    export const AGENCY_ORG_ID_ENV = "VULKAN_AGENCY_ORG_ID";
+    export function resolveAgencyOrgId(env: NodeJS.ProcessEnv = process.env): string | null {
+      return env[AGENCY_ORG_ID_ENV] ?? null;
+    }`,
+  "admin.ts": `
+    import { createClient } from "@supabase/supabase-js";
+    export function admin() { return createClient("http://localhost", "no-es-una-llave"); }`,
+  "tokenStore.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import { admin } from "./admin";
+    export async function agencyAccessToken() {
+      const org = resolveAgencyOrgId();
+      const { data } = await admin().rpc("integration_token_secret", { p_organization_id: org });
+      return data;
+    }`,
+  "agencyToken.ts": `
+    import { admin } from "./admin";
+    export async function estado(org: string) {
+      return admin().from("integration_tokens").select("expires_at").eq("organization_id", org);
+    }`,
+  "servicioCompartido.ts": `
+    import { agencyAccessToken } from "./tokenStore";
+    export async function servir(mapeos: string[]) { return mapeos.length > 0 ? agencyAccessToken() : null; }`,
+  "datosLegitimos.ts": `
+    import { servir } from "./servicioCompartido";
+    export const reporte = () => servir(["properties/1"]);`,
+  "conexion.ts": `
+    import { agencyAccessToken } from "./tokenStore";
+    export const conectar = () => agencyAccessToken();`,
+  "yaNoLlega.ts": `export const nada = 1;`,
+
+  // --- La variable, por las tres formas de la revisión del #118 y una más.
+  "asConst.ts": `
+    const AGENCIA_ENV = "VULKAN_AGENCY_ORG_ID" as const;
+    export function organizacionParaGoogle(org: string | null) { return org ?? process.env[AGENCIA_ENV]; }`,
+  "constLocal.ts": `
+    export function organizacionParaGoogleLocal(org: string | null) {
+      const VARIABLE = "VULKAN_AGENCY_ORG_ID";
+      return org ?? process.env[VARIABLE];
+    }`,
+  "agenciaPorDefecto.js": `
+    export function organizacionDeLaAgencia() { return process.env.VULKAN_AGENCY_ORG_ID; }`,
+  "reexporta.ts": `export { organizacionDeLaAgencia } from "./agenciaPorDefecto";`,
+  "constanteImportada.ts": `
+    import { AGENCY_ORG_ID_ENV } from "./agency";
+    export const agencia = () => process.env[AGENCY_ORG_ID_ENV];`,
+  "desestructurada.ts": `
+    export function agencia() { const { VULKAN_AGENCY_ORG_ID: id } = process.env; return id; }`,
+
+  // --- El entorno, con una clave que no se puede saber.
+  "claveArmada.ts": `
+    export const agencia = () => process.env[["VULKAN", "AGENCY", "ORG", "ID"].join("_")];`,
+  "entornoEscapado.ts": `
+    export const agencia = () => Object.entries(process.env).find(([k]) => k.endsWith("AGENCY_ORG_ID"))?.[1];`,
+  "entornoGuardado.ts": `
+    const e: Record<string, string | undefined> = process.env;
+    export const agencia = () => e["VULKAN_AGENCY_ORG_ID"];`,
+  "restoDelEntorno.ts": `
+    const { ...todo } = process.env;
+    export const agencia = () => todo.VULKAN_AGENCY_ORG_ID;`,
+
+  // --- La custodia, sin pasar por la variable.
+  "secretoDirecto.ts": `
+    import { admin } from "./admin";
+    export async function secretoDeQuienTengaToken() {
+      const { data: filas } = await admin().from("integration_tokens").select("organization_id").is("revoked_at", null).limit(1);
+      const org = filas?.[0]?.organization_id;
+      if (!org) return null;
+      const { data } = await admin().rpc("integration_token_secret", { p_organization_id: org, p_provider: "google" });
+      return typeof data === "string" ? data : null;
+    }`,
+  "usaElSecreto.ts": `
+    import { secretoDeQuienTengaToken } from "./secretoDirecto";
+    export const reporte = () => secretoDeQuienTengaToken();`,
+  "rpcArmada.ts": `
+    import { admin } from "./admin";
+    const nombre: string = ["integration", "token", "secret"].join("_");
+    export const secreto = () => admin().rpc(nombre, {});`,
+  "urlCruda.ts": `
+    export const secreto = (url: string) => fetch(url + "/rest/v1/rpc/integration_token_secret", { method: "POST" });`,
+  "esquemaDelVault.ts": `
+    import { admin } from "./admin";
+    export const secretos = () => admin().schema("vault").from("secrets").select("*");`,
+
+  // --- El grafo: lo que no se puede seguir, y lo que no está en la lista de convenciones.
+  "importDinamico.ts": `
+    const destino = "./" + "tokenStore";
+    export const token = async () => (await import(destino)).agencyAccessToken();`,
+  "app/reports/template.tsx": `
+    import { agencyAccessToken } from "../../tokenStore";
+    export default async function Template({ children }: { children: unknown }) {
+      const token = await agencyAccessToken();
+      return { conectado: token ? "si" : "no", children };
+    }`,
+  "instrumentation.ts": `
+    import { conectar } from "./conexion";
+    export const register = () => conectar();`,
+
+  // --- Controles: nada de esto es una lectura, un camino ni una fuga.
+  "controlMensaje.ts": `
+    // Un comentario que dice process.env.VULKAN_AGENCY_ORG_ID no lee nada.
+    export const aviso = () => { throw new Error("falta VULKAN_AGENCY_ORG_ID: es la organización de la agencia"); };`,
+  "controlSoloTipos.ts": `
+    import type { agencyAccessToken } from "./tokenStore";
+    export type T = typeof agencyAccessToken;`,
+  "controlOtrasVariables.ts": `
+    type Clave = "OTRA_VARIABLE" | "Y_OTRA";
+    export const leer = (k: Clave) => process.env[k] ?? process.env.MAS_OTRA;`,
+  "controlPasaElEntorno.ts": `
+    function leer(env: NodeJS.ProcessEnv) { return env.OTRA_VARIABLE; }
+    export const valor = () => leer(process.env);`,
+};
+
+const POLITICA_VIRTUAL: Politica = {
+  variable: VARIABLE,
+  lector: `${V}/agency.ts`,
+  nadieLee: [],
+  puerta: `${V}/servicioCompartido.ts`,
+  custodia: {
+    integration_token_secret: [`${V}/tokenStore.ts`],
+    refresh_integration_token: [],
+    store_integration_token: [],
+    integration_tokens: [`${V}/agencyToken.ts`],
+    decrypted_secrets: [],
+  },
+  conexion: [`${V}/conexion.ts`, `${V}/yaNoLlega.ts`],
+};
+
+let virtual: Veredicto;
+let analisisVirtual: Analisis;
+
+describe("el detector ve cada forma conocida de saltarse la pared, y nada más", () => {
+  beforeAll(() => {
+    const opciones = opcionesDelProyecto(ROOT);
+    const archivos = new Map(
+      Object.entries(VIRTUALES).map(([nombre, texto]) => [path.join(ROOT, V, nombre), texto])
+    );
+    analisisVirtual = analizar(ROOT, [...archivos.keys()], opciones, hostEnMemoria(opciones, archivos));
+    virtual = juzgar(analisisVirtual, POLITICA_VIRTUAL);
+  }, 180_000);
+
+  const en = (nombres: string[]) => nombres.map((n) => `${V}/${n}`).sort();
+  const archivosDe = (sitios: string[]) => [...new Set(sitios.map((s) => s.split(":")[0]))].sort();
+
+  it("analizó todas las fuentes, también el .js", () => {
+    expect(virtual.produccion).toEqual(en(Object.keys(VIRTUALES)));
+  });
+
+  it("la variable: el `as const`, la constante local, el .js, la importada y el destructuring", () => {
+    expect(virtual.lectoresDe(VARIABLE)).toEqual(
+      en(["agency.ts", "asConst.ts", "constLocal.ts", "agenciaPorDefecto.js", "constanteImportada.ts", "desestructurada.ts"])
+    );
+  });
+
+  it("el entorno con clave desconocida: armada, escapada, guardada como otra cosa, o el resto", () => {
+    expect(archivosDe(virtual.envOpaco)).toEqual(
+      en(["claveArmada.ts", "entornoEscapado.ts", "entornoGuardado.ts", "restoDelEntorno.ts"])
+    );
+  });
+
+  it("la custodia: el secreto pedido directo con service_role, y por una URL de PostgREST", () => {
+    expect(virtual.custodios.integration_token_secret).toEqual(
+      en(["secretoDirecto.ts", "tokenStore.ts", "urlCruda.ts"])
+    );
+    expect(virtual.custodios.integration_tokens).toEqual(en(["agencyToken.ts", "secretoDirecto.ts"]));
+    expect(archivosDe(virtual.supabaseOpaco)).toEqual(en(["rpcArmada.ts"]));
+    expect(virtual.esquemas).toEqual(["vault"]);
+  });
+
+  it("el grafo: un import() que no se puede seguir", () => {
+    expect(archivosDe(virtual.sinResolver)).toEqual(en(["importDinamico.ts"]));
+  });
+
+  it("las fugas: template.tsx, instrumentation.ts, el .js reexportado, y quien importa una fuga", () => {
+    // Los que leen la variable o nombran la custodia ya están arriba, en su
+    // propia regla; acá están los que LLEGAN a uno de ellos sin la puerta.
+    const origenes = virtual.fugas.map((f) => f.split(" -> ")[0]).sort();
+    expect(origenes).toEqual(
+      en(["app/reports/template.tsx", "instrumentation.ts", "reexporta.ts", "usaElSecreto.ts"])
+    );
+    // La exención no se hereda: instrumentation.ts llega POR la de conexión.
+    expect(virtual.fugas).toContain(
+      [`${V}/instrumentation.ts`, `${V}/conexion.ts`, `${V}/tokenStore.ts`].join(" -> ")
+    );
+  });
+
+  it("lo legítimo pasa: la ruta de datos por la puerta, la de conexión, y los controles", () => {
+    expect(virtual.porLaPuerta).toEqual(en(["datosLegitimos.ts"]));
+    const marcados = new Set([
+      ...virtual.lectoresDe(VARIABLE),
+      ...archivosDe(virtual.envOpaco),
+      ...Object.values(virtual.custodios).flat(),
+      ...virtual.fugas.map((f) => f.split(" -> ")[0]),
+    ]);
+    for (const control of en([
+      "controlMensaje.ts",
+      "controlSoloTipos.ts",
+      "controlOtrasVariables.ts",
+      "controlPasaElEntorno.ts",
+      "datosLegitimos.ts",
+      "conexion.ts",
+    ])) {
+      expect(marcados.has(control), `${control} no es una fuga y el detector lo marcó`).toBe(false);
+    }
+    expect(analisisVirtual.lecturas.get(`${V}/controlSoloTipos.ts`)!.importa).toEqual([]);
+    expect([...analisisVirtual.lecturas.get(`${V}/controlOtrasVariables.ts`)!.leeEnv].sort()).toEqual([
+      "MAS_OTRA",
+      "OTRA_VARIABLE",
+      "Y_OTRA",
+    ]);
+  });
+
+  it("una exención que ya no llega a la credencial está vencida", () => {
+    expect(virtual.vencidas).toEqual([`${V}/yaNoLlega.ts`]);
+  });
+
+  it("el recorrido del disco levanta todo lo que Next compila, no sólo .ts y .tsx", () => {
+    // El árbol de memoria de arriba le pasa sus archivos al compilador a mano;
+    // el de `src` sale de `fuentesEn`. Medido en la revisión del #118: el
+    // recorrido anterior filtraba `/\.tsx?$/` y un `.js` en `src` no existía
+    // para la pared. Hoy no hay ninguno, así que esto lo mide sobre un
+    // directorio propio.
+    const dir = mkdtempSync(path.join(tmpdir(), "pared-"));
+    try {
+      mkdirSync(path.join(dir, "app"));
+      for (const f of ["a.ts", "b.tsx", "c.js", "d.jsx", "e.mjs", "f.cjs", "g.d.ts", "h.json", "app/i.mts"]) {
+        writeFileSync(path.join(dir, f), "export {};\n");
       }
+      expect(
+        fuentesEn(dir)
+          .map((f) => path.relative(dir, f))
+          .sort()
+      ).toEqual(["a.ts", "app/i.mts", "b.tsx", "c.js", "d.jsx", "e.mjs", "f.cjs"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
-  }
-  return { locales, exportadas };
-}
-
-const constantes = new Map([...arboles].map(([r, a]) => [r, constantesVigiladas(a)]));
-
-function leer(r: string, arbol: ts.SourceFile): Lectura {
-  const importa: string[] = [];
-  const alias = new Map(constantes.get(r)!.locales);
-  const lee = new Set<string>();
-  const literal = (n: ts.Node) =>
-    (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && VIGILADAS.includes(n.text) ? n.text : null;
-
-  const primera = arbol.statements[0];
-  const usaServidor =
-    !!primera &&
-    ts.isExpressionStatement(primera) &&
-    ts.isStringLiteral(primera.expression) &&
-    primera.expression.text === "use server";
-
-  // Los imports primero, para saber qué identificadores importados valen el literal.
-  for (const sentencia of arbol.statements) {
-    if (ts.isImportDeclaration(sentencia) && ts.isStringLiteral(sentencia.moduleSpecifier)) {
-      const destino = resolver(r, sentencia.moduleSpecifier.text);
-      if (!destino) continue;
-      if (!soloTipos(sentencia)) importa.push(destino);
-      const exportadas = constantes.get(destino)?.exportadas;
-      const nombres = sentencia.importClause?.namedBindings;
-      if (exportadas && nombres && ts.isNamedImports(nombres)) {
-        for (const e of nombres.elements) {
-          const variable = exportadas.get((e.propertyName ?? e.name).text);
-          if (variable) alias.set(e.name.text, variable);
-        }
-      }
-    }
-    if (
-      ts.isExportDeclaration(sentencia) &&
-      !sentencia.isTypeOnly &&
-      sentencia.moduleSpecifier &&
-      ts.isStringLiteral(sentencia.moduleSpecifier)
-    ) {
-      const destino = resolver(r, sentencia.moduleSpecifier.text);
-      if (destino) importa.push(destino);
-    }
-  }
-
-  const visitar = (nodo: ts.Node): void => {
-    // import("x") dinámico: también ejecuta x.
-    if (
-      ts.isCallExpression(nodo) &&
-      nodo.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      nodo.arguments[0] &&
-      ts.isStringLiteral(nodo.arguments[0])
-    ) {
-      const destino = resolver(r, nodo.arguments[0].text);
-      if (destino) importa.push(destino);
-    }
-    if (ts.isPropertyAccessExpression(nodo) && VIGILADAS.includes(nodo.name.text)) lee.add(nodo.name.text);
-    if (ts.isElementAccessExpression(nodo)) {
-      const arg = nodo.argumentExpression;
-      const directo = literal(arg);
-      if (directo) lee.add(directo);
-      if (ts.isIdentifier(arg) && alias.has(arg.text)) lee.add(alias.get(arg.text)!);
-    }
-    if (ts.isBindingElement(nodo) && ts.isObjectBindingPattern(nodo.parent)) {
-      const clave = nodo.propertyName ?? nodo.name;
-      if (ts.isIdentifier(clave) && VIGILADAS.includes(clave.text)) lee.add(clave.text);
-      if (nodo.propertyName && !ts.isIdentifier(nodo.propertyName)) {
-        const directo = literal(nodo.propertyName);
-        if (directo) lee.add(directo);
-      }
-    }
-    ts.forEachChild(nodo, visitar);
-  };
-  visitar(arbol);
-
-  return { importa, lee, usaServidor };
-}
-
-const lecturas = new Map([...arboles].map(([r, a]) => [r, leer(r, a)]));
-
-const lectoresDe = (variable: string) =>
-  [...lecturas].filter(([, l]) => l.lee.has(variable)).map(([r]) => r).sort();
-const lectores = lectoresDe(VARIABLE);
-
-const entradas = archivos
-  .filter(
-    (r) =>
-      (r.startsWith("src/app/") && /\/(route|page|layout)\.tsx?$/.test(r)) ||
-      r === "src/middleware.ts" ||
-      lecturas.get(r)!.usaServidor
-  )
-  .sort();
-
-/** El camino de `desde` a `hasta` por imports de valor, sin pasar por `sacado`. `null` si no hay. */
-function camino(desde: string, hasta: string, sacado: string | null): string[] | null {
-  const previo = new Map<string, string | null>([[desde, null]]);
-  const cola = [desde];
-  while (cola.length > 0) {
-    const actual = cola.shift()!;
-    if (actual === hasta) {
-      const salida: string[] = [];
-      for (let p: string | null = actual; p !== null; p = previo.get(p) ?? null) salida.unshift(p);
-      return salida;
-    }
-    for (const siguiente of lecturas.get(actual)?.importa ?? []) {
-      if (siguiente === sacado || previo.has(siguiente)) continue;
-      previo.set(siguiente, actual);
-      cola.push(siguiente);
-    }
-  }
-  return null;
-}
-
-const conexion = new Set(CONEXION.map((c) => c.entrada));
-const deDatos = entradas.filter((e) => !conexion.has(e));
+  });
+});
 
 // ---------------------------------------------------------------------------
+// 2. El árbol de verdad
+// ---------------------------------------------------------------------------
 
-describe("el inventario se lee del disco, y no está vacío", () => {
-  it("encuentra las rutas, las páginas y las server actions", () => {
-    // Anti-vacuidad: si el recorrido no encuentra nada, la pared de abajo pasa
-    // sobre una lista vacía e informa éxito sin haber mirado.
-    expect(entradas.filter((e) => e.endsWith("/route.ts")).length).toBeGreaterThan(15);
-    expect(entradas.filter((e) => e.endsWith("/page.tsx")).length).toBeGreaterThan(15);
-    expect(entradas.filter((e) => lecturas.get(e)!.usaServidor).length).toBeGreaterThan(0);
+let real: Veredicto;
+let analisisReal: Analisis;
+
+describe("el árbol de src, leído del disco", () => {
+  beforeAll(() => {
+    const raices = fuentesEn(SRC).filter((f) => !esTest(path.relative(ROOT, f).replace(/\\/g, "/")));
+    analisisReal = analizar(ROOT, raices, opcionesDelProyecto(ROOT));
+    real = juzgar(analisisReal, POLITICA);
+  }, 180_000);
+
+  describe("el inventario no está vacío, y no es una lista", () => {
+    it("todo módulo de producción está, no sólo las convenciones de Next", () => {
+      // Anti-vacuidad: si el recorrido no encuentra nada, la pared de abajo
+      // pasa sobre una lista vacía e informa éxito sin haber mirado.
+      expect(real.produccion.filter((r) => r.endsWith("/route.ts")).length).toBeGreaterThan(15);
+      expect(real.produccion.filter((r) => r.endsWith("/page.tsx")).length).toBeGreaterThan(15);
+      expect(real.produccion).toContain("src/middleware.ts");
+      expect(real.produccion).toContain("src/app/app/integrations/client.tsx");
+      expect(real.produccion.length).toBeGreaterThan(100);
+    });
+
+    it("distingue un import de tipos de uno que ejecuta, y resuelve los `@/`", () => {
+      // `hydrate.ts` importa de `tokenStore.ts` SÓLO tipos. Si el grafo los
+      // contara, la pared vería caminos que no ejecutan nada.
+      expect(analisisReal.lecturas.get("src/lib/integrations/google/hydrate.ts")!.importa).not.toContain(TOKEN_STORE);
+      expect(analisisReal.lecturas.get(PUERTA)!.importa).toContain(TOKEN_STORE);
+      expect(analisisReal.lecturas.get("src/lib/reports/orchestrator.ts")!.importa).toContain(PUERTA);
+    });
   });
 
-  it("distingue un import de tipos de uno que ejecuta", () => {
-    // `hydrate.ts` importa de `tokenStore.ts` SÓLO tipos. Si el grafo los
-    // contara, la pared vería caminos que no ejecutan nada y habría que llenarla
-    // de exenciones falsas — o, al revés, se aprendería a ignorarla.
-    expect(lecturas.get("src/lib/integrations/google/hydrate.ts")!.importa).not.toContain(
-      "src/lib/integrations/google/tokenStore.ts"
-    );
-    expect(lecturas.get(PUERTA)!.importa).toContain("src/lib/integrations/google/tokenStore.ts");
-  });
-});
-
-describe("la variable de la agencia la lee un solo archivo", () => {
-  it(`sólo ${LECTOR} lee ${VARIABLE}`, () => {
-    // Que `agency.ts` aparezca es también la anti-vacuidad del detector: lee la
-    // variable por una constante (`env[AGENCY_ORG_ID_ENV]`), que es la forma
-    // más difícil de ver. Si el detector no la viera, vería cero lectores y
-    // esto no mediría nada.
-    expect(
-      lectores,
-      `Leer ${VARIABLE} fuera de agency.ts es la forma más corta del fallback: ` +
-        `«si el cliente no tiene, usá lo de la agencia». Pedí la organización por ` +
-        `resolveAgencyOrgId() desde una ruta de conexión, o el token por ` +
-        `servirConLaAgencia() desde una de datos.`
-    ).toEqual([LECTOR]);
-  });
-});
-
-describe("las properties de la agencia no las lee nadie", () => {
-  for (const variable of PROPERTIES_DE_LA_AGENCIA) {
-    it(`${variable}: cero lectores`, () => {
+  describe("la variable", () => {
+    it(`sólo ${LECTOR} lee ${VARIABLE}`, () => {
+      // Que `agency.ts` aparezca es también la anti-vacuidad del detector: lee la
+      // variable por una constante (`env[AGENCY_ORG_ID_ENV]`).
       expect(
-        lectoresDe(variable),
-        `${variable} es una property de la AGENCIA. Leerla como valor por defecto ` +
-          `para una organización sin mapeo sirve los datos de la agencia en el ` +
-          `reporte —o la ficha— de otro. El mapeo vive en integration_properties.`
+        real.lectoresDe(VARIABLE),
+        `Leer ${VARIABLE} fuera de agency.ts es la forma más corta del fallback: ` +
+          `«si el cliente no tiene, usá lo de la agencia». Pedí la organización por ` +
+          `resolveAgencyOrgId() desde un módulo de conexión, o el token por ` +
+          `servirConLaAgencia() desde uno de datos.`
+      ).toEqual([LECTOR]);
+    });
+
+    for (const variable of PROPERTIES_DE_LA_AGENCIA) {
+      it(`${variable}: cero lectores`, () => {
+        expect(
+          real.lectoresDe(variable),
+          `${variable} es una property de la AGENCIA. Leerla como valor por defecto ` +
+            `para una organización sin mapeo sirve los datos de la agencia en el ` +
+            `reporte —o la ficha— de otro. El mapeo vive en integration_properties.`
+        ).toEqual([]);
+      });
+    }
+
+    it("toda lectura del entorno tiene claves que el compilador puede enumerar", () => {
+      expect(
+        real.envOpaco,
+        "Una lectura del entorno con una clave de tipo `string`, o un process.env " +
+          "que se va a algo que no lo tipa como entorno, puede ser la variable de la " +
+          "agencia y la pared no tiene cómo saberlo. Tipá la clave con una unión de literales."
       ).toEqual([]);
     });
-  }
-});
-
-describe("ninguna ruta de datos llega a la agencia salvo por la regla del servicio compartido", () => {
-  it("la puerta existe y llega a la variable", () => {
-    expect(arboles.has(PUERTA), `${PUERTA} no existe`).toBe(true);
-    expect(camino(PUERTA, LECTOR, null), "la puerta no llega a agency.ts: la pared no separa nada").not.toBeNull();
   });
 
-  it("hay rutas de datos que llegan a la agencia, y todas pasan por la puerta", () => {
-    // Anti-vacuidad: si ninguna entrada de datos llegara a la variable ni
-    // siquiera CON la puerta, el resultado de abajo sería verde por no haber
-    // camino que cortar — que es lo que pasaría si el grafo dejara de resolver
-    // los `@/` imports.
-    const llegan = deDatos.filter((e) => camino(e, LECTOR, null) !== null);
-    expect(llegan.length, "ninguna ruta de datos llega a la agencia: el grafo no está resolviendo").toBeGreaterThan(1);
-    for (const e of llegan) {
-      expect(camino(e, PUERTA, null), `${e} llega a la agencia sin pasar por la puerta`).not.toBeNull();
-    }
+  describe("la custodia", () => {
+    it("cada pieza la nombra sólo su dueño", () => {
+      expect(
+        real.custodios,
+        "La custodia del token se toca desde tokenStore.ts (el secreto) y agencyToken.ts " +
+          "(el estado), y desde ningún otro lado: un módulo de datos que la nombra pide " +
+          "el secreto de la agencia sin pasar por la regla."
+      ).toEqual({
+        integration_token_secret: [TOKEN_STORE],
+        refresh_integration_token: [TOKEN_STORE],
+        store_integration_token: [TOKEN_STORE],
+        integration_tokens: [AGENCY_TOKEN],
+        decrypted_secrets: [],
+      });
+    });
+
+    it("ninguna llamada de Supabase nombra lo que pide en ejecución, ni cambia de esquema", () => {
+      expect(real.supabaseOpaco).toEqual([]);
+      expect(real.esquemas).toEqual([]);
+    });
   });
 
-  it("sin la puerta en el medio, ninguna ruta de datos alcanza la variable", () => {
-    const fugas = deDatos
-      .map((e) => camino(e, LECTOR, PUERTA))
-      .filter((c): c is string[] => c !== null)
-      .map((c) => c.join(" -> "));
+  describe("ningún módulo de datos llega a la credencial salvo por la regla del servicio compartido", () => {
+    it("la puerta existe y llega a la variable y a la custodia", () => {
+      expect(analisisReal.lecturas.has(PUERTA), `${PUERTA} no existe`).toBe(true);
+      expect(camino(analisisReal.lecturas, PUERTA, new Set([LECTOR]), null)).not.toBeNull();
+      expect(camino(analisisReal.lecturas, PUERTA, new Set([TOKEN_STORE]), null)).not.toBeNull();
+    });
 
-    expect(
-      fugas,
-      `Estas entradas leen la organización de la agencia por un costado. El token ` +
-        `de la agencia se presta SÓLO por servirConLaAgencia(), que exige un mapeo ` +
-        `vivo de la organización del recurso. Si es una ruta de conexión, va a ` +
-        `CONEXION con su razón.`
-    ).toEqual([]);
-  });
+    it("hay rutas de datos que llegan, y llegan por la puerta", () => {
+      // Anti-vacuidad: si ninguna llegara ni siquiera CON la puerta, el
+      // resultado de abajo sería verde por no haber camino que cortar.
+      expect(real.porLaPuerta).toEqual(
+        expect.arrayContaining(["src/app/api/publishing/publish/route.ts", "src/app/api/reports/generate/route.ts"])
+      );
+    });
 
-  it("las exenciones de conexión existen, son entradas y siguen llegando", () => {
-    // Una exención que ya no llega a la variable no exime nada y le hace lugar a
-    // la próxima sin que se note en el diff.
-    const vencidas = CONEXION.filter(
-      (c) => !entradas.includes(c.entrada) || camino(c.entrada, LECTOR, PUERTA) === null
-    ).map((c) => c.entrada);
+    it("ningún import se resuelve en ejecución", () => {
+      expect(real.sinResolver).toEqual([]);
+    });
 
-    expect(vencidas, "exenta como conexión pero ya no es entrada o no llega a la agencia").toEqual([]);
+    it("sin la puerta en el medio, ningún módulo de datos llega a la credencial", () => {
+      expect(
+        real.fugas,
+        "Estos módulos llegan a la credencial de la agencia por un costado. El token " +
+          "se presta SÓLO por servirConLaAgencia(), que exige un mapeo vivo de la " +
+          "organización del recurso. Si es un módulo de conexión, va a CONEXION con su razón."
+      ).toEqual([]);
+    });
+
+    it("las exenciones de conexión existen y siguen llegando", () => {
+      // Una exención que ya no llega a la credencial no exime nada y le hace
+      // lugar a la próxima sin que se note en el diff.
+      expect(real.vencidas, "exenta como conexión pero ya no existe o no llega a la credencial").toEqual([]);
+    });
   });
 });

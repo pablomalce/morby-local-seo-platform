@@ -30,6 +30,30 @@
  * secreto en el historial del navegador de quien la abrió.
  */
 
+/**
+ * Las variables de entorno que esta pantalla mira, todas, escritas una vez.
+ *
+ * Una unión de literales y no `string`, y no es prolijidad: `platformStatus()`
+ * indexa el entorno con ellas, y la pared del token de la agencia
+ * (`src/lib/__tests__/credencialDeLaAgencia.test.ts`) exige que TODA lectura del
+ * entorno tenga claves que el compilador pueda enumerar. Con `string`, esta
+ * lectura podía ser cualquier variable —también `VULKAN_AGENCY_ORG_ID`— y la
+ * pared no tenía cómo saber que no lo era.
+ */
+export type PlatformEnvVar =
+  | "OPENAI_API_KEY"
+  | "OPENAI_IMAGE_MODEL"
+  | "GOOGLE_PLACES_API_KEY"
+  | "GOOGLE_PAGESPEED_API_KEY"
+  | "GOOGLE_CLIENT_ID"
+  | "GOOGLE_CLIENT_SECRET"
+  | "ANTHROPIC_API_KEY"
+  | "GOOGLE_GEMINI_API_KEY"
+  | "RESEND_API_KEY"
+  | "SENTRY_DSN"
+  | "POSTHOG_KEY"
+  | "GROWTH_OS_WEBHOOK_SECRET";
+
 /** Qué hace falta para que una integración esté lista, y dónde se termina. */
 export interface PlatformIntegration {
   /** El nombre que se muestra. */
@@ -39,7 +63,7 @@ export interface PlatformIntegration {
    * intercambio, y decir «configurado» con media manda a investigar un fallo a
    * quien tenía que terminar una configuración.
    */
-  needs: readonly string[];
+  needs: readonly PlatformEnvVar[];
   /**
    * Si además hace falta mapear cada cliente. Cuando es `true` y la plataforma
    * está configurada, el estado NO es «listo»: es «falta por cliente».
