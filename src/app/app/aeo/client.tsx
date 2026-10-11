@@ -58,15 +58,23 @@ interface Resultado {
 
 function TextoComparado({ lectura }: { lectura: NonNullable<Resultado["lectura"]> }) {
   const render = lectura.caracteresRenderizados;
+  // Lo que decide el punto es lo VISIBLE sin JavaScript (P4); el número del
+  // HTML va al lado, chico, porque cuenta también lo que el CSS oculta.
+  const visible = render?.estado === "medido" ? render.servidos : undefined;
   return (
     <div className="mt-3 grid grid-cols-2 gap-2" data-testid="texto-comparado">
       <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
         <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
-          Sin JavaScript · HTML servido
+          Sin JavaScript · {visible !== undefined ? "visible" : "HTML servido"}
         </p>
         <p className="mt-1 text-[13px] text-metal-200" data-testid="texto-servido">
-          {lectura.caracteresSinJs.toLocaleString("es")} caracteres
+          {(visible ?? lectura.caracteresSinJs).toLocaleString("es")} caracteres
         </p>
+        {visible !== undefined && (
+          <p className="mt-1 text-[11px] text-metal-500" data-testid="texto-en-html">
+            en el HTML: {lectura.caracteresSinJs.toLocaleString("es")}
+          </p>
+        )}
       </div>
       <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
         <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">

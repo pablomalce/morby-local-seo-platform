@@ -124,7 +124,7 @@ describe("la medición contra el punto de la puerta", () => {
     const html = `<body><p>Hola</p>\n<p>mundo   de\tverdad</p></body>`;
     const { deps } = armar({ "http://sitio.test/": { cuerpo: html } }, { textoCrudo: "Hola\n\nmundo de verdad\n" });
     const render = await medirRenderizado("http://sitio.test/", deps);
-    expect(render).toEqual({ estado: "medido", caracteres: textoSinJavaScript(html) });
+    expect(render).toEqual({ estado: "medido", caracteres: textoSinJavaScript(html), servidos: textoSinJavaScript(html) });
     expect(textoSinJavaScript(html)).toBe("Hola mundo de verdad".length);
   });
 });
@@ -179,6 +179,57 @@ describe("P2: el texto que llega DESPUÉS de la quietud de red también se cuent
     expect(render.estado === "medido" && render.caracteres).toBe(
       contarCaracteres(["inicio", ...pasos.map((p) => p.texto)].join(" "))
     );
+  });
+});
+
+/**
+ * P4. Reproducido con Chrome 154: un mega-menú `display: none` de 1 671
+ * caracteres servidos y TODO lo visible (3 189) dibujado por JavaScript salía
+ * VERDE, porque el lado servido se contaba en el HTML —con lo oculto— y el
+ * renderizado con `innerText` —sin lo oculto—. Ahora el lado servido es la
+ * misma página con el JavaScript apagado, y la misma extracción.
+ */
+describe("P4: el lado servido se mide con la MISMA extracción, en una pestaña sin JavaScript", () => {
+  const MEGA_MENU = `<nav style="display: none">${Array.from({ length: 80 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const DIBUJADO = "Todo lo que una persona ve lo dibuja el JavaScript. ".repeat(61);
+
+  it("un mega-menú oculto no cuenta como texto servido: la página sólo-JS sale ROJA", async () => {
+    const html = `<html><body>${MEGA_MENU}<main id="app"></main><script src="/app.js"></script></body></html>`;
+    const { deps, red, navegador } = armar(
+      { "http://sitio.test/": { cuerpo: html }, "http://sitio.test/app.js": { cuerpo: "" } },
+      // Lo que Chrome muestra con JavaScript: el contenido, y no el menú oculto.
+      { textoCrudo: DIBUJADO }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+
+    // El número viejo —el HTML sin etiquetas— pasaba la mitad de lo dibujado.
+    expect(textoSinJavaScript(html)).toBeGreaterThan(render.caracteres / 2);
+    expect(render.servidos).toBeLessThan(10);
+    const punto = contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render });
+    expect(punto.estado).toBe("rojo");
+    expect(punto.hallazgo?.quePasa).toMatch(/oculto por CSS/);
+
+    // La pestaña sin JavaScript recibió el MISMO documento, sin volver a la red.
+    expect(navegador.registro.paginasSinJs).toBe(1);
+    expect(red.pedidos.filter((p) => p.url === "http://sitio.test/")).toHaveLength(1);
+  });
+
+  it("una página SSR: lo servido visible ≈ lo renderizado, y el punto sigue verde", async () => {
+    const html = `<html><body><main><p>${"Texto servido por el servidor. ".repeat(60)}</p></main></body></html>`;
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: html } });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado === "medido" && render.servidos).toBe(textoSinJavaScript(html));
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe(
+      "verde"
+    );
+  });
+
+  it("si la pestaña sin JavaScript no se puede abrir, no hay número: `lectura-servida`, y el navegador se cierra", async () => {
+    const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: `<p>${"x ".repeat(600)}</p>` } }, { paginaSinJsFalla: true });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "lectura-servida" });
+    expect(navegador.registro.cierres).toBe(1);
   });
 });
 

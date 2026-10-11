@@ -298,6 +298,19 @@ describe("el punto «contenido sin JavaScript»: servido contra renderizado", ()
     expect(con(400, { estado: "medido", caracteres: 499 }).hallazgo?.donde).toMatch(/contenido/);
   });
 
+  it("P4: con el lado servido VISIBLE medido, manda ése, no el del HTML", () => {
+    // El mega-menú oculto: 1 671 en el HTML, 0 visibles, 3 189 dibujados.
+    const oculto = con(1_671, { estado: "medido", caracteres: 3_189, servidos: 0 });
+    expect(oculto.estado).toBe("rojo");
+    expect(oculto.servido).toBe(0);
+    expect(oculto.servidoEnHtml).toBe(1_671);
+    expect(oculto.hallazgo?.quePasa).toMatch(/El HTML trae 1671/);
+    // Y al revés no regala nada: visible bajo, HTML alto, sigue rojo.
+    expect(con(4_000, { estado: "medido", caracteres: 4_000, servidos: 100 }).estado).toBe("rojo");
+    // Una lectura vieja, sin el visible, decide con el HTML como antes.
+    expect(con(1_671, { estado: "medido", caracteres: 3_189 }).estado).toBe("verde");
+  });
+
   it("un renderizado medido en CERO es un dato, no un fallo", () => {
     // Una página que no dibuja nada existe. Lo prohibido es inventar el cero
     // cuando no se midió, no informarlo cuando sí.

@@ -86,13 +86,25 @@ const CRECIENTE = `<!doctype html><html><head><meta charset="utf-8"></head><body
 /**
  * P5: el número renderizado es el texto VISIBLE. Con `textContent` en vez de
  * `innerText` la integración entera seguía verde; esta página lo separa: un
- * párrafo visible, un bloque oculto por CSS y un `<script>` largo en línea.
+ * párrafo visible, un bloque oculto por CSS, un `<script>` largo en línea y un
+ * `<noscript>` —que la pestaña sin JavaScript dibuja y no tiene que contar—.
  */
 const VISIBLE = "Texto que una persona ve en la página, servido por el servidor. ".repeat(30);
 const OCULTO_Y_SCRIPT = `<!doctype html><html><head><meta charset="utf-8"><title>Oculto</title></head><body>
 <p>${VISIBLE}</p>
 <div style="display: none">${"Texto oculto por CSS que nadie ve. ".repeat(90)}</div>
+<noscript><p>${"Sin JavaScript se dibujaría este aviso, que con JavaScript no existe. ".repeat(20)}</p></noscript>
 <script>/* ${"código que no es texto de la página ".repeat(90)} */ document.body.dataset.listo = "1";</script>
+</body></html>`;
+
+/**
+ * P4: un mega-menú servido y OCULTO por CSS, y todo lo visible dibujado por
+ * JavaScript. Contado en el HTML, el menú pasaba la mitad y el punto salía
+ * verde; contado como se ve sin JavaScript, es cero.
+ */
+const MEGA_MENU = `<nav style="display: none">${Array.from({ length: 80 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+const OCULTO = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MEGA_MENU}<main id="app"></main>
+<script>document.getElementById("app").textContent = ${JSON.stringify("Todo lo que una persona ve lo dibuja el JavaScript. ".repeat(61))};</script>
 </body></html>`;
 
 let sitio: http.Server;
@@ -191,6 +203,8 @@ beforeAll(async () => {
         return html(TARDE);
       case "/oculto-y-script":
         return html(OCULTO_Y_SCRIPT);
+      case "/oculto":
+        return html(OCULTO);
       case "/al-verse":
         return html(AL_VERSE);
       case "/creciente":
@@ -255,7 +269,7 @@ function deps(
       const n = await abrir();
       aperturas += 1;
       return {
-        nuevaPagina: () => n.nuevaPagina(),
+        nuevaPagina: (opciones) => n.nuevaPagina(opciones),
         cerrar: async () => {
           await n.cerrar();
           cierres += 1;
@@ -301,11 +315,12 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       const d = deps();
       const render = await medirRenderizado("http://sitio.test/control", d);
       const servido = textoSinJavaScript(CONTROL);
-      console.log(`[H2-GO-1 control] servido=${servido} renderizado=${JSON.stringify(render)}`);
+      console.log(`[H2-GO-1 control] html=${servido} renderizado=${JSON.stringify(render)}`);
 
       expect(render.estado).toBe("medido");
       if (render.estado !== "medido") return;
       expect(servido).toBeLessThan(60);
+      expect(render.servidos, "sin JavaScript, la página de control no muestra nada").toBe(0);
       expect(render.caracteres).toBeGreaterThan(MINIMO_DE_TEXTO);
 
       const punto = contenidoSinJs({
@@ -329,11 +344,12 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       const d = deps();
       const render = await medirRenderizado("http://sitio.test/ssr", d);
       const servido = textoSinJavaScript(SSR);
-      console.log(`[H2-GO-1 ssr] servido=${servido} renderizado=${JSON.stringify(render)}`);
+      console.log(`[H2-GO-1 ssr] html=${servido} renderizado=${JSON.stringify(render)}`);
 
       expect(render.estado).toBe("medido");
       if (render.estado !== "medido") return;
       expect(Math.abs(render.caracteres - servido) / servido).toBeLessThan(0.05);
+      expect(Math.abs((render.servidos ?? 0) - servido) / servido).toBeLessThan(0.05);
       expect(
         contenidoSinJs({
           acceso: TODOS_ENTRAN,
@@ -348,6 +364,29 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
   );
 
   it(
+    "P4 — un mega-menú OCULTO no es texto servido: lo visible sin JavaScript es ~0, y el punto sale ROJO",
+    async () => {
+      const d = deps();
+      const b = bitacora();
+      const render = await medirRenderizado("http://sitio.test/oculto", d, undefined, b);
+      const enHtml = textoSinJavaScript(OCULTO);
+      console.log(`[P4 /oculto] html=${enHtml} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(enHtml, "el número viejo pasaba la mitad").toBeGreaterThan(render.caracteres / 2);
+      expect(render.servidos).toBeLessThan(10);
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: enHtml, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+      // La pestaña sin JavaScript no volvió a pedir el documento.
+      expect(sinFavicon(b.pedidos).map((p) => p.url)).toEqual(["http://sitio.test/oculto"]);
+      expect(d.cierres()).toBe(d.aperturas());
+    },
+    30_000
+  );
+
+  it(
     "P5 — el renderizado es el texto VISIBLE: ni lo oculto por CSS ni el código de un <script> en línea",
     async () => {
       const render = await medirRenderizado("http://sitio.test/oculto-y-script", deps());
@@ -356,6 +395,8 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render.estado).toBe("medido");
       if (render.estado !== "medido") return;
       expect(Math.abs(render.caracteres - visible) / visible).toBeLessThan(0.05);
+      // Y del lado servido, lo mismo: la misma extracción, sin JavaScript.
+      expect(Math.abs((render.servidos ?? 0) - visible) / visible).toBeLessThan(0.05);
     },
     30_000
   );

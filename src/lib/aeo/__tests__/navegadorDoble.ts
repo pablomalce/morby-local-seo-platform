@@ -86,6 +86,19 @@ function textoDelHtml(html: string): string {
 }
 
 /**
+ * Lo que la pestaña SIN JavaScript «ve»: el HTML sin scripts, sin `<noscript>`
+ * y sin los elementos ocultos por CSS en línea o por `hidden` (sin anidar: al
+ * doble le alcanza con eso). Es la regla del lado servido de `renderizado.ts`.
+ */
+function textoVisibleSinJs(html: string): string {
+  return textoDelHtml(
+    html
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<(\w+)[^>]*(?:\shidden\b|display:\s*none)[^>]*>[\s\S]*?<\/\1>/gi, " ")
+  );
+}
+
+/**
  * Un reloj que sólo avanza cuando la medición «duerme»: la espera de quietud
  * del DOM corre en tiempo virtual, y los tests no esperan dos segundos reales
  * por cada medición. Va en `DependenciasRender` (`ahora` y `esperar`) y en el
@@ -120,8 +133,13 @@ export interface OpcionesDoble {
   navegacionColgada?: boolean;
   /** `nuevaPagina` tira: el navegador murió entre el arranque y la pestaña. */
   paginaFalla?: boolean;
-  /** Reemplaza el texto dibujado: para probar la normalización con un `innerText` exacto. */
+  /**
+   * Reemplaza el texto dibujado CON JavaScript: para probar la normalización
+   * con un `innerText` exacto. La pestaña sin JavaScript no lo usa.
+   */
   textoCrudo?: string;
+  /** La pestaña SIN JavaScript no se puede abrir: el lado servido queda sin medir. */
+  paginaSinJsFalla?: boolean;
 }
 
 export function navegadorDoble(opciones: OpcionesDoble = {}) {
@@ -133,6 +151,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     textoDibujado: null as string | null,
     /** Cuántas veces se recorrió una página de arriba abajo. */
     recorridos: 0,
+    /** Cuántas pestañas sin JavaScript llegaron a dibujar un documento. */
+    paginasSinJs: 0,
   };
 
   async function emitir(
@@ -159,7 +179,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     return d;
   }
 
-  function pagina(): PaginaAbierta {
+  function pagina(sinJs: boolean): PaginaAbierta {
     let atender: ((p: PedidoDelNavegador) => Promise<void>) | null = null;
     let texto = "";
     let navegadoEn: number | null = null;
@@ -188,6 +208,13 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         if (!documento) throw new Error("net::ERR_TOO_MANY_REDIRECTS");
 
         const html = documento.cuerpo.toString("utf8");
+        if (sinJs) {
+          // Sin JavaScript no corre ningún script: ni los que el documento
+          // trae, ni los tardíos, ni los que dibujan al verse.
+          texto = textoVisibleSinJs(html);
+          registro.paginasSinJs += 1;
+          return;
+        }
         const partes = [textoDelHtml(html)];
         const declarados: Array<{ url: string; tipo: string; principal: boolean }> = [];
         for (const m of html.matchAll(/<script[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "script", principal: false });
@@ -212,6 +239,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         registro.recorridos += 1;
       },
       async textoVisible() {
+        if (sinJs) return texto;
         const base = opciones.textoCrudo ?? texto;
         const ahora = opciones.reloj?.ahora();
         const tardio = (opciones.textoTardio ?? [])
@@ -228,9 +256,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     if (opciones.arranqueFalla) throw new Error("no hay Chromium");
     registro.aperturas += 1;
     const navegador: NavegadorAbierto = {
-      async nuevaPagina() {
+      async nuevaPagina(opcionesPagina) {
         if (opciones.paginaFalla) throw new Error("Target closed");
-        return pagina();
+        if (opcionesPagina?.javascript === false && opciones.paginaSinJsFalla) throw new Error("Target closed");
+        return pagina(opcionesPagina?.javascript === false);
       },
       async cerrar() {
         registro.cierres += 1;

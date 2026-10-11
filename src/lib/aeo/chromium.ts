@@ -147,7 +147,7 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
   };
 }
 
-function envolverPagina(page: Page): PaginaAbierta {
+function envolverPagina(page: Page, sinJavaScript: boolean): PaginaAbierta {
   return {
     async interceptar(atender) {
       await page.setBypassServiceWorker(true);
@@ -183,6 +183,15 @@ function envolverPagina(page: Page): PaginaAbierta {
         .catch(() => {});
     },
     async textoVisible() {
+      // Sin JavaScript, `<noscript>` se dibuja; con JavaScript, no. Se saca
+      // para que los dos lados cuenten lo mismo. Sólo en la pestaña sin
+      // JavaScript: ahí ningún script de la página ve el cambio.
+      if (sinJavaScript) {
+        return page.evaluate(() => {
+          document.querySelectorAll("noscript").forEach((n) => n.remove());
+          return document.body?.innerText ?? "";
+        });
+      }
       return page.evaluate(() => document.body?.innerText ?? "");
     },
   };
@@ -190,15 +199,17 @@ function envolverPagina(page: Page): PaginaAbierta {
 
 function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boolean): NavegadorAbierto {
   return {
-    async nuevaPagina() {
+    async nuevaPagina(opcionesPagina = {}) {
       const page = await browser.newPage();
-      if (quitarWebRtc) await page.evaluateOnNewDocument(sinWebRtc);
+      const sinJavaScript = opcionesPagina.javascript === false;
+      if (sinJavaScript) await page.setJavaScriptEnabled(false);
+      else if (quitarWebRtc) await page.evaluateOnNewDocument(sinWebRtc);
       await page.setViewport(VENTANA);
       // Se dice quién mira, sin el «Headless» que algunos WAF usan para
       // contestar otra página que la que ve una persona.
       const agente = (await browser.userAgent()).replace("HeadlessChrome", "Chrome");
       await page.setUserAgent({ userAgent: `${agente} VulkanGrowthOS/1.0 (auditoria AEO; renderizado)` });
-      return envolverPagina(page);
+      return envolverPagina(page, sinJavaScript);
     },
     async cerrar() {
       const proceso = browser.process();

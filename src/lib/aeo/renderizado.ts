@@ -12,6 +12,17 @@
  * la red se aquiete, y cuenta `document.body.innerText` con la MISMA función
  * que cuenta el lado servido (`contarCaracteres` de `lectura.ts`).
  *
+ * Y EL LADO SERVIDO TAMBIÉN SE MIDE ACÁ, CON LA MISMA EXTRACCIÓN. Contar el
+ * HTML servido sacándole las etiquetas (`textoSinJavaScript`) cuenta lo que
+ * el CSS oculta, y `innerText` no: MEDIDO con Chrome 154 (P4), una página con
+ * un mega-menú `display: none` de 1 671 caracteres servidos y TODO lo visible
+ * (3 189) dibujado por JavaScript salía VERDE —1 671 es más de la mitad de
+ * 3 189— aunque una persona no vea ni una letra que no venga del JavaScript.
+ * Por eso, con el mismo navegador, se abre una segunda pestaña con el
+ * JavaScript APAGADO, se le entrega el mismo documento que recibió la primera
+ * (de la caché de esta medición: no se pide dos veces) y se cuenta su
+ * `innerText`, sin `<noscript>`: es el texto que se VE sin ejecutar nada.
+ *
  * TRES ESTADOS, Y NINGÚN CERO INVENTADO
  *
  * `medido` trae el número; `fallo` trae un código con nombre —`timeout`,
@@ -135,6 +146,7 @@ export type CodigoDeFallo =
   | "sin-navegador"
   | "navegacion"
   | "lectura"
+  | "lectura-servida"
   | "inestable"
   | "descarga"
   | MotivoDeBloqueo
@@ -142,7 +154,17 @@ export type CodigoDeFallo =
   | `http_${number}`;
 
 export type ResultadoRenderizado =
-  | { estado: "medido"; caracteres: number }
+  | {
+      estado: "medido";
+      /** El texto visible CON JavaScript. */
+      caracteres: number;
+      /**
+       * El texto visible SIN JavaScript: el mismo documento en una pestaña con
+       * el JavaScript apagado, con la misma extracción. Opcional para que las
+       * lecturas viejas sigan valiendo; sin él, la regla usa el conteo del HTML.
+       */
+      servidos?: number;
+    }
   | { estado: "fallo"; codigo: CodigoDeFallo };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,7 +242,12 @@ export interface PaginaAbierta {
 }
 
 export interface NavegadorAbierto {
-  nuevaPagina(): Promise<PaginaAbierta>;
+  /**
+   * `javascript: false` es la pestaña del lado servido: no corre ningún
+   * script, y `textoVisible` no cuenta `<noscript>` (que sin JavaScript sí se
+   * dibuja) para contar lo mismo que el lado renderizado.
+   */
+  nuevaPagina(opciones?: { javascript?: boolean }): Promise<PaginaAbierta>;
   /** Cierra, y si no cierra a tiempo, mata. Nunca rechaza. */
   cerrar(): Promise<void>;
 }
@@ -399,13 +426,20 @@ function esDescarga(encabezados: Record<string, string | string[]>): boolean {
  * en Node y le entrega la respuesta. Nunca lo deja colgado: cualquier excepción
  * termina en `abortar()`.
  */
+/** Las respuestas que ya se entregaron, por URL, para la pestaña sin JavaScript. */
+export type CacheDeRespuestas = Map<
+  string,
+  { status: number; encabezados: Record<string, string | string[]>; cuerpo: Buffer }
+>;
+
 export function crearInterceptor(
   deps: Pick<DependenciasRender, "transporte" | "resolver">,
   opciones: OpcionesRender,
   bitacora: Bitacora,
   restanteMs: () => number,
   senal: AbortSignal,
-  examinar: Examinador = crearExaminador(deps.resolver)
+  examinar: Examinador = crearExaminador(deps.resolver),
+  cache: { guardarEn?: CacheDeRespuestas; servirDesde?: CacheDeRespuestas } = {}
 ) {
   let bytesTotales = 0;
 
@@ -432,6 +466,14 @@ export function crearInterceptor(
       if (!METODOS.has(pedido.metodo.toUpperCase())) return await bloquear("metodo");
       if (!pedido.esDocumentoPrincipal && SIN_TEXTO.has(pedido.tipo)) return await bloquear("sin-texto");
       if (senal.aborted) return await bloquear("presupuesto");
+
+      // La pestaña sin JavaScript recibe lo MISMO que recibió la primera, sin
+      // volver a la red: el examen ya se hizo cuando se pidió.
+      const guardada = pedido.metodo.toUpperCase() === "GET" ? cache.servirDesde?.get(url.toString()) : undefined;
+      if (guardada) {
+        if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
+        return await pedido.responder(guardada);
+      }
 
       const examen = await examinar(url, senal);
       if (!examen.ok) return await bloquear(examen.motivo);
@@ -465,7 +507,9 @@ export function crearInterceptor(
       for (const [nombre, valor] of Object.entries(respuesta.encabezados)) {
         if (!DE_LA_RESPUESTA.has(nombre.toLowerCase())) devueltos[nombre.toLowerCase()] = valor;
       }
-      await pedido.responder({ status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo });
+      const entregada = { status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo };
+      if (pedido.metodo.toUpperCase() === "GET") cache.guardarEn?.set(url.toString(), entregada);
+      await pedido.responder(entregada);
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
       // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
@@ -569,6 +613,9 @@ export async function medirRenderizado(
   // da la misma dirección de principio a fin. Dos examinadores serían dos
   // consultas DNS, y entre las dos un DNS hostil cambia la respuesta.
   const examinar = crearExaminador(deps.resolver);
+  // Lo que la pestaña con JavaScript recibió, para entregárselo igual a la
+  // pestaña sin JavaScript.
+  const respuestas: CacheDeRespuestas = new Map();
 
   // La URL inicial se examina ANTES de arrancar nada: un destino prohibido no
   // cuesta un Chromium. El interceptor la vuelve a ver —es un pedido más— y la
@@ -595,7 +642,9 @@ export async function medirRenderizado(
 
     try {
       const pagina = await vivo.navegador.nuevaPagina();
-      await pagina.interceptar(crearInterceptor(deps, opciones, bitacora, restante, corte.signal, examinar));
+      await pagina.interceptar(
+        crearInterceptor(deps, opciones, bitacora, restante, corte.signal, examinar, { guardarEn: respuestas })
+      );
 
       try {
         await pagina.navegar(destino.toString(), Math.max(restante(), 1));
@@ -635,7 +684,27 @@ export async function medirRenderizado(
       }
       if (caracteres === "inestable") return fallo("inestable");
       if (caracteres === "plazo") return fallo("timeout");
-      return { estado: "medido", caracteres };
+
+      // El lado servido, con la misma extracción: ver el encabezado (P4). Si
+      // no se puede medir, el resultado no se da: el número del HTML cuenta
+      // lo oculto, y con él la página del mega-menú vuelve a salir verde.
+      const servida = nuevaBitacora();
+      try {
+        const sinJs = await vivo.navegador.nuevaPagina({ javascript: false });
+        await sinJs.interceptar(
+          crearInterceptor(deps, opciones, servida, restante, corte.signal, examinar, { servirDesde: respuestas })
+        );
+        await sinJs.navegar(destino.toString(), Math.max(restante(), 1));
+        bitacora.pedidos.push(...servida.pedidos);
+        bitacora.bloqueados.push(...servida.bloqueados);
+        if (servida.falloDocumento || servida.statusDocumento === null || servida.statusDocumento >= 400) {
+          return fallo("lectura-servida");
+        }
+        const servidos = contarCaracteres(await sinJs.textoVisible());
+        return { estado: "medido", caracteres, servidos };
+      } catch {
+        return fallo(corte.signal.aborted ? "timeout" : "lectura-servida");
+      }
     } catch {
       return fallo(corte.signal.aborted ? "timeout" : "navegacion");
     }

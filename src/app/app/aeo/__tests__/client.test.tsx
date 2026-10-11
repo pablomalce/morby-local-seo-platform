@@ -149,6 +149,29 @@ describe("la auditoría desde la pantalla", () => {
     expect(renderizado.textContent?.replace(/\D/g, "")).toBe("1677");
   });
 
+  it("P4: con el visible sin JavaScript medido, muestra ÉSE como servido, y el del HTML al lado", async () => {
+    // El mega-menú oculto: 1 669 en el HTML, 0 visibles. Mostrar 1 669 como
+    // «servido» diría que el rastreador tiene texto que ninguna persona ve.
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [],
+        lectura: { caracteresSinJs: 1669, caracteresRenderizados: { estado: "medido", caracteres: 3171, servidos: 0 } },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("texto-comparado")).toBeTruthy());
+    expect(screen.getByTestId("texto-servido").textContent).toBe("0 caracteres");
+    expect(screen.getByTestId("texto-en-html").textContent).toMatch(/1\.?669/);
+    expect(screen.getByTestId("texto-comparado").textContent).toMatch(/visible/);
+  });
+
   it("un renderizado que falló dice «no medido» y el código, NUNCA un cero", async () => {
     respuesta = {
       ok: true,
