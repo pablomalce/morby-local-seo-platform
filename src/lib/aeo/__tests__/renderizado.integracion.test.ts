@@ -25,14 +25,22 @@
  *
  * CUÁNDO CORRE
  *
- * Sólo con `AEO_CHROME_PATH` apuntando a un Chrome que exista. En la Mac:
+ * Con `AEO_CHROME_PATH` apuntando a un Chrome que exista. En la Mac:
  *
  *   AEO_CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
  *     npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
  *
- * Sin la variable se saltea con el motivo escrito en el nombre del bloque, y
- * eso NO es un verde: el CI de este repo no la define, así que ahí estos casos
- * no corren.
+ * O con `AEO_CHROMIUM_DE_PRODUCCION=1`, en Linux y SIN `AEO_CHROME_PATH`: el
+ * mismo camino que la ruta en Vercel, el headless shell de
+ * `@sparticuz/chromium`. Es el binario que importa, y no se porta igual que
+ * Chrome (RV-1: una bandera de WebRTC que en Chrome 154 cierra el UDP, en
+ * headless shell 153 no). Se corre en un contenedor
+ * `public.ecr.aws/lambda/nodejs:24` con `VERCEL=1` y
+ * `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, con su propio `npm ci`.
+ *
+ * Sin ninguna de las dos se saltea con el motivo escrito en el nombre del
+ * bloque, y eso NO es un verde: el CI de este repo no las define, así que ahí
+ * estos casos no corren.
  */
 import dgram from "node:dgram";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -48,11 +56,15 @@ import { medirRenderizado, OPCIONES_RENDER, type Bitacora, type DependenciasRend
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
 
-const CHROME = process.env.AEO_CHROME_PATH;
-const HAY_CHROME = Boolean(CHROME && existsSync(CHROME));
-const MOTIVO = HAY_CHROME
-  ? `con ${CHROME}`
-  : "SALTEADO: no hay Chrome local — exportá AEO_CHROME_PATH con la ruta de un Chrome para correrlo";
+const DE_PRODUCCION =
+  process.env.AEO_CHROMIUM_DE_PRODUCCION === "1" && process.platform === "linux" && !process.env.AEO_CHROME_PATH;
+const CHROME = DE_PRODUCCION ? undefined : process.env.AEO_CHROME_PATH;
+const HAY_CHROME = DE_PRODUCCION || Boolean(CHROME && existsSync(CHROME));
+const MOTIVO = DE_PRODUCCION
+  ? "con el headless shell de @sparticuz/chromium, el de producción"
+  : HAY_CHROME
+    ? `con ${CHROME}`
+    : "SALTEADO: no hay Chrome — exportá AEO_CHROME_PATH, o AEO_CHROMIUM_DE_PRODUCCION=1 en Linux";
 
 const PUBLICA = "93.184.216.34";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
@@ -106,6 +118,26 @@ const MEGA_MENU = `<nav style="display: none">${Array.from({ length: 80 }, (_, i
 const OCULTO = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MEGA_MENU}<main id="app"></main>
 <script>document.getElementById("app").textContent = ${JSON.stringify("Todo lo que una persona ve lo dibuja el JavaScript. ".repeat(61))};</script>
 </body></html>`;
+
+/**
+ * RV-1: un popup es otro target. Ni la intercepción ni `evaluateOnNewDocument`
+ * llegan a él, así que el constructor de WebRTC está entero adentro, y su
+ * navegación no pasa por el interceptor.
+ */
+function paginaConPopup(): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<p>${"Página que abre ventanas nuevas. ".repeat(30)}</p>
+<script>
+  try {
+    const w = window.open("about:blank");
+    const pc = new w.RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${puertoUdp}" }] });
+    pc.createDataChannel("d");
+    pc.createOffer().then((o) => pc.setLocalDescription(o));
+  } catch (e) {}
+  try { window.open("http://127.0.0.1:${puertoCanario}/popup-directo"); } catch (e) {}
+</script>
+</body></html>`;
+}
 
 let sitio: http.Server;
 let canario: http.Server;
@@ -211,6 +243,8 @@ beforeAll(async () => {
         return html(CRECIENTE);
       case "/subrecursos":
         return html(paginaConSubrecursos());
+      case "/popup-webrtc":
+        return html(paginaConPopup());
       case "/redir-loopback":
         res.writeHead(302, { location: `http://127.0.0.1/admin` });
         return res.end();
@@ -503,6 +537,53 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           "http://mixto.test/",
         ])
       );
+    },
+    30_000
+  );
+
+  it.each([
+    ["todas las capas", BANDERAS_SIN_RED],
+    // UDP del popup: sólo las banderas de WebRTC (el popup puede abrirse).
+    ["sólo las banderas de WebRTC", capasDeRed.webRtc],
+  ] as const)(
+    "RV-1 — un POPUP con WebRTC y una navegación propia, con %s: CERO al canario",
+    async (capa, banderas) => {
+      // Con el constructor borrado, como producción: el popup no lo hereda.
+      const render = await medirRenderizado("http://sitio.test/popup-webrtc", deps(banderas, true));
+      const visto = await canarioDespues(1_500);
+      console.log(`[RV-1 popup ${capa}] render=${JSON.stringify(render)} canario=${JSON.stringify(visto)}`);
+      expect(render.estado).toBe("medido");
+      expect(visto).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+    },
+    30_000
+  );
+
+  // `--block-new-web-contents` sola cierra el popup en el headless shell de
+  // producción, y NO en Chrome 154 con `headless: true`: MEDIDO en la Mac,
+  // `window.open("about:blank")` devuelve una ventana con `RTCPeerConnection`
+  // igual con la bandera (y sin `--disable-popup-blocking`), y el canario
+  // contó 4 datagramas. Ahí al popup lo cierra sólo la bandera de WebRTC, y
+  // el caso de arriba lo afirma. Éste corre con el binario de producción.
+  it.skipIf(!DE_PRODUCCION)(
+    "RV-1 — un POPUP con WebRTC, con sólo --block-new-web-contents: CERO al canario (headless shell)",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/popup-webrtc", deps(capasDeRed.popup, true));
+      const visto = await canarioDespues(1_500);
+      console.log(`[RV-1 popup sólo --block-new-web-contents] render=${JSON.stringify(render)} canario=${JSON.stringify(visto)}`);
+      expect(render.estado).toBe("medido");
+      expect(visto).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+    },
+    30_000
+  );
+
+  it(
+    "el canario VE el popup: sin banderas, el mismo popup le manda UDP y le pide la página —el cero de arriba no es sordo—",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/popup-webrtc", deps([], true));
+      const visto = await canarioDespues(1_500);
+      console.log(`[RV-1 popup sin banderas] render=${JSON.stringify(render)} canario=${JSON.stringify(visto)}`);
+      expect(visto.udp).toBeGreaterThan(0);
+      expect(visto.pedidos).toContain("GET /popup-directo");
     },
     30_000
   );

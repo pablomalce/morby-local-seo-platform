@@ -25,20 +25,32 @@
  *                                        prefetch de DNS tampoco sale.
  *
  *   --webrtc-ip-handling-policy=disable_non_proxied_udp
+ *   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
  *                                        WebRTC no manda UDP por fuera del proxy.
+ *                                        Hacen falta LAS DOS: cada binario
+ *                                        escucha una (ver abajo).
+ *   --block-new-web-contents             `window.open` no abre nada: un popup es
+ *                                        otro target, y ni la intercepción ni
+ *                                        `evaluateOnNewDocument` llegan a él.
  *
  * WEBRTC ES OTRA SALIDA, Y EL PROXY Y EL RESOLVEDOR NO LA CIERRAN. Un
  * `RTCPeerConnection` con un servidor STUN manda UDP directo a la dirección que
  * la página elija. MEDIDO con Chrome 154 y un canario UDP en loopback: 4
- * paquetes sin banderas, 4 con el proxy y el resolvedor, y 4 con
- * `--force-webrtc-ip-handling-policy` (la que suele recomendarse, que en este
- * Chrome no hace nada y por eso no está). Lo cierran dos cosas, y cada una
- * sola da 0: la bandera de arriba, y que el constructor no exista —`sinWebRtc`
- * lo borra de cada documento ANTES de que corra el JavaScript de la página
- * (`evaluateOnNewDocument`, que también llega a un `<iframe>` recién creado:
- * sacar el constructor del `contentWindow` de un iframe en blanco da «not a
- * constructor»)—. Lo medido es Chrome completo en la Mac; el binario de
- * Vercel es headless shell, y ahí ninguna de las dos está medida.
+ * paquetes sin banderas, 4 con el proxy y el resolvedor, 4 con la `--force-…`
+ * sola, y 0 con la `--webrtc-…` sola. Y MEDIDO al revés en el binario que
+ * corre en Vercel (RV-1: headless shell 153 de `@sparticuz/chromium`, en un
+ * contenedor `public.ecr.aws/lambda/nodejs:24` con AL2023): la `--webrtc-…`
+ * sola dejó salir 8 datagramas y la `--force-…` CON valor los cerró. Por eso
+ * van las dos, y el test de integración corre con los dos binarios.
+ *
+ * Además, el constructor no existe en la pestaña: `sinWebRtc` lo borra de cada
+ * documento ANTES de que corra el JavaScript de la página
+ * (`evaluateOnNewDocument`, que también llega a un `<iframe>` recién creado).
+ * Pero NO llega a un popup: con la configuración de producción entera, una
+ * página que hace `window.open("about:blank")` y usa `w.RTCPeerConnection`
+ * mandó UDP en headless shell 153 —y puppeteer agrega
+ * `--disable-popup-blocking` por defecto—. Al popup lo cierran las banderas de
+ * WebRTC, y además `--block-new-web-contents`, que no deja que exista.
  *
  * LAS DOS CAPAS SON REDUNDANTES A PROPÓSITO, y está medido. Contra el mismo
  * canario, con un `WebSocket` y dos `preconnect` a loopback: sin banderas, 4
@@ -46,9 +58,10 @@
  * 0 —`MAP *` alcanza también a las IP literales—; el proxy SIN `<-loopback>`,
  * 4. Cada capa basta sola, así que borrar una no pone rojo un test que corra
  * con las dos: por eso el test de integración arranca Chromium con todas las
- * capas y con cada una sola (`capasDeRed`, y WebRTC con su bandera sola y con
- * su constructor borrado solo), y afirma cero en todas. Borrar una bandera de
- * acá pone rojo el caso de su capa.
+ * capas y con cada una sola (`capasDeRed`, WebRTC con sus banderas solas y con
+ * su constructor borrado solo, y el popup con las banderas de WebRTC solas y
+ * con `--block-new-web-contents` sola), y afirma cero en todas. Borrar una
+ * bandera de acá pone rojo el caso de su capa en el binario que la escucha.
  *
  * Además: las descargas se deniegan por CDP —MEDIDO: sin eso, una página que
  * arma un `Blob` y hace clic en un `<a download>` escribe el archivo en disco, y
@@ -91,6 +104,8 @@ export const BANDERAS_SIN_RED = [
   "--proxy-bypass-list=<-loopback>",
   "--host-resolver-rules=MAP * ~NOTFOUND",
   "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--block-new-web-contents",
   "--disable-background-networking",
   "--disable-component-update",
   "--disable-sync",
@@ -104,10 +119,15 @@ export const BANDERAS_SIN_RED = [
  */
 const esProxy = (b: string) => b.startsWith("--proxy-");
 const esResolvedor = (b: string) => b.startsWith("--host-resolver-rules");
-const esWebRtc = (b: string) => b.startsWith("--webrtc-");
+const esWebRtc = (b: string) => b.startsWith("--webrtc-") || b.startsWith("--force-webrtc-");
+const esPopup = (b: string) => b === "--block-new-web-contents";
 export const capasDeRed = {
   proxy: BANDERAS_SIN_RED.filter((b) => !esResolvedor(b) && !esWebRtc(b)),
   resolvedor: BANDERAS_SIN_RED.filter((b) => !esProxy(b) && !esWebRtc(b)),
+  /** Para el popup: sólo las banderas de WebRTC cierran su UDP. */
+  webRtc: BANDERAS_SIN_RED.filter((b) => !esPopup(b)),
+  /** Para el popup: sólo `--block-new-web-contents`, sin las de WebRTC. */
+  popup: BANDERAS_SIN_RED.filter((b) => !esWebRtc(b)),
 };
 
 /** Lo que `@sparticuz/chromium` agrega y un render fiel no puede llevar. */
