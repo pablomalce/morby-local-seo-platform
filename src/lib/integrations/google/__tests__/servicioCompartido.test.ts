@@ -126,6 +126,25 @@ describe("el fallback: nunca se presta el token de la agencia a quien no tiene m
   });
 });
 
+describe("un mapeo que no se pudo leer no es un mapeo que falta", () => {
+  it("A, con la lectura caída: `mapping-unreadable`, no `not-mapped`, y el token NI SE PIDE", async () => {
+    // Medido en la revisión del #118: los dos lectores convertían un error de
+    // la consulta en la lista vacía, y la regla lo anotaba como «no tiene ningún
+    // mapeo vivo». A puede estar mapeada: decirle «mapeá» la manda a arreglar lo
+    // que está bien. Y prestarle el token «por las dudas» es prestarlo sin
+    // ninguna property que sea suya.
+    process.env.VULKAN_AGENCY_ORG_ID = AGENCIA;
+    const token = resolvedor();
+
+    const s = await servirConLaAgencia(CLIENTE_A, { ilegible: true, detalle: "57014" }, { resolver: token.fn });
+
+    expect(s.mapeos).toEqual([]);
+    expect(s.token).toMatchObject({ ok: false, reason: "mapping-unreadable" });
+    if (!s.token.ok) expect(s.token.detail).toContain("57014");
+    expect(token.pedidos).toBe(0);
+  });
+});
+
 describe("el mapeo ajeno: lo que la RLS deja ver a quien es miembro de dos organizaciones", () => {
   // Un operador de la agencia que es también miembro de A ve, bajo la RLS, los
   // mapeos de las DOS. Si la consulta pierde su filtro por organización, le

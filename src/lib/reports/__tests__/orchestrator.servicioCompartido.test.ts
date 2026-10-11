@@ -88,6 +88,9 @@ const ACCESO_NUEVO = "ACCESO-refrescado-de-la-agencia";
 /** De qué organizaciones es miembro quien pide el reporte. Lo que la RLS deja ver. */
 let miembroDe: string[] = [];
 
+/** Si la lectura de `integration_properties` falla, con qué código. */
+let mapeoFalla: { code: string; message: string } | null = null;
+
 /** Lo que los dobles registran. */
 let salidas: { url: string; autorizacion: string | null }[] = [];
 let secretosLeidos: string[] = [];
@@ -152,7 +155,12 @@ const createSupabaseServerClient = vi.fn(async () => ({
       },
       maybeSingle: async () => ({ data: filas()[0] ?? null, error: null }),
       insert: async () => ({ data: null, error: null }),
-      then: (resolver: (v: unknown) => unknown) => Promise.resolve({ data: filas(), error: null }).then(resolver),
+      then: (resolver: (v: unknown) => unknown) =>
+        Promise.resolve(
+          tabla === "integration_properties" && mapeoFalla
+            ? { data: null, error: mapeoFalla }
+            : { data: filas(), error: null }
+        ).then(resolver),
     };
     return cadena;
   },
@@ -244,6 +252,7 @@ beforeEach(() => {
   refrescosGuardados = [];
   sondas = [];
   miembroDe = [];
+  mapeoFalla = null;
   // La plataforma entera conectada: si algo no sale, no es por falta de
   // credenciales.
   process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
@@ -332,6 +341,30 @@ describe("el fallback: B, sembrada sin token y sin mapeo", () => {
     expect(rep!.dataSourceHealth.ga4).toBe("missing");
     expect(rep!.dataSourceHealth.gbp).toBe("missing");
     expect(sondas).toEqual([]);
+    // Y lo dice CON MOTIVO, que es lo que la Espina pide: no es «a esta
+    // superficie le falta su property», es que la organización no tiene
+    // ninguna y el token de la agencia no se le presta.
+    expect(rep!.dataSourceHealth.motivos).toEqual({
+      searchConsole: "not-mapped",
+      ga4: "not-mapped",
+      gbp: "not-mapped",
+    });
+  });
+
+  it("y ese motivo no es el de una plataforma sin credenciales", async () => {
+    // Antes de la revisión del #118 los dos reportes eran idénticos en lo
+    // visible: tres `missing`. Ahora se distinguen.
+    miembroDe = [CLIENTE_B];
+    delete process.env.GOOGLE_CLIENT_ID;
+
+    const rep = await reporteDe(CLIENTE_B);
+
+    expect(rep!.dataSourceHealth.searchConsole).toBe("missing");
+    expect(rep!.dataSourceHealth.motivos).toEqual({
+      searchConsole: "platform-not-connected",
+      ga4: "platform-not-connected",
+      gbp: "platform-not-connected",
+    });
   });
 
   it("y el reporte de B no trae los números de A ni los de la agencia", async () => {
@@ -353,6 +386,30 @@ describe("el fallback: B, sembrada sin token y sin mapeo", () => {
   });
 });
 
+describe("el mapeo que no se pudo leer no es un mapeo que falta", () => {
+  it("A mapeada con la lectura caída: `error` con motivo, y el token de la agencia no se toca", async () => {
+    // Medido en la revisión del #118: `readPropertyMappings` devolvía `[]` ante
+    // un error, la regla lo anotaba «sin ningún mapeo vivo», y el reporte de A
+    // —que SÍ está mapeada— decía «sin conectar». Mandaba a mapear lo mapeado.
+    miembroDe = [CLIENTE_A];
+    mapeoFalla = { code: "57014", message: "canceling statement due to statement timeout" };
+
+    const rep = await reporteDe(CLIENTE_A);
+
+    expect(tokensLeidos).toEqual([]);
+    expect(secretosLeidos).toEqual([]);
+    expect(salidas).toEqual([]);
+    expect(rep!.dataSourceHealth.searchConsole).toBe("error");
+    expect(rep!.dataSourceHealth.ga4).toBe("error");
+    expect(rep!.dataSourceHealth.gbp).toBe("error");
+    expect(rep!.dataSourceHealth.motivos).toEqual({
+      searchConsole: "mapping-unreadable",
+      ga4: "mapping-unreadable",
+      gbp: "mapping-unreadable",
+    });
+  });
+});
+
 describe("a mitad del alta: lo que no está mapeado no se completa con lo de la agencia", () => {
   it("C con sólo GA4: el token se presta para SU GA4, y Search Console no se consulta", async () => {
     // C tiene un mapeo, así que el token de la agencia SÍ se le presta — para
@@ -369,6 +426,12 @@ describe("a mitad del alta: lo que no está mapeado no se completa con lo de la 
     expect(aGoogleDatos().some((s) => s.url.includes("searchconsole"))).toBe(false);
     expect(rep!.dataSourceHealth.ga4).toBe("live");
     expect(rep!.dataSourceHealth.searchConsole).toBe("missing");
+    // C SÍ tiene un mapeo: lo que le falta es de ESTA superficie, no de la
+    // organización. Distinto de B.
+    expect(rep!.dataSourceHealth.motivos).toEqual({
+      searchConsole: "client-not-mapped",
+      gbp: "client-not-mapped",
+    });
   });
 });
 

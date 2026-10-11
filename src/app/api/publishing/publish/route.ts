@@ -140,6 +140,13 @@ export async function POST(req: Request) {
     }
 
     const armado = await armarPublicador(supabase, asset.organization_id, asset.body);
+
+    // Un mapeo que no se pudo leer no es un mapeo que falta, igual que el asset
+    // de más arriba: 502 y nada más, antes de reservar nada en el ledger. Decir
+    // `falta: "mapeo"` mandaría a mapear una organización que puede estar
+    // mapeada — medido así en la revisión del #118 con un 57014 (timeout).
+    if ("ilegible" in armado) return NextResponse.json({ error: "mapping unreadable" }, { status: 502 });
+
     const publicador = "publicador" in armado ? armado.publicador : undefined;
 
     const resultado = await publicar(
@@ -191,6 +198,10 @@ export async function POST(req: Request) {
  *   token   la organización está mapeada y el token de la agencia no se pudo
  *           resolver. El motivo fino no viaja: es estado de la agencia, no del
  *           cliente que pidió publicar.
+ *
+ * Y una cuarta respuesta que NO es una pieza que falta: el mapeo no se pudo
+ * leer (`{ ilegible: true }`). No se sabe si falta, así que no se dice que
+ * falta: la ruta contesta 502 «mapping unreadable», como con el asset.
  */
 type Falta = "cuenta" | "mapeo" | "token";
 
@@ -207,7 +218,7 @@ async function armarPublicador(
   supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
   organizationId: string,
   cuerpo: string
-): Promise<{ publicador: Publicador } | { falta: Falta }> {
+): Promise<{ publicador: Publicador } | { falta: Falta } | { ilegible: true }> {
   const accountId = process.env.GOOGLE_BUSINESS_ACCOUNT_ID;
   if (!accountId) return { falta: "cuenta" };
 
@@ -215,7 +226,7 @@ async function armarPublicador(
   // distingue el mapeo actual del historial: la `0017` guarda los dos. Y
   // `organization_id` se lee aunque el filtro ya lo fije, para que la regla del
   // servicio compartido lo compruebe en vez de creérselo al filtro.
-  const { data: propiedad } = await supabase
+  const { data: propiedad, error } = await supabase
     .from("integration_properties")
     .select("organization_id, property_ref")
     .eq("organization_id", organizationId)
@@ -223,13 +234,20 @@ async function armarPublicador(
     .is("unmapped_at", null)
     .maybeSingle();
 
-  const leidos = propiedad
-    ? [{ organizationId: propiedad.organization_id, provider: DESTINO, propertyRef: propiedad.property_ref }]
-    : [];
+  // El error se lee, y viaja como fallo: antes se ignoraba, y una lectura caída
+  // se convertía en «no hay ficha». El código y no el mensaje, que puede
+  // nombrar tablas.
+  const leidos = error
+    ? { ilegible: true as const, detalle: error.code ?? "sin código" }
+    : propiedad
+      ? [{ organizationId: propiedad.organization_id, provider: DESTINO, propertyRef: propiedad.property_ref }]
+      : [];
 
   // La ficha y el token salen juntos de la regla: sin mapeo propio no hay
-  // ficha, y entonces el token de la agencia no se resuelve.
+  // ficha, y entonces el token de la agencia no se resuelve. Con el mapeo
+  // ilegible, tampoco.
   const { mapeos, token } = await servirConLaAgencia(organizationId, leidos);
+  if (!token.ok && token.reason === "mapping-unreadable") return { ilegible: true };
 
   const locationRef = mapeos.find((m) => m.provider === DESTINO)?.propertyRef;
   if (!locationRef) return { falta: "mapeo" };

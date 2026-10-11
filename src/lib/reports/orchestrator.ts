@@ -22,7 +22,11 @@ import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
 import type { GoogleSurface } from "@/lib/integrations/google/sources";
 import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
-import { type MapeoLeido, servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
+import {
+  type MapeoIlegible,
+  type MapeoLeido,
+  servirConLaAgencia,
+} from "@/lib/integrations/google/servicioCompartido";
 import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
 import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
 import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
@@ -452,13 +456,16 @@ async function hydrateWithPageSpeed(
  * índice único sólo alcance a los vivos — el índice impide que haya DOS vivos,
  * no que se lea uno muerto.
  *
- * Un fallo de lectura devuelve la lista vacía y NO rompe el reporte. La
- * consecuencia es que las tres fuentes salen `client-not-mapped`, que es lo
- * mismo que dirían si no hubiera mapeo — y eso es una pérdida de precisión
- * aceptada a cambio de que una integración no tumbe un reporte que las otras
- * cuatro fuentes pueden llenar igual.
+ * Un fallo de lectura NO rompe el reporte —las otras cuatro fuentes lo pueden
+ * llenar igual— y tampoco se disfraza de lista vacía. Hasta la revisión del #118
+ * devolvía `[]`, y una organización mapeada con la lectura caída salía «sin
+ * mapear»: la regla del servicio compartido lo anotaba como «no tiene ningún
+ * mapeo vivo», y el reporte decía `missing`, que manda a mapear lo que puede
+ * estar mapeado. Ahora devuelve el fallo, la regla lo niega con
+ * `mapping-unreadable` sin resolver el token, y las tres fuentes salen `error`
+ * con ese motivo. Ausencia, cero y fallo son tres estados.
  */
-async function readPropertyMappings(organizationId: string): Promise<MapeoLeido[]> {
+async function readPropertyMappings(organizationId: string): Promise<MapeoLeido[] | MapeoIlegible> {
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("integration_properties")
@@ -466,7 +473,8 @@ async function readPropertyMappings(organizationId: string): Promise<MapeoLeido[
     .eq("organization_id", organizationId)
     .is("unmapped_at", null);
 
-  if (error || !data) return [];
+  if (error) return { ilegible: true, detalle: error.code ?? "sin código" };
+  if (!data) return [];
   // `organization_id` se lee aunque el filtro ya lo fije: es lo que deja a
   // `servirConLaAgencia` comprobar que la fila es de ESTA organización en vez de
   // creérselo al filtro. Ver su encabezado.
@@ -539,6 +547,10 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
       searchConsole: google.searchConsole,
       gbp: google.gbp,
       ga4: google.ga4,
+      // El porqué de cada `missing` y `error` de Google, con nombre: «sin
+      // ningún mapeo» no es «sin credenciales de plataforma», y la Espina pide
+      // que una organización sin token propio falle CON MOTIVO.
+      motivos: google.motivos,
     },
     localeOverride: input.locale,
     profileCitation: result.profileCitation,

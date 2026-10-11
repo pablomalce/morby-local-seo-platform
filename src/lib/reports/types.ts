@@ -96,12 +96,55 @@ export interface ReportKpi {
   cadence: string;
 }
 
+/**
+ * Por qué una superficie de Google NO se consultó, cuando no se consultó.
+ *
+ * `missing` dice «sin conectar» y nada más, y detrás de esa palabra hay cuatro
+ * arreglos distintos en cuatro lugares distintos. Hasta la revisión del #118
+ * (2026-10-11) el reporte de una organización sin ningún mapeo era, en lo
+ * visible, idéntico al de una plataforma sin credenciales de Google: el motivo
+ * explícito que la Espina pide para «organización sin token propio → falla con
+ * motivo» existía en la regla del servicio compartido y no llegaba a ninguna
+ * parte.
+ *
+ *   platform-not-connected  Growth OS no tiene credenciales de Google. Para nadie.
+ *   not-mapped              la organización no tiene NINGÚN mapeo vivo: el token
+ *                           de la agencia no se le presta (`servicioCompartido.ts`).
+ *   mapping-unreadable      el mapeo no se pudo leer: no se sabe si está mapeada,
+ *                           y el token no se presta a ciegas. Es `error`, no
+ *                           `missing`.
+ *   client-not-mapped       la organización tiene mapeos, pero no de ESTA
+ *                           superficie.
+ *   agency-token            mapeada; el token de la agencia no se pudo resolver.
+ *                           El motivo fino no viaja: es estado de la agencia, no
+ *                           de la organización del reporte (igual que `falta:
+ *                           "token"` al publicar).
+ *
+ * Lo que Google contestó NO es un motivo de esta lista: un fallo de la consulta
+ * se anota en los logs y en `integration_probe`, y no en el reporte (ver
+ * `describirFallo` en `hydrate.ts`).
+ */
+export type MotivoDeFuente =
+  | "platform-not-connected"
+  | "not-mapped"
+  | "mapping-unreadable"
+  | "client-not-mapped"
+  | "agency-token";
+
+/** Las tres superficies de Google del reporte, por su clave en `DataSourceHealth`. */
+export type FuenteDeGoogle = "searchConsole" | "ga4" | "gbp";
+
 export interface DataSourceHealth {
   places: DataSourceStatus;
   pagespeed: DataSourceStatus;
   searchConsole: DataSourceStatus;
   gbp: DataSourceStatus;
   ga4: DataSourceStatus;
+  /**
+   * Por qué cada superficie de Google no se consultó. Sólo las que no se
+   * consultaron; un reporte guardado antes de esto no trae el campo.
+   */
+  motivos?: Partial<Record<FuenteDeGoogle, MotivoDeFuente>>;
   /** Plain text explanation for the user about what's live vs demo. */
   note: string;
 }

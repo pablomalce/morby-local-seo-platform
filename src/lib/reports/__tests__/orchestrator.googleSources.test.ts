@@ -412,10 +412,11 @@ describe("las tres fuentes de Google salen del mapeo, no de una palabra", () => 
     expect(rep!.dataSourceHealth.searchConsole).toBe("missing");
   });
 
-  it("un fallo al leer el mapeo no tumba el reporte", async () => {
-    // Las otras dos fuentes y el motor entero siguen sirviendo. La pérdida
-    // aceptada está escrita en `readPropertyMappings`: las tres salen como si no
-    // hubiera mapeo, que es menos preciso y no es falso.
+  it("un fallo al leer el mapeo no tumba el reporte, y no se disfraza de «sin mapear»", async () => {
+    // Las otras dos fuentes y el motor entero siguen sirviendo. Hasta la
+    // revisión del #118 las tres salían `missing`, «como si no hubiera mapeo»,
+    // y eso SÍ era falso: «sin conectar» manda a mapear una organización que
+    // puede estar mapeada. Ahora es `error`, con su motivo.
     process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
     process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
     errorDeMapeo = { message: "la lectura falló" };
@@ -423,7 +424,8 @@ describe("las tres fuentes de Google salen del mapeo, no de una palabra", () => 
     const rep = await generar();
 
     expect(rep, "el reporte se cayó entero por una integración").not.toBeNull();
-    expect(rep!.dataSourceHealth.ga4).toBe("missing");
+    expect(rep!.dataSourceHealth.ga4).toBe("error");
+    expect(rep!.dataSourceHealth.motivos?.ga4).toBe("mapping-unreadable");
   });
 
   it("en modo demostración no pregunta por el mapeo de nadie", async () => {

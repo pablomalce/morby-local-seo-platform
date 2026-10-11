@@ -48,6 +48,9 @@ let miembroDe: string[] = [];
 /** Las lecturas del mapeo, con sus filtros: dicen de QUÉ organización se pidió la ficha. */
 let lecturasDeMapeo: Record<string, unknown>[] = [];
 
+/** Si la lectura del mapeo falla, con qué. */
+let mapeoFalla: { code: string; message: string } | null = null;
+
 function filas(tabla: string, filtros: Record<string, unknown>) {
   const coincide = (f: Record<string, unknown>) => Object.entries(filtros).every(([c, v]) => f[c] === v);
   if (tabla === "content_assets") return ASSETS.filter((a) => miembroDe.includes(a.organization_id) && coincide(a));
@@ -78,6 +81,7 @@ vi.mock("@/lib/supabase/server", () => ({
         limit: async () => ({ data: filas(tabla, filtros), error: null }),
         maybeSingle: async () => {
           if (tabla === "integration_properties") lecturasDeMapeo.push({ ...filtros });
+          if (tabla === "integration_properties" && mapeoFalla) return { data: null, error: mapeoFalla };
           const f = filas(tabla, filtros);
           // Como PostgREST: más de una fila en un `maybeSingle` es un error, no
           // la primera. Si el código pierde un filtro, eso se ve.
@@ -116,12 +120,15 @@ vi.mock("@/lib/publishing/googleBusinessProfile", () => ({
   },
 }));
 
-/** El transporte, con su contrato: sin publicador, `sin-transporte`. */
+/** El transporte, con su contrato: sin publicador, `sin-transporte`. Cuenta cuántas veces se llamó. */
+let llamadasAPublicar = 0;
 vi.mock("@/lib/publishing/transport", () => ({
-  publicar: async (_entrada: unknown, _modo: unknown, publicador: unknown) =>
-    publicador
+  publicar: async (_entrada: unknown, _modo: unknown, publicador: unknown) => {
+    llamadasAPublicar += 1;
+    return publicador
       ? { ok: true, estado: "publicado", publicationId: "pub-1", externalId: "x" }
-      : { ok: false, motivo: "sin-transporte" },
+      : { ok: false, motivo: "sin-transporte" };
+  },
 }));
 
 vi.mock("@/lib/api/rate-limit", () => ({ rateLimit: () => null }));
@@ -142,6 +149,8 @@ const publicar = (assetId: string) =>
 beforeEach(() => {
   miembroDe = [];
   lecturasDeMapeo = [];
+  mapeoFalla = null;
+  llamadasAPublicar = 0;
   pedidosDeToken = 0;
   respuestaDelToken = { ok: true, accessToken: "ACCESO-de-la-agencia" };
   armados = [];
@@ -210,6 +219,38 @@ describe("el fallback: B, sembrada sin token y sin ficha", () => {
 
     expect(res.status).toBe(503);
     expect(armados).toEqual([]);
+    expect(pedidosDeToken).toBe(0);
+  });
+});
+
+describe("un mapeo que no se pudo leer no es un mapeo que falta", () => {
+  it("A mapeada con la lectura caída: 502, ni `falta: mapeo` ni token, y no se reserva nada", async () => {
+    // Medido en la revisión del #118: `armarPublicador` ignoraba el `error` del
+    // `maybeSingle`, y un timeout (57014) sobre la organización de A —que tiene
+    // `locations/100`— contestaba 503 `falta: "mapeo"`. Un motivo explícito y
+    // falso, que manda a mapear lo mapeado. Igual que el asset ilegible: 502.
+    miembroDe = [CLIENTE_A];
+    mapeoFalla = { code: "57014", message: "canceling statement due to statement timeout" };
+
+    const res = await publicar(ASSET_A);
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "mapping unreadable" });
+    expect(pedidosDeToken).toBe(0);
+    expect(armados).toEqual([]);
+    expect(llamadasAPublicar).toBe(0);
+    expect(salidas).toBe(0);
+  });
+
+  it("y PostgREST con más de una fila en el maybeSingle también es un fallo, no una ausencia", async () => {
+    // Es lo que devuelve la base si el código pierde un filtro: un error, que
+    // antes también terminaba en `falta: "mapeo"`.
+    miembroDe = [CLIENTE_A];
+    mapeoFalla = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned" };
+
+    const res = await publicar(ASSET_A);
+
+    expect(res.status).toBe(502);
     expect(pedidosDeToken).toBe(0);
   });
 });
