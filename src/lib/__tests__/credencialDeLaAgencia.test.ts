@@ -52,7 +52,11 @@
  * lectura del entorno cuya clave el compilador no puede enumerar, un
  * `process.env` que se escapa a algo que no lo tipa como entorno, una llamada de
  * Supabase con un nombre armado en ejecución, o un `import()` de destino no
- * literal, son fallas por sí mismas — por ahí pasaría la próxima.
+ * literal, son fallas por sí mismas — por ahí pasaría la próxima. Lo mismo un
+ * `process` o un `globalThis` que pierden el tipo (`as any`, `Reflect.get`) y una
+ * carga que resuelve webpack sin `import()` (`require.context`,
+ * `import.meta.webpackContext`, `__non_webpack_require__`): medidos en la
+ * tercera revisión del #118.
  *
  * Y NO SÓLO POR ARCHIVO: POR SÍMBOLO (R14)
  *
@@ -66,7 +70,9 @@
  *   - `agencyAccessToken` y `resolveAccessToken` los usa SÓLO la puerta;
  *   - la puerta exporta como valor su regla, `servirConLaAgencia`, y nada más;
  *   - cada exención de conexión declara qué piezas de la credencial usa, y usa
- *     exactamente ésas.
+ *     exactamente ésas. También si las nombra por TEXTO (`almacen["x"]`, una
+ *     clave `as const`, un `import()`) o si el namespace se va a otra función:
+ *     la tercera revisión del #118 pidió el token así desde `property-actions.ts`.
  *
  * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
  *
@@ -232,6 +238,11 @@ const VIRTUALES: Record<string, string> = {
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
+  // Lo mismo con un import() esperado: usa la regla de la puerta y nada más. Si
+  // el namespace se contara entero, usaría también el agencyAccessToken que la
+  // puerta virtual reexporta, y sería un falso positivo.
+  "datosPorImportDinamico.ts": `
+    export const reporte = async () => (await import("./servicioCompartido")).servir(["properties/2"]);`,
   "conexion.ts": `
     import { resolveAgencyOrgId } from "./agency";
     export const conectar = () => resolveAgencyOrgId();`,
@@ -258,6 +269,47 @@ const VIRTUALES: Record<string, string> = {
     import { agencyAccessToken } from "./tokenStore";
     export const operador = () => resolveAgencyOrgId();
     export async function clicsDeUnaProperty(propertyRef: string) { return { propertyRef, token: await agencyAccessToken() }; }`,
+  // La misma server action de más, sin nombrar el símbolo con un identificador
+  // (tercera revisión del #118): la clave es un texto, o el namespace se va a
+  // otra función. Con `usa` cosechado sólo de identificadores, las seis pasaban.
+  "conexionPorElemento.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => almacen["agencyAccessToken"]();`,
+  "conexionPorImportDinamico.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = async () => (await import("./tokenStore"))["agencyAccessToken"]();`,
+  "conexionPorClaveConst.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    const k = "agencyAccessToken" as const;
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => almacen[k]();`,
+  "conexionPorReflect.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => (Reflect.get(almacen, "agencyAccessToken") as () => Promise<unknown>)();`,
+  "conexionPorClaveArmada.js": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => almacen[["agency", "AccessToken"].join("")]();`,
+  // El namespace llega por lo que devuelve otra función: no hay identificador
+  // suyo en este archivo, sólo un acceso por elemento sobre su tipo.
+  "cargadorDelAlmacen.ts": `export const cargar = () => import("./tokenStore");`,
+  "conexionPorCargador.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import { cargar } from "./cargadorDelAlmacen";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = async () => (await cargar())["agencyAccessToken"]();`,
+  "conexionPorPatronComputado.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => { const { ["agencyAccessToken"]: token } = almacen; return token(); };`,
 
   // --- La variable, por las tres formas de la revisión del #118 y una más.
   "asConst.ts": `
@@ -288,6 +340,27 @@ const VIRTUALES: Record<string, string> = {
   "restoDelEntorno.ts": `
     const { ...todo } = process.env;
     export const agencia = () => todo.VULKAN_AGENCY_ORG_ID;`,
+
+  // --- El entorno, sacándole el tipo a `process` (tercera revisión del #118). El
+  // rastreo empezaba en lo tipado como entorno, y `process` es un `Process`: un
+  // `as any` o un `Reflect.get` le borraban el tipo antes de llegar a `.env`.
+  "procesoComoAny.ts": `
+    export const agencia = () => (process as any).env.VULKAN_AGENCY_ORG_ID;`,
+  "procesoReflect.ts": `
+    export const agencia = () => Reflect.get(process, "env").VULKAN_AGENCY_ORG_ID;`,
+  "procesoGlobalThisAny.ts": `
+    export const agencia = () => (globalThis as any).process.env.VULKAN_AGENCY_ORG_ID;`,
+  "procesoDescriptor.ts": `
+    export const agencia = () => Object.getOwnPropertyDescriptor(process, "env")?.value?.VULKAN_AGENCY_ORG_ID;`,
+  "procesoImportado.ts": `
+    import proceso from "node:process";
+    export const agencia = () => (proceso as any).env.VULKAN_AGENCY_ORG_ID;`,
+  "procesoGuardado.js": `
+    const p = /** @type {any} */ (process);
+    export const agencia = () => p["env"]["VULKAN_AGENCY_ORG_ID"];`,
+  // Con el tipo intacto, por el objeto global: es una lectura, y se ve como tal.
+  "procesoPorElGlobal.ts": `
+    export const agencia = () => globalThis.process.env.VULKAN_AGENCY_ORG_ID;`,
 
   // --- La custodia, sin pasar por la variable.
   "secretoDirecto.ts": `
@@ -323,6 +396,24 @@ const VIRTUALES: Record<string, string> = {
   "importInexistente.ts": `
     import { algo } from "./noExiste";
     export const valor = () => algo;`,
+  // Cargas que resuelve webpack sin `import()` ni `require("literal")` (tercera
+  // revisión del #118: `require.context` empaquetaba tokenStore.ts en una ruta
+  // con la pared, tsc, eslint y next build en verde).
+  "datosRequireContext.js": `
+    const ctx = require.context("./", false, /tokenStore\\.ts$/);
+    export const clics = () => ctx(ctx.keys()[0]).agencyAccessToken();`,
+  "datosWebpackContext.js": `
+    const ctx = import.meta.webpackContext("./", { recursive: false, regExp: /tokenStore\\.ts$/ });
+    export const clics = () => ctx(ctx.keys()[0]).agencyAccessToken();`,
+  "datosModuleRequire.js": `
+    export const clics = () => module.require("./tokenStore").agencyAccessToken();`,
+  "datosNonWebpackRequire.js": `
+    export const clics = () => __non_webpack_require__("./tokenStore").agencyAccessToken();`,
+  "datosWebpackRequire.js": `
+    export const clics = (id) => __webpack_require__(id).agencyAccessToken();`,
+  "datosRequireAlias.js": `
+    const cargar = require;
+    export const clics = () => cargar("./tokenStore").agencyAccessToken();`,
   // Next lo sirve como ruta: el segmento no empieza con «_». No es un test.
   "app/api/clics__tests__/route.ts": `
     import { agencyAccessToken } from "../../../tokenStore";
@@ -350,6 +441,16 @@ const VIRTUALES: Record<string, string> = {
   "controlPasaElEntorno.ts": `
     function leer(env: NodeJS.ProcessEnv) { return env.OTRA_VARIABLE; }
     export const valor = () => leer(process.env);`,
+  // `process`, el objeto global y `require` usados como se usan: nada se escapa.
+  "controlProceso.ts": `
+    export const donde = () => process.cwd() + process.platform + String(typeof process) + String(process.env.OTRA_VARIABLE);
+    export const red = () => globalThis.fetch;
+    export const enElNavegador = () => typeof window !== "undefined" && typeof globalThis.window !== "undefined";
+    export const aqui = () => import.meta.url;`,
+  "controlRequireLiteral.js": `
+    const { randomUUID } = require("node:crypto");
+    export const id = () => randomUUID();
+    export const exportado = () => typeof module !== "undefined" && module.exports;`,
   // Lo que resuelve el bundler y no es código del repo: un módulo de Node, el
   // marcador de Next y una hoja de estilos.
   "controlEstilos.ts": `
@@ -362,6 +463,17 @@ const VIRTUALES: Record<string, string> = {
     import { agencyAccessToken } from "../../../../tokenStore";
     export const ayuda = () => agencyAccessToken();`,
 };
+
+/** Las exenciones de conexión que piden el token sin nombrarlo con un identificador. */
+const CONEXION_SIN_IDENTIFICADOR = [
+  "conexionPorCargador.ts",
+  "conexionPorClaveArmada.js",
+  "conexionPorClaveConst.ts",
+  "conexionPorElemento.ts",
+  "conexionPorImportDinamico.ts",
+  "conexionPorPatronComputado.ts",
+  "conexionPorReflect.ts",
+];
 
 const POLITICA_VIRTUAL: Politica = {
   variable: VARIABLE,
@@ -380,6 +492,7 @@ const POLITICA_VIRTUAL: Politica = {
   conexion: [
     { modulo: `${V}/conexion.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
     { modulo: `${V}/conexionConToken.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
+    ...CONEXION_SIN_IDENTIFICADOR.map((m) => ({ modulo: `${V}/${m}`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] })),
     { modulo: `${V}/yaNoLlega.ts`, usa: [] },
   ],
 };
@@ -414,16 +527,47 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(esTest("src/test/server-only.stub.ts")).toBe(true);
   });
 
-  it("la variable: el `as const`, la constante local, el .js, la importada y el destructuring", () => {
+  it("la variable: el `as const`, la constante local, el .js, la importada, el destructuring y por el objeto global", () => {
     expect(virtual.lectoresDe(VARIABLE)).toEqual(
-      en(["agency.ts", "asConst.ts", "constLocal.ts", "agenciaPorDefecto.js", "constanteImportada.ts", "desestructurada.ts"])
+      en([
+        "agency.ts",
+        "asConst.ts",
+        "constLocal.ts",
+        "agenciaPorDefecto.js",
+        "constanteImportada.ts",
+        "desestructurada.ts",
+        "procesoPorElGlobal.ts",
+      ])
     );
   });
 
   it("el entorno con clave desconocida: armada, escapada, guardada como otra cosa, o el resto", () => {
     expect(archivosDe(virtual.envOpaco)).toEqual(
-      en(["claveArmada.ts", "entornoEscapado.ts", "entornoGuardado.ts", "restoDelEntorno.ts"])
+      en([
+        "claveArmada.ts",
+        "entornoEscapado.ts",
+        "entornoGuardado.ts",
+        "procesoComoAny.ts",
+        "procesoDescriptor.ts",
+        "procesoGlobalThisAny.ts",
+        "procesoGuardado.js",
+        "procesoImportado.ts",
+        "procesoReflect.ts",
+        "restoDelEntorno.ts",
+      ])
     );
+  });
+
+  it("`process` y el objeto global sin su tipo son entorno de clave desconocida, y cada sitio se nombra", () => {
+    // Por SITIO, no sólo por archivo: el `as any`, el `Reflect.get`, el
+    // descriptor y el global, cada uno con su línea.
+    const sitios = virtual.envOpaco.join("\n");
+    expect(sitios).toContain(`${V}/procesoComoAny.ts:2 process se escapa`);
+    expect(sitios).toContain(`${V}/procesoReflect.ts:2 process se escapa`);
+    expect(sitios).toContain(`${V}/procesoDescriptor.ts:2 process se escapa`);
+    expect(sitios).toContain(`${V}/procesoGlobalThisAny.ts:2 el objeto global se escapa`);
+    expect(sitios).toContain(`${V}/procesoImportado.ts:3 process se escapa`);
+    expect(sitios).toContain(`${V}/procesoGuardado.js:2 process se escapa`);
   });
 
   it("la custodia: el secreto pedido directo con service_role, y por una URL de PostgREST", () => {
@@ -435,11 +579,24 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(virtual.esquemas).toEqual(["vault"]);
   });
 
-  it("el grafo: un import() que no se puede seguir, uno con query y uno que no resuelve", () => {
+  it("el grafo: un import() que no se puede seguir, uno con query, uno que no resuelve, y las cargas de webpack", () => {
     expect(archivosDe(virtual.sinResolver)).toEqual(
-      en(["importConQuery.js", "importDinamico.ts", "importInexistente.ts"])
+      en([
+        "datosModuleRequire.js",
+        "datosNonWebpackRequire.js",
+        "datosRequireAlias.js",
+        "datosRequireContext.js",
+        "datosWebpackContext.js",
+        "datosWebpackRequire.js",
+        "importConQuery.js",
+        "importDinamico.ts",
+        "importInexistente.ts",
+      ])
     );
-    expect(virtual.sinResolver.join("\n")).toContain('"./tokenStore.ts?fallback": lleva ? o #');
+    const sitios = virtual.sinResolver.join("\n");
+    expect(sitios).toContain('"./tokenStore.ts?fallback": lleva ? o #');
+    expect(sitios).toContain(`${V}/datosRequireContext.js:2 require que no es require("literal")`);
+    expect(sitios).toContain(`${V}/datosWebpackContext.js:2 import.meta.webpackContext`);
   });
 
   it("las fugas: template.tsx, instrumentation.ts, el .js reexportado, la ruta clics__tests__, y quien importa una fuga", () => {
@@ -450,6 +607,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       en([
         "app/api/clics__tests__/route.ts",
         "app/reports/template.tsx",
+        "cargadorDelAlmacen.ts",
         "instrumentation.ts",
         "reexporta.ts",
         "reexportaTodo.ts",
@@ -471,7 +629,9 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "app/api/clics__tests__/route.ts",
         "app/reports/template.tsx",
         "atajoPorLaPuerta.ts",
+        "cargadorDelAlmacen.ts",
         "conexionConToken.ts",
+        ...CONEXION_SIN_IDENTIFICADOR,
         "servicioCompartido.ts",
         "usaAbreviado.ts",
         "usaPorEstrella.ts",
@@ -480,15 +640,22 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     });
     expect(virtual.exportaLaPuerta).toEqual(["agencyAccessToken", "servir"]);
     expect(analisisVirtual.lecturas.get(`${V}/reexportaTodo.ts`)!.exporta).toContain("agencyAccessToken");
+    const conToken = [`${V}/agency.ts#resolveAgencyOrgId`, `${V}/tokenStore.ts#agencyAccessToken`];
     expect(virtual.conexionUsa).toEqual({
       [`${V}/conexion.ts`]: [`${V}/agency.ts#resolveAgencyOrgId`],
-      [`${V}/conexionConToken.ts`]: [`${V}/agency.ts#resolveAgencyOrgId`, `${V}/tokenStore.ts#agencyAccessToken`],
+      [`${V}/conexionConToken.ts`]: conToken,
+      ...Object.fromEntries(CONEXION_SIN_IDENTIFICADOR.map((m) => [`${V}/${m}`, conToken])),
       [`${V}/yaNoLlega.ts`]: [],
     });
   });
 
   it("lo legítimo pasa: la ruta de datos por la puerta, la de conexión, y los controles", () => {
-    expect(virtual.porLaPuerta).toEqual(en(["atajoPorLaPuerta.ts", "datosLegitimos.ts", "usaAbreviado.ts"]));
+    expect(virtual.porLaPuerta).toEqual(
+      en(["atajoPorLaPuerta.ts", "datosLegitimos.ts", "datosPorImportDinamico.ts", "usaAbreviado.ts"])
+    );
+    expect([...analisisVirtual.lecturas.get(`${V}/datosPorImportDinamico.ts`)!.usa]).toEqual([
+      `${V}/servicioCompartido.ts#servir`,
+    ]);
     expect(analisisVirtual.lecturas.get(`${V}/controlEstilos.ts`)!.sinResolver).toEqual([]);
     expect(analisisVirtual.lecturas.get(`${V}/controlSoloTipos.ts`)!.usa.size).toBe(0);
     const marcados = new Set([
@@ -502,10 +669,17 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       "controlSoloTipos.ts",
       "controlOtrasVariables.ts",
       "controlPasaElEntorno.ts",
+      "controlProceso.ts",
+      "controlRequireLiteral.js",
       "datosLegitimos.ts",
+      "datosPorImportDinamico.ts",
       "conexion.ts",
     ])) {
       expect(marcados.has(control), `${control} no es una fuga y el detector lo marcó`).toBe(false);
+    }
+    for (const control of ["controlProceso.ts", "controlRequireLiteral.js"]) {
+      expect(analisisVirtual.lecturas.get(`${V}/${control}`)!.sinResolver, control).toEqual([]);
+      expect(analisisVirtual.lecturas.get(`${V}/${control}`)!.envOpaco, control).toEqual([]);
     }
     expect(analisisVirtual.lecturas.get(`${V}/controlSoloTipos.ts`)!.importa).toEqual([]);
     expect([...analisisVirtual.lecturas.get(`${V}/controlOtrasVariables.ts`)!.leeEnv].sort()).toEqual([
