@@ -385,6 +385,23 @@ describe("la unicidad global, que es la fuga rechazada", () => {
     expect(res.ok === false && res.message).toContain("otra organización");
   });
 
+  it("un 23P01 es el solape de Search Console de la 0034, y se dice así", async () => {
+    // Medido en la revisión del #118: `sc-domain:x` en una organización y
+    // `https://www.x/` en otra son textos distintos, la 0017 los deja vivos a
+    // los dos, y son el mismo tráfico. La 0034 lo rechaza con 23P01, y el
+    // operador tiene que leer «se solapa», no «ya está mapeada» —no hay un texto
+    // idéntico que buscar— ni «error al guardar».
+    errorPorVerbo = { insert: { code: "23P01", message: "se solapa con la de otra organización" } };
+    const { mapProperty } = await acciones();
+    const res = await mapProperty({
+      organizationId: ORG,
+      surface: "search_console",
+      propertyRef: "https://www.ejemplo.test/",
+    });
+    expect(res).toMatchObject({ code: "property-overlaps" });
+    expect(res.ok === false && res.message).toContain("se solapa");
+  });
+
   it("cualquier otro fallo de la base no se disfraza de conflicto de property", async () => {
     errorPorVerbo = { insert: { code: "42501", message: "permission denied" } };
     const { mapProperty } = await acciones();

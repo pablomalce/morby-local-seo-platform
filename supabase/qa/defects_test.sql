@@ -1,4 +1,4 @@
--- A hundred and eighty isolation checks against the Growth OS schema — executable.
+-- A hundred and eighty-eight isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -9964,11 +9964,270 @@ SELECT 227, 'un asset sellado se muda de organización o de negocio con la firma
             END
   FROM s33 WHERE bloque = 227;
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- 0034 — lo que cubre una propiedad de Search Console es de UNA organización
+-- ═════════════════════════════════════════════════════════════════════════════
+-- La 0017 hace única la property por su TEXTO. Una propiedad de Search Console
+-- es un conjunto de URLs: `sc-domain:x` cubre todo `x` y sus subdominios, y un
+-- prefijo cubre lo que empieza con él. Medido el 2026-10-11 en la revisión del
+-- #118, sobre una réplica y como `service_role`: cuatro organizaciones vivas
+-- sobre el mismo dominio, `INSERT 0 4`. El bloque 230 es ese caso, tal cual.
+--
+-- Escribe `service_role`, que es como escribe `property-actions.ts`: tiene
+-- BYPASSRLS, así que si algo frena acá es la regla y no una policy. Cada caso
+-- dice el SQLSTATE esperado, o `ok` si tiene que entrar: un trigger que
+-- rechazara todo Search Console pondría verdes los rechazos, y los `ok` son su
+-- contraprueba.
+--
+-- Treinta organizaciones, una por usuaria, por el alta de verdad
+-- (`handle_new_user()`): cada una puede tener UN mapeo vivo de Search Console
+-- (la 0017), así que cada caso necesita la suya.
+RESET ROLE;
+
+INSERT INTO auth.users (id, email)
+SELECT ('34000000-0034-4034-8034-' || lpad(n::text, 12, '0'))::uuid, 'sc34-' || n || '@example.test'
+  FROM generate_series(1, 30) n;
+
+CREATE TEMP TABLE o34 AS
+SELECT n, m.organization_id AS org
+  FROM generate_series(1, 30) n
+  JOIN org_members m ON m.user_id = ('34000000-0034-4034-8034-' || lpad(n::text, 12, '0'))::uuid;
+
+CREATE TEMP TABLE s34 (bloque int, caso text, esperado text, medido text) ON COMMIT DROP;
+GRANT SELECT ON o34 TO service_role;
+GRANT ALL ON s34 TO service_role;
+
+-- Mapear `p_ref` en la organización `p_n`, viva o ya desmapeada. Devuelve el
+-- SQLSTATE con que murió, u `ok`. Lo que entra, queda: los casos de un bloque
+-- se apoyan en los de antes.
+CREATE OR REPLACE FUNCTION pg_temp.sc34(p_n int, p_ref text, p_vivo boolean DEFAULT true) RETURNS text
+LANGUAGE sql AS $$
+    SELECT coalesce(pg_temp.sqlstate_of(format(
+        'INSERT INTO public.integration_properties (organization_id, provider, property_ref, unmapped_at) '
+        'VALUES (%L, ''search_console'', %L, %L)',
+        (SELECT org FROM o34 WHERE n = p_n), p_ref,
+        CASE WHEN p_vivo THEN NULL ELSE now() END)), 'ok');
+$$;
+
+-- Una sentencia cualquiera sobre el mapeo de la organización `p_n`.
+CREATE OR REPLACE FUNCTION pg_temp.sc34_sql(p_n int, p_set text) RETURNS text
+LANGUAGE sql AS $$
+    SELECT coalesce(pg_temp.sqlstate_of(format(
+        'UPDATE public.integration_properties SET %s WHERE organization_id = %L AND provider = ''search_console''',
+        p_set, (SELECT org FROM o34 WHERE n = p_n))), 'ok');
+$$;
+
+-- ── 230 ──────────────────────────────────────────────────────────────────────
+-- EL CASO MEDIDO. El dominio entra; su raíz en https, su `www` y una ruta en
+-- http, en otras tres organizaciones, no. Y `sc-domain:otro-cliente-a.test`
+-- termina en «cliente-a.test» sin el punto: es OTRO dominio, y tiene que entrar
+-- (un sufijo de texto no es un subdominio).
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (230, 'a dominio',            'ok',    pg_temp.sc34(1, 'sc-domain:cliente-a.test'));
+INSERT INTO s34 VALUES (230, 'b raíz https',         '23P01', pg_temp.sc34(2, 'https://cliente-a.test/'));
+INSERT INTO s34 VALUES (230, 'c www',                '23P01', pg_temp.sc34(3, 'https://www.cliente-a.test/'));
+INSERT INTO s34 VALUES (230, 'd ruta en http',       '23P01', pg_temp.sc34(4, 'http://cliente-a.test/blog/'));
+INSERT INTO s34 VALUES (230, 'e sufijo sin punto',   'ok',    pg_temp.sc34(5, 'sc-domain:otro-cliente-a.test'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 230, 'a domain property and URL prefixes of the same site are live in two organizations',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 5,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 5
+            THEN 'sc-domain:cliente-a.test entra; https://cliente-a.test/, https://www.cliente-a.test/ y ' ||
+                 'http://cliente-a.test/blog/ en otras tres organizaciones mueren con 23P01; ' ||
+                 'sc-domain:otro-cliente-a.test (otro dominio) entra'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 230;
+
+-- ── 231 ──────────────────────────────────────────────────────────────────────
+-- DOS PREFIJOS. Uno que contiene al otro se solapa, también con otras
+-- mayúsculas en el host. El protocolo es parte del prefijo (`http://` no está
+-- dentro de `https://`), y `https://p34.test/` no es prefijo de
+-- `https://p34.testing.test/`: los dos terminan en `/`.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (231, 'a raíz',               'ok',    pg_temp.sc34(6, 'https://p34.test/'));
+INSERT INTO s34 VALUES (231, 'b ruta adentro',       '23P01', pg_temp.sc34(7, 'https://p34.test/blog/'));
+INSERT INTO s34 VALUES (231, 'c mayúsculas',         '23P01', pg_temp.sc34(8, 'https://P34.test/tienda/'));
+INSERT INTO s34 VALUES (231, 'd otro protocolo',     'ok',    pg_temp.sc34(9, 'http://p34.test/blog/'));
+INSERT INTO s34 VALUES (231, 'e host más largo',     'ok',    pg_temp.sc34(10, 'https://p34.testing.test/'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 231, 'two URL prefixes where one contains the other are live in two organizations',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 5,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 5
+            THEN 'https://p34.test/ entra; /blog/ y /tienda/ (con el host en mayúsculas) debajo de él mueren con ' ||
+                 '23P01; http://p34.test/blog/ y https://p34.testing.test/ no se solapan y entran'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 231;
+
+-- ── 232 ──────────────────────────────────────────────────────────────────────
+-- DOMINIO Y SUBDOMINIOS. La propiedad de un subdominio es un subconjunto de la
+-- del dominio, y un prefijo con puerto sigue siendo de ese host.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (232, 'a dominio',            'ok',    pg_temp.sc34(11, 'sc-domain:d34.test'));
+INSERT INTO s34 VALUES (232, 'b subdominio',         '23P01', pg_temp.sc34(12, 'sc-domain:blog.d34.test'));
+INSERT INTO s34 VALUES (232, 'c prefijo con puerto', '23P01', pg_temp.sc34(13, 'https://shop.d34.test:8443/'));
+INSERT INTO s34 VALUES (232, 'd otro dominio',       'ok',    pg_temp.sc34(14, 'sc-domain:otro-d34.test'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 232, 'a domain property and its subdomains are live in two organizations',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 4,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 4
+            THEN 'sc-domain:d34.test entra; sc-domain:blog.d34.test y https://shop.d34.test:8443/ mueren con ' ||
+                 '23P01; sc-domain:otro-d34.test entra'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 232;
+
+-- ── 233 ──────────────────────────────────────────────────────────────────────
+-- EL ORDEN NO IMPORTA. El solape es simétrico: el dominio que llega DESPUÉS de
+-- un prefijo suyo, o de un subdominio suyo, choca igual.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (233, 'a prefijo primero',    'ok',    pg_temp.sc34(15, 'https://www.q34.test/'));
+INSERT INTO s34 VALUES (233, 'b dominio después',    '23P01', pg_temp.sc34(16, 'sc-domain:q34.test'));
+INSERT INTO s34 VALUES (233, 'c subdominio primero', 'ok',    pg_temp.sc34(17, 'sc-domain:a.r34.test'));
+INSERT INTO s34 VALUES (233, 'd dominio después',    '23P01', pg_temp.sc34(18, 'sc-domain:r34.test'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 233, 'a domain property mapped after its own prefix or subdomain is accepted',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 4,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 4
+            THEN 'https://www.q34.test/ y luego sc-domain:q34.test: 23P01; sc-domain:a.r34.test y luego ' ||
+                 'sc-domain:r34.test: 23P01'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 233;
+
+-- ── 234 ──────────────────────────────────────────────────────────────────────
+-- LO QUE NO TIENE QUE BLOQUEAR. Como la 0017: el historial (un mapeo
+-- desmapeado) no bloquea a nadie —un cliente se va y otro hereda el sitio—, y
+-- una organización que cambia SU propio mapeo por uno que se solapa con el
+-- viejo, tampoco. Desmapear nunca choca.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (234, 'a mapear',             'ok',    pg_temp.sc34(19, 'sc-domain:h34.test'));
+INSERT INTO s34 VALUES (234, 'b desmapear',          'ok',    pg_temp.sc34_sql(19, 'unmapped_at = now()'));
+INSERT INTO s34 VALUES (234, 'c heredar el sitio',   'ok',    pg_temp.sc34(20, 'https://h34.test/'));
+INSERT INTO s34 VALUES (234, 'd propio, mapear',     'ok',    pg_temp.sc34(21, 'sc-domain:z34.test'));
+INSERT INTO s34 VALUES (234, 'e propio, desmapear',  'ok',    pg_temp.sc34_sql(21, 'unmapped_at = now()'));
+INSERT INTO s34 VALUES (234, 'f propio, remapear',   'ok',    pg_temp.sc34(21, 'https://www.z34.test/'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 234, 'the overlap rule blocks history or an organization''s own re-mapping',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 6,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 6
+            THEN 'un dominio desmapeado no bloquea que otra organización mapee su raíz; una organización ' ||
+                 'desmapea su dominio y mapea su www: todo entra'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 234;
+
+-- ── 235 ──────────────────────────────────────────────────────────────────────
+-- POR UPDATE. Revivir un mapeo muerto que se solapa con uno vivo de otra, y
+-- cambiarle la referencia a un mapeo vivo para que se solape, son la misma fuga
+-- que un INSERT: el trigger mira los dos.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (235, 'a vivo',               'ok',    pg_temp.sc34(22, 'sc-domain:u34.test'));
+INSERT INTO s34 VALUES (235, 'b muerto',             'ok',    pg_temp.sc34(23, 'https://u34.test/', false));
+INSERT INTO s34 VALUES (235, 'c revivir',            '23P01', pg_temp.sc34_sql(23, 'unmapped_at = NULL'));
+INSERT INTO s34 VALUES (235, 'd vivo ajeno',         'ok',    pg_temp.sc34(24, 'https://otro-u34.test/'));
+INSERT INTO s34 VALUES (235, 'e cambiar la ref',     '23P01', pg_temp.sc34_sql(24, 'property_ref = ''https://www.u34.test/'''));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 235, 'an UPDATE brings a Search Console overlap to life',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 5,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 5
+            THEN 'revivir https://u34.test/ con sc-domain:u34.test vivo en otra, y cambiar un mapeo vivo a ' ||
+                 'https://www.u34.test/: 23P01 los dos'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 235;
+
+-- ── 236 ──────────────────────────────────────────────────────────────────────
+-- LO IDÉNTICO ES DE LA 0017. El mismo texto en otra organización —con otras
+-- mayúsculas, o tal cual— lo rechaza el índice con 23505 ANTES de que el
+-- trigger corra (es AFTER). Si el trigger lo contestara, el bloque 43 mediría
+-- este trigger y no el índice.
+SET LOCAL ROLE service_role;
+INSERT INTO s34 VALUES (236, 'a prefijo',            'ok',    pg_temp.sc34(25, 'https://e34.test/'));
+INSERT INTO s34 VALUES (236, 'b mayúsculas',         '23505', pg_temp.sc34(26, 'https://E34.test/'));
+INSERT INTO s34 VALUES (236, 'c dominio tal cual',   '23505', pg_temp.sc34(27, 'sc-domain:cliente-a.test'));
+-- Y una forma no canónica muere en el CHECK, no acá: `http` empieza como
+-- `http://p34.test/blog/`, y un trigger BEFORE lo vería «solapado».
+INSERT INTO s34 VALUES (236, 'd forma no canónica',  '23514', pg_temp.sc34(28, 'http'));
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 236, 'the overlap rule answers for the 0017 index or the shape CHECK',
+       count(*) FILTER (WHERE medido <> esperado) > 0 OR count(*) <> 4,
+       CASE WHEN count(*) FILTER (WHERE medido <> esperado) = 0 AND count(*) = 4
+            THEN 'https://E34.test/ y sc-domain:cliente-a.test repetidos: 23505 del índice de la 0017; ' ||
+                 '`http`: 23514 del CHECK de forma'
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ' ' || medido || ' (' || esperado || ')', ' / ' ORDER BY caso)
+            END
+  FROM s34 WHERE bloque = 236;
+
+-- ── 237 ──────────────────────────────────────────────────────────────────────
+-- POR CATÁLOGO, lo que la conducta de arriba no distingue porque todos los
+-- escritores de hoy (`service_role`, `postgres`) tienen BYPASSRLS:
+--
+--   * la función del trigger es SECURITY DEFINER y su dueño tiene BYPASSRLS. Con
+--     INVOKER, un escritor sin BYPASSRLS miraría bajo SU RLS y no vería los
+--     mapeos de las otras organizaciones: «nadie más lo tiene», sin mirar;
+--   * el trigger es AFTER, por fila, y `ENABLE ALWAYS` (dispara también con
+--     `session_replication_role = 'replica'`);
+--   * ningún rol de la API ejecuta las dos funciones.
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 237, 'the Search Console overlap trigger can be skipped or looks through RLS',
+       NOT (definer AND dueno_ve_todo AND despues AND por_fila AND siempre AND nadie_ejecuta),
+       format('SECURITY DEFINER: %s; dueño con BYPASSRLS: %s; AFTER: %s; por fila: %s; ENABLE ALWAYS: %s; '
+              'ningún rol de la API ejecuta: %s',
+              definer, dueno_ve_todo, despues, por_fila, siempre, nadie_ejecuta)
+  FROM (
+    SELECT
+      coalesce(bool_and(p.prosecdef), false) AS definer,
+      coalesce(bool_and(r.rolbypassrls OR r.rolsuper), false) AS dueno_ve_todo,
+      coalesce(bool_and((tg.tgtype & 2) = 0), false) AS despues,
+      coalesce(bool_and((tg.tgtype & 1) = 1), false) AS por_fila,
+      coalesce(bool_and(tg.tgenabled = 'A'), false) AS siempre,
+      NOT EXISTS (
+        SELECT 1
+          FROM unnest(ARRAY['anon', 'authenticated', 'service_role']) rol,
+               unnest(ARRAY['public.integration_properties_search_console_coverage()',
+                            'public.search_console_overlap(text, text)']) fn
+         -- Sin la función no hay nada que ejecutar, y la corrida no se cae:
+         -- el bloque ya está rojo por el trigger que falta.
+         WHERE CASE WHEN to_regprocedure(fn) IS NULL THEN false
+                    ELSE has_function_privilege(rol, to_regprocedure(fn), 'EXECUTE') END
+      ) AS nadie_ejecuta
+      FROM pg_trigger tg
+      JOIN pg_proc p ON p.oid = tg.tgfoid
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE tg.tgrelid = 'public.integration_properties'::regclass
+       AND tg.tgname = 'trg_integration_properties_search_console_coverage'
+  ) q;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and eighty checks were written, so a hundred
--- and eighty rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and eighty-eight checks were written, so a hundred
+-- and eighty-eight rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
@@ -9976,8 +10235,9 @@ SELECT 227, 'un asset sellado se muda de organización o de negocio con la firma
 -- todavía estaban en PRs abiertos, para que los tres frentes no chocaran al
 -- mergearse. Y del 216 al 300 por lo mismo: los de la 0032 (H2-GO-3) se
 -- escribieron con la 0031 en un PR abierto. Los de la 0033 siguen la misma
--- regla desde el 220, escritos con la 0032 en un PR abierto. El conteo de
--- abajo es de FILAS, no el número más alto: 143 + 17 + 12 + 8.
+-- regla desde el 220, escritos con la 0032 en un PR abierto. Los de la 0034
+-- (230 a 237) siguen después de los de la 0033. El conteo de abajo es de FILAS,
+-- no el número más alto: 143 + 17 + 12 + 8 + 8.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -9992,8 +10252,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 180 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 180 checks recorded a result.', checks;
+    IF checks <> 188 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 188 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -10004,11 +10264,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 180 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 188 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 180 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 188 checks green: the schema prevents every one of them.';
 END
 $$;
 

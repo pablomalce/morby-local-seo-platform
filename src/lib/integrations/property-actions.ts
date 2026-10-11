@@ -87,6 +87,12 @@ export type PropertyActionError =
   | "bad-shape"
   /** Otra organización ya tiene esa property viva. Es la fuga, rechazada. */
   | "property-taken"
+  /**
+   * Es otra property de Search Console, pero cubre URLs de la que otra
+   * organización tiene viva —un dominio y sus prefijos, o un prefijo dentro de
+   * otro—. La misma fuga por otro camino: la 0034 la rechaza con 23P01.
+   */
+  | "property-overlaps"
   /** Cualquier otro fallo de la base. */
   | "write-failed";
 
@@ -184,6 +190,12 @@ export async function mapProperty(input: {
     if (error.code === "23505") {
       return { ok: false, code: "property-taken", message: mensaje("property-taken") };
     }
+    // 23P01 es la 0034: no es el mismo texto, es la misma cuenta de tráfico.
+    // «Error al guardar» dejaría al operador reintentando; «ya está mapeada»
+    // lo mandaría a buscar un texto idéntico que no existe.
+    if (error.code === "23P01") {
+      return { ok: false, code: "property-overlaps", message: mensaje("property-overlaps") };
+    }
     return { ok: false, code: "write-failed", message: mensaje("write-failed") };
   }
 
@@ -239,6 +251,8 @@ function mensaje(code: PropertyActionError): string {
       return "Ese identificador no tiene la forma que Google devuelve.";
     case "property-taken":
       return "Esa property ya está mapeada a otra organización. Desmapeala allá primero.";
+    case "property-overlaps":
+      return "Esa property de Search Console se solapa con la de otra organización (un dominio cubre sus subdominios y sus prefijos de URL). Desmapeá la otra primero, o elegí una que no se solape.";
     case "write-failed":
       return "No se pudo guardar el mapeo.";
   }
