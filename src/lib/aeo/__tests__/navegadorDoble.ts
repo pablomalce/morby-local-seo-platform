@@ -31,6 +31,7 @@
  */
 import type {
   AbrirNavegador,
+  MotivoDeTransporte,
   NavegadorAbierto,
   PaginaAbierta,
   PedidoDelNavegador,
@@ -49,6 +50,10 @@ export interface PaginaDelSitio {
   status?: number;
   encabezados?: Record<string, string>;
   cuerpo?: string;
+  /** El transporte no la trae: `timeout`, `tls`, `demasiado-grande`… (RT-1). */
+  error?: MotivoDeTransporte;
+  /** La respuesta sale recién cuando esto resuelve: un origen lento (con `relojVirtual().alcanzar`). */
+  llegaCuando?: () => Promise<void>;
 }
 
 /** El «internet» del doble: qué contesta cada URL. Lo que no está, `sin-respuesta`. */
@@ -60,6 +65,8 @@ export function transporteDoble(sitio: Sitio) {
     pedidos.push(pedido);
     const pagina = sitio[pedido.url];
     if (!pagina) return { tipo: "error", motivo: "sin-respuesta" } satisfies RespuestaHttp;
+    if (pagina.llegaCuando) await pagina.llegaCuando();
+    if (pagina.error) return { tipo: "error", motivo: pagina.error } satisfies RespuestaHttp;
     return {
       tipo: "respuesta",
       status: pagina.status ?? 200,
@@ -95,11 +102,18 @@ function escrito(texto: string): string {
  */
 export function relojVirtual() {
   let t = 0;
+  const alarmas: Array<{ en: number; sonar: () => void }> = [];
   return {
     ahora: () => t,
     esperar: async (ms: number) => {
       t += ms;
+      for (const a of alarmas.filter((x) => x.en <= t)) {
+        alarmas.splice(alarmas.indexOf(a), 1);
+        a.sonar();
+      }
     },
+    /** Resuelve cuando el reloj llega a `ms`: un origen que contesta a esa hora. */
+    alcanzar: (ms: number) => new Promise<void>((sonar) => (ms <= t ? sonar() : alarmas.push({ en: ms, sonar }))),
   };
 }
 
@@ -130,6 +144,12 @@ export interface OpcionesDoble {
   htmlCrudo?: string;
   /** La pestaña SIN JavaScript no se puede abrir: el lado servido queda sin medir. */
   paginaSinJsFalla?: boolean;
+  /**
+   * Pedidos que el «JavaScript» hace DESPUÉS del `load`, sin que la navegación
+   * los espere: un chunk perezoso, los datos de una hidratación. Si llegan,
+   * su cuerpo se escribe en el DOM cuando llegan (RT-1).
+   */
+  enSegundoPlano?: Array<{ url: string; tipo: string }>;
 }
 
 export function navegadorDoble(opciones: OpcionesDoble = {}) {
@@ -233,6 +253,13 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         html = partes.join("\n");
         registro.textoDibujado = html;
         navegadoEn = opciones.reloj?.ahora() ?? null;
+        for (const r of opciones.enSegundoPlano ?? []) {
+          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false).then((d) => {
+            if (d.tipo !== "respondido") return;
+            html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
+            registro.textoDibujado = html;
+          });
+        }
       },
       async esperarQuietud() {},
       async desplazar() {

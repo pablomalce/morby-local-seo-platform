@@ -24,6 +24,7 @@ import { AGENTES_IA, contarCaracteres, textoSinJavaScript } from "../lectura";
 import {
   crearExaminador,
   medirRenderizado,
+  nuevaBitacora,
   OPCIONES_RENDER,
   type Bitacora,
   type DependenciasRender,
@@ -46,14 +47,17 @@ const DNS = {
 };
 
 function bitacoraVacia(): Bitacora {
-  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null };
+  return nuevaBitacora();
 }
 
-function armar(sitio: Sitio, opcionesNavegador: Parameters<typeof navegadorDoble>[0] = {}) {
+function armar(
+  sitio: Sitio | ((reloj: ReturnType<typeof relojVirtual>) => Sitio),
+  opcionesNavegador: Parameters<typeof navegadorDoble>[0] = {}
+) {
   // Tiempo virtual: la espera de quietud del DOM no duerme de verdad.
   const reloj = relojVirtual();
   const navegador = navegadorDoble({ reloj, ...opcionesNavegador });
-  const red = transporteDoble(sitio);
+  const red = transporteDoble(typeof sitio === "function" ? sitio(reloj) : sitio);
   const dns = resolvedorDoble(DNS);
   const deps: DependenciasRender = {
     abrirNavegador: navegador.abrirNavegador,
@@ -285,6 +289,102 @@ describe("P4 y GATE-1: el lado servido es el texto del HTML, del mismo documento
   it("si la pestaña sin JavaScript no se puede abrir, no hay número: `lectura-servida`, y el navegador se cierra", async () => {
     const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: `<p>${"x ".repeat(600)}</p>` } }, { paginaSinJsFalla: true });
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "lectura-servida" });
+    expect(navegador.registro.cierres).toBe(1);
+  });
+});
+
+/**
+ * RT-1. Reproducido con el headless shell de producción en AL2023 con 1 vCPU:
+ * una página que sirve un menú visible de 1 249 caracteres y dibuja el
+ * contenido con `<script src=app.js>` daba `medido 1249/1249` —VERDE— cuando
+ * el bundle no llegaba (demorado 9 s, o de 6 MB), y contra el despliegue real
+ * 3 de 43 renders salieron `medido` con chunks de Next.js en `timeout`.
+ */
+describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una medición", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+  const HIBRIDA = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script></body></html>`;
+
+  it("el control del instrumento: con el bundle entregado, la página híbrida es ROJA", async () => {
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(HIBRIDA), caracteresRenderizados: render }).estado).toBe(
+      "rojo"
+    );
+  });
+
+  it.each(["timeout", "sin-respuesta", "tls", "demasiado-grande"] as const)(
+    "el bundle no llega por el transporte (%s): `subrecurso-<motivo>`, sin número, y el punto queda «no medido»",
+    async (motivo) => {
+      const { deps, navegador, bitacora } = armar({
+        "http://sitio.test/": { cuerpo: HIBRIDA },
+        "http://sitio.test/app.js": { cuerpo: CONTENIDO, error: motivo },
+      });
+      const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+      expect(render).toEqual({ estado: "fallo", codigo: `subrecurso-${motivo}` });
+      expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo }]);
+      expect(navegador.registro.cierres).toBe(1);
+      const punto = contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(HIBRIDA), caracteresRenderizados: render });
+      expect(punto.estado).toBe("no-medido");
+    }
+  );
+
+  it("el presupuesto de bytes ya gastado cuando sale el bundle: `subrecurso-presupuesto`", async () => {
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } });
+    const render = await medirRenderizado("http://sitio.test/", deps, {
+      ...OPCIONES_RENDER,
+      maxBytesTotales: Buffer.byteLength(HIBRIDA),
+    });
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+  });
+
+  it("los datos que trae el JavaScript (`fetch`) y un marco cuentan igual que un script", async () => {
+    const conDatos = `<html><body>${MENU}<main data-fetch="/api/contenido"></main></body></html>`;
+    const datos = armar({ "http://sitio.test/": { cuerpo: conDatos }, "http://sitio.test/api/contenido": { error: "timeout" } });
+    expect(await medirRenderizado("http://sitio.test/", datos.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
+
+    const conMarco = `<html><body>${MENU}<iframe src="/widget"></iframe></body></html>`;
+    const marco = armar({ "http://sitio.test/": { cuerpo: conMarco }, "http://sitio.test/widget": { error: "tls" } });
+    expect(await medirRenderizado("http://sitio.test/", marco.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-tls" });
+  });
+
+  it("lo que la POLÍTICA rechaza no es «no llegó»: un script a una red privada deja medir", async () => {
+    const html = `<html><body>${MENU}<script src="http://interno.test/interno.js"></script><img src="/foto.jpg"></body></html>`;
+    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html }, "http://interno.test/interno.js": { cuerpo: "x" } });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  it("un chunk que todavía está EN VUELO al leer se espera, y lo que trae se cuenta: el punto sale ROJO, no verde", async () => {
+    // El chunk perezoso sale después del `load` y su origen contesta a los
+    // 5 s: la lectura ya vio 2 s de quietud con el menú solo. Sin esperar lo
+    // que estaba en vuelo, el número era el del menú, igual al servido: verde.
+    const { deps, navegador } = armar(
+      (reloj) => ({
+        "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main></body></html>` },
+        "http://sitio.test/chunk.js": { cuerpo: CONTENIDO, llegaCuando: () => reloj.alcanzar(5_000) },
+      }),
+      { enSegundoPlano: [{ url: "/chunk.js", tipo: "script" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(contarCaracteres(CONTENIDO));
+    expect(navegador.registro.pedidos.find((p) => p.url.endsWith("/chunk.js"))?.desenlace).toBe("respondido");
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: render.servidos ?? 0, caracteresRenderizados: render }).estado).toBe("rojo");
+  });
+
+  it("un pedido que escribe texto y NO termina nunca: `subrecurso-pendiente`, y el navegador se cierra", async () => {
+    const { deps, navegador } = armar(
+      {
+        "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main></body></html>` },
+        "http://sitio.test/api/siempre": { cuerpo: "x", llegaCuando: () => new Promise(() => {}) },
+      },
+      { enSegundoPlano: [{ url: "/api/siempre", tipo: "fetch" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "subrecurso-pendiente" });
     expect(navegador.registro.cierres).toBe(1);
   });
 });

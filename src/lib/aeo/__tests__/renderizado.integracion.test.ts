@@ -52,7 +52,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
 import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
 import { AGENTES_IA, contarCaracteres, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
-import { medirRenderizado, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
+import { medirRenderizado, nuevaBitacora, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
 
@@ -161,6 +161,17 @@ const NOSCRIPT_STYLE = `<!doctype html><html lang="es"><head><meta charset="utf-
 <noscript><style>main { display: block; }</style></noscript>
 </head><body><main><h1>Clínica de prueba</h1><p>${PARRAFO_SSR.repeat(27)}</p></main>
 <script>document.querySelector("main").style.display = "block";</script></body></html>`;
+
+/**
+ * RT-1: una página híbrida —un menú servido de más de 500 caracteres y el
+ * contenido escrito por un bundle—. Si el bundle no llega, el DOM es el menú
+ * solo, igual al servido, y el punto salía VERDE.
+ */
+const CONTENIDO_DEL_BUNDLE = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+const BUNDLE = `document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};`;
+function hibrida(script: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>${script}</body></html>`;
+}
 
 /**
  * RV-1: un popup es otro target. Ni la intercepción ni `evaluateOnNewDocument`
@@ -280,6 +291,35 @@ beforeAll(async () => {
         return html(OCULTO_Y_SCRIPT);
       case "/oculto":
         return html(OCULTO);
+      case "/hibrida":
+        return html(hibrida(`<script src="/app.js"></script>`));
+      case "/hibrida-lenta":
+        return html(hibrida(`<script src="/app-lento.js"></script>`));
+      case "/hibrida-grande":
+        return html(hibrida(`<script src="/app-grande.js"></script>`));
+      case "/hibrida-chunk":
+        // El chunk perezoso: lo pide el JavaScript después del `load`.
+        return html(
+          hibrida(`<script>addEventListener("load", () => {
+            const s = document.createElement("script"); s.src = "/chunk-tardio.js"; document.body.appendChild(s);
+          });</script>`)
+        );
+      case "/app.js":
+        res.writeHead(200, { "content-type": "text/javascript" });
+        return res.end(BUNDLE);
+      case "/app-lento.js":
+      case "/chunk-tardio.js": {
+        const demora = req.url === "/app-lento.js" ? 3_000 : 3_500;
+        const reloj = setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/javascript" });
+          res.end(BUNDLE);
+        }, demora);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
+      case "/app-grande.js":
+        res.writeHead(200, { "content-type": "text/javascript" });
+        return res.end(`${BUNDLE}\n/* ${"relleno ".repeat(15_000)} */`);
       case "/elementor-invisible":
         return html(ELEMENTOR_INVISIBLE);
       case "/anti-fouc":
@@ -375,7 +415,7 @@ function deps(
 }
 
 function bitacora(): Bitacora {
-  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null };
+  return nuevaBitacora();
 }
 
 /** Chromium pide `/favicon.ico` por su cuenta, al mismo origen: no es de la página. */
@@ -510,6 +550,71 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     },
     60_000
   );
+
+  describe("RT-1 — lo que escribe el texto tiene que haber LLEGADO", () => {
+    const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+      contenidoSinJs({
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: textoSinJavaScript(hibrida("")),
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      }).estado;
+
+    it(
+      "el control del instrumento: con el bundle entregado, la página híbrida es ROJA",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/hibrida", deps());
+        console.log(`[RT-1 /hibrida] renderizado=${JSON.stringify(render)}`);
+        expect(render.estado).toBe("medido");
+        expect(punto(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "el bundle no llega a tiempo: `subrecurso-timeout`, y el punto queda «no medido» —antes, VERDE—",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/hibrida-lenta", deps(), { ...OPCIONES_RENDER, plazoPorPedidoMs: 1_500 }, b);
+        console.log(`[RT-1 /hibrida-lenta] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
+        expect(punto(render)).toBe("no-medido");
+      },
+      60_000
+    );
+
+    it(
+      "el bundle es más grande que el tope: `subrecurso-demasiado-grande`, y el punto queda «no medido»",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/hibrida-grande", deps(), {
+          ...OPCIONES_RENDER,
+          maxBytesPorRespuesta: 60_000,
+        });
+        console.log(`[RT-1 /hibrida-grande] renderizado=${JSON.stringify(render)}`);
+        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-demasiado-grande" });
+      },
+      60_000
+    );
+
+    it(
+      "un chunk que todavía está EN VUELO al leer se espera, y lo que escribe se cuenta: ROJO, no verde",
+      async () => {
+        // Con plazos cortos la lectura termina antes de que el chunk llegue
+        // (a los 3,5 s): sin esperar lo que está en vuelo, el DOM era el menú.
+        const render = await medirRenderizado("http://sitio.test/hibrida-chunk", deps(), {
+          ...OPCIONES_RENDER,
+          quietudMs: 500,
+          desplazarMs: 200,
+          quietudDomMs: 1_000,
+        });
+        console.log(`[RT-1 /hibrida-chunk] renderizado=${JSON.stringify(render)}`);
+        expect(render.estado).toBe("medido");
+        expect(punto(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
 
   it(
     "P2 — contenido puesto con un temporizador de 1,5 s, sin red: se cuenta, y el punto sale ROJO",

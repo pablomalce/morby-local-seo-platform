@@ -115,6 +115,32 @@
  * Lo que NO alcanza, dicho: un texto que aparece más de `quietudDomMs`
  * después del último cambio no se ve. Es un umbral escrito, no una medición.
  *
+ * Y UN NÚMERO SÓLO VALE SI LLEGÓ LO QUE ESCRIBE EL TEXTO (RT-1)
+ *
+ * El JavaScript de la página escribe el texto con lo que el transporte le
+ * entregó: sus scripts, los datos que esos scripts piden (`xhr`, `fetch`) y
+ * sus marcos. Si uno de esos pedidos NO LLEGÓ —`timeout`, `sin-respuesta`,
+ * `tls`, `demasiado-grande`, o el presupuesto de bytes o de tiempo ya
+ * gastado—, el DOM que se cuenta es el que quedó sin hidratar, o la pantalla
+ * de error del cliente. MEDIDO con el headless shell de producción en AL2023
+ * con 1 vCPU: una página con un menú servido y el contenido en `app.js` daba
+ * `medido 1249/1249` —VERDE— con el bundle demorado 9 s o de 6 MB, y contra
+ * el despliegue real, 3 de 43 renders salieron `medido` con chunks de Next.js
+ * en `timeout` (uno con «Application error» como todo el texto). Por eso:
+ *
+ *   1. si al leer queda alguno de esos pedidos EN VUELO, se lo espera (con
+ *      tope: su propio plazo) y se vuelve a leer; si no termina,
+ *      `subrecurso-pendiente`;
+ *   2. si alguno no llegó, `subrecurso-<motivo>`, sin número: el punto queda
+ *      «no medido», nunca verde.
+ *
+ * Lo que NO cuenta como «no llegó»: lo que se rechazó por política —una red
+ * que no es pública, un puerto, un esquema, un método que escribe—, que un
+ * navegador del público tampoco recibiría de esta auditoría, y un nombre que
+ * no resuelve (`no-resuelve`), que con el DNS de hoy no se distingue de un
+ * dominio muerto. Las imágenes, las fuentes, el CSS y los videos no escriben
+ * texto en el DOM.
+ *
  * EL TIEMPO
  *
  * `TOPE_MS` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
@@ -154,6 +180,9 @@ export type MotivoDeTransporte = "timeout" | "sin-respuesta" | "tls" | "demasiad
  * Lista cerrada más `http_<status>`. Un motivo libre sería texto, y lo que se
  * hace con esto es decidir un color.
  */
+/** Un pedido que escribe texto y no llegó, o que seguía en vuelo al leer (RT-1). */
+export type MotivoDeSubrecurso = MotivoDeTransporte | "presupuesto" | "pendiente";
+
 export type CodigoDeFallo =
   | "timeout"
   | "sin-navegador"
@@ -164,6 +193,7 @@ export type CodigoDeFallo =
   | "descarga"
   | MotivoDeBloqueo
   | MotivoDeTransporte
+  | `subrecurso-${MotivoDeSubrecurso}`
   | `http_${number}`;
 
 export type ResultadoRenderizado =
@@ -427,10 +457,28 @@ export interface Bitacora {
   statusDocumento: number | null;
   /** Si un salto del documento principal no salió, por qué. */
   falloDocumento: CodigoDeFallo | null;
+  /**
+   * Los pedidos que ESCRIBEN texto (scripts, datos, marcos) y no llegaron por
+   * el transporte o por el presupuesto. Uno solo deja el render sin número.
+   */
+  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeTransporte | "presupuesto" }>;
+  /** Cuántos de esos pedidos están en el transporte ahora mismo. */
+  enVuelo: number;
 }
 
-function nuevaBitacora(): Bitacora {
-  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null };
+export function nuevaBitacora(): Bitacora {
+  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null, noLlegaron: [], enVuelo: 0 };
+}
+
+/**
+ * Los tipos de pedido con los que el JavaScript de la página escribe texto en
+ * el DOM: el código, los datos que el código trae, y un marco (`document` que
+ * no es el principal), que puede ser del mismo origen y escribir en él.
+ */
+const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "document"]);
+
+function escribeTexto(pedido: PedidoDelNavegador): boolean {
+  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo);
 }
 
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
@@ -474,6 +522,16 @@ export function crearInterceptor(
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
     const bloquear = async (motivo: Bitacora["bloqueados"][number]["motivo"]) => {
       bitacora.bloqueados.push({ url: pedido.url, motivo });
+      if (
+        escribeTexto(pedido) &&
+        (motivo === "timeout" ||
+          motivo === "sin-respuesta" ||
+          motivo === "tls" ||
+          motivo === "demasiado-grande" ||
+          motivo === "presupuesto")
+      ) {
+        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo });
+      }
       if (pedido.esDocumentoPrincipal && motivo !== "sin-texto") {
         bitacora.falloDocumento =
           motivo === "presupuesto" ? "timeout" : motivo === "metodo" ? "navegacion" : motivo;
@@ -518,15 +576,32 @@ export function crearInterceptor(
       }
 
       bitacora.pedidos.push({ url: pedido.url, ip: examen.ip });
-      const respuesta = await deps.transporte({
-        url: url.toString(),
-        ip: examen.ip,
-        metodo: pedido.metodo.toUpperCase(),
-        encabezados,
-        cuerpo: pedido.cuerpo,
-        timeoutMs: plazo,
-        maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
-      });
+      // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
+      // la lectura no se da por buena mientras un pedido que escribe texto
+      // siga en camino.
+      const cuenta = escribeTexto(pedido);
+      if (cuenta) bitacora.enVuelo += 1;
+      try {
+        const respuesta = await deps.transporte({
+          url: url.toString(),
+          ip: examen.ip,
+          metodo: pedido.metodo.toUpperCase(),
+          encabezados,
+          cuerpo: pedido.cuerpo,
+          timeoutMs: plazo,
+          maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
+        });
+        await entregar(respuesta, url.toString());
+      } finally {
+        if (cuenta) bitacora.enVuelo -= 1;
+      }
+    } catch {
+      // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
+      // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
+      await pedido.abortar().catch(() => {});
+    }
+
+    async function entregar(respuesta: RespuestaHttp, clave: string) {
       if (respuesta.tipo === "error") return await bloquear(respuesta.motivo);
       if (esDescarga(respuesta.encabezados)) return await bloquear("descarga");
 
@@ -538,12 +613,8 @@ export function crearInterceptor(
         if (!DE_LA_RESPUESTA.has(nombre.toLowerCase())) devueltos[nombre.toLowerCase()] = valor;
       }
       const entregada = { status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo };
-      if (pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(url.toString(), entregada);
+      if (pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(clave, entregada);
       await pedido.responder(entregada);
-    } catch {
-      // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
-      // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
-      await pedido.abortar().catch(() => {});
     }
   };
 }
@@ -700,20 +771,41 @@ export async function medirRenderizado(
       // red: ver «CUÁNDO SE LEE» arriba. El recorrido y la espera salen del
       // mismo presupuesto total, y dejan un segundo para cerrar.
       await pagina.desplazar(Math.min(opciones.desplazarMs, Math.max(restante() - 1_000, 0)));
-      let caracteres: number | "inestable" | "plazo";
-      try {
-        caracteres = await leerCuandoSeQuede(
-          pagina,
-          opciones,
-          Math.min(opciones.topeDomMs, Math.max(restante() - 1_000, 0)),
-          ahora,
-          esperar
-        );
-      } catch {
-        return fallo("lectura");
+      const leer = async (): Promise<number | ResultadoRenderizado> => {
+        let leidos: number | "inestable" | "plazo";
+        try {
+          leidos = await leerCuandoSeQuede(
+            pagina,
+            opciones,
+            Math.min(opciones.topeDomMs, Math.max(restante() - 1_000, 0)),
+            ahora,
+            esperar
+          );
+        } catch {
+          return fallo("lectura");
+        }
+        if (leidos === "inestable") return fallo("inestable");
+        if (leidos === "plazo") return fallo("timeout");
+        return leidos;
+      };
+      let caracteres = await leer();
+      if (typeof caracteres !== "number") return caracteres;
+
+      // RT-1: lo que escribe el texto tiene que haber LLEGADO. Lo que sigue en
+      // vuelo se espera —como mucho su propio plazo— y se vuelve a leer; dos
+      // rondas, para que una página que pide datos sin parar no las vuelva
+      // infinitas.
+      for (let ronda = 0; bitacora.enVuelo > 0 && ronda < 2; ronda++) {
+        const desde = ahora();
+        const hasta = Math.min(opciones.plazoPorPedidoMs, Math.max(restante() - 1_000, 0));
+        while (bitacora.enVuelo > 0 && ahora() - desde < hasta) await esperar(opciones.sondeoMs);
+        if (bitacora.enVuelo > 0) break;
+        caracteres = await leer();
+        if (typeof caracteres !== "number") return caracteres;
       }
-      if (caracteres === "inestable") return fallo("inestable");
-      if (caracteres === "plazo") return fallo("timeout");
+      if (bitacora.enVuelo > 0) return fallo("subrecurso-pendiente");
+      const perdido = bitacora.noLlegaron[0];
+      if (perdido) return fallo(`subrecurso-${perdido.motivo}`);
 
       // El lado servido, del MISMO documento y con la misma extracción: ver
       // el encabezado. Si no se puede medir, el resultado no se da: un número
