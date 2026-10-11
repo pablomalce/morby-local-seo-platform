@@ -15,6 +15,7 @@ import {
   MINIMO_DE_TEXTO,
   accesoDeLasIA,
   agentePuede,
+  erroresDeSchema,
   textoSinJavaScript,
   tiposDeSchema,
 } from "../lectura";
@@ -161,6 +162,48 @@ describe("los tipos de schema declarados", () => {
 
   it("sin JSON-LD devuelve la lista vacía", () => {
     expect(tiposDeSchema("<html><body>hola</body></html>")).toEqual([]);
+  });
+});
+
+/**
+ * GATE-9: el validador era casi de presencia. Medido con vitest: un
+ * `@context` que no es schema.org daba `[]`, y un bloque con `type=` sin
+ * comillas ni se detectaba —ni sus tipos ni que no parsea—.
+ */
+describe("GATE-9: el JSON-LD se valida, no sólo se busca", () => {
+  const bloque = (cuerpo: string, tipo = '"application/ld+json"') => `<script type=${tipo}>${cuerpo}</script>`;
+
+  it("un `@context` que no es schema.org es un error, con el valor que trae", () => {
+    const errores = erroresDeSchema(bloque('{"@context":"https://example.com/nada","@type":"LocalBusiness"}'));
+    expect(errores).toEqual([expect.stringMatching(/bloque 1: @context no es schema\.org.*example\.com\/nada/)]);
+  });
+
+  it("schema.org con http o https, con o sin barra, en un arreglo o como @vocab, es válido", () => {
+    for (const ctx of [
+      '"https://schema.org"',
+      '"http://schema.org/"',
+      '["https://schema.org", {"ex": "https://example.com/"}]',
+      '{"@vocab": "https://schema.org/"}',
+    ]) {
+      expect(erroresDeSchema(bloque(`{"@context":${ctx},"@type":"Organization"}`)), ctx).toEqual([]);
+    }
+  });
+
+  it("un bloque con `type=` SIN comillas se lee: sus tipos cuentan y, roto, es un error", () => {
+    expect(tiposDeSchema(bloque('{"@context":"https://schema.org","@type":"FAQPage"}', "application/ld+json"))).toEqual(["FAQPage"]);
+    expect(erroresDeSchema(bloque('{"@type": }', "application/ld+json"))).toEqual([expect.stringMatching(/bloque 1: no parsea/)]);
+  });
+
+  it("un `type` con parámetros o en mayúsculas también es JSON-LD", () => {
+    const html = bloque('{"@context":"https://schema.org","@type":"Organization"}', '"application/ld+json; charset=utf-8"');
+    expect(tiposDeSchema(html)).toEqual(["Organization"]);
+    expect(tiposDeSchema(bloque('{"@context":"https://schema.org","@type":"Organization"}', "'Application/LD+JSON'"))).toEqual([
+      "Organization",
+    ]);
+  });
+
+  it("un `<script>` que no es JSON-LD no se valida", () => {
+    expect(erroresDeSchema('<script type="application/json">{"@type": }</script><script>var x = {</script>')).toEqual([]);
   });
 });
 

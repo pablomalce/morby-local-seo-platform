@@ -164,16 +164,27 @@ export function accesoDeLasIA(robots: string, ruta = "/"): Record<AgenteIA, bool
  * o hay que inferirlo. Se aplana `@graph`, que es donde vive la mitad de los
  * sitios reales.
  */
+/**
+ * Los bloques JSON-LD del HTML: `<script type="application/ld+json">` con el
+ * atributo entre comillas dobles, simples o SIN comillas, con parámetros
+ * (`; charset=utf-8`) y en cualquier caja. Antes sólo se veía con comillas
+ * (GATE-9): un bloque con `type=application/ld+json` no aportaba tipos y,
+ * roto, tampoco era un error.
+ */
+const BLOQUE_JSON_LD =
+  /<script\b[^>]*?\stype\s*=\s*(?:"\s*application\/ld\+json\s*(?:;[^"]*)?"|'\s*application\/ld\+json\s*(?:;[^']*)?'|application\/ld\+json(?:;[^\s>]*)?(?=[\s>]))[^>]*>([\s\S]*?)<\/script\s*>/gi;
+
+function bloquesJsonLd(html: string): string[] {
+  return [...html.matchAll(BLOQUE_JSON_LD)].map((m) => m[1]);
+}
+
 export function tiposDeSchema(html: string): string[] {
   const tipos = new Set<string>();
-  const bloques = html.matchAll(
-    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-  );
 
-  for (const bloque of bloques) {
+  for (const bloque of bloquesJsonLd(html)) {
     let datos: unknown;
     try {
-      datos = JSON.parse(bloque[1].trim());
+      datos = JSON.parse(bloque.trim());
     } catch {
       // Un JSON-LD roto no es un tipo ausente ni uno presente: el motor tampoco
       // lo va a poder leer. Se ignora, y la ausencia habla sola.
@@ -218,24 +229,25 @@ function recolectar(nodo: unknown, tipos: Set<string>): void {
  * distintos. La puerta lo dice: *si el JSON-LD sólo se comprueba por presencia,
  * el schema inválido sale verde*.
  *
- * Tres errores, cada uno con el bloque en el que está, para que el hallazgo
+ * Cuatro errores, cada uno con el bloque en el que está, para que el hallazgo
  * apunte a algo que se pueda abrir y corregir:
  *   - no parsea (con el mensaje del parser);
  *   - parsea pero no declara `@context`, sin lo cual no es JSON-LD sino JSON;
+ *   - declara un `@context` que no es schema.org, y entonces sus `@type` no son
+ *     los de schema.org: un motor no los lee como tales (GATE-9);
  *   - parsea pero algún nodo no declara `@type`, o sea que no dice qué es.
+ *
+ * Lo que NO valida, dicho: que cada `@type` exista en el vocabulario de
+ * schema.org, ni las propiedades de cada tipo. Para eso hace falta el
+ * vocabulario, y este repo no lo tiene.
  */
 export function erroresDeSchema(html: string): string[] {
   const errores: string[] = [];
-  const bloques = [
-    ...html.matchAll(
-      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-    ),
-  ];
-  bloques.forEach((bloque, i) => {
+  bloquesJsonLd(html).forEach((bloque, i) => {
     const n = i + 1;
     let datos: unknown;
     try {
-      datos = JSON.parse(bloque[1].trim());
+      datos = JSON.parse(bloque.trim());
     } catch (e) {
       errores.push(`bloque ${n}: no parsea (${(e as Error).message})`);
       return;
@@ -248,6 +260,9 @@ export function erroresDeSchema(html: string): string[] {
       }
       const objeto = raiz as Record<string, unknown>;
       if (!("@context" in objeto)) errores.push(`bloque ${n}: sin @context`);
+      else if (!esContextoDeSchemaOrg(objeto["@context"])) {
+        errores.push(`bloque ${n}: @context no es schema.org (${JSON.stringify(objeto["@context"]).slice(0, 80)})`);
+      }
       const nodos = Array.isArray(objeto["@graph"]) ? objeto["@graph"] : [objeto];
       for (const nodo of nodos) {
         if (nodo && typeof nodo === "object" && !("@type" in (nodo as object))) {
@@ -257,6 +272,20 @@ export function erroresDeSchema(html: string): string[] {
     }
   });
   return errores;
+}
+
+/** `https://schema.org`, con http o https y con o sin barra final. */
+const SCHEMA_ORG = /^https?:\/\/schema\.org\/?$/i;
+
+/** Un `@context` que pone los términos en schema.org: el IRI, un arreglo que lo trae, o `@vocab`. */
+function esContextoDeSchemaOrg(contexto: unknown): boolean {
+  if (typeof contexto === "string") return SCHEMA_ORG.test(contexto.trim());
+  if (Array.isArray(contexto)) return contexto.some(esContextoDeSchemaOrg);
+  if (contexto && typeof contexto === "object") {
+    const vocab = (contexto as Record<string, unknown>)["@vocab"];
+    return typeof vocab === "string" && SCHEMA_ORG.test(vocab.trim());
+  }
+  return false;
 }
 
 export function textoSinJavaScript(html: string): number {
