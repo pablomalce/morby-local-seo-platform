@@ -106,10 +106,11 @@
  * EL TIEMPO
  *
  * `TOPE_MS` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
- * Chromium la primera vez—, navegación, quietud, recorrido y lectura. La ruta lo corre en
- * paralelo con los pedidos por agente, después de traer la portada (8 s), así
- * que el peor caso es 8 + 25 + 5 de cierre = 38 s, dentro de los 60 s de
- * `maxDuration` en Vercel Hobby. El navegador se cierra en `finally`, también
+ * Chromium la primera vez—, navegación, quietud, recorrido, lectura y la
+ * pestaña sin JavaScript. La ruta lo corre en paralelo con los pedidos por
+ * agente, después de traer la portada (8 s), así que el peor caso es 8 + 25 +
+ * 5 de cierre = 38 s, dentro de los 59 s de `maxDuration` de la ruta (59 y no
+ * 60 a propósito: ver la ruta). El navegador se cierra en `finally`, también
  * cuando vence el plazo, y si el cierre se cuelga `chromium.ts` mata el proceso.
  *
  * LO QUE ESTE ARCHIVO NO SABE
