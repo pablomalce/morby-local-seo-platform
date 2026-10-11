@@ -122,7 +122,7 @@
 --
 -- LO QUE HAY HOY, Y LA GUARDA
 --
--- Antes de crear el trigger, la migración cuenta los pares de mapeos vivos de
+-- Con el trigger ya creado, la migración cuenta los pares de mapeos vivos de
 -- Search Console de organizaciones distintas que ya se solapan. Si hay alguno,
 -- NO se aplica: el trigger no mira lo que ya está, y aplicar sobre un solape
 -- vivo dejaría la promesa escrita y la fuga puesta. Hosted, medido el 2026-10-11
@@ -133,6 +133,31 @@
 -- canónica: el trigger no mira lo que ya está, así que una viva sin forma
 -- canónica tampoco deja aplicar. Hosted, medido el 2026-10-11: ver la medición
 -- del ejecutable en `~/vulkan-backups/growth-os/2026-10-11-pre-0034/exec/`.
+--
+-- POR QUÉ DESPUÉS DEL TRIGGER Y NO ANTES. Hasta la tercera revisión del #118 la
+-- guarda contaba ANTES de crearlo, sin candado sobre la tabla. Medido el
+-- 2026-10-11 sobre una réplica propia: un onboarding con su INSERT solapado
+-- abierto mientras corría la migración confirmaba después de la cuenta y antes
+-- del CREATE TRIGGER, y la 0034 quedaba aplicada —trigger puesto, fila en el
+-- registro— con el par solapado vivo. Ahora cuenta después del DROP/CREATE
+-- TRIGGER, cuyos candados sobre `integration_properties` chocan con toda
+-- escritura (ROW EXCLUSIVE) y duran hasta el COMMIT: esperan a que termine el
+-- escritor que ya estaba adentro y no dejan entrar a ninguno nuevo. La cuenta ve
+-- lo que ese escritor confirmó sólo si toma una foto nueva, que es READ
+-- COMMITTED; en REPEATABLE READ o SERIALIZABLE la foto es la del principio de la
+-- migración, anterior al candado, así que la guarda rechaza con 45007.
+-- `supabase/qa/solape_concurrente.sh` mide las dos cosas.
+--
+-- EL ORDEN EN HOSTED
+--
+-- `mapProperty()` llama a `remap_integration_property()`, que nace acá: el
+-- código no puede llegar a main antes que esta migración a hosted, o mapear
+-- deja de andar. Y el workflow `deriva` compara hosted con main: entre aplicar y
+-- mergear da rojo («la base tiene versiones que el repositorio no»), y lo
+-- corren el cron diario y cualquier push a main. Así que, en este orden y sin
+-- otro merge a main en el medio: aplicar en hosted y verificar, mergear el PR
+-- que la trae, y recién entonces correr `deriva`. Si hay que esperar entre las
+-- dos, `check_drift.sh` contra una réplica de la rama, no el workflow de main.
 --
 -- EL REMAPEO, EN UNA TRANSACCIÓN
 --
@@ -289,50 +314,7 @@ REVOKE ALL ON FUNCTION public.search_console_overlap(text, text)
     FROM PUBLIC, anon, authenticated, service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2. La guarda: no se aplica sobre un solape que ya existe, ni sobre una
---    propiedad viva sin forma canónica
--- ─────────────────────────────────────────────────────────────────────────────
-DO $$
-DECLARE
-    sin_forma int;
-    pares     int;
-BEGIN
-    SELECT count(*) INTO sin_forma
-      FROM public.integration_properties
-     WHERE provider = 'search_console'
-       AND unmapped_at IS NULL
-       AND public.search_console_canonical(property_ref) IS NULL;
-
-    IF sin_forma > 0 THEN
-        RAISE EXCEPTION
-            '0034: % mapeo(s) vivo(s) de Search Console sin forma canonica',
-            sin_forma
-            USING ERRCODE = '23514',
-                  HINT = 'desmapear (unmapped_at) o reescribir en ASCII (punycode) antes de aplicar: el trigger no mira lo que ya existe.';
-    END IF;
-
-    SELECT count(*) INTO pares
-      FROM public.integration_properties p
-      JOIN public.integration_properties q
-        ON q.provider = 'search_console'
-       AND q.unmapped_at IS NULL
-       AND q.organization_id > p.organization_id
-       AND public.search_console_overlap(p.property_ref, q.property_ref)
-     WHERE p.provider = 'search_console'
-       AND p.unmapped_at IS NULL;
-
-    IF pares > 0 THEN
-        RAISE EXCEPTION
-            '0034: % par(es) de mapeos vivos de Search Console de organizaciones distintas se solapan',
-            pares
-            USING ERRCODE = '23P01',
-                  HINT = 'desmapear uno de cada par (unmapped_at) antes de aplicar: el trigger no mira lo que ya existe.';
-    END IF;
-END
-$$;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- 3. El trigger
+-- 2. El trigger
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.integration_properties_search_console_coverage()
 RETURNS trigger
@@ -422,6 +404,61 @@ CREATE TRIGGER trg_integration_properties_search_console_coverage
 -- `session_replication_role = 'replica'`.
 ALTER TABLE public.integration_properties
     ENABLE ALWAYS TRIGGER trg_integration_properties_search_console_coverage;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3. La guarda: no se aplica sobre un solape que ya existe, ni sobre una
+--    propiedad viva sin forma canónica. DESPUÉS del trigger: el candado del
+--    DROP/CREATE TRIGGER sobre la tabla ya esperó a todo escritor que estaba
+--    adentro y no deja entrar a ninguno hasta el COMMIT. Ver el encabezado.
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$
+DECLARE
+    sin_forma int;
+    pares     int;
+BEGIN
+    -- La cuenta ve lo que confirmaron los escritores que el candado esperó sólo
+    -- si toma una foto nueva, y eso es READ COMMITTED.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION
+            '0034: la guarda solo cuenta en READ COMMITTED, y esta transaccion es %',
+            current_setting('transaction_isolation')
+            USING ERRCODE = '45007',
+                  HINT = 'aplicar en una transaccion READ COMMITTED: en otra, la foto es anterior al candado y no ve un mapeo que confirmo mientras la migracion esperaba.';
+    END IF;
+
+    SELECT count(*) INTO sin_forma
+      FROM public.integration_properties
+     WHERE provider = 'search_console'
+       AND unmapped_at IS NULL
+       AND public.search_console_canonical(property_ref) IS NULL;
+
+    IF sin_forma > 0 THEN
+        RAISE EXCEPTION
+            '0034: % mapeo(s) vivo(s) de Search Console sin forma canonica',
+            sin_forma
+            USING ERRCODE = '23514',
+                  HINT = 'desmapear (unmapped_at) o reescribir en ASCII (punycode) antes de aplicar: el trigger no mira lo que ya existe.';
+    END IF;
+
+    SELECT count(*) INTO pares
+      FROM public.integration_properties p
+      JOIN public.integration_properties q
+        ON q.provider = 'search_console'
+       AND q.unmapped_at IS NULL
+       AND q.organization_id > p.organization_id
+       AND public.search_console_overlap(p.property_ref, q.property_ref)
+     WHERE p.provider = 'search_console'
+       AND p.unmapped_at IS NULL;
+
+    IF pares > 0 THEN
+        RAISE EXCEPTION
+            '0034: % par(es) de mapeos vivos de Search Console de organizaciones distintas se solapan',
+            pares
+            USING ERRCODE = '23P01',
+                  HINT = 'desmapear uno de cada par (unmapped_at) antes de aplicar: el trigger no mira lo que ya existe.';
+    END IF;
+END
+$$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. El remapeo, en una transacción

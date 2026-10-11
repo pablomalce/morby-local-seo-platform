@@ -29,14 +29,32 @@
 #      espera, muere con 23P01, y CONSERVA su mapeo anterior: el desmapeo que la
 #      función hizo antes del INSERT se revierte con él. Con el remapeo en dos
 #      llamadas (hasta la segunda revisión del #118), B quedaba sin ninguno.
+#   4. LA MIGRACIÓN, CON UN ONBOARDING ABIERTO. Lo que la guarda de la 0034 no
+#      puede dejar pasar: un INSERT que se solapa con un mapeo vivo, sin
+#      confirmar MIENTRAS corre la migración. Se revierte la 0034 (su .down), la
+#      organización 6 tiene `https://www.toctou34.test/` vivo, la sesión A
+#      inserta `sc-domain:toctou34.test` en la 7 y confirma a los tres segundos,
+#      y en el medio se aplica el archivo de la migración. Con la guarda DESPUÉS
+#      del trigger, el candado del DROP/CREATE TRIGGER espera a A, la guarda ve
+#      el par y la 0034 NO se aplica. Con la guarda antes (hasta la tercera
+#      revisión del #118), contaba antes de que A confirmara y la 0034 quedaba
+#      aplicada con el par vivo. Contraprueba: sin el par, se aplica.
+#   5. LA MIGRACIÓN, FUERA DE READ COMMITTED. En REPEATABLE READ la foto de la
+#      guarda es anterior al candado, así que el punto 4 deja de valer: la
+#      guarda rechaza. Contraprueba: en READ COMMITTED, se aplica.
 #
 # Escribe filas de verdad (las dos sesiones tienen que confirmar para medir algo)
-# en dos organizaciones propias, y las borra al salir, pase lo que pase.
+# en organizaciones propias, y las borra al salir, pase lo que pase. Los puntos 4
+# y 5 revierten y vuelven a aplicar la 0034 sobre la misma base: al salir, pase
+# lo que pase, la deja aplicada (con el archivo del repositorio).
 
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-growthos-replica}"
 PSQL="${PSQL:-docker exec -i $CONTAINER psql -U postgres -d growthos}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MIGRACION="$REPO_ROOT/supabase/migrations/0034_search_console_coverage.sql"
+VUELTA="$REPO_ROOT/supabase/rollback/0034_search_console_coverage.down.sql"
 
 sql() { $PSQL -v ON_ERROR_STOP=1 -qAt "$@"; }
 
@@ -45,11 +63,27 @@ U2="34990000-0034-4034-8034-000000000002"
 U3="34990000-0034-4034-8034-000000000003"
 U4="34990000-0034-4034-8034-000000000004"
 U5="34990000-0034-4034-8034-000000000005"
+U6="34990000-0034-4034-8034-000000000006"
+U7="34990000-0034-4034-8034-000000000007"
+USUARIOS="'$U1', '$U2', '$U3', '$U4', '$U5', '$U6', '$U7'"
+
+# ¿Está la 0034? Su fila en el registro, y el estado de su trigger ('-' si no hay).
+registro() { sql -c "SELECT count(*) FROM public.schema_migrations WHERE version = '0034_search_console_coverage'"; }
+disparo() {
+    sql -c "SELECT coalesce((SELECT tgenabled::text FROM pg_trigger
+                              WHERE tgrelid = 'public.integration_properties'::regclass
+                                AND tgname = 'trg_integration_properties_search_console_coverage'), '-')"
+}
+aplicada() { if [[ "$(registro)" == "1" ]]; then echo "aplicada, trigger $(disparo)"; else echo "sin aplicar, trigger $(disparo)"; fi; }
 
 limpiar() {
     sql -c "DELETE FROM public.organizations WHERE id IN (
-                SELECT organization_id FROM public.org_members WHERE user_id IN ('$U1', '$U2', '$U3', '$U4', '$U5'));
-            DELETE FROM auth.users WHERE id IN ('$U1', '$U2', '$U3', '$U4', '$U5');" >/dev/null 2>&1 || true
+                SELECT organization_id FROM public.org_members WHERE user_id IN ($USUARIOS));
+            DELETE FROM auth.users WHERE id IN ($USUARIOS);" >/dev/null 2>&1 || true
+    # Los puntos 4 y 5 revierten la 0034: la base queda como la encontraron.
+    if [[ "$(registro 2>/dev/null)" == "0" ]]; then
+        $PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+    fi
 }
 trap limpiar EXIT
 limpiar
@@ -59,15 +93,20 @@ limpiar
 # ya tendría un mapeo vivo y el punto 2 mediría la unicidad de la 0017.
 sql -c "INSERT INTO auth.users (id, email) VALUES ('$U1', 'conc34-1@example.test'),
         ('$U2', 'conc34-2@example.test'), ('$U3', 'conc34-3@example.test'),
-        ('$U4', 'conc34-4@example.test'), ('$U5', 'conc34-5@example.test')" >/dev/null
+        ('$U4', 'conc34-4@example.test'), ('$U5', 'conc34-5@example.test'),
+        ('$U6', 'conc34-6@example.test'), ('$U7', 'conc34-7@example.test')" >/dev/null
 ORG1="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U1'")"
 ORG2="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U2'")"
 ORG3="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U3'")"
 ORG4="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U4'")"
 ORG5="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U5'")"
-[[ -n "$ORG1" && -n "$ORG2" && -n "$ORG3" && -n "$ORG4" && -n "$ORG5" \
-   && "$ORG1" != "$ORG2" && "$ORG2" != "$ORG3" && "$ORG3" != "$ORG4" && "$ORG4" != "$ORG5" ]] \
-    || { echo "no se crearon las cinco organizaciones" >&2; exit 1; }
+ORG6="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U6'")"
+ORG7="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '$U7'")"
+[[ -n "$ORG1" && -n "$ORG2" && -n "$ORG3" && -n "$ORG4" && -n "$ORG5" && -n "$ORG6" && -n "$ORG7" \
+   && "$(printf '%s\n' "$ORG1" "$ORG2" "$ORG3" "$ORG4" "$ORG5" "$ORG6" "$ORG7" | sort -u | wc -l | tr -d ' ')" == "7" ]] \
+    || { echo "no se crearon las siete organizaciones" >&2; exit 1; }
+[[ "$(aplicada)" == "aplicada, trigger A" ]] \
+    || { echo "la 0034 no está aplicada en esta base: $(aplicada)" >&2; exit 1; }
 
 # Un INSERT como `service_role` (como `property-actions.ts`), que dice con qué
 # SQLSTATE murió en vez de abortar.
@@ -102,9 +141,11 @@ SQL
 }
 
 fallas=0
+verdes=0
 esperar() { # <caso> <esperado> <medido>
     if [[ "$2" == "$3" ]]; then
         echo "  ok    $1: $3"
+        verdes=$((verdes + 1))
     else
         echo "  ROJO  $1: $3 (se esperaba $2)"
         fallas=$((fallas + 1))
@@ -146,8 +187,41 @@ esperar "el mapeo previo de B" "ok" "$PREVIO"
 esperar "B se remapea mientras A no confirmó" "23P01" "$B"
 esperar "B conserva su mapeo anterior" "https://previo-remapconc34.example/" "$VIVO_B"
 
+echo "==> 4. la migración, con un onboarding solapado abierto"
+$PSQL -v ON_ERROR_STOP=1 -q < "$VUELTA" >/dev/null
+esperar "la 0034, revertida para medir" "sin aplicar, trigger -" "$(aplicada)"
+VIGENTE="$(mapear "$ORG6" "https://www.toctou34.test/" | $PSQL -qAt 2>&1 | sed -n 's/.*RESULTADO //p')"
+{ echo "BEGIN;"; mapear "$ORG7" "sc-domain:toctou34.test"; echo "SELECT pg_sleep(3); COMMIT;"; } \
+    | $PSQL -v ON_ERROR_STOP=1 -qAt >/dev/null 2>&1 &
+A=$!
+sleep 1
+SALIDA="$($PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" 2>&1)" || true
+wait "$A"
+VIVOS="$(sql -c "SELECT count(*) FROM public.integration_properties
+                 WHERE provider = 'search_console' AND unmapped_at IS NULL
+                   AND property_ref LIKE '%toctou34.test%'")"
+R4="$(aplicada)"
+[[ "$R4" == sin* ]] && grep -q "se solapan" <<<"$SALIDA" && R4="rechazada: el par solapado"
+esperar "el mapeo vivo de la organización 6" "ok" "$VIGENTE"
+esperar "A confirmó su mapeo solapado mientras la migración esperaba" "2" "$VIVOS"
+esperar "la 0034, aplicada en el medio" "rechazada: el par solapado" "$R4"
+sql -c "UPDATE public.integration_properties SET unmapped_at = now()
+        WHERE organization_id = '$ORG7' AND unmapped_at IS NULL" >/dev/null
+$PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+esperar "la 0034, sin el par (contraprueba)" "aplicada, trigger A" "$(aplicada)"
+
+echo "==> 5. la migración fuera de READ COMMITTED"
+$PSQL -v ON_ERROR_STOP=1 -q < "$VUELTA" >/dev/null
+SALIDA="$({ echo "SET default_transaction_isolation = 'repeatable read';"; cat "$MIGRACION"; } \
+          | $PSQL -v ON_ERROR_STOP=1 -q 2>&1)" || true
+R5="$(aplicada)"
+[[ "$R5" == sin* ]] && grep -q "solo cuenta en READ COMMITTED" <<<"$SALIDA" && R5="rechazada: el aislamiento"
+esperar "la 0034 en REPEATABLE READ" "rechazada: el aislamiento" "$R5"
+$PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+esperar "la 0034 en READ COMMITTED (contraprueba)" "aplicada, trigger A" "$(aplicada)"
+
 if [[ "$fallas" -gt 0 ]]; then
     echo "$fallas garantía(s) de la 0034 en rojo" >&2
     exit 1
 fi
-echo "las 7 en verde"
+echo "las $verdes en verde"
