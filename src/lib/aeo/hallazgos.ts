@@ -1,4 +1,5 @@
 import { AGENTES_IA, MINIMO_DE_TEXTO, type AgenteIA } from "./lectura";
+import type { ResultadoRenderizado } from "./renderizado";
 
 /**
  * QUÉ IMPIDE ESTE ARCHIVO
@@ -31,7 +32,15 @@ export interface LecturaDelSitio {
    * sigan valiendo; cuando está, manda sobre `acceso`.
    */
   statusPorAgente?: Record<AgenteIA, number | null>;
+  /** Caracteres de texto del HTML SERVIDO, sin ejecutar JavaScript. */
   caracteresSinJs: number;
+  /**
+   * Caracteres de texto del DOM RENDERIZADO (`renderizado.ts`), o el motivo por
+   * el que no se pudo medir. Opcional para que las lecturas viejas sigan
+   * valiendo, y su AUSENCIA se lee como «no medido», igual que un fallo: nunca
+   * como un cero ni como un verde. Ver `contenidoSinJs`.
+   */
+  caracteresRenderizados?: ResultadoRenderizado;
   schema: string[];
   /** Lo que el validador encontró mal en el JSON-LD. Vacío es «no hay errores». */
   erroresDeSchema?: string[];
@@ -43,7 +52,13 @@ function bloqueadoPorHttp(status: number | null | undefined): boolean {
   return status === 401 || status === 403 || status === 429 || status === 451;
 }
 
-export type Gravedad = "bloqueante" | "importante" | "informativo";
+/**
+ * `no-medido` no es una gravedad del SITIO: es la auditoría diciendo que no
+ * pudo contestar. Va en la misma lista para que la pantalla lo muestre en el
+ * mismo lugar que los hallazgos, y con su propia etiqueta para que nadie lo lea
+ * como un problema del sitio —ni, sobre todo, como la ausencia de uno—.
+ */
+export type Gravedad = "bloqueante" | "importante" | "informativo" | "no-medido";
 
 export interface Hallazgo {
   gravedad: Gravedad;
@@ -96,15 +111,8 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
     });
   }
 
-  if (lectura.caracteresSinJs < MINIMO_DE_TEXTO) {
-    salida.push({
-      gravedad: "bloqueante",
-      quePasa: `Sin ejecutar JavaScript la página trae ${lectura.caracteresSinJs} caracteres de texto.`,
-      queHacer:
-        "Los rastreadores de IA no ejecutan JavaScript: para ellos la página está vacía. Se arregla renderizando en el servidor el contenido que importa.",
-      donde: "el renderizado del sitio",
-    });
-  }
+  const texto = contenidoSinJs(lectura);
+  if (texto.hallazgo) salida.push(texto.hallazgo);
 
   if (lectura.erroresDeSchema && lectura.erroresDeSchema.length > 0) {
     salida.push({
@@ -142,11 +150,137 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
 /**
  * Si el sitio es legible por una IA.
  *
- * `false` EXACTAMENTE cuando hay algún hallazgo bloqueante — que son los dos que
+ * `false` EXACTAMENTE cuando hay algún hallazgo bloqueante — que son los que
  * dejan a un motor sin nada que leer. Los importantes empeoran la cita; los
  * bloqueantes la impiden, y mezclarlos haría que un sitio invisible se viera
  * igual que uno mejorable.
+ *
+ * `null` cuando no hay ningún bloqueante pero algo NO SE MIDIÓ: la respuesta
+ * honesta es «no se sabe», y un `true` ahí sería el verde que la puerta H2-GO-1
+ * prohíbe para un render que falló.
  */
-export function esLegiblePorIA(lista: Hallazgo[]): boolean {
-  return !lista.some((h) => h.gravedad === "bloqueante");
+export function esLegiblePorIA(lista: Hallazgo[]): boolean | null {
+  if (lista.some((h) => h.gravedad === "bloqueante")) return false;
+  if (lista.some((h) => h.gravedad === "no-medido")) return null;
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// El punto «contenido sin JavaScript»: servido contra renderizado
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * La fracción mínima del texto renderizado que tiene que venir YA en el HTML
+ * servido. Escrita a mano y en un solo lugar, como `MINIMO_DE_TEXTO`: es un
+ * juicio, no una medición.
+ */
+export const FRACCION_MINIMA_SERVIDA = 0.5;
+
+export type EstadoDelPunto = "rojo" | "verde" | "no-medido";
+
+export interface PuntoContenidoSinJs {
+  estado: EstadoDelPunto;
+  servido: number;
+  /** `null` si el renderizado no se midió: no es un cero. */
+  renderizado: number | null;
+  hallazgo: Hallazgo | null;
+}
+
+/**
+ * LA REGLA, en una frase: el punto es VERDE sólo si el HTML servido trae al
+ * menos `MINIMO_DE_TEXTO` caracteres Y al menos la mitad de los que trae el DOM
+ * renderizado. Si falla cualquiera de las dos, ROJO. Si el renderizado no se
+ * midió —falló, o la lectura es vieja—, la segunda condición no tiene
+ * respuesta: NO MEDIDO, salvo que la primera ya dé rojo, que no necesita al
+ * navegador para saberse.
+ *
+ * Por qué las dos y no una:
+ *
+ *   - sólo el mínimo absoluto deja en verde a un sitio que sirve el menú y el
+ *     pie (1 500 caracteres) y dibuja el contenido con JavaScript (4 000 más):
+ *     el rastreador lee el menú. Es el caso que la puerta describe —el auditor
+ *     que no compara con el DOM renderizado no lo ve—;
+ *   - sólo la proporción deja en verde a una página de 300 caracteres servidos
+ *     y 300 renderizados: no depende de JavaScript, y aun así un motor no tiene
+ *     qué citar. Ese rojo se dice distinto, porque se arregla en otro lugar.
+ *
+ * La mitad deja afuera el ruido que las dos extracciones no igualan
+ * (`contarCaracteres` en `lectura.ts`: el `<title>`, las entidades, los
+ * espacios que deja una etiqueta en línea) y un banner de cookies dibujado en
+ * el cliente sobre una página real, y atrapa la página de control, que sirve
+ * 40 caracteres y dibuja más de 1 600.
+ */
+export function contenidoSinJs(lectura: LecturaDelSitio): PuntoContenidoSinJs {
+  const servido = lectura.caracteresSinJs;
+  const render = lectura.caracteresRenderizados;
+  const renderizado = render?.estado === "medido" ? render.caracteres : null;
+  const motivoNoMedido = render === undefined ? "lectura sin renderizado" : render.estado === "fallo" ? render.codigo : null;
+
+  if (renderizado === null) {
+    if (servido < MINIMO_DE_TEXTO) {
+      return {
+        estado: "rojo",
+        servido,
+        renderizado,
+        hallazgo: {
+          gravedad: "bloqueante",
+          quePasa: `Sin ejecutar JavaScript la página trae ${servido} caracteres de texto. El DOM renderizado no se pudo medir (${motivoNoMedido}), así que no se sabe si el texto aparece con JavaScript o no existe.`,
+          queHacer:
+            "Los rastreadores de IA no ejecutan JavaScript: para ellos la página está vacía. Se arregla renderizando en el servidor el contenido que importa.",
+          donde: "el renderizado del sitio",
+        },
+      };
+    }
+    return {
+      estado: "no-medido",
+      servido,
+      renderizado,
+      hallazgo: {
+        gravedad: "no-medido",
+        quePasa: `Sin JavaScript la página trae ${servido} caracteres, pero el DOM renderizado no se pudo medir (${motivoNoMedido}): no se sabe cuánto del texto aparece sólo con JavaScript.`,
+        queHacer:
+          "Volver a correr la auditoría. Esto NO es un verde: sin el número renderizado, una página que dibuja la mitad de su contenido en el cliente se ve igual que una que no.",
+        donde: "la auditoría, no el sitio",
+      },
+    };
+  }
+
+  // Las dos ramas rojas se dicen distinto porque se arreglan en lugares
+  // distintos. Depende de JavaScript: lo servido es una fracción chica de lo
+  // renderizado, o no llega al mínimo y renderizada sí.
+  const dependeDeJs =
+    servido < renderizado * FRACCION_MINIMA_SERVIDA ||
+    (servido < MINIMO_DE_TEXTO && renderizado >= MINIMO_DE_TEXTO);
+  if (dependeDeJs) {
+    return {
+      estado: "rojo",
+      servido,
+      renderizado,
+      hallazgo: {
+        gravedad: "bloqueante",
+        quePasa: `Sin ejecutar JavaScript la página trae ${servido} caracteres de texto; renderizada, ${renderizado}. El texto que ve una persona no existe, o no alcanza, para un rastreador.`,
+        queHacer:
+          "Los rastreadores de IA no ejecutan JavaScript: leen sólo lo que viene en el HTML. Se arregla renderizando en el servidor el contenido que importa.",
+        donde: "el renderizado del sitio",
+      },
+    };
+  }
+
+  // Acá `renderizado` también está por debajo del mínimo.
+  if (servido < MINIMO_DE_TEXTO) {
+    return {
+      estado: "rojo",
+      servido,
+      renderizado,
+      hallazgo: {
+        gravedad: "bloqueante",
+        quePasa: `La página trae ${servido} caracteres de texto sin JavaScript y ${renderizado} renderizada: poco texto en los dos casos.`,
+        queHacer:
+          "No es un problema de JavaScript —renderizar en el servidor no agrega nada—: la página no tiene texto que un motor pueda citar. Se arregla escribiendo el contenido.",
+        donde: "el contenido de la página",
+      },
+    };
+  }
+
+  return { estado: "verde", servido, renderizado, hallazgo: null };
 }

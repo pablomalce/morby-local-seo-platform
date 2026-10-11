@@ -11,11 +11,18 @@ import {
 } from "@/lib/aeo/lectura";
 import { statusPorAgente } from "@/lib/aeo/peticion";
 import { hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
+import { medirRenderizado } from "@/lib/aeo/renderizado";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-/** Tres peticiones a un sitio ajeno, que puede ser lento. */
-export const maxDuration = 30;
+/**
+ * Tres peticiones a un sitio ajeno (8 s), y después, en paralelo, las cinco por
+ * agente (8 s) y el render en Chromium (`renderizado.ts`: 25 s de tope total,
+ * más 5 s para cerrar el navegador). Peor caso, unos 38 s: 60 es el techo de
+ * Vercel Hobby y deja lugar para la escritura.
+ */
+export const maxDuration = 60;
 
 /**
  * QUÉ IMPIDE ESTA RUTA
@@ -131,16 +138,31 @@ export async function POST(req: Request) {
     // La petición REAL con cada user-agent. No reemplaza la lectura del
     // robots: la complementa con lo que el servidor hace de verdad, que es lo
     // que la puerta H2-GO-1 exige y lo único que un CDN no puede fingir.
-    const statusAgentes = await statusPorAgente(base.toString());
+    //
+    // Y en paralelo, el DOM RENDERIZADO: la otra mitad del punto «contenido
+    // sin JavaScript». Va después de la portada a propósito —si el sitio no
+    // contesta no se arranca un navegador— y nunca rechaza: un render que
+    // falla vuelve como `{ estado: "fallo", codigo }`, y el hallazgo lo dice
+    // como «no medido», no como un cero.
+    const [statusAgentes, caracteresRenderizados] = await Promise.all([
+      statusPorAgente(base.toString()),
+      medirRenderizado(base.toString(), dependenciasDeProduccion()),
+    ]);
     const lectura: LecturaDelSitio = {
       acceso: accesoDeLasIA(textoRobots),
       statusPorAgente: statusAgentes,
       caracteresSinJs: textoSinJavaScript(portada.texto),
+      caracteresRenderizados,
       schema: tiposDeSchema(portada.texto),
       erroresDeSchema: erroresDeSchema(portada.texto),
       tieneLlmsTxt: llms.ok,
     };
 
+    // `caracteresRenderizados` NO se guarda: la 0025 no tiene columna para
+    // él, y ni `acceso` ni `schema_encontrado` son su lugar —meterlo en un
+    // jsonb ajeno sería escribir en la base un dato con otro nombre—. Viaja en
+    // la respuesta; guardarlo pide una migración que este cambio no escribe.
+    //
     // Una fila por corrida: la historia es el producto (encabezado de la 0025).
     // Hasta hoy la tabla existía y nadie la escribía — la forma «módulo sin
     // llamadores» del #95, en versión tabla. Si la escritura falla, la

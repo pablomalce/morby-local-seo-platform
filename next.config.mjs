@@ -31,6 +31,16 @@ const securityHeaders = [
 
 const nextConfig = {
   poweredByHeader: false,
+  // The AEO audit renders the client's site in Chromium (src/lib/aeo/chromium.ts).
+  // `puppeteer-core` and `@sparticuz/chromium` are already in Next's default
+  // serverExternalPackages, so their JS is traced — but the Chromium binary ships as
+  // brotli files under `bin/` that the package opens by path, not by `require`, and the
+  // tracer does not see them. Measured on this build: without this entry the route's
+  // .nft.json lists build/*.js and no bin/*.br, and the function would fail at runtime
+  // with "The input directory .../bin does not exist". Only this route pays the ~70 MB.
+  outputFileTracingIncludes: {
+    "/api/aeo/audit": ["./node_modules/@sparticuz/chromium/bin/**"],
+  },
   async headers() {
     return [{ source: "/(.*)", headers: securityHeaders }];
   },

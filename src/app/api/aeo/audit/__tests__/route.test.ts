@@ -3,8 +3,21 @@
  *
  * Que la auditoría salga a internet con una URL que mandó quien llama, y que un
  * fallo de red se lea como un hallazgo.
+ *
+ * El render en Chromium corre con el `medirRenderizado` DE VERDAD y un
+ * navegador, un transporte y un DNS dobles (`navegadorDoble.ts`): lo que se
+ * prueba acá es que la ruta lo llame con el sitio del negocio, que el número
+ * llegue a la lectura y al hallazgo, y que un render que falla no tumbe la
+ * auditoría ni se lea como verde.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  navegadorDoble,
+  resolvedorDoble,
+  transporteDoble,
+  type OpcionesDoble,
+} from "@/lib/aeo/__tests__/navegadorDoble";
+import type { DependenciasRender } from "@/lib/aeo/renderizado";
 
 const NEGOCIO = "7d703707-4f9d-43bf-9305-6bc22eddf45f";
 
@@ -33,6 +46,24 @@ vi.mock("@/lib/supabase/server", () => ({
       },
     }),
   }),
+}));
+
+// El render: lo que el navegador doble «descarga» por el transporte doble.
+let paginasRender: Record<string, { cuerpo?: string; status?: number }> = {};
+let opcionesNavegador: OpcionesDoble = {};
+let navegador = navegadorDoble();
+let redRender = transporteDoble({});
+
+vi.mock("@/lib/aeo/chromium", () => ({
+  dependenciasDeProduccion: (): DependenciasRender => {
+    navegador = navegadorDoble(opcionesNavegador);
+    redRender = transporteDoble(paginasRender);
+    return {
+      abrirNavegador: navegador.abrirNavegador,
+      transporte: redRender.transporte,
+      resolver: resolvedorDoble({ "ejemplo.com": ["93.184.216.34"], "otro-sitio.com": ["151.101.1.1"] }).resolver,
+    };
+  },
 }));
 
 const { POST } = await import("../route");
@@ -71,6 +102,11 @@ beforeEach(() => {
     "https://ejemplo.com/": HTML_SANO,
     "https://ejemplo.com/llms.txt": "# llms",
   };
+  // Por defecto, el navegador ve la misma portada que el fetch: una página SSR.
+  paginasRender = { "https://ejemplo.com/": { cuerpo: HTML_SANO } };
+  opcionesNavegador = {};
+  navegador = navegadorDoble();
+  redRender = transporteDoble({});
   vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
     const ua = init ? new Headers(init.headers).get("user-agent") : null;
     // Las peticiones por agente se registran aparte: no son «archivos que
@@ -216,5 +252,73 @@ describe("lo que la puerta H2-GO-1 exige de la ruta", () => {
     expect(res.status).toBe(200);
     expect(cuerpo.ok).toBe(true);
     expect(cuerpo.guardada).toBe(false);
+  });
+});
+
+describe("el DOM renderizado: la otra mitad del punto «contenido sin JavaScript»", () => {
+  it("renderiza el sitio del NEGOCIO y devuelve los dos números en la lectura", async () => {
+    const res = await POST(pedido({ businessId: NEGOCIO, url: "https://otro-sitio.com" }));
+    const cuerpo = (await res.json()) as {
+      lectura: { caracteresSinJs: number; caracteresRenderizados: { estado: string; caracteres?: number } };
+      hallazgos: unknown[];
+    };
+
+    expect(redRender.pedidos.map((p) => p.url)).toEqual(["https://ejemplo.com/"]);
+    expect(cuerpo.lectura.caracteresRenderizados.estado).toBe("medido");
+    expect(cuerpo.lectura.caracteresRenderizados.caracteres).toBeGreaterThan(500);
+    expect(cuerpo.lectura.caracteresSinJs).toBeGreaterThan(500);
+    expect(cuerpo.hallazgos).toEqual([]);
+    expect(navegador.registro.cierres).toBe(navegador.registro.aperturas);
+  });
+
+  it("un sitio que sirve vacío y dibuja con JavaScript sale ROJO, con los dos números", async () => {
+    const vacio = `<html><body><div id="app"></div><script src="/app.js"></script>
+      <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization"}</script></body></html>`;
+    respuestas["https://ejemplo.com/"] = vacio;
+    paginasRender = {
+      "https://ejemplo.com/": { cuerpo: vacio },
+      "https://ejemplo.com/app.js": { cuerpo: "Texto que sólo dibuja el JavaScript. ".repeat(40) },
+    };
+
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as {
+      lectura: { caracteresSinJs: number; caracteresRenderizados: { estado: string; caracteres: number } };
+      hallazgos: Array<{ gravedad: string; quePasa: string; donde: string }>;
+    };
+    const { caracteresSinJs, caracteresRenderizados } = cuerpo.lectura;
+    expect(caracteresSinJs).toBeLessThan(10);
+    expect(caracteresRenderizados.caracteres).toBeGreaterThan(1_000);
+    const h = cuerpo.hallazgos.find((x) => /renderizado/.test(x.donde));
+    expect(h?.gravedad).toBe("bloqueante");
+    expect(h?.quePasa).toContain(String(caracteresRenderizados.caracteres));
+  });
+
+  it("un render que falla NO tumba la auditoría y se dice «no medido», no verde", async () => {
+    opcionesNavegador = { arranqueFalla: true };
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    const cuerpo = (await res.json()) as {
+      ok: boolean;
+      lectura: { caracteresRenderizados: unknown };
+      hallazgos: Array<{ gravedad: string; quePasa: string }>;
+    };
+
+    expect(res.status).toBe(200);
+    expect(cuerpo.ok).toBe(true);
+    expect(cuerpo.lectura.caracteresRenderizados).toEqual({ estado: "fallo", codigo: "sin-navegador" });
+    expect(cuerpo.hallazgos.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(cuerpo.hallazgos[0].quePasa).toContain("sin-navegador");
+  });
+
+  it("sin sesión, sin negocio o sin portada no se arranca ningún navegador", async () => {
+    usuario = null;
+    await POST(pedido({ businessId: NEGOCIO }));
+    usuario = { id: "u1" };
+    negocio = null;
+    await POST(pedido({ businessId: NEGOCIO }));
+    negocio = { id: NEGOCIO, organization_id: "org-1", website: "https://ejemplo.com" };
+    respuestas["https://ejemplo.com/"] = null;
+    await POST(pedido({ businessId: NEGOCIO }));
+
+    expect(navegador.registro.aperturas).toBe(0);
+    expect(redRender.pedidos).toHaveLength(0);
   });
 });

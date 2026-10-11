@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Badge, Card, HudLabel } from "@/components/ui";
 import type { Gravedad, Hallazgo } from "@/lib/aeo/hallazgos";
+import type { ResultadoRenderizado } from "@/lib/aeo/renderizado";
 
 /**
  * QUÉ IMPIDE ESTA PANTALLA
@@ -13,18 +14,26 @@ import type { Gravedad, Hallazgo } from "@/lib/aeo/hallazgos";
  * Y que un hallazgo se muestre sin decir dónde se arregla: un bloqueo de
  * rastreadores lo toca quien maneja el `robots.txt` o el CDN, y un sitio sin
  * texto sin JavaScript lo toca quien hace el sitio. Son dos personas distintas.
+ *
+ * Y que el texto servido se muestre sin el renderizado al lado. La puerta
+ * H2-GO-1 pide los DOS números crudos, uno frente al otro: con uno solo no se
+ * distingue una página corta de una que se dibuja en el cliente. Si el
+ * renderizado no se pudo medir, el lugar del número dice «no medido» y por qué
+ * —nunca un cero, que se leería como «la página no tiene texto»—.
  */
 
-const TONO: Record<Gravedad, "critical" | "orange" | "hud"> = {
+const TONO: Record<Gravedad, "critical" | "orange" | "hud" | "outline"> = {
   bloqueante: "critical",
   importante: "orange",
   informativo: "hud",
+  "no-medido": "outline",
 };
 
 const ETIQUETA: Record<Gravedad, string> = {
   bloqueante: "BLOQUEANTE",
   importante: "IMPORTANTE",
   informativo: "INFORMATIVO",
+  "no-medido": "NO MEDIDO",
 };
 
 interface Resultado {
@@ -32,6 +41,41 @@ interface Resultado {
   robotsLeido: boolean;
   motivoRobots: string | null;
   hallazgos: Hallazgo[];
+  /** Opcional: una respuesta sin lectura no rompe la pantalla, y no muestra números. */
+  lectura?: {
+    caracteresSinJs: number;
+    caracteresRenderizados?: ResultadoRenderizado;
+  };
+}
+
+function TextoComparado({ lectura }: { lectura: NonNullable<Resultado["lectura"]> }) {
+  const render = lectura.caracteresRenderizados;
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2" data-testid="texto-comparado">
+      <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
+        <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+          Sin JavaScript · HTML servido
+        </p>
+        <p className="mt-1 text-[13px] text-metal-200" data-testid="texto-servido">
+          {lectura.caracteresSinJs.toLocaleString("es")} caracteres
+        </p>
+      </div>
+      <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
+        <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+          Renderizado · DOM en Chromium
+        </p>
+        {render?.estado === "medido" ? (
+          <p className="mt-1 text-[13px] text-metal-200" data-testid="texto-renderizado" data-estado="medido">
+            {render.caracteres.toLocaleString("es")} caracteres
+          </p>
+        ) : (
+          <p className="mt-1 text-[13px] text-metal-400" data-testid="texto-renderizado" data-estado="no-medido">
+            no medido ({render?.estado === "fallo" ? render.codigo : "sin dato"})
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
@@ -79,8 +123,8 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
       <HudLabel>AI READABILITY</HudLabel>
       <p className="mt-3 text-[12px] text-metal-400">
         Mide lo que decide si un motor de IA puede leer el sitio: si los rastreadores pueden entrar,
-        y si el contenido existe sin ejecutar JavaScript. Las dos cosas son binarias y son la mitad
-        del resultado.
+        y cuánto del texto existe sin ejecutar JavaScript frente al que dibuja un navegador. Las dos
+        cosas son la mitad del resultado.
       </p>
 
       <button
@@ -113,6 +157,8 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
           <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
             {resultado.url}
           </p>
+
+          {resultado.lectura && <TextoComparado lectura={resultado.lectura} />}
 
           {!resultado.robotsLeido && (
             <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido">

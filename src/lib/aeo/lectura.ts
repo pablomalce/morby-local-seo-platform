@@ -234,15 +234,37 @@ export function erroresDeSchema(html: string): string[] {
 }
 
 export function textoSinJavaScript(html: string): number {
-  const limpio = html
+  const texto = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
     .replace(/<[^>]+>/g, " ")
-    .replace(/&[a-z]+;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return limpio.length;
+    .replace(/&[a-z]+;/gi, " ");
+  return contarCaracteres(texto);
+}
+
+/**
+ * Cuántos caracteres de texto hay, con UNA sola normalización para los dos
+ * lados de la comparación: el HTML servido (`textoSinJavaScript`) y el DOM
+ * renderizado (`renderizado.ts`, sobre `document.body.innerText`).
+ *
+ * Es una función aparte, y no una línea repetida en cada archivo, por lo que la
+ * puerta H2-GO-1 compara: «servido frente a renderizado». Si cada lado colapsara
+ * el espacio a su manera, la diferencia entre los dos números sería en parte
+ * inventada por el código que los cuenta —por ejemplo, `innerText` mete `\n\n`
+ * entre párrafos donde el HTML sin etiquetas deja espacios—, y un umbral sobre
+ * esa diferencia mediría la normalización y no el sitio.
+ *
+ * Lo que NO iguala, dicho: la EXTRACCIÓN. Del HTML se sacan las etiquetas y las
+ * entidades con nombre se cuentan como un espacio; del DOM sale el texto que el
+ * navegador ya decodificó y dibujó. Eso deja diferencias de pocos caracteres
+ * por elemento (`&amp;` es un espacio de un lado y una `&` del otro; el
+ * `<title>` cuenta servido y no renderizado) que la regla de `hallazgos.ts`
+ * —la mitad del texto— no puede confundir con una página que depende de
+ * JavaScript.
+ */
+export function contarCaracteres(texto: string): number {
+  return texto.replace(/\s+/g, " ").trim().length;
 }
 
 /**

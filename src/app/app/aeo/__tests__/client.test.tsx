@@ -112,6 +112,58 @@ describe("la auditoría desde la pantalla", () => {
     );
   });
 
+  it("muestra los DOS números, servido y renderizado, uno al lado del otro", async () => {
+    // Es lo que la puerta H2-GO-1 pide del sitio real: no «poco» o «mucho»,
+    // sino cuánto texto sin JavaScript frente a cuánto en el DOM renderizado.
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [],
+        lectura: { caracteresSinJs: 40, caracteresRenderizados: { estado: "medido", caracteres: 1677 } },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+
+    await waitFor(() => expect(screen.getByTestId("texto-comparado")).toBeTruthy());
+    expect(screen.getByTestId("texto-servido").textContent).toMatch(/^40 caracteres$/);
+    const renderizado = screen.getByTestId("texto-renderizado");
+    expect(renderizado.dataset.estado).toBe("medido");
+    expect(renderizado.textContent?.replace(/\D/g, "")).toBe("1677");
+  });
+
+  it("un renderizado que falló dice «no medido» y el código, NUNCA un cero", async () => {
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [
+          { gravedad: "no-medido", quePasa: "no se pudo medir (timeout)", queHacer: "Volver a correr.", donde: "la auditoría" },
+        ],
+        lectura: { caracteresSinJs: 4000, caracteresRenderizados: { estado: "fallo", codigo: "timeout" } },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+
+    await waitFor(() => expect(screen.getByTestId("texto-renderizado")).toBeTruthy());
+    const renderizado = screen.getByTestId("texto-renderizado");
+    expect(renderizado.dataset.estado).toBe("no-medido");
+    expect(renderizado.textContent).toMatch(/no medido \(timeout\)/);
+    expect(renderizado.textContent).not.toMatch(/\b0\b/);
+    expect(screen.getByTestId("hallazgo").textContent).toMatch(/NO MEDIDO/);
+    expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
+  });
+
   it("avisa cuando el robots.txt no se pudo leer, aunque la auditoría salga bien", async () => {
     // «Permite» y «no se pudo comprobar» no son lo mismo, y la pantalla lo dice.
     respuesta = {

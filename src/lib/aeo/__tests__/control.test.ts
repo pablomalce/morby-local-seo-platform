@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { hallazgos, type LecturaDelSitio } from "../hallazgos";
+import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
 import {
   accesoDeLasIA,
   erroresDeSchema,
@@ -44,6 +44,25 @@ describe("la página de control sale en rojo en los tres ejes", () => {
     );
     // Y el número crudo, que es lo que la puerta pide: no «poco», sino cuánto.
     expect(caracteres).toBeLessThan(60);
+  });
+
+  it("eje 1, con el DOM renderizado al lado: rojo si el render midió, y rojo si falló", () => {
+    // La puerta pide «servido frente a renderizado». El número renderizado de
+    // ESTA página con un Chromium de verdad lo mide
+    // `renderizado.integracion.test.ts` (1677 caracteres el 2026-10-11, con
+    // Chrome 154); acá se fija lo que la regla hace con cualquiera de los dos
+    // desenlaces, para que un render caído no pueda pintar de verde el control.
+    const servido = textoSinJavaScript(CONTROL);
+    const base: LecturaDelSitio = {
+      acceso: accesoDeLasIA(ROBOTS, "/aeo-control/"),
+      caracteresSinJs: servido,
+      schema: tiposDeSchema(CONTROL),
+      erroresDeSchema: erroresDeSchema(CONTROL),
+      tieneLlmsTxt: false,
+    };
+    expect(contenidoSinJs({ ...base, caracteresRenderizados: { estado: "medido", caracteres: 1677 } }).estado).toBe("rojo");
+    expect(contenidoSinJs({ ...base, caracteresRenderizados: { estado: "fallo", codigo: "timeout" } }).estado).toBe("rojo");
+    expect(contenidoSinJs(base).estado).toBe("rojo");
   });
 
   it("eje 2 — el JSON-LD es inválido, y el validador dice en qué", () => {
