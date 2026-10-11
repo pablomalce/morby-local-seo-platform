@@ -39,6 +39,7 @@ import { navegadorDoble, relojVirtual, resolvedorDoble } from "./navegadorDoble"
  */
 const RAIZ = process.cwd();
 const CONTROL = readFileSync(path.join(RAIZ, "public", "aeo-control", "index.html"), "utf8");
+const SANA = readFileSync(path.join(RAIZ, "public", "aeo-sana", "index.html"), "utf8");
 const ROBOTS = readFileSync(path.join(RAIZ, "public", "robots.txt"), "utf8");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +54,9 @@ const ROBOTS = readFileSync(path.join(RAIZ, "public", "robots.txt"), "utf8");
 
 const ORIGEN = "https://morby-local-seo-platform.vercel.app";
 
+/** El `robots.txt` que sirve el despliegue: el de `public/`, salvo en el caso de GATE-4. */
+let robotsDelDespliegue = ROBOTS;
+
 // El middleware pregunta por la sesión: acá no hay ninguna, y no sale a la red.
 vi.mock("@supabase/ssr", () => ({
   createServerClient: () => ({ auth: { getUser: async () => ({ data: { user: null } }) } }),
@@ -60,8 +64,10 @@ vi.mock("@supabase/ssr", () => ({
 
 async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
   const vacio = Buffer.alloc(0);
-  if (pedido.url === `${ORIGEN}/aeo-control/`) {
-    return { tipo: "respuesta", status: 308, encabezados: { location: "/aeo-control" }, cuerpo: vacio };
+  for (const ruta of ["/aeo-control", "/aeo-sana"]) {
+    if (pedido.url === `${ORIGEN}${ruta}/`) {
+      return { tipo: "respuesta", status: 308, encabezados: { location: ruta }, cuerpo: vacio };
+    }
   }
   const delMiddleware = await middleware(new NextRequest(pedido.url, { headers: pedido.encabezados }));
   if (delMiddleware.headers.get("x-middleware-next") !== "1") {
@@ -75,8 +81,10 @@ async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
   switch (pedido.url) {
     case `${ORIGEN}/aeo-control`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
+    case `${ORIGEN}/aeo-sana`:
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(SANA) };
     case `${ORIGEN}/robots.txt`:
-      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/plain" }, cuerpo: Buffer.from(ROBOTS) };
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/plain" }, cuerpo: Buffer.from(robotsDelDespliegue) };
     default:
       return { tipo: "respuesta", status: 404, encabezados: {}, cuerpo: vacio };
   }
@@ -113,7 +121,12 @@ vi.mock("@/lib/aeo/chromium", () => ({
   dependenciasDeProduccion: (): DependenciasRender => {
     const reloj = relojVirtual();
     return {
-      abrirNavegador: navegadorDoble({ reloj, htmlCrudo: domQueDibujaElControl() }).abrirNavegador,
+      // El DOM del control es el que dibuja su script; la sana no tiene
+      // ninguno, y su DOM es el documento que llegó.
+      abrirNavegador: navegadorDoble({
+        reloj,
+        htmlCrudo: (url) => (url.endsWith("/aeo-control") ? domQueDibujaElControl() : undefined),
+      }).abrirNavegador,
       transporte: (pedido) => despliegue(pedido),
       resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
       ...reloj,
@@ -279,5 +292,67 @@ describe("la página de control sale en rojo en los tres ejes", () => {
     };
     const h = hallazgos(lectura);
     expect(h.some((x) => x.gravedad === "bloqueante" && /CDN|WAF/.test(x.donde))).toBe(true);
+  });
+});
+
+/**
+ * GATE-3: la puerta corregida pide DOS páginas de control —la rota en ROJO 3/3
+ * y una SANA en VERDE 3/3, en la misma corrida—. Sin la sana, un auditor que
+ * diera rojo siempre pasaba. La sana está en `public/aeo-sana/index.html`, y
+ * se lee del disco como la rota.
+ */
+describe("GATE-3: la página SANA sale en VERDE en los tres puntos, en la misma corrida que la rota", () => {
+  it("la sana, por la ruta: verde en los tres, legible, y sin un solo bloqueante", async () => {
+    const { status, cuerpo } = await auditarPorLaRuta(`${ORIGEN}/aeo-sana/`);
+    expect(status).toBe(200);
+    expect(cuerpo.urlFinal).toBe(`${ORIGEN}/aeo-sana`);
+    expect(cuerpo.lectura.statusPorAgente).toEqual({ gptbot: 200, claudebot: 200, perplexitybot: 200, "google-extended": 200, ccbot: 200 });
+    expect(cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "verde" });
+    expect(cuerpo.legible).toBe(true);
+    expect(cuerpo.hallazgos.filter((h) => h.gravedad === "bloqueante" || h.gravedad === "no-medido")).toEqual([]);
+  });
+
+  it("las dos en la MISMA corrida: rota 3/3 rojo y sana 3/3 verde", async () => {
+    const [rota, sana] = [await auditarPorLaRuta(`${ORIGEN}/aeo-control/`), await auditarPorLaRuta(`${ORIGEN}/aeo-sana/`)];
+    expect(rota.cuerpo.puntos).toEqual({ acceso: "rojo", contenidoSinJs: "rojo", schema: "rojo" });
+    expect(sana.cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "verde" });
+  });
+
+  it("la sana trae el texto en el HTML, un JSON-LD válido con los tres tipos, y el robots la deja abierta", () => {
+    expect(textoSinJavaScript(SANA)).toBeGreaterThan(MINIMO_DE_TEXTO);
+    expect(tiposDeSchema(SANA)).toEqual(["FAQPage", "LocalBusiness", "Organization"]);
+    expect(erroresDeSchema(SANA)).toEqual([]);
+    for (const ruta of ["/aeo-sana", "/aeo-sana/"]) {
+      expect(Object.values(accesoDeLasIA(ROBOTS, ruta)).every(Boolean), ruta).toBe(true);
+    }
+    // Ni un script que dibuje: lo que hay es lo servido.
+    expect(SANA).not.toMatch(/<script(?![^>]*application\/ld\+json)/);
+  });
+});
+
+/**
+ * GATE-4, por la ruta: un robots que bloquea con la sintaxis de RFC 9309
+ * —comodín, fin de ruta, `Allow: /` más largo-gana— tiene que poner rojo el
+ * acceso. Con `startsWith`, los dos agentes salían «entran» y la pantalla decía
+ * «Los rastreadores entran» sobre la página bloqueada.
+ */
+describe("GATE-4: el control bloqueado con comodines sale rojo en el acceso, por la ruta", () => {
+  it.each([
+    ["Disallow: /*", "User-agent: GPTBot\nDisallow: /*\n\nUser-agent: ClaudeBot\nDisallow: /*\n\nUser-agent: *\nDisallow:\n"],
+    [
+      "comodín, fin de ruta y Allow: / más corto",
+      "User-agent: GPTBot\nDisallow: /*control\n\nUser-agent: ClaudeBot\nAllow: /\nDisallow: /aeo-control$\n\nUser-agent: *\nDisallow:\n",
+    ],
+  ])("%s", async (_caso, robots) => {
+    robotsDelDespliegue = robots;
+    try {
+      const { cuerpo } = await auditarPorLaRuta(`${ORIGEN}/aeo-control/`);
+      expect(cuerpo.lectura.acceso.gptbot).toBe(false);
+      expect(cuerpo.lectura.acceso.claudebot).toBe(false);
+      expect(cuerpo.puntos.acceso).toBe("rojo");
+      expect(cuerpo.hallazgos.map((h) => h.quePasa).join(" | ")).toMatch(/Bloqueados: gptbot, claudebot, perplexitybot\./);
+    } finally {
+      robotsDelDespliegue = ROBOTS;
+    }
   });
 });

@@ -145,10 +145,11 @@ export interface OpcionesDoble {
   paginaFalla?: boolean;
   /**
    * Reemplaza el DOM serializado de la pestaña CON JavaScript: lo que el
-   * navegador devolvería después de correr la página. La pestaña sin
-   * JavaScript no lo usa: ella devuelve el documento que llegó.
+   * navegador devolvería después de correr la página. Con una función, por la
+   * URL del documento (la del último salto), y `undefined` deja el del doble.
+   * La pestaña sin JavaScript no lo usa: ella devuelve el documento que llegó.
    */
-  htmlCrudo?: string;
+  htmlCrudo?: string | ((urlDelDocumento: string) => string | undefined);
   /** La pestaña SIN JavaScript no se puede abrir: el lado servido queda sin medir. */
   paginaSinJsFalla?: boolean;
   /**
@@ -200,6 +201,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
   function pagina(sinJs: boolean): PaginaAbierta {
     let atender: ((p: PedidoDelNavegador) => Promise<void>) | null = null;
     let html = "";
+    let urlDelDocumento = "";
     let navegadoEn: number | null = null;
     let recorrida = false;
 
@@ -225,6 +227,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
           documento = d;
         }
         if (!documento) throw new Error("net::ERR_TOO_MANY_REDIRECTS");
+        urlDelDocumento = actual;
 
         const documentoHtml = documento.cuerpo.toString("utf8");
         if (sinJs) {
@@ -276,7 +279,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       },
       async html() {
         if (sinJs) return html;
-        const base = opciones.htmlCrudo ?? html;
+        const crudo = typeof opciones.htmlCrudo === "function" ? opciones.htmlCrudo(urlDelDocumento) : opciones.htmlCrudo;
+        const base = crudo ?? html;
         const ahora = opciones.reloj?.ahora();
         const tardio = (opciones.textoTardio ?? [])
           .filter((t) => navegadoEn !== null && ahora !== undefined && ahora - navegadoEn >= t.enMs)

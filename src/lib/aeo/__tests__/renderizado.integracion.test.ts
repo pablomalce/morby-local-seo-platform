@@ -68,6 +68,7 @@ const MOTIVO = DE_PRODUCCION
 
 const PUBLICA = "93.184.216.34";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
+const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
 <body><main><h1>Clínica de prueba</h1>
 <p>${"Atendemos de lunes a viernes, con turnos por teléfono y en el mostrador. ".repeat(30)}</p>
@@ -283,6 +284,8 @@ beforeAll(async () => {
     switch (req.url) {
       case "/control":
         return html(CONTROL);
+      case "/sana":
+        return html(SANA);
       case "/ssr":
         return html(SSR);
       case "/tarde":
@@ -454,6 +457,25 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         tieneLlmsTxt: false,
       });
       expect(punto.estado).toBe("rojo");
+      expect(d.cierres()).toBe(d.aperturas());
+    },
+    60_000
+  );
+
+  it(
+    "GATE-3 — la página de control SANA (`public/aeo-sana/`) en la MISMA corrida: servido = renderizado, punto VERDE",
+    async () => {
+      const d = deps();
+      const render = await medirRenderizado("http://sitio.test/sana", d);
+      const servido = textoSinJavaScript(SANA);
+      console.log(`[H2-GO-1 sana] html=${servido} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(Math.abs((render.servidos ?? 0) - servido) / servido).toBeLessThan(0.05);
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: servido, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("verde");
       expect(d.cierres()).toBe(d.aperturas());
     },
     60_000
