@@ -43,7 +43,7 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
 import { contenidoSinJs, type LecturaDelSitio } from "../hallazgos";
-import { AGENTES_IA, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
+import { AGENTES_IA, contarCaracteres, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
 import { medirRenderizado, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
@@ -81,6 +81,18 @@ const AL_VERSE = `<!doctype html><html><head><meta charset="utf-8"></head><body>
 /** P2: un texto que no deja de crecer. */
 const CRECIENTE = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<div id="goteo"></div>
 <script>let i = 0; setInterval(() => { const p = document.createElement("p"); p.textContent = "línea número " + (i++) + " agregada sin parar"; document.getElementById("goteo").appendChild(p); }, 300);</script>
+</body></html>`;
+
+/**
+ * P5: el número renderizado es el texto VISIBLE. Con `textContent` en vez de
+ * `innerText` la integración entera seguía verde; esta página lo separa: un
+ * párrafo visible, un bloque oculto por CSS y un `<script>` largo en línea.
+ */
+const VISIBLE = "Texto que una persona ve en la página, servido por el servidor. ".repeat(30);
+const OCULTO_Y_SCRIPT = `<!doctype html><html><head><meta charset="utf-8"><title>Oculto</title></head><body>
+<p>${VISIBLE}</p>
+<div style="display: none">${"Texto oculto por CSS que nadie ve. ".repeat(90)}</div>
+<script>/* ${"código que no es texto de la página ".repeat(90)} */ document.body.dataset.listo = "1";</script>
 </body></html>`;
 
 let sitio: http.Server;
@@ -177,6 +189,8 @@ beforeAll(async () => {
         return html(SSR);
       case "/tarde":
         return html(TARDE);
+      case "/oculto-y-script":
+        return html(OCULTO_Y_SCRIPT);
       case "/al-verse":
         return html(AL_VERSE);
       case "/creciente":
@@ -329,6 +343,19 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           tieneLlmsTxt: false,
         }).estado
       ).toBe("verde");
+    },
+    30_000
+  );
+
+  it(
+    "P5 — el renderizado es el texto VISIBLE: ni lo oculto por CSS ni el código de un <script> en línea",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/oculto-y-script", deps());
+      const visible = contarCaracteres(VISIBLE);
+      console.log(`[P5 /oculto-y-script] visible=${visible} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(Math.abs(render.caracteres - visible) / visible).toBeLessThan(0.05);
     },
     30_000
   );

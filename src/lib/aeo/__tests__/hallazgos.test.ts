@@ -274,6 +274,30 @@ describe("el punto «contenido sin JavaScript»: servido contra renderizado", ()
     expect(punto.hallazgo?.quePasa).toContain("http_403");
   });
 
+  // P5: los bordes, en las tres ramas. Sin estos casos sobrevivían a la suite
+  // entera `servido < 301` en la rama de poco texto (con(450,450) pasaba a
+  // verde), 499 en la de no medido y `>` en vez de `>=` en la de JavaScript.
+  it("borde de la rama de poco texto: 499 y 499 es ROJO de contenido; 500 y 500, verde", () => {
+    expect(con(450, { estado: "medido", caracteres: 450 }).estado).toBe("rojo");
+    const justo = con(499, { estado: "medido", caracteres: 499 });
+    expect(justo.estado).toBe("rojo");
+    expect(justo.hallazgo?.donde).toMatch(/contenido/);
+    expect(con(500, { estado: "medido", caracteres: 500 }).estado).toBe("verde");
+  });
+
+  it("borde de la rama no medida: 499 con el render caído es ROJO; 500, «no medido»", () => {
+    expect(con(499, { estado: "fallo", codigo: "timeout" }).estado).toBe("rojo");
+    expect(con(500, { estado: "fallo", codigo: "timeout" }).estado).toBe("no-medido");
+  });
+
+  it("borde de la rama de JavaScript: servido bajo el mínimo y renderizado JUSTO en el mínimo es JavaScript", () => {
+    const punto = con(400, { estado: "medido", caracteres: 500 });
+    expect(punto.estado).toBe("rojo");
+    expect(punto.hallazgo?.donde).toMatch(/renderizado/);
+    // Un carácter menos renderizado y ya no alcanza el mínimo: es contenido.
+    expect(con(400, { estado: "medido", caracteres: 499 }).hallazgo?.donde).toMatch(/contenido/);
+  });
+
   it("un renderizado medido en CERO es un dato, no un fallo", () => {
     // Una página que no dibuja nada existe. Lo prohibido es inventar el cero
     // cuando no se midió, no informarlo cuando sí.

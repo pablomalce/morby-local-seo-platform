@@ -130,4 +130,27 @@ describe("cuánto texto hay sin JavaScript", () => {
     const html = `<html><body><div id="root"></div><script src="/app.js"></script></body></html>`;
     expect(textoSinJavaScript(html)).toBeLessThan(MINIMO_DE_TEXTO);
   });
+
+  // P5: lo que la extracción hace con cada pieza, con el número EXACTO que
+  // dibuja un navegador. Sin esto, sacar el reemplazo de entidades o el de
+  // `<noscript>` sobrevivía a la suite entera.
+  it("cada entidad es UN carácter dibujado, numérica o con nombre, y el espacio duro es espacio", () => {
+    // Dibujado: «a & b’s ’c d» — 12 caracteres.
+    expect(textoSinJavaScript("<p>a &amp; b&#8217;s &#x2019;c&nbsp;d</p>")).toBe(12);
+    expect(textoSinJavaScript("<p>&#8220;Hola&#8221;</p>")).toBe("“Hola”".length);
+    // El espacio duro entre espacios se colapsa con ellos, como `\s` colapsa
+    // el U+00A0 que devuelve `innerText`: «a b», 3.
+    expect(textoSinJavaScript("<p>a &nbsp; b</p>")).toBe(3);
+  });
+
+  it("no cuenta `<noscript>`: con JavaScript —como lo ve una persona— no se dibuja", () => {
+    expect(textoSinJavaScript("<p>hola</p><noscript>Activá JavaScript para ver esta página</noscript>")).toBe(4);
+  });
+
+  it("no cuenta el `<title>`, ni un `<template>`, ni un comentario: `innerText` tampoco", () => {
+    const html = `<html><head><title>Un título largo de la pestaña</title></head><body>
+      <!-- un comentario > con signo de mayor -->
+      <template><p>Una fila que el JavaScript clona</p></template><p>hola</p></body></html>`;
+    expect(textoSinJavaScript(html)).toBe(4);
+  });
 });

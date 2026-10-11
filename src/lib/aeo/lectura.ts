@@ -238,8 +238,18 @@ export function textoSinJavaScript(html: string): number {
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    // Ni el `<title>` ni un `<template>` se dibujan: `innerText` no los
+    // cuenta, y contarlos acá era ruido a favor del verde (P4).
+    .replace(/<title[\s\S]*?<\/title>/gi, " ")
+    .replace(/<template[\s\S]*?<\/template>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<[^>]+>/g, " ")
-    .replace(/&[a-z]+;/gi, " ");
+    // Una entidad es UN carácter dibujado: `&amp;` es «&», `&#8217;` es «’».
+    // El espacio duro es espacio, como lo trata `contarCaracteres` del otro
+    // lado. Antes las numéricas se contaban crudas (siete caracteres por
+    // apóstrofo) y las con nombre como un espacio (P5).
+    .replace(/&(?:nbsp|#0*160|#x0*a0);/gi, " ")
+    .replace(/&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);/gi, "x");
   return contarCaracteres(texto);
 }
 
@@ -255,13 +265,14 @@ export function textoSinJavaScript(html: string): number {
  * entre párrafos donde el HTML sin etiquetas deja espacios—, y un umbral sobre
  * esa diferencia mediría la normalización y no el sitio.
  *
- * Lo que NO iguala, dicho: la EXTRACCIÓN. Del HTML se sacan las etiquetas y las
- * entidades con nombre se cuentan como un espacio; del DOM sale el texto que el
- * navegador ya decodificó y dibujó. Eso deja diferencias de pocos caracteres
- * por elemento (`&amp;` es un espacio de un lado y una `&` del otro; el
- * `<title>` cuenta servido y no renderizado) que la regla de `hallazgos.ts`
- * —la mitad del texto— no puede confundir con una página que depende de
- * JavaScript.
+ * Lo que NO iguala, dicho: la EXTRACCIÓN. Del HTML se sacan las etiquetas, el
+ * `<title>`, los `<template>` y los comentarios, y cada entidad cuenta como un
+ * carácter; del DOM sale el texto que el navegador ya decodificó y dibujó. Lo
+ * que el HTML trae OCULTO por CSS (`display: none`) cuenta de este lado y no
+ * del otro, y eso no es ruido de pocos caracteres: un mega-menú oculto puede
+ * ser la mitad de lo servido. Por eso el número servido que decide el punto
+ * es el VISIBLE, medido en el mismo Chromium sin JavaScript
+ * (`renderizado.ts`); éste queda para cuando el navegador no está.
  */
 export function contarCaracteres(texto: string): number {
   return texto.replace(/\s+/g, " ").trim().length;
