@@ -46,6 +46,41 @@
 -- Todo en minúsculas, como la 0017 y por lo mismo: rechazar de más es una
 -- molestia de onboarding, compartir es una fuga entre clientes.
 --
+-- SOBRE LA FORMA CANÓNICA, NO SOBRE EL TEXTO
+--
+-- La primera versión de esta regla comparaba el texto en minúsculas, y medido
+-- el 2026-10-11 en la segunda revisión del #118 (30 casos sobre una réplica
+-- propia) daba «no se solapan» en alias que el CHECK de la 0017 deja entrar:
+-- `https://a.test/` contra `https://a.test:443/`, `https://u@a.test/`,
+-- `https://a.test./` o `https://a.test/%62log/`; `sc-domain:a.test` contra
+-- `https://a.test?q/`, `https://a.test#f/`, `https://a.test\x/` o
+-- `https://a@b@c.test/`; y un dominio internacional escrito en Unicode contra
+-- su punycode. Tres de esos pares entraron vivos en dos organizaciones como
+-- `service_role`, con el trigger puesto.
+--
+-- Ahora las dos propiedades se llevan antes a su FORMA CANÓNICA
+-- (`search_console_canonical`), con las reglas del parser de URL de los
+-- navegadores (WHATWG) para http y https:
+--
+--   * la autoridad termina en el primero de `/ ? # \`; el usuario es todo hasta
+--     la ÚLTIMA `@`; el puerto vacío o el del esquema (`:443` en https, `:80` en
+--     http, con o sin ceros adelante) no se escribe; los puntos finales del host
+--     se sacan (también en `sc-domain:`);
+--   * la ruta usa `/` por `\`. Si tiene un segmento `.` o `..` —también escrito
+--     `%2e`— se reduce a `/`: un `..` sube por encima de cualquier recorte. Si
+--     no, se corta en el primer `?`, `#` o `%`. Cortar un prefijo lo AGRANDA (un
+--     prefijo más corto cubre más), así que nunca esconde un solape: a lo sumo
+--     inventa uno, que es el lado de rechazar de más;
+--   * el host tiene que ser un nombre en ASCII —letras, dígitos, guiones y
+--     puntos, sin etiquetas vacías— y su última etiqueta no puede ser un número
+--     (`127.1`, `0x7f.1` y `2130706433` son la misma dirección IP para un
+--     navegador). Si no lo es, NO HAY forma canónica: un dominio internacional
+--     va en punycode (`xn--…`), que es como lo devuelve Search Console.
+--
+-- Una propiedad viva sin forma canónica se rechaza con 23514 (`check_violation`):
+-- no se puede saber con qué se solapa, y no se adivina. Para el solape, una sin
+-- forma canónica se solapa con todo.
+--
 -- Lo IDÉNTICO no lo mira esta regla: es de la 0017, que lo rechaza con 23505.
 -- Separarlo es a propósito: si esta regla también lo rechazara, el bloque 43 de
 -- la suite —que mide el índice de la 0017— pasaría por ESTE trigger el día que
@@ -94,14 +129,30 @@
 -- (`tpqiltnskfeycnybczgz`, sólo SELECT de conteos): un solo mapeo vivo de Search
 -- Console, así que cero pares.
 --
+-- Y LA GUARDA TAMBIÉN CUENTA las propiedades vivas de Search Console sin forma
+-- canónica: el trigger no mira lo que ya está, así que una viva sin forma
+-- canónica tampoco deja aplicar. Hosted, medido el 2026-10-11: ver la medición
+-- del ejecutable en `~/vulkan-backups/growth-os/2026-10-11-pre-0034/exec/`.
+--
+-- EL REMAPEO, EN UNA TRANSACCIÓN
+--
+-- `property-actions.ts` remapeaba en dos llamadas: desmapear el vivo de la
+-- organización y después insertar el nuevo. Medido en la misma revisión: si el
+-- INSERT chocaba —con esta regla, cada remapeo que se solapara con otra
+-- organización—, la organización quedaba SIN su mapeo vivo anterior, que era
+-- válido. `remap_integration_property()` hace las dos cosas en una
+-- transacción: un 23505, 23P01, 23514 o 45007 revierte también el desmapeo.
+-- SECURITY INVOKER: corre con los privilegios de quien la llama
+-- (`service_role`, que ya tiene UPDATE e INSERT sobre la tabla); DEFINER le
+-- daría a cualquiera con EXECUTE la escritura del mapeo. EXECUTE, sólo
+-- `service_role`.
+--
 -- QUÉ NO HACE
 --
 --   * No mira GA4 ni Business Profile: sus identificadores no se contienen.
---   * No sabe de nombres internacionalizados ni de la lista de sufijos públicos:
---     `sc-domain:co.uk` solaparía con todo `.co.uk`, y está bien que lo haga.
---   * No deshace el desmapeo que `mapProperty()` hace ANTES del INSERT: si el
---     INSERT nuevo choca, la organización queda sin mapeo vivo de Search Console.
---     Es como se comporta hoy con el 23505, y es otro frente.
+--   * No sabe de la lista de sufijos públicos: `sc-domain:co.uk` solaparía con
+--     todo `.co.uk`, y está bien que lo haga.
+--   * No traduce Unicode a punycode: lo rechaza (ver arriba).
 --   * El historial (filas con `unmapped_at`) no bloquea nada, como en la 0017.
 
 \set ON_ERROR_STOP on
@@ -113,8 +164,70 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 1. Qué cubre cada propiedad, y cuándo dos se solapan
+-- 1. La forma canónica de una propiedad, qué cubre, y cuándo dos se solapan
 -- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.search_console_canonical(ref text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    r         text := lower(ref);
+    esquema   text;
+    resto     text;
+    autoridad text;
+    ruta      text;
+    host      text;
+    puerto    text;
+BEGIN
+    IF starts_with(r, 'sc-domain:') THEN
+        host := rtrim(substr(r, 11), '.');
+    ELSE
+        esquema := split_part(r, '://', 1);
+        IF esquema NOT IN ('http', 'https') THEN
+            RETURN NULL;
+        END IF;
+        resto     := substr(r, length(esquema) + 4);
+        -- La autoridad termina en el primero de / ? # \ (esquema especial).
+        autoridad := substring(resto FROM '^[^/?#\\]*');
+        ruta      := replace(substr(resto, length(autoridad) + 1), '\', '/');
+        -- El usuario es todo hasta la ÚLTIMA @.
+        host      := regexp_replace(autoridad, '^.*@', '');
+        puerto    := coalesce(substring(host FROM ':([0-9]*)$'), '');
+        host      := rtrim(regexp_replace(host, ':[0-9]*$', ''), '.');
+        IF puerto <> '' THEN
+            puerto := coalesce(nullif(ltrim(puerto, '0'), ''), '0');
+        END IF;
+        IF (esquema = 'https' AND puerto = '443') OR (esquema = 'http' AND puerto = '80') THEN
+            puerto := '';
+        END IF;
+        -- Sin ruta (la autoridad terminó en ? o #), o con un segmento . o ..:
+        -- la raíz. Si no, la ruta hasta el primer ? # %. Ver el encabezado.
+        IF ruta !~ '^/' OR ruta ~ '(^|/)(\.|%2e)(\.|%2e)?(/|[?#]|$)' THEN
+            ruta := '/';
+        ELSE
+            ruta := substring(ruta FROM '^[^?#%]*');
+        END IF;
+    END IF;
+
+    -- Un nombre en ASCII, sin etiquetas vacías, que no sea una dirección IP.
+    IF host !~ '^[a-z0-9-]+(\.[a-z0-9-]+)*$' OR host ~ '(^|\.)(0x[0-9a-f]*|[0-9]+)$' THEN
+        RETURN NULL;
+    END IF;
+
+    IF esquema IS NULL THEN
+        RETURN 'sc-domain:' || host;
+    END IF;
+    RETURN esquema || '://' || host || CASE WHEN puerto <> '' THEN ':' || puerto ELSE '' END || ruta;
+END
+$$;
+
+COMMENT ON FUNCTION public.search_console_canonical(text) IS
+    'La forma canonica de una propiedad de Search Console (parser WHATWG para http/https: autoridad hasta / ? # \, usuario hasta la ultima @, sin puerto por defecto ni puntos finales; ruta hasta ? # %, o / si tiene un segmento . o ..), o NULL si el host no es un nombre ASCII o es una IP. Ver la 0034.';
+
 CREATE OR REPLACE FUNCTION public.search_console_overlap(a text, b text)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -124,25 +237,32 @@ PARALLEL SAFE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    x  text := lower(a);
-    y  text := lower(b);
-    dx boolean := starts_with(lower(a), 'sc-domain:');
-    dy boolean := starts_with(lower(b), 'sc-domain:');
+    x  text := public.search_console_canonical(a);
+    y  text := public.search_console_canonical(b);
+    dx boolean;
+    dy boolean;
     hx text;
     hy text;
 BEGIN
-    -- Dos prefijos: uno contiene al otro. Los dos terminan en `/` (el CHECK de
-    -- la 0017), así que `https://a.test/` no es prefijo de `https://a.testing/`.
+    -- Sin forma canónica no se sabe qué cubre: se solapa con todo.
+    IF x IS NULL OR y IS NULL THEN
+        RETURN true;
+    END IF;
+    dx := starts_with(x, 'sc-domain:');
+    dy := starts_with(y, 'sc-domain:');
+
+    -- Dos prefijos: uno contiene al otro. Los dos terminan en `/` o en un
+    -- recorte, así que `https://a.test/` no es prefijo de `https://a.testing/`.
     IF NOT dx AND NOT dy THEN
         RETURN starts_with(x, y) OR starts_with(y, x);
     END IF;
 
     -- El host: lo que sigue a `sc-domain:`, o lo que va entre `://` y la
-    -- primera `/`, sin usuario ni puerto.
+    -- primera `/` de la forma canónica, sin el puerto que haya quedado.
     hx := CASE WHEN dx THEN substr(x, 11)
-               ELSE regexp_replace(split_part(split_part(x, '://', 2), '/', 1), '^[^@]*@|:[0-9]*$', '', 'g') END;
+               ELSE regexp_replace(split_part(split_part(x, '://', 2), '/', 1), ':[0-9]+$', '') END;
     hy := CASE WHEN dy THEN substr(y, 11)
-               ELSE regexp_replace(split_part(split_part(y, '://', 2), '/', 1), '^[^@]*@|:[0-9]*$', '', 'g') END;
+               ELSE regexp_replace(split_part(split_part(y, '://', 2), '/', 1), ':[0-9]+$', '') END;
 
     -- Un dominio cubre un host si es él o un subdominio suyo. Con `right()` y no
     -- con LIKE: un `_` en un host sería un comodín.
@@ -159,20 +279,38 @@ END
 $$;
 
 COMMENT ON FUNCTION public.search_console_overlap(text, text) IS
-    'Si dos propiedades de Search Console cubren alguna URL en común: prefijo/prefijo si uno empieza con el otro; dominio/prefijo si el host es el dominio o un subdominio; dominio/dominio si son iguales o uno es subdominio del otro. En minúsculas. Ver la 0034.';
+    'Si dos propiedades de Search Console cubren alguna URL en comun, sobre su forma canonica (search_console_canonical): prefijo/prefijo si uno empieza con el otro; dominio/prefijo si el host es el dominio o un subdominio; dominio/dominio si son iguales o uno es subdominio del otro. Sin forma canonica, true. Ver la 0034.';
 
--- Pura, sin datos: no hay nada que esconder, pero tampoco ningún rol de la API
--- la necesita. Por nombre además de PUBLIC, por los default privileges.
+-- Puras, sin datos: no hay nada que esconder, pero tampoco ningún rol de la API
+-- las necesita. Por nombre además de PUBLIC, por los default privileges.
+REVOKE ALL ON FUNCTION public.search_console_canonical(text)
+    FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.search_console_overlap(text, text)
     FROM PUBLIC, anon, authenticated, service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2. La guarda: no se aplica sobre un solape que ya existe
+-- 2. La guarda: no se aplica sobre un solape que ya existe, ni sobre una
+--    propiedad viva sin forma canónica
 -- ─────────────────────────────────────────────────────────────────────────────
 DO $$
 DECLARE
-    pares int;
+    sin_forma int;
+    pares     int;
 BEGIN
+    SELECT count(*) INTO sin_forma
+      FROM public.integration_properties
+     WHERE provider = 'search_console'
+       AND unmapped_at IS NULL
+       AND public.search_console_canonical(property_ref) IS NULL;
+
+    IF sin_forma > 0 THEN
+        RAISE EXCEPTION
+            '0034: % mapeo(s) vivo(s) de Search Console sin forma canonica',
+            sin_forma
+            USING ERRCODE = '23514',
+                  HINT = 'desmapear (unmapped_at) o reescribir en ASCII (punycode) antes de aplicar: el trigger no mira lo que ya existe.';
+    END IF;
+
     SELECT count(*) INTO pares
       FROM public.integration_properties p
       JOIN public.integration_properties q
@@ -209,6 +347,15 @@ DECLARE
 BEGIN
     IF NEW.provider IS DISTINCT FROM 'search_console' OR NEW.unmapped_at IS NOT NULL THEN
         RETURN NULL;
+    END IF;
+
+    -- Sin forma canónica no se sabe qué cubre. Ver el encabezado.
+    IF public.search_console_canonical(NEW.property_ref) IS NULL THEN
+        RAISE EXCEPTION
+            'la propiedad de Search Console % no tiene forma canonica',
+            NEW.property_ref
+            USING ERRCODE = '23514',
+                  HINT = 'el host tiene que ser un nombre en ASCII (un dominio internacional va en punycode, xn--...) y no una direccion IP.';
     END IF;
 
     -- Lo que esta comprobación necesita para valer, preguntado y no supuesto.
@@ -262,7 +409,7 @@ REVOKE ALL ON FUNCTION public.integration_properties_search_console_coverage()
     FROM PUBLIC, anon, authenticated, service_role;
 
 COMMENT ON FUNCTION public.integration_properties_search_console_coverage() IS
-    'Un mapeo vivo de Search Console no se solapa con el vivo de otra organizacion (23P01). Lo identico es de la 0017 (23505). Fuera de READ COMMITTED, o sin ver todas las filas, rechaza (45007). Ver la 0034.';
+    'Un mapeo vivo de Search Console tiene forma canonica (23514) y no se solapa con el vivo de otra organizacion (23P01). Lo identico es de la 0017 (23505). Fuera de READ COMMITTED, o sin ver todas las filas, rechaza (45007). Ver la 0034.';
 
 DROP TRIGGER IF EXISTS trg_integration_properties_search_console_coverage ON public.integration_properties;
 CREATE TRIGGER trg_integration_properties_search_console_coverage
@@ -275,6 +422,42 @@ CREATE TRIGGER trg_integration_properties_search_console_coverage
 -- `session_replication_role = 'replica'`.
 ALTER TABLE public.integration_properties
     ENABLE ALWAYS TRIGGER trg_integration_properties_search_console_coverage;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 4. El remapeo, en una transacción
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.remap_integration_property(
+    p_organization_id uuid,
+    p_provider        text,
+    p_property_ref    text
+)
+RETURNS void
+LANGUAGE plpgsql
+-- INVOKER a propósito: ver el encabezado.
+SECURITY INVOKER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    -- Primero se desmapea: el índice `integration_properties_one_live_per_provider`
+    -- rechazaría el INSERT con el anterior vivo. Si el INSERT choca, esta
+    -- función entera se revierte, y el desmapeo con ella.
+    UPDATE public.integration_properties
+       SET unmapped_at = now()
+     WHERE organization_id = p_organization_id
+       AND provider = p_provider
+       AND unmapped_at IS NULL;
+
+    INSERT INTO public.integration_properties (organization_id, provider, property_ref)
+    VALUES (p_organization_id, p_provider, p_property_ref);
+END
+$$;
+
+COMMENT ON FUNCTION public.remap_integration_property(uuid, text, text) IS
+    'Desmapea el vivo de (organizacion, superficie) e inserta el nuevo en UNA transaccion: si el INSERT choca (23505, 23P01, 23514, 45007) se revierte tambien el desmapeo. SECURITY INVOKER; EXECUTE solo service_role. Ver la 0034.';
+
+REVOKE ALL ON FUNCTION public.remap_integration_property(uuid, text, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.remap_integration_property(uuid, text, text) TO service_role;
 
 INSERT INTO public.schema_migrations (version) VALUES ('0034_search_console_coverage')
 ON CONFLICT (version) DO NOTHING;
