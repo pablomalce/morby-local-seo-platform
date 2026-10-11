@@ -20,9 +20,9 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
-import type { GoogleSurface, PropertyMapping } from "@/lib/integrations/google/sources";
+import type { GoogleSurface } from "@/lib/integrations/google/sources";
 import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
-import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
+import { type MapeoLeido, servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
 import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
 import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
 import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
@@ -458,35 +458,23 @@ async function hydrateWithPageSpeed(
  * aceptada a cambio de que una integración no tumbe un reporte que las otras
  * cuatro fuentes pueden llenar igual.
  */
-async function readPropertyMappings(organizationId: string): Promise<PropertyMapping[]> {
+async function readPropertyMappings(organizationId: string): Promise<MapeoLeido[]> {
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("integration_properties")
-    .select("provider, property_ref")
+    .select("organization_id, provider, property_ref")
     .eq("organization_id", organizationId)
     .is("unmapped_at", null);
 
   if (error || !data) return [];
+  // `organization_id` se lee aunque el filtro ya lo fije: es lo que deja a
+  // `servirConLaAgencia` comprobar que la fila es de ESTA organización en vez de
+  // creérselo al filtro. Ver su encabezado.
   return data.map((row) => ({
+    organizationId: row.organization_id as string,
     provider: row.provider as GoogleSurface,
     propertyRef: row.property_ref as string,
   }));
-}
-
-/**
- * El token de la agencia para ESTE reporte, o por qué no lo hay.
- *
- * Un reporte de demostración no tiene sesión ni organización, así que tampoco
- * tiene mapeos: las tres fuentes salen `missing` por el mapeo y el token nunca se
- * llega a usar. Se escribe igual, y con un motivo honesto, para que haya UN solo
- * camino — una rama que saltee la hidratación entera sería una segunda manera de
- * decidir estados, y dos maneras se separan con el tiempo.
- */
-async function tokenParaElReporte(authenticated: boolean): Promise<AccessTokenResult> {
-  if (!authenticated) {
-    return { ok: false, reason: "absent", detail: "reporte de demostración, sin sesión" };
-  }
-  return agencyAccessToken();
 }
 
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
@@ -511,16 +499,22 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
   // Sin sesión no hay mapeo que leer: la tabla es por organización y un reporte
   // de demostración no tiene ninguna. Las tres salen `missing`, que es lo que
   // corresponde — y por eso la lista vacía, no por una palabra escrita.
-  const mappings = result.authenticated
-    ? await readPropertyMappings(result.snapshot.business.organizationId)
-    : [];
+  const organizacion = result.authenticated ? result.snapshot.business.organizationId : null;
+  const leidos = organizacion ? await readPropertyMappings(organizacion) : [];
+
+  // El token de la agencia y los mapeos salen JUNTOS de la regla del servicio
+  // compartido (H4.4): sólo los mapeos vivos de ESTA organización, y el token
+  // sólo si hay alguno. Una organización sin mapeo —un cliente recién dado de
+  // alta, o el reporte de demostración— no resuelve el token de la agencia: ni
+  // se lee su secreto ni se refresca contra Google. Ver `servicioCompartido.ts`.
+  const { mapeos, token } = await servirConLaAgencia(organizacion, leidos);
 
   // El token se pide UNA vez para las tres superficies, y las dos consultas que
   // hoy existen salen en paralelo. Ver `hydrate.ts`.
   const ahora = new Date();
   const google = await hydrateGoogle({
-    mappings,
-    token: await tokenParaElReporte(result.authenticated),
+    mappings: mapeos,
+    token,
     fetchSearchConsole: (accessToken, propertyRef) =>
       fetchSearchConsoleTotals({ accessToken, propertyRef, ahora, fetcher: fetch }),
     fetchGa4: (accessToken, propertyRef) =>

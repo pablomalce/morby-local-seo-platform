@@ -140,6 +140,9 @@ describe("cada motivo del token dice lo que es", () => {
     expect(statusForTokenFailure("absent")).toBe("missing");
     expect(statusForTokenFailure("revoked")).toBe("missing");
     expect(statusForTokenFailure("refresh-rejected")).toBe("missing");
+    // Una organización sin mapeo no tiene nada que mandar ni a quién: es el
+    // `client-not-mapped` de `sources.ts` visto desde el token, y no un fallo.
+    expect(statusForTokenFailure("not-mapped")).toBe("missing");
   });
 });
 

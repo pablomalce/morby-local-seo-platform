@@ -12,7 +12,7 @@
  *
  *   `sources.ts`    si hay credenciales de plataforma y si ESTE cliente tiene
  *                   property. Decide sin preguntarle nada a Google;
- *   `tokenStore.ts` si hay un access token usable, y si no, cuál de las seis
+ *   `tokenStore.ts` si hay un access token usable, y si no, cuál de las siete
  *                   maneras de no tenerlo es;
  *   `status.ts`     qué significa lo que Google contestó.
  *
@@ -57,8 +57,8 @@ export interface GoogleHydration {
 /**
  * Qué muestra una fuente cuando no hay token con el que preguntarle.
  *
- * Dos de los seis motivos no dicen nada del token —dicen que no se pudo
- * averiguar— así que son `error`. Los otros cuatro son «no hay nada que mandar»,
+ * Dos de los siete motivos no dicen nada del token —dicen que no se pudo
+ * averiguar— así que son `error`. Los otros cinco son «no hay nada que mandar»,
  * que es lo único que `status.ts` deja llamar `missing`.
  */
 export function statusForTokenFailure(reason: TokenUnavailable): DataSourceStatus {
@@ -67,6 +67,9 @@ export function statusForTokenFailure(reason: TokenUnavailable): DataSourceStatu
     case "unreadable":
       return "error";
     case "platform-not-configured":
+    // Sin mapeo no hay nada que mandar, ni a quién: es el mismo `missing` que
+    // `client-not-mapped`, visto desde el token.
+    case "not-mapped":
     case "absent":
     case "revoked":
     case "refresh-rejected":
@@ -117,7 +120,11 @@ export function describirFallo(outcome: FetchOutcome, propertyRef: string): stri
 
 export interface HydrateDeps {
   mappings: readonly PropertyMapping[];
-  /** El access token de la agencia, ya resuelto. Se pide UNA vez. */
+  /**
+   * El access token de la agencia, ya resuelto. Se pide UNA vez, y lo da
+   * `servirConLaAgencia()` junto con `mappings`: los dos salen de la misma
+   * llamada para que no se pueda prestar el token a mapeos de otra organización.
+   */
   token: AccessTokenResult;
   fetchSearchConsole: (accessToken: string, propertyRef: string) => Promise<SearchConsoleResult>;
   fetchGa4: (accessToken: string, propertyRef: string) => Promise<Ga4Result>;

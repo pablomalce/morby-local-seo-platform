@@ -68,7 +68,13 @@ export type TokenUnavailable =
   /** Google rechazó el refresco. Casi siempre es una revocación del otro lado. */
   | "refresh-rejected"
   /** No se pudo averiguar. El token puede estar vivo; esto NO manda a reconectar. */
-  | "unreadable";
+  | "unreadable"
+  /**
+   * La organización no tiene ningún mapeo vivo, así que el token de la agencia
+   * no se le presta: ni se resolvió. Lo decide `servicioCompartido.ts`, nunca
+   * este archivo — acá no se sabe para quién se pide el token.
+   */
+  | "not-mapped";
 
 export type AccessTokenResult =
   | { ok: true; accessToken: string }

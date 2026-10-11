@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { agencyAccessToken } from "@/lib/integrations/google/tokenStore";
+import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
 import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
 import { publicar, type Destino, type Publicador } from "@/lib/publishing/transport";
 import { permisoEn } from "@/lib/org/rol";
@@ -57,7 +57,14 @@ export const runtime = "nodejs";
  * organización. Si falta cualquiera, esta ruta NO arma el publicador y
  * `publicar()` contesta `sin-transporte` — un fallo con nombre, no un éxito
  * silencioso ni un cero inventado. Ese camino ya está probado en `transport.ts`
- * desde la #74.
+ * desde la #74. Y la respuesta dice cuál faltó (`falta`: `cuenta`, `mapeo` o
+ * `token`), porque son tres arreglos distintos.
+ *
+ * El mapeo va ANTES que el token, y no es un detalle de orden: el token de la
+ * agencia se presta sólo a una organización con mapeo vivo
+ * (`servicioCompartido.ts`). Sin `locations/N` propio, el asset de un cliente no
+ * se publica con el token de la agencia ni en la ficha de la agencia, y el
+ * token ni se pide.
  *
  * Al 2026-09-10 falta la cuota de Business Profile y falta el mapeo de la ficha,
  * así que en producción esta ruta contesta `sin-transporte` hoy. **Eso es lo
@@ -132,7 +139,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, motivo: "no-aprobado" }, { status: 409 });
     }
 
-    const publicador = await armarPublicador(supabase, asset.organization_id, asset.body);
+    const armado = await armarPublicador(supabase, asset.organization_id, asset.body);
+    const publicador = "publicador" in armado ? armado.publicador : undefined;
 
     const resultado = await publicar(
       {
@@ -147,6 +155,14 @@ export async function POST(req: Request) {
     );
 
     if (resultado.ok) return NextResponse.json(resultado, { status: 200 });
+
+    // `sin-transporte` dice que no hubo con qué publicar; `falta` dice POR QUÉ, y
+    // son tres arreglos distintos. El que importa acá es `mapeo`: una
+    // organización sin su `locations/N` vivo NO se publica con lo de la agencia
+    // —ni con su token ni con una ficha por defecto—, y lo dice con nombre.
+    if (resultado.motivo === "sin-transporte" && "falta" in armado) {
+      return NextResponse.json({ ...resultado, falta: armado.falta }, { status: 503 });
+    }
 
     // Cada motivo con su código, y ninguno con 200.
     //
@@ -167,45 +183,67 @@ export async function POST(req: Request) {
 }
 
 /**
- * El publicador, o `undefined` si falta cualquiera de las tres piezas.
+ * Qué pieza faltó para armar el publicador. Ver `falta` en la respuesta.
  *
- * Devolver `undefined` es una respuesta, no una omisión: `publicar()` la lee
- * como `sin-transporte` y deja constancia. Lo que NO hace este archivo es
- * inventar un valor por defecto para seguir adelante — una cuenta inventada
- * publicaría en la ficha de otro, y un `locationRef` inventado es exactamente el
- * defecto que la `0017` existe para impedir.
+ *   cuenta  `GOOGLE_BUSINESS_ACCOUNT_ID` no está puesta;
+ *   mapeo   ESTA organización no tiene `locations/N` vivo — y entonces el token
+ *           de la agencia ni se pide (`servicioCompartido.ts`);
+ *   token   la organización está mapeada y el token de la agencia no se pudo
+ *           resolver. El motivo fino no viaja: es estado de la agencia, no del
+ *           cliente que pidió publicar.
+ */
+type Falta = "cuenta" | "mapeo" | "token";
+
+/**
+ * El publicador, o qué pieza faltó.
+ *
+ * Que falte es una respuesta, no una omisión: `publicar()` lee la ausencia de
+ * publicador como `sin-transporte` y deja constancia. Lo que NO hace este
+ * archivo es inventar un valor por defecto para seguir adelante — una cuenta
+ * inventada publicaría en la ficha de otro, y un `locationRef` inventado es
+ * exactamente el defecto que la `0017` existe para impedir.
  */
 async function armarPublicador(
   supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
   organizationId: string,
   cuerpo: string
-): Promise<Publicador | undefined> {
+): Promise<{ publicador: Publicador } | { falta: Falta }> {
   const accountId = process.env.GOOGLE_BUSINESS_ACCOUNT_ID;
-  if (!accountId) return undefined;
+  if (!accountId) return { falta: "cuenta" };
 
   // El mapeo vivo de ESTA organización. `unmapped_at is null` es lo que
-  // distingue el mapeo actual del historial: la `0017` guarda los dos.
+  // distingue el mapeo actual del historial: la `0017` guarda los dos. Y
+  // `organization_id` se lee aunque el filtro ya lo fije, para que la regla del
+  // servicio compartido lo compruebe en vez de creérselo al filtro.
   const { data: propiedad } = await supabase
     .from("integration_properties")
-    .select("property_ref")
+    .select("organization_id, property_ref")
     .eq("organization_id", organizationId)
     .eq("provider", DESTINO)
     .is("unmapped_at", null)
     .maybeSingle();
 
-  const locationRef = propiedad?.property_ref;
-  if (!locationRef) return undefined;
+  const leidos = propiedad
+    ? [{ organizationId: propiedad.organization_id, provider: DESTINO, propertyRef: propiedad.property_ref }]
+    : [];
 
-  const token = await agencyAccessToken();
-  if (!token.ok) return undefined;
+  // La ficha y el token salen juntos de la regla: sin mapeo propio no hay
+  // ficha, y entonces el token de la agencia no se resuelve.
+  const { mapeos, token } = await servirConLaAgencia(organizationId, leidos);
 
-  return publicadorDeBusinessProfile({
-    accessToken: token.accessToken,
-    accountId,
-    // El texto y la ficha ya se resolvieron acá arriba, con el cliente de sesión
-    // y en la misma operación que decidió publicar. `leerDatos` existe para que
-    // el publicador no sepa de dónde salen, no para volver a buscarlos.
-    leerDatos: async () => ({ cuerpo, locationRef }),
-    fetcher: fetch,
-  });
+  const locationRef = mapeos.find((m) => m.provider === DESTINO)?.propertyRef;
+  if (!locationRef) return { falta: "mapeo" };
+  if (!token.ok) return { falta: "token" };
+
+  return {
+    publicador: publicadorDeBusinessProfile({
+      accessToken: token.accessToken,
+      accountId,
+      // El texto y la ficha ya se resolvieron acá arriba, con el cliente de sesión
+      // y en la misma operación que decidió publicar. `leerDatos` existe para que
+      // el publicador no sepa de dónde salen, no para volver a buscarlos.
+      leerDatos: async () => ({ cuerpo, locationRef }),
+      fetcher: fetch,
+    }),
+  };
 }
