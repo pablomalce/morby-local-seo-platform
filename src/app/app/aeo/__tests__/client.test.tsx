@@ -172,6 +172,46 @@ describe("la auditoría desde la pantalla", () => {
     expect(screen.getByTestId("texto-comparado").textContent).toMatch(/visible/);
   });
 
+  it("P6: muestra los datos CRUDOS aunque el sitio esté sano —código por agente, tipos y errores de schema—", async () => {
+    // Un sitio sano no tiene hallazgos, y antes por eso no mostraba ni un
+    // código: la comparación de las dos URLs de la puerta pedía devtools.
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [],
+        legible: true,
+        guardada: false,
+        lectura: {
+          caracteresSinJs: 4000,
+          caracteresRenderizados: { estado: "medido", caracteres: 4000, servidos: 4000 },
+          acceso: { gptbot: true, claudebot: false, perplexitybot: null },
+          statusPorAgente: { gptbot: 200, claudebot: 403, perplexitybot: null },
+          schema: ["LocalBusiness", "Organization"],
+          erroresDeSchema: ["bloque 2: sin @context"],
+        },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("datos-crudos")).toBeTruthy());
+
+    const filas = screen.getAllByTestId("dato-agente");
+    expect(filas.map((f) => f.dataset.agente)).toEqual(["gptbot", "claudebot", "perplexitybot"]);
+    expect(filas.map((f) => f.textContent)).toEqual([
+      "gptbotpermite200",
+      "claudebotbloquea403",
+      "perplexitybotsin medirsin respuesta",
+    ]);
+    expect(screen.getByTestId("dato-schema").textContent).toMatch(/LocalBusiness, Organization/);
+    expect(screen.getByTestId("dato-errores-schema").textContent).toMatch(/bloque 2: sin @context/);
+    expect(screen.getByTestId("no-guardada")).toBeTruthy();
+  });
+
   it("un renderizado que falló dice «no medido» y el código, NUNCA un cero", async () => {
     respuesta = {
       ok: true,

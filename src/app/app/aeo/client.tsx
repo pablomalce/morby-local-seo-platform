@@ -49,11 +49,72 @@ interface Resultado {
    * lista vacía sola no la habilita.
    */
   legible?: boolean | null;
+  /** Si la corrida quedó en `aeo_audits`. Hoy, contra la base real, no (ver `DatosCrudos`). */
+  guardada?: boolean;
   /** Opcional: una respuesta sin lectura no rompe la pantalla, y no muestra números. */
   lectura?: {
     caracteresSinJs: number;
     caracteresRenderizados?: ResultadoRenderizado;
+    /** Lo que el robots declara por agente; `null` es «no se pudo leer». */
+    acceso?: Record<string, boolean | null>;
+    /** El código HTTP de la petición con el user-agent de cada agente; `null` es «no contestó». */
+    statusPorAgente?: Record<string, number | null>;
+    schema?: string[];
+    erroresDeSchema?: string[];
   };
+}
+
+/**
+ * Los datos CRUDOS que la puerta H2-GO-1 pide para la web real: el código por
+ * agente, los tipos de schema y los errores del validador. Antes sólo
+ * aparecían dentro del texto de un hallazgo cuando había un problema, así que
+ * un sitio sano no mostraba ninguno, y comparar dos URLs pedía abrir devtools
+ * (P6). Tampoco quedan guardados: `aeo_audits` no acepta la escritura de una
+ * sesión (0025), y la pantalla lo dice en vez de callarlo.
+ */
+function DatosCrudos({ lectura, guardada }: { lectura: NonNullable<Resultado["lectura"]>; guardada?: boolean }) {
+  const agentes = Object.keys({ ...(lectura.acceso ?? {}), ...(lectura.statusPorAgente ?? {}) });
+  const robots = (v: boolean | null | undefined) => (v === true ? "permite" : v === false ? "bloquea" : "sin medir");
+  return (
+    <div className="mt-3 rounded-vulkan border border-metal-800 bg-metal-950 p-3" data-testid="datos-crudos">
+      <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">Datos crudos</p>
+      {agentes.length > 0 && (
+        <table className="mt-2 w-full text-left text-[12px] text-metal-300">
+          <thead>
+            <tr className="text-metal-500">
+              <th className="font-normal">Agente</th>
+              <th className="font-normal">robots.txt</th>
+              <th className="font-normal">HTTP con su user-agent</th>
+            </tr>
+          </thead>
+          <tbody>
+            {agentes.map((a) => {
+              const status = lectura.statusPorAgente?.[a];
+              return (
+                <tr key={a} data-testid="dato-agente" data-agente={a}>
+                  <td className="font-mono">{a}</td>
+                  <td>{robots(lectura.acceso?.[a])}</td>
+                  <td data-testid="dato-http">{typeof status === "number" ? status : "sin respuesta"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      <p className="mt-2 text-[12px] text-metal-300" data-testid="dato-schema">
+        Schema: {lectura.schema && lectura.schema.length > 0 ? lectura.schema.join(", ") : "ninguno"}
+      </p>
+      <p className="mt-1 text-[12px] text-metal-300" data-testid="dato-errores-schema">
+        Errores del JSON-LD:{" "}
+        {lectura.erroresDeSchema && lectura.erroresDeSchema.length > 0 ? lectura.erroresDeSchema.join("; ") : "ninguno"}
+      </p>
+      {guardada === false && (
+        <p className="mt-2 text-[11px] text-metal-500" data-testid="no-guardada">
+          Esta corrida no quedó guardada: lo que ves acá es lo único que hay de ella.
+        </p>
+      )}
+    </div>
+  );
 }
 
 function TextoComparado({ lectura }: { lectura: NonNullable<Resultado["lectura"]> }) {
@@ -177,6 +238,7 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
           </p>
 
           {resultado.lectura && <TextoComparado lectura={resultado.lectura} />}
+          {resultado.lectura && <DatosCrudos lectura={resultado.lectura} guardada={resultado.guardada} />}
 
           {!resultado.robotsLeido &&
             (resultado.estadoRobots === "ausente" ? (
