@@ -167,6 +167,21 @@ function envolverPagina(page: Page): PaginaAbierta {
       if (timeoutMs <= 0) return;
       await page.waitForNetworkIdle({ idleTime: 500, timeout: timeoutMs }).catch(() => {});
     },
+    async desplazar(timeoutMs) {
+      if (timeoutMs <= 0) return;
+      // Una ventana por vez, con una pausa para que el `IntersectionObserver`
+      // de cada sección llegue a dispararse, y al final al fondo de todo.
+      await page
+        .evaluate(async (tope: number) => {
+          const fin = Date.now() + tope;
+          for (let y = 0; Date.now() < fin && y < document.documentElement.scrollHeight; y += window.innerHeight) {
+            window.scrollTo(0, y);
+            await new Promise((listo) => setTimeout(listo, 100));
+          }
+          window.scrollTo(0, document.documentElement.scrollHeight);
+        }, timeoutMs)
+        .catch(() => {});
+    },
     async textoVisible() {
       return page.evaluate(() => document.body?.innerText ?? "");
     },

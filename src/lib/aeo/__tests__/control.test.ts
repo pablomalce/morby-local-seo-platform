@@ -13,7 +13,7 @@ import {
 import { bloqueadoPorHttp, statusPorAgente, USER_AGENTS } from "../peticion";
 import { crearRedExaminada } from "../red";
 import type { DependenciasRender, PedidoHttp, RespuestaHttp, Transporte } from "../renderizado";
-import { navegadorDoble, resolvedorDoble } from "./navegadorDoble";
+import { navegadorDoble, relojVirtual, resolvedorDoble } from "./navegadorDoble";
 
 /**
  * H2-GO-1 — la auditoría contra una página que TIENE que salir en rojo.
@@ -91,11 +91,15 @@ vi.mock("@/lib/supabase/server", () => ({
 }));
 
 vi.mock("@/lib/aeo/chromium", () => ({
-  dependenciasDeProduccion: (): DependenciasRender => ({
-    abrirNavegador: navegadorDoble({ textoCrudo: textoQueDibujaElControl() }).abrirNavegador,
-    transporte: async (pedido) => despliegue(pedido),
-    resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
-  }),
+  dependenciasDeProduccion: (): DependenciasRender => {
+    const reloj = relojVirtual();
+    return {
+      abrirNavegador: navegadorDoble({ reloj, textoCrudo: textoQueDibujaElControl() }).abrirNavegador,
+      transporte: async (pedido) => despliegue(pedido),
+      resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
+      ...reloj,
+    };
+  },
 }));
 
 async function auditarPorLaRuta(website: string) {

@@ -44,7 +44,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
 import { contenidoSinJs, type LecturaDelSitio } from "../hallazgos";
 import { AGENTES_IA, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
-import { medirRenderizado, type Bitacora, type DependenciasRender } from "../renderizado";
+import { medirRenderizado, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
 
@@ -60,6 +60,28 @@ const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>C
 <body><main><h1>Clínica de prueba</h1>
 <p>${"Atendemos de lunes a viernes, con turnos por teléfono y en el mostrador. ".repeat(30)}</p>
 </main><script>document.body.dataset.listo = "1";</script></body></html>`;
+
+/** Un menú servido de 60 enlaces: lo que el rastreador lee de una página que dibuja el resto. */
+const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+const CONTENIDO_TARDE = "Contenido real que el JavaScript pone con un temporizador. ".repeat(147);
+
+/** P2: el contenido llega con un temporizador, sin un solo pedido a la red. */
+const TARDE = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>
+<script>setTimeout(() => { document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_TARDE)}; }, 1500);</script>
+</body></html>`;
+
+/** P2: una sección debajo del pliegue que se dibuja cuando se la ve. */
+const AL_VERSE = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}
+<div style="height: 4000px"></div><section id="abajo" style="min-height: 10px"></section>
+<script>new IntersectionObserver((entradas, o) => {
+  if (entradas.some((e) => e.isIntersecting)) { document.getElementById("abajo").textContent = ${JSON.stringify(CONTENIDO_TARDE)}; o.disconnect(); }
+}).observe(document.getElementById("abajo"));</script>
+</body></html>`;
+
+/** P2: un texto que no deja de crecer. */
+const CRECIENTE = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<div id="goteo"></div>
+<script>let i = 0; setInterval(() => { const p = document.createElement("p"); p.textContent = "línea número " + (i++) + " agregada sin parar"; document.getElementById("goteo").appendChild(p); }, 300);</script>
+</body></html>`;
 
 let sitio: http.Server;
 let canario: http.Server;
@@ -153,6 +175,12 @@ beforeAll(async () => {
         return html(CONTROL);
       case "/ssr":
         return html(SSR);
+      case "/tarde":
+        return html(TARDE);
+      case "/al-verse":
+        return html(AL_VERSE);
+      case "/creciente":
+        return html(CRECIENTE);
       case "/subrecursos":
         return html(paginaConSubrecursos());
       case "/redir-loopback":
@@ -306,6 +334,44 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
   );
 
   it(
+    "P2 — contenido puesto con un temporizador de 1,5 s, sin red: se cuenta, y el punto sale ROJO",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/tarde", deps());
+      const servido = textoSinJavaScript(TARDE);
+      console.log(`[P2 /tarde] servido=${servido} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(render.caracteres).toBeGreaterThan(servido + 8_000);
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: servido, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+    },
+    30_000
+  );
+
+  it(
+    "P2 — una sección que un IntersectionObserver dibuja debajo del pliegue: se recorre y se cuenta",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/al-verse", deps());
+      console.log(`[P2 /al-verse] servido=${textoSinJavaScript(AL_VERSE)} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(textoSinJavaScript(AL_VERSE) + 8_000);
+    },
+    30_000
+  );
+
+  it(
+    "P2 — un texto que no deja de crecer: `inestable`, no un número parcial",
+    async () => {
+      const d = deps();
+      const render = await medirRenderizado("http://sitio.test/creciente", d, { ...OPCIONES_RENDER, topeDomMs: 3_000 });
+      expect(render).toEqual({ estado: "fallo", codigo: "inestable" });
+      expect(d.cierres()).toBe(d.aperturas());
+    },
+    30_000
+  );
+
+  it(
     "una redirección SANA se sigue: la entrega el transporte y la pide el navegador",
     async () => {
       const b = bitacora();
@@ -449,6 +515,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     async () => {
       const d = deps();
       const render = await medirRenderizado("http://sitio.test/ssr", d, {
+        ...OPCIONES_RENDER,
         topeMs: 1,
         plazoPorPedidoMs: 1,
         quietudMs: 0,

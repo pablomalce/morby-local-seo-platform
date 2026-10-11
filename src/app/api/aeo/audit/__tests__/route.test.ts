@@ -13,6 +13,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   navegadorDoble,
+  relojVirtual,
   resolvedorDoble,
   transporteDoble,
   type OpcionesDoble,
@@ -114,12 +115,14 @@ const DNS = {
 
 vi.mock("@/lib/aeo/chromium", () => ({
   dependenciasDeProduccion: (): DependenciasRender => {
-    navegador = navegadorDoble(opcionesNavegador);
+    const reloj = relojVirtual();
+    navegador = navegadorDoble({ reloj, ...opcionesNavegador });
     redRender = transporteDoble(paginasRender);
     return {
       abrirNavegador: navegador.abrirNavegador,
       transporte,
       resolver: resolvedorDoble(DNS).resolver,
+      ...reloj,
     };
   },
 }));

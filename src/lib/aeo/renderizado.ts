@@ -69,10 +69,33 @@
  * DNS que lo decide pasa por `node:dns`, donde la ve el espía de
  * `precondicionRutas.test.ts`.
  *
+ * CUÁNDO SE LEE
+ *
+ * No a la primera quietud de red. MEDIDO con Chrome 154 (P2): una página que
+ * pone 8 699 caracteres con un `setTimeout` de 1,5 s, sin pedir nada, salía
+ * con 1 669 renderizados —se leía a los ~500 ms de red quieta— y el punto en
+ * VERDE con el 84 % del texto dibujado por JavaScript. Lo mismo vale para la
+ * hidratación perezosa, `requestIdleCallback` y las secciones que un
+ * `IntersectionObserver` dibuja cuando se las ve. Por eso, después de la
+ * quietud de red:
+ *
+ *   1. se recorre la página hasta el final (`desplazar`), para que lo que se
+ *      dibuja al verse se dibuje;
+ *   2. se lee el texto cada `sondeoMs` hasta que su MÁXIMO no crezca durante
+ *      `quietudDomMs`, y se devuelve ese máximo —un carrusel que cambia de
+ *      texto sin crecer no impide la lectura, y contar de más del lado
+ *      renderizado empuja al rojo, nunca al verde—;
+ *   3. si al vencer `topeDomMs` el texto SIGUE creciendo, el número no se
+ *      devuelve: `inestable`, y el punto queda «no medido». Un número parcial
+ *      sería el verde que la puerta prohíbe.
+ *
+ * Lo que NO alcanza, dicho: un texto que aparece más de `quietudDomMs`
+ * después del último cambio no se ve. Es un umbral escrito, no una medición.
+ *
  * EL TIEMPO
  *
  * `TOPE_MS` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
- * Chromium la primera vez—, navegación, quietud y lectura. La ruta lo corre en
+ * Chromium la primera vez—, navegación, quietud, recorrido y lectura. La ruta lo corre en
  * paralelo con los pedidos por agente, después de traer la portada (8 s), así
  * que el peor caso es 8 + 25 + 5 de cierre = 38 s, dentro de los 60 s de
  * `maxDuration` en Vercel Hobby. El navegador se cierra en `finally`, también
@@ -112,6 +135,7 @@ export type CodigoDeFallo =
   | "sin-navegador"
   | "navegacion"
   | "lectura"
+  | "inestable"
   | "descarga"
   | MotivoDeBloqueo
   | MotivoDeTransporte
@@ -185,6 +209,12 @@ export interface PaginaAbierta {
   navegar(url: string, timeoutMs: number): Promise<void>;
   /** Espera a que la red se aquiete, como mucho `timeoutMs`. Nunca rechaza. */
   esperarQuietud(timeoutMs: number): Promise<void>;
+  /**
+   * Recorre la página de arriba abajo, una ventana por vez, como mucho
+   * `timeoutMs`: lo que se dibuja al verse (`IntersectionObserver`, carga
+   * perezosa) se dibuja. Nunca rechaza.
+   */
+  desplazar(timeoutMs: number): Promise<void>;
   /** `document.body.innerText`, crudo: la normalización es de este archivo. */
   textoVisible(): Promise<string>;
 }
@@ -201,7 +231,9 @@ export interface DependenciasRender {
   abrirNavegador: AbrirNavegador;
   transporte: Transporte;
   resolver: Resolvedor;
+  /** El reloj y la espera van juntos: un test con reloj propio no duerme de verdad. */
   ahora?: () => number;
+  esperar?: (ms: number) => Promise<void>;
 }
 
 export interface OpcionesRender {
@@ -211,6 +243,14 @@ export interface OpcionesRender {
   plazoPorPedidoMs: number;
   /** Cuánto se espera, después del `load`, a que la red quede quieta. */
   quietudMs: number;
+  /** Cuánto se recorre la página, como mucho, para que se dibuje lo perezoso. */
+  desplazarMs: number;
+  /** Cuánto tiempo sin que el texto crezca hace falta para leerlo. */
+  quietudDomMs: number;
+  /** Cada cuánto se vuelve a leer el texto mientras se espera esa quietud. */
+  sondeoMs: number;
+  /** Cuánto se espera esa quietud, como mucho: pasado esto, `inestable`. */
+  topeDomMs: number;
   /** Cuánto se espera al cierre antes de matar el proceso. */
   cierreMs: number;
   maxBytesPorRespuesta: number;
@@ -221,6 +261,10 @@ export const OPCIONES_RENDER: OpcionesRender = {
   topeMs: 25_000,
   plazoPorPedidoMs: 8_000,
   quietudMs: 3_000,
+  desplazarMs: 2_000,
+  quietudDomMs: 2_000,
+  sondeoMs: 250,
+  topeDomMs: 8_000,
   cierreMs: 5_000,
   maxBytesPorRespuesta: 5 * 1024 * 1024,
   maxBytesTotales: 25 * 1024 * 1024,
@@ -438,6 +482,39 @@ function fallo(codigo: CodigoDeFallo): ResultadoRenderizado {
   return { estado: "fallo", codigo };
 }
 
+const dormir = (ms: number) => new Promise<void>((listo) => setTimeout(listo, Math.max(ms, 0)));
+
+/**
+ * Lee el texto visible hasta que su MÁXIMO deje de crecer durante
+ * `quietudDomMs`, y devuelve ese máximo. Si el tope llega con el texto todavía
+ * creciendo, `inestable`: el número de ese momento es parcial, y un parcial
+ * del lado renderizado es un verde inventado.
+ */
+async function leerCuandoSeQuede(
+  pagina: PaginaAbierta,
+  opciones: OpcionesRender,
+  topeMs: number,
+  ahora: () => number,
+  esperar: (ms: number) => Promise<void>
+): Promise<number | "inestable" | "plazo"> {
+  const inicio = ahora();
+  let maximo = contarCaracteres(await pagina.textoVisible());
+  let crecioEn = inicio;
+  while (ahora() - crecioEn < opciones.quietudDomMs) {
+    // Al tope: si el texto creció mientras se miraba, sigue creciendo y el
+    // número es parcial; si no creció pero no hubo tiempo de ver una quietud
+    // entera, es el presupuesto el que no alcanzó, no la página.
+    if (ahora() - inicio >= topeMs) return crecioEn === inicio ? "plazo" : "inestable";
+    await esperar(opciones.sondeoMs);
+    const n = contarCaracteres(await pagina.textoVisible());
+    if (n > maximo) {
+      maximo = n;
+      crecioEn = ahora();
+    }
+  }
+  return maximo;
+}
+
 /**
  * Espera a `promesa` como mucho `ms`. Al vencer llama `alVencer`, que es lo que
  * CORTA el trabajo de abajo: sin eso, el plazo sólo deja de esperar.
@@ -475,6 +552,7 @@ export async function medirRenderizado(
   bitacora: Bitacora = nuevaBitacora()
 ): Promise<ResultadoRenderizado> {
   const ahora = deps.ahora ?? Date.now;
+  const esperar = deps.esperar ?? dormir;
   const limite = ahora() + opciones.topeMs;
   const restante = () => limite - ahora();
   const corte = new AbortController();
@@ -539,13 +617,25 @@ export async function medirRenderizado(
       if (bitacora.statusDocumento === null) return fallo("navegacion");
       if (bitacora.statusDocumento >= 400) return fallo(`http_${bitacora.statusDocumento}`);
 
-      let texto: string;
+      // Lo que se dibuja al verse, y lo que llega tarde sin pedir nada a la
+      // red: ver «CUÁNDO SE LEE» arriba. El recorrido y la espera salen del
+      // mismo presupuesto total, y dejan un segundo para cerrar.
+      await pagina.desplazar(Math.min(opciones.desplazarMs, Math.max(restante() - 1_000, 0)));
+      let caracteres: number | "inestable" | "plazo";
       try {
-        texto = await pagina.textoVisible();
+        caracteres = await leerCuandoSeQuede(
+          pagina,
+          opciones,
+          Math.min(opciones.topeDomMs, Math.max(restante() - 1_000, 0)),
+          ahora,
+          esperar
+        );
       } catch {
         return fallo("lectura");
       }
-      return { estado: "medido", caracteres: contarCaracteres(texto) };
+      if (caracteres === "inestable") return fallo("inestable");
+      if (caracteres === "plazo") return fallo("timeout");
+      return { estado: "medido", caracteres };
     } catch {
       return fallo(corte.signal.aborted ? "timeout" : "navegacion");
     }

@@ -85,7 +85,33 @@ function textoDelHtml(html: string): string {
     .replace(/<[^>]+>/g, " ");
 }
 
+/**
+ * Un reloj que sólo avanza cuando la medición «duerme»: la espera de quietud
+ * del DOM corre en tiempo virtual, y los tests no esperan dos segundos reales
+ * por cada medición. Va en `DependenciasRender` (`ahora` y `esperar`) y en el
+ * navegador doble (`reloj`), que lo usa para el texto que llega tarde.
+ */
+export function relojVirtual() {
+  let t = 0;
+  return {
+    ahora: () => t,
+    esperar: async (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
 export interface OpcionesDoble {
+  /**
+   * Texto que el «JavaScript» agrega después de la navegación, sin pedir nada
+   * a la red: cada entrada aparece a los `enMs` del reloj. Es la página que
+   * dibuja con un `setTimeout`, o con `requestIdleCallback`.
+   */
+  textoTardio?: Array<{ enMs: number; texto: string }>;
+  /** Texto que aparece SÓLO si la página se recorrió: lo que un `IntersectionObserver` dibuja al verse. */
+  textoAlVerse?: string;
+  /** El reloj de `textoTardio`. Sin él, el tardío nunca aparece. */
+  reloj?: { ahora: () => number };
   /** El arranque falla, como un Chromium que no está. */
   arranqueFalla?: boolean;
   /** El arranque tarda esto antes de devolver el navegador. */
@@ -105,6 +131,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     /** Cada pedido que el navegador hizo, y cómo terminó. */
     pedidos: [] as Array<{ url: string; tipo: string; desenlace: Desenlace["tipo"] }>,
     textoDibujado: null as string | null,
+    /** Cuántas veces se recorrió una página de arriba abajo. */
+    recorridos: 0,
   };
 
   async function emitir(
@@ -134,6 +162,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
   function pagina(): PaginaAbierta {
     let atender: ((p: PedidoDelNavegador) => Promise<void>) | null = null;
     let texto = "";
+    let navegadoEn: number | null = null;
+    let recorrida = false;
 
     return {
       async interceptar(a) {
@@ -174,10 +204,21 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         }
         texto = partes.join(" ");
         registro.textoDibujado = texto;
+        navegadoEn = opciones.reloj?.ahora() ?? null;
       },
       async esperarQuietud() {},
+      async desplazar() {
+        recorrida = true;
+        registro.recorridos += 1;
+      },
       async textoVisible() {
-        return opciones.textoCrudo ?? texto;
+        const base = opciones.textoCrudo ?? texto;
+        const ahora = opciones.reloj?.ahora();
+        const tardio = (opciones.textoTardio ?? [])
+          .filter((t) => navegadoEn !== null && ahora !== undefined && ahora - navegadoEn >= t.enMs)
+          .map((t) => t.texto);
+        const alVerse = recorrida && opciones.textoAlVerse ? [opciones.textoAlVerse] : [];
+        return [base, ...tardio, ...alVerse].join(" ");
       },
     };
   }

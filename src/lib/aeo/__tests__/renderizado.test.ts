@@ -20,7 +20,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
-import { AGENTES_IA, textoSinJavaScript } from "../lectura";
+import { AGENTES_IA, contarCaracteres, textoSinJavaScript } from "../lectura";
 import {
   crearExaminador,
   medirRenderizado,
@@ -28,7 +28,7 @@ import {
   type Bitacora,
   type DependenciasRender,
 } from "../renderizado";
-import { navegadorDoble, resolvedorDoble, transporteDoble, type Sitio } from "./navegadorDoble";
+import { navegadorDoble, relojVirtual, resolvedorDoble, transporteDoble, type Sitio } from "./navegadorDoble";
 
 const PUBLICA = "93.184.216.34";
 const OTRA_PUBLICA = "151.101.1.1";
@@ -50,15 +50,18 @@ function bitacoraVacia(): Bitacora {
 }
 
 function armar(sitio: Sitio, opcionesNavegador: Parameters<typeof navegadorDoble>[0] = {}) {
-  const navegador = navegadorDoble(opcionesNavegador);
+  // Tiempo virtual: la espera de quietud del DOM no duerme de verdad.
+  const reloj = relojVirtual();
+  const navegador = navegadorDoble({ reloj, ...opcionesNavegador });
   const red = transporteDoble(sitio);
   const dns = resolvedorDoble(DNS);
   const deps: DependenciasRender = {
     abrirNavegador: navegador.abrirNavegador,
     transporte: red.transporte,
     resolver: dns.resolver,
+    ...reloj,
   };
-  return { deps, navegador, red, dns, bitacora: bitacoraVacia() };
+  return { deps, navegador, red, dns, reloj, bitacora: bitacoraVacia() };
 }
 
 const TEXTO_JS = "Contenido que sólo existe después de ejecutar JavaScript. ".repeat(30);
@@ -125,6 +128,66 @@ describe("la medición contra el punto de la puerta", () => {
     expect(textoSinJavaScript(html)).toBe("Hola mundo de verdad".length);
   });
 });
+
+/**
+ * P2. Reproducido con Chrome 154: una página que pone su contenido con un
+ * `setTimeout` de 1,5 s, sin red, salía con el menú solo —el render leía a la
+ * primera quietud de red— y el punto en VERDE con el 84 % del texto dibujado
+ * por JavaScript. El doble dibuja texto tardío en tiempo virtual.
+ */
+describe("P2: el texto que llega DESPUÉS de la quietud de red también se cuenta", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO_TARDE = "Contenido real que el JavaScript pone con un temporizador. ".repeat(147);
+
+  it("contenido puesto a los 1,5 s sin pedir nada: se espera, se cuenta, y el punto sale ROJO", async () => {
+    const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: html } }, { textoTardio: [{ enMs: 1_500, texto: CONTENIDO_TARDE }] });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    const servido = textoSinJavaScript(html);
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(servido + 8_000);
+    expect(
+      contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: servido, caracteresRenderizados: render, schema: [], tieneLlmsTxt: true }).estado
+    ).toBe("rojo");
+  });
+
+  it("lo que se dibuja AL VERSE (debajo del pliegue) se cuenta: la página se recorre antes de leer", async () => {
+    const html = `<html><body>${MENU}<section id="abajo"></section></body></html>`;
+    const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: html } }, { textoAlVerse: CONTENIDO_TARDE });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(navegador.registro.recorridos).toBe(1);
+    expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(textoSinJavaScript(html) + 8_000);
+  });
+
+  it("un texto que NO DEJA de crecer: `inestable`, sin número, y el punto queda «no medido»", async () => {
+    const goteo = Array.from({ length: 200 }, (_, i) => ({ enMs: (i + 1) * 300, texto: `línea número ${i} agregada sin parar` }));
+    const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: `<body>${MENU}</body>` } }, { textoTardio: goteo });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render).toEqual({ estado: "fallo", codigo: "inestable" });
+    expect(navegador.registro.cierres).toBe(1);
+    const punto = contenidoSinJs({ ...SANO_PUNTO, caracteresRenderizados: render });
+    expect(punto.estado).toBe("no-medido");
+  });
+
+  it("un texto que crece y se QUEDA se lee cuando se quedó, no antes ni nunca", async () => {
+    const pasos = [1, 2, 3].map((i) => ({ enMs: i * 600, texto: "Tramo que llega por partes. ".repeat(20) }));
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: `<body><p>inicio</p></body>` } }, { textoTardio: pasos });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    // Los tres tramos: el último llegó a los 1,8 s, y después hubo quietud.
+    expect(render.estado === "medido" && render.caracteres).toBe(
+      contarCaracteres(["inicio", ...pasos.map((p) => p.texto)].join(" "))
+    );
+  });
+});
+
+const SANO_PUNTO: LecturaDelSitio = {
+  acceso: TODOS_ENTRAN,
+  caracteresSinJs: 4_000,
+  schema: [],
+  tieneLlmsTxt: true,
+};
 
 describe("un fallo es un fallo: con código, sin número, y con el navegador cerrado", () => {
   it("sin Chromium: `sin-navegador`, y el punto queda «no medido», no verde", async () => {
@@ -333,7 +396,8 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     const hostil = resolvedorDoble({
       "sitio.test": () => (veces++ === 0 ? [PUBLICA] : ["169.254.169.254"]),
     });
-    const navegador = navegadorDoble();
+    const reloj = relojVirtual();
+    const navegador = navegadorDoble({ reloj });
     const red = transporteDoble({
       "http://sitio.test/": { cuerpo: `<p>hola</p><script src="/a.js"></script><script src="/b.js"></script>` },
       "http://sitio.test/a.js": { cuerpo: "a" },
@@ -343,6 +407,7 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
       abrirNavegador: navegador.abrirNavegador,
       transporte: red.transporte,
       resolver: hostil.resolver,
+      ...reloj,
     });
     expect(render.estado).toBe("medido");
     expect(red.pedidos.map((p) => p.ip)).toEqual([PUBLICA, PUBLICA, PUBLICA]);
