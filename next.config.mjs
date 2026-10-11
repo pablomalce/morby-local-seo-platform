@@ -37,7 +37,11 @@ const nextConfig = {
   // brotli files under `bin/` that the package opens by path, not by `require`, and the
   // tracer does not see them. Measured on this build: without this entry the route's
   // .nft.json lists build/*.js and no bin/*.br, and the function would fail at runtime
-  // with "The input directory .../bin does not exist". Only this route pays the ~70 MB.
+  // with "The input directory .../bin does not exist". Only this route pays the ~70 MB —
+  // as long as it stays in a Vercel function of its own: the builder groups routes with the
+  // same config, and with maxDuration 60 it bundled geo/grid, profile/evidence-check and
+  // reports/generate into this 72.8 MB function (measured with `vercel inspect`). That is why
+  // the route's maxDuration is unique (route.ts, and funcionPropia.test.ts).
   outputFileTracingIncludes: {
     "/api/aeo/audit": ["./node_modules/@sparticuz/chromium/bin/**"],
   },

@@ -22,10 +22,17 @@ export const runtime = "nodejs";
  * La portada (8 s, redirecciones incluidas), y después, en paralelo, el
  * `robots.txt` y el `llms.txt` del origen al que llevó la portada (8 s), las
  * cinco por agente (8 s) y el render en Chromium (`renderizado.ts`: 25 s de
- * tope total, más 5 s para cerrar el navegador). Peor caso, unos 38 s: 60 es
- * el techo de Vercel Hobby y deja lugar para la escritura.
+ * tope total, más 5 s para cerrar el navegador). Peor caso, unos 38 s.
+ *
+ * 59 y no 60, A PROPÓSITO: el builder de Vercel junta en UNA función las rutas
+ * con la misma configuración. MEDIDO con `vercel inspect` sobre la preview de
+ * este PR (RV-3): con 60, esta ruta compartía función con `geo/grid`,
+ * `profile/evidence-check` y `reports/generate` —las tres con 60—, y las tres
+ * pasaron de 2,0 MB a 72,8 MB y a compartir instancia con un Chromium. Un
+ * valor que ninguna otra ruta tiene la deja sola; `funcionPropia.test.ts` lo
+ * sostiene.
  */
-export const maxDuration = 60;
+export const maxDuration = 59;
 
 /**
  * QUÉ IMPIDE ESTA RUTA
