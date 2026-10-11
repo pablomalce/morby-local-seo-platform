@@ -87,7 +87,7 @@
  * de auditoría importa este archivo, y el barrido de rutas, el build y cada
  * pedido que no llega a renderizar no tienen por qué cargar un navegador.
  */
-import type { Browser, HTTPRequest, Page } from "puppeteer-core";
+import type { Browser, HTTPRequest, LaunchOptions, Page } from "puppeteer-core";
 import { resolverDns } from "@/lib/profile/nodeTransport";
 import type {
   AbrirNavegador,
@@ -291,6 +291,27 @@ export interface OpcionesChromium {
    * la bandera de WebRTC sola. Producción no lo pasa.
    */
   quitarWebRtc?: boolean;
+  /**
+   * Los dos paquetes, para el test de la descompresión única (`chromium.test.ts`),
+   * que necesita dobles sin depender de cómo el runner simula un `import()`
+   * dinámico. Producción no lo pasa y los importa adentro de la función.
+   */
+  paquetes?: () => Promise<{ puppeteer: PuppeteerLanzador; chromium: () => Promise<SparticuzChromium> }>;
+  /** Para el mismo test: la plataforma, que fuera de Linux sin Chrome local no arranca nada. */
+  plataforma?: NodeJS.Platform;
+}
+
+/** Lo que este archivo usa de `puppeteer-core`. */
+type PuppeteerLanzador = { launch(opciones: LaunchOptions): Promise<Browser> };
+/** Lo que este archivo usa de `@sparticuz/chromium`. */
+type SparticuzChromium = { args: string[]; setGraphicsMode: boolean; executablePath(): Promise<string> };
+
+async function paquetesDeVerdad() {
+  const { default: puppeteer } = await import("puppeteer-core");
+  return {
+    puppeteer,
+    chromium: async (): Promise<SparticuzChromium> => (await import("@sparticuz/chromium")).default,
+  };
 }
 
 export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
@@ -300,10 +321,11 @@ export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
     // El binario de `@sparticuz/chromium` es Linux x64. Fuera de Linux, sin un
     // Chrome local, no hay navegador: se dice ya, en vez de descomprimir 180 MB
     // en `/tmp` para que después el sistema se niegue a ejecutarlos.
-    if (!local && process.platform !== "linux") {
+    if (!local && (opciones.plataforma ?? process.platform) !== "linux") {
       throw new Error("sin Chromium: fuera de Linux hace falta AEO_CHROME_PATH");
     }
-    const { default: puppeteer } = await import("puppeteer-core");
+    const paquetes = await (opciones.paquetes ?? paquetesDeVerdad)();
+    const { puppeteer } = paquetes;
 
     let executablePath: string;
     let headless: boolean | "shell";
@@ -313,7 +335,7 @@ export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
       headless = true;
       args = [...sinRed];
     } else {
-      const { default: chromium } = await import("@sparticuz/chromium");
+      const chromium = await paquetes.chromium();
       // Sin WebGL: no cambia el texto, y ahorra descomprimir SwiftShader en
       // cada arranque en frío.
       chromium.setGraphicsMode = false;

@@ -11,43 +11,29 @@
  * 3 corridas; con la promesa única, 5 de 5 midieron las dos.
  *
  * Acá se prueba la unidad que puede fallar —`abrirChromium` por la rama de
- * producción— con el paquete y puppeteer dobles: cuántas veces se pide la
- * descompresión, y que un fallo no quede guardado.
+ * producción— con los dos paquetes dobles, inyectados por `paquetes` y no con
+ * `vi.mock`: dos `import()` simultáneos de un módulo simulado le daban a veces
+ * el paquete REAL al segundo (medido en vitest 3.2.7, en la suite entera), y
+ * el test fallaba por el arnés y no por el código.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpcionesChromium } from "../chromium";
 
 const descomprimir = vi.fn<() => Promise<string>>();
-const lanzar = vi.fn();
+const lanzar = vi.fn<(ruta: string) => void>();
 
-vi.mock("@sparticuz/chromium", () => ({
-  default: { setGraphicsMode: true, args: ["--de-sparticuz"], executablePath: () => descomprimir() },
-}));
-
-vi.mock("puppeteer-core", () => ({
-  default: {
-    launch: async (opciones: { executablePath: string }) => {
-      lanzar(opciones.executablePath);
+const paquetes: NonNullable<OpcionesChromium["paquetes"]> = async () => ({
+  puppeteer: {
+    launch: async (opciones) => {
+      lanzar(String(opciones.executablePath));
       return {
         target: () => ({ createCDPSession: async () => ({ send: async () => {} }) }),
         close: async () => {},
         process: () => null,
-      };
+      } as never;
     },
   },
-}));
-
-const plataforma = process.platform;
-const chromeLocal = process.env.AEO_CHROME_PATH;
-
-beforeAll(() => {
-  // La rama de producción: Linux y sin Chrome local.
-  Object.defineProperty(process, "platform", { value: "linux" });
-  delete process.env.AEO_CHROME_PATH;
-});
-
-afterAll(() => {
-  Object.defineProperty(process, "platform", { value: plataforma });
-  if (chromeLocal !== undefined) process.env.AEO_CHROME_PATH = chromeLocal;
+  chromium: async () => ({ args: ["--de-sparticuz"], setGraphicsMode: true, executablePath: () => descomprimir() }),
 });
 
 beforeEach(() => {
@@ -58,13 +44,9 @@ beforeEach(() => {
 
 /** Un `chromium.ts` nuevo por caso: la promesa única vive en el módulo. */
 async function abrir() {
-  // Los dobles se cargan ANTES de las aperturas concurrentes: con el registro
-  // recién vaciado, dos `import()` simultáneos del mismo módulo simulado le
-  // dan el real al segundo (medido en vitest 3.2.7). Es del arnés, no de Node.
-  await import("puppeteer-core");
-  await import("@sparticuz/chromium");
   const { abrirChromium } = await import("../chromium");
-  return abrirChromium();
+  // La rama de producción: Linux y sin Chrome local.
+  return abrirChromium({ ejecutable: "", paquetes, plataforma: "linux" });
 }
 
 describe("RV-2: una sola descompresión de Chromium por proceso", () => {
@@ -76,6 +58,7 @@ describe("RV-2: una sola descompresión de Chromium por proceso", () => {
 
     const una = abrirNavegador();
     const otra = abrirNavegador();
+    await vi.waitFor(() => expect(pendientes.length).toBeGreaterThan(0));
     await new Promise((listo) => setTimeout(listo, 20));
     // Mientras la primera descomprime, la segunda NO lanza nada.
     expect(lanzar).not.toHaveBeenCalled();
