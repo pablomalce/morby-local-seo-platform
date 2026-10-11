@@ -56,7 +56,13 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * Hoy no hay ninguna. Las dos últimas se cruzaron: la `0031` de H4.1 (PR
+ * Hoy hay una: la `0034_search_console_coverage`, de la rama
+ * `fix/sin-token-propio-no-se-usa-el-de-la-agencia` (PR #118), reservada
+ * mientras la `0035_account_deletion_in_one_transaction` (la baja de cuenta en
+ * una transacción, `fix/la-baja-decide-y-borra-en-una-transaccion`) se escribía
+ * con el número siguiente. Se borra al integrar `main` con la `0034` adentro.
+ *
+ * Las dos anteriores se cruzaron: la `0031` de H4.1 (PR
  * #114), reservada mientras la `0032_geo_grid` (H2-GO-3,
  * `feat/la-grilla-mide-geografia`, PR #115) se escribía con el número
  * siguiente; y la `0032`, reservada por la rama del sello
@@ -66,7 +72,13 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * primera al integrar `main` en la rama de la grilla, la segunda al integrar
  * la rama de la grilla en la del sello, con los archivos ya presentes.
  */
-const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [];
+const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [
+  {
+    numero: 34,
+    porque:
+      "0034_search_console_coverage, PR #118 (fix/sin-token-propio-no-se-usa-el-de-la-agencia), abierto mientras se escribía la 0035",
+  },
+];
 
 describe("migration registry", () => {
   // Anti-vacuity. An empty or missing directory would make every assertion
