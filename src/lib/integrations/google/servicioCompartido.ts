@@ -36,6 +36,20 @@
  * Con las dos, si (X, S, P) es un mapeo vivo, lo que P cubre es de X y de nadie
  * más.
  *
+ * Y LA FILA LA LEE ESTE ARCHIVO, NO QUIEN LLAMA
+ *
+ * Hasta la segunda revisión del #118 la regla recibía las filas del mapeo que le
+ * pasaba el llamador, y se creía la organización y que estuvieran vivas. Medido
+ * el 2026-10-11 con la suite entera en verde: un módulo de datos nuevo que le
+ * pasaba `[{ organizationId: X, provider: "search_console", propertyRef:
+ * "sc-domain:..." }]` inventado le conseguía el token de la agencia a X, sin
+ * ningún mapeo. Ahora la lectura vive acá, con el cliente de SESIÓN —la RLS de
+ * quien llama— y con el filtro adentro: `organization_id = X`, `unmapped_at IS
+ * NULL` y, si se pide, `provider = S`. Y cada fila que vuelve se vuelve a
+ * mirar entera —organización, superficie, `unmapped_at`— en vez de creérsela al
+ * filtro. Quien llama dice DE QUIÉN es el recurso; qué está mapeado lo dice la
+ * base.
+ *
  * Todo lo demás es el fallback, y falla con motivo:
  *
  *   - X sin ningún mapeo vivo → `not-mapped`, y el token de la agencia NI SE
@@ -59,12 +73,20 @@
  *
  * Este archivo es el único llamador de producción de `agencyAccessToken()`, y
  * `src/lib/__tests__/credencialDeLaAgencia.test.ts` lo sostiene con el
- * compilador sobre TODO módulo de `src` (también los `.js`): ningún módulo de
- * DATOS alcanza la credencial —la lectura de `VULKAN_AGENCY_ORG_ID`, o la
- * custodia de la `0021`: las RPC del secreto y la tabla `integration_tokens`— si
- * se le saca este archivo del medio. Los únicos que la alcanzan directo son los
- * de CONEXIÓN —el OAuth, la pantalla de integraciones, el mapeo y el guardián
- * del operador—, declarados allá con su razón.
+ * compilador sobre TODO módulo de `src` (también los `.js`), por archivo Y por
+ * símbolo:
+ *
+ *   - ningún módulo de DATOS alcanza la credencial —la lectura de
+ *     `VULKAN_AGENCY_ORG_ID`, o la custodia de la `0021`: las RPC del secreto y
+ *     la tabla `integration_tokens`— si se le saca este archivo del medio;
+ *   - `agencyAccessToken` y `resolveAccessToken` los usa este archivo y ningún
+ *     otro, a través de cualquier reexportación;
+ *   - este archivo exporta como valor `servirConLaAgencia` y nada más: una
+ *     reexportación del token desde acá pone la pared en rojo;
+ *   - los de CONEXIÓN —el OAuth, la pantalla de integraciones, el mapeo y el
+ *     guardián del operador— llegan a la credencial sin pasar por acá, y cada
+ *     uno usa exactamente las piezas que declara allá, con su razón. Ninguno
+ *     usa el token.
  *
  * QUÉ NO DICE
  *
@@ -76,18 +98,20 @@
  * credencial con su propia regla, no una excepción a ésta.
  */
 
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { type AccessTokenResult, agencyAccessToken } from "./tokenStore";
 import type { GoogleSurface, PropertyMapping } from "./sources";
 
-/** Una fila de `integration_properties` tal como se lee: CON su organización. */
-export interface MapeoLeido {
+/** Una fila de `integration_properties` tal como se lee: CON su organización y su `unmapped_at`. */
+interface MapeoLeido {
   organizationId: string;
   provider: GoogleSurface;
   propertyRef: string;
+  unmappedAt: string | null;
 }
 
 /** La lectura del mapeo falló. Un fallo no es una lista vacía. */
-export interface MapeoIlegible {
+interface MapeoIlegible {
   ilegible: true;
   /** El código del error, nunca el mensaje de PostgreSQL (puede nombrar tablas). */
   detalle: string;
@@ -113,11 +137,51 @@ export interface Servicio {
   token: TokenDelServicio;
 }
 
-export interface ServicioDeps {
-  /** Quién resuelve el token de la agencia. Inyectable para poder contar si se llamó. */
-  resolver?: () => Promise<AccessTokenResult>;
-  /** Dónde se anota que llegó una fila ajena. Inyectable por lo mismo que en `hydrate.ts`. */
+export interface OpcionesDelServicio {
+  /**
+   * Sólo los mapeos de esta superficie. La publicación pide la ficha de Business
+   * Profile y nada más: una organización con GA4 mapeado y sin ficha no tiene
+   * con qué publicar, y entonces el token tampoco se resuelve.
+   */
+  superficie?: GoogleSurface;
+  /**
+   * Dónde se anota una fila descartada. Inyectable por lo mismo que en
+   * `hydrate.ts`. No hay nada más inyectable a propósito: ni las filas ni quién
+   * resuelve el token. Los tests reemplazan los módulos, no la regla.
+   */
   log?: (mensaje: string) => void;
+}
+
+/**
+ * Los mapeos vivos de `organizationId`, leídos con la RLS de quien llama.
+ *
+ * `unmapped_at` se lee aunque el filtro lo fije: es lo que deja a la regla
+ * comprobar que la fila está viva en vez de creérselo al filtro, igual que
+ * `organization_id`. Una excepción del cliente es un fallo de lectura, no una
+ * lista vacía.
+ */
+async function leerMapeos(
+  organizationId: string,
+  superficie: GoogleSurface | undefined
+): Promise<MapeoLeido[] | MapeoIlegible> {
+  try {
+    const supabase = await createSupabaseServerClient();
+    let consulta = supabase
+      .from("integration_properties")
+      .select("organization_id, provider, property_ref, unmapped_at")
+      .eq("organization_id", organizationId);
+    if (superficie) consulta = consulta.eq("provider", superficie);
+    const { data, error } = await consulta.is("unmapped_at", null);
+    if (error) return { ilegible: true, detalle: error.code ?? "sin código" };
+    return (data ?? []).map((fila) => ({
+      organizationId: fila.organization_id as string,
+      provider: fila.provider as GoogleSurface,
+      propertyRef: fila.property_ref as string,
+      unmappedAt: (fila.unmapped_at as string | null) ?? null,
+    }));
+  } catch {
+    return { ilegible: true, detalle: "excepción del cliente" };
+  }
 }
 
 /**
@@ -127,13 +191,18 @@ export interface ServicioDeps {
  * asset que se publica—, leída de la base bajo la RLS de quien llama. Nunca la
  * del pedido, y nunca la de la agencia por defecto. `null` es no tener
  * organización (el reporte de demostración): no hay mapeo que sea suyo, así que
- * tampoco hay token.
+ * tampoco hay token, y tampoco se lee nada.
+ *
+ * Los mapeos los lee esta función. Ver el encabezado: un llamador que pudiera
+ * pasarle filas podría inventarlas.
  */
 export async function servirConLaAgencia(
   organizationId: string | null,
-  leidos: readonly MapeoLeido[] | MapeoIlegible,
-  deps: ServicioDeps = {}
+  opciones: OpcionesDelServicio = {}
 ): Promise<Servicio> {
+  const superficie = opciones.superficie;
+  const leidos = organizationId === null ? [] : await leerMapeos(organizationId, superficie);
+
   if ("ilegible" in leidos) {
     return {
       mapeos: [],
@@ -145,19 +214,36 @@ export async function servirConLaAgencia(
     };
   }
 
-  const propios = organizationId === null ? [] : leidos.filter((m) => m.organizationId === organizationId);
+  // Cada fila, entera, contra la regla: de ESTA organización, viva, y de la
+  // superficie pedida. Una fila que no lo es no puede llegar si la consulta
+  // filtra, que es lo que hace `leerMapeos`. Si llega, un filtro se perdió: se
+  // anota y se descarta. Lo que NO se hace es servirla, ni «arreglarla».
+  const ajenas = leidos.filter((m) => m.organizationId !== organizationId).length;
+  const muertas = leidos.filter((m) => m.organizationId === organizationId && m.unmappedAt !== null).length;
+  const deOtraSuperficie = leidos.filter(
+    (m) => m.organizationId === organizationId && m.unmappedAt === null && superficie !== undefined && m.provider !== superficie
+  ).length;
+  const propios = leidos.filter(
+    (m) =>
+      organizationId !== null &&
+      m.organizationId === organizationId &&
+      m.unmappedAt === null &&
+      (superficie === undefined || m.provider === superficie)
+  );
 
-  // Una fila ajena no puede llegar si la consulta filtra por organización, que
-  // es lo que hacen los dos lectores. Si llega, el filtro se perdió: se anota y
-  // se descarta. Lo que NO se hace es servirla, ni «arreglarla» reasignándola.
-  const ajenas = leidos.length - propios.length;
-  if (ajenas > 0 && organizationId !== null) {
-    const registrar =
-      deps.log ??
-      ((mensaje: string) => {
-        console.warn(mensaje);
-      });
+  const registrar =
+    opciones.log ??
+    ((mensaje: string) => {
+      console.warn(mensaje);
+    });
+  if (ajenas > 0) {
     registrar(`[google] ${ajenas} mapeo(s) de otra organización descartado(s): el token de la agencia no los sirve`);
+  }
+  if (muertas > 0) {
+    registrar(`[google] ${muertas} mapeo(s) desmapeado(s) descartado(s): el historial no se sirve`);
+  }
+  if (deOtraSuperficie > 0) {
+    registrar(`[google] ${deOtraSuperficie} mapeo(s) de otra superficie descartado(s): se pidió ${superficie}`);
   }
 
   const mapeos = propios.map((m) => ({ provider: m.provider, propertyRef: m.propertyRef }));
@@ -173,6 +259,5 @@ export async function servirConLaAgencia(
     };
   }
 
-  const resolver = deps.resolver ?? (() => agencyAccessToken());
-  return { mapeos, token: await resolver() };
+  return { mapeos, token: await agencyAccessToken() };
 }

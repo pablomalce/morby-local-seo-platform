@@ -6,7 +6,6 @@ import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido
 import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
 import { publicar, type Destino, type Publicador } from "@/lib/publishing/transport";
 import { permisoEn } from "@/lib/org/rol";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { quienLlama } from "@/lib/api/sesion";
 
 export const dynamic = "force-dynamic";
@@ -139,7 +138,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, motivo: "no-aprobado" }, { status: 409 });
     }
 
-    const armado = await armarPublicador(supabase, asset.organization_id, asset.body);
+    const armado = await armarPublicador(asset.organization_id, asset.body);
 
     // Un mapeo que no se pudo leer no es un mapeo que falta, igual que el asset
     // de más arriba: 502 y nada más, antes de reservar nada en el ledger. Decir
@@ -215,38 +214,19 @@ type Falta = "cuenta" | "mapeo" | "token";
  * exactamente el defecto que la `0017` existe para impedir.
  */
 async function armarPublicador(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
   organizationId: string,
   cuerpo: string
 ): Promise<{ publicador: Publicador } | { falta: Falta } | { ilegible: true }> {
   const accountId = process.env.GOOGLE_BUSINESS_ACCOUNT_ID;
   if (!accountId) return { falta: "cuenta" };
 
-  // El mapeo vivo de ESTA organización. `unmapped_at is null` es lo que
-  // distingue el mapeo actual del historial: la `0017` guarda los dos. Y
-  // `organization_id` se lee aunque el filtro ya lo fije, para que la regla del
-  // servicio compartido lo compruebe en vez de creérselo al filtro.
-  const { data: propiedad, error } = await supabase
-    .from("integration_properties")
-    .select("organization_id, property_ref")
-    .eq("organization_id", organizationId)
-    .eq("provider", DESTINO)
-    .is("unmapped_at", null)
-    .maybeSingle();
-
-  // El error se lee, y viaja como fallo: antes se ignoraba, y una lectura caída
-  // se convertía en «no hay ficha». El código y no el mensaje, que puede
-  // nombrar tablas.
-  const leidos = error
-    ? { ilegible: true as const, detalle: error.code ?? "sin código" }
-    : propiedad
-      ? [{ organizationId: propiedad.organization_id, provider: DESTINO, propertyRef: propiedad.property_ref }]
-      : [];
-
-  // La ficha y el token salen juntos de la regla: sin mapeo propio no hay
-  // ficha, y entonces el token de la agencia no se resuelve. Con el mapeo
-  // ilegible, tampoco.
-  const { mapeos, token } = await servirConLaAgencia(organizationId, leidos);
+  // La ficha y el token salen juntos de la regla, que LEE el mapeo ella misma:
+  // el vivo de ESTA organización y de Business Profile, con la sesión de quien
+  // publica (`unmapped_at is null` distingue el mapeo actual del historial; la
+  // `0017` guarda los dos). Sin mapeo propio no hay ficha, y entonces el token
+  // de la agencia no se resuelve. Con el mapeo ilegible, tampoco: antes una
+  // lectura caída se convertía en «no hay ficha».
+  const { mapeos, token } = await servirConLaAgencia(organizationId, { superficie: DESTINO });
   if (!token.ok && token.reason === "mapping-unreadable") return { ilegible: true };
 
   const locationRef = mapeos.find((m) => m.provider === DESTINO)?.propertyRef;

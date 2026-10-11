@@ -83,10 +83,15 @@ vi.mock("@/lib/supabase/server", () => ({
           eq: () => ({
             // La lectura del asset termina acá.
             maybeSingle: async () => ({ data: asset, error: errorLectura }),
-            // La del mapeo encadena provider y `unmapped_at is null`.
+            // La del mapeo (la hace la regla del servicio compartido) encadena
+            // provider y `unmapped_at is null`, y es una lista.
             eq: () => ({
               is: () => ({
-                maybeSingle: async () => ({ data: propiedad, error: null }),
+                then: (resolver: (v: unknown) => unknown) =>
+                  Promise.resolve({
+                    data: propiedad ? [{ ...propiedad, provider: "google_business_profile", unmapped_at: null }] : [],
+                    error: null,
+                  }).then(resolver),
               }),
             }),
           }),

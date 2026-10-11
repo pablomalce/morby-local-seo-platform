@@ -20,13 +20,8 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
-import type { GoogleSurface } from "@/lib/integrations/google/sources";
 import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
-import {
-  type MapeoIlegible,
-  type MapeoLeido,
-  servirConLaAgencia,
-} from "@/lib/integrations/google/servicioCompartido";
+import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
 import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
 import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
 import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
@@ -443,48 +438,6 @@ async function hydrateWithPageSpeed(
   return "error";
 }
 
-/**
- * Los mapeos VIVOS de una organización, de `integration_properties`.
- *
- * Una consulta para las tres superficies: la 0017 garantiza un mapeo vivo por
- * organización y proveedor, así que son tres filas como mucho y pedirlas de a
- * una sería triplicar el costo de cada reporte por nada.
- *
- * `organization_id` va escrito aunque la RLS ya lo imponga, por lo mismo que el
- * INSERT en `reports` lo escribe: la policy es la garantía y el filtro es lo que
- * hace legible qué se está pidiendo. Y `unmapped_at IS NULL` también, aunque el
- * índice único sólo alcance a los vivos — el índice impide que haya DOS vivos,
- * no que se lea uno muerto.
- *
- * Un fallo de lectura NO rompe el reporte —las otras cuatro fuentes lo pueden
- * llenar igual— y tampoco se disfraza de lista vacía. Hasta la revisión del #118
- * devolvía `[]`, y una organización mapeada con la lectura caída salía «sin
- * mapear»: la regla del servicio compartido lo anotaba como «no tiene ningún
- * mapeo vivo», y el reporte decía `missing`, que manda a mapear lo que puede
- * estar mapeado. Ahora devuelve el fallo, la regla lo niega con
- * `mapping-unreadable` sin resolver el token, y las tres fuentes salen `error`
- * con ese motivo. Ausencia, cero y fallo son tres estados.
- */
-async function readPropertyMappings(organizationId: string): Promise<MapeoLeido[] | MapeoIlegible> {
-  const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase
-    .from("integration_properties")
-    .select("organization_id, provider, property_ref")
-    .eq("organization_id", organizationId)
-    .is("unmapped_at", null);
-
-  if (error) return { ilegible: true, detalle: error.code ?? "sin código" };
-  if (!data) return [];
-  // `organization_id` se lee aunque el filtro ya lo fije: es lo que deja a
-  // `servirConLaAgencia` comprobar que la fila es de ESTA organización en vez de
-  // creérselo al filtro. Ver su encabezado.
-  return data.map((row) => ({
-    organizationId: row.organization_id as string,
-    provider: row.provider as GoogleSurface,
-    propertyRef: row.property_ref as string,
-  }));
-}
-
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
   const result = await loadSnapshot(input);
   if (!result) {
@@ -506,16 +459,17 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
 
   // Sin sesión no hay mapeo que leer: la tabla es por organización y un reporte
   // de demostración no tiene ninguna. Las tres salen `missing`, que es lo que
-  // corresponde — y por eso la lista vacía, no por una palabra escrita.
+  // corresponde — y por eso `null`, no por una palabra escrita.
   const organizacion = result.authenticated ? result.snapshot.business.organizationId : null;
-  const leidos = organizacion ? await readPropertyMappings(organizacion) : [];
 
   // El token de la agencia y los mapeos salen JUNTOS de la regla del servicio
-  // compartido (H4.4): sólo los mapeos vivos de ESTA organización, y el token
-  // sólo si hay alguno. Una organización sin mapeo —un cliente recién dado de
-  // alta, o el reporte de demostración— no resuelve el token de la agencia: ni
-  // se lee su secreto ni se refresca contra Google. Ver `servicioCompartido.ts`.
-  const { mapeos, token } = await servirConLaAgencia(organizacion, leidos);
+  // compartido (H4.4), que además LEE los mapeos ella misma, con la sesión de
+  // quien pide el reporte: sólo los vivos de ESTA organización, y el token sólo
+  // si hay alguno. Una organización sin mapeo —un cliente recién dado de alta, o
+  // el reporte de demostración— no resuelve el token de la agencia: ni se lee su
+  // secreto ni se refresca contra Google. Una lectura caída tampoco: es
+  // `mapping-unreadable`, no «sin mapear». Ver `servicioCompartido.ts`.
+  const { mapeos, token } = await servirConLaAgencia(organizacion);
 
   // El token se pide UNA vez para las tres superficies, y las dos consultas que
   // hoy existen salen en paralelo. Ver `hydrate.ts`.

@@ -51,6 +51,13 @@ let lecturasDeMapeo: Record<string, unknown>[] = [];
 /** Si la lectura del mapeo falla, con qué. */
 let mapeoFalla: { code: string; message: string } | null = null;
 
+/**
+ * Si la base PIERDE los filtros de la lectura del mapeo y devuelve todo lo que
+ * la RLS deja ver. Modela un filtro perdido en la consulta: lo que vuelve no es
+ * de ESTA organización, y la regla tiene que verlo en la fila.
+ */
+let filtrosPerdidos = false;
+
 function filas(tabla: string, filtros: Record<string, unknown>) {
   const coincide = (f: Record<string, unknown>) => Object.entries(filtros).every(([c, v]) => f[c] === v);
   if (tabla === "content_assets") return ASSETS.filter((a) => miembroDe.includes(a.organization_id) && coincide(a));
@@ -80,13 +87,21 @@ vi.mock("@/lib/supabase/server", () => ({
         },
         limit: async () => ({ data: filas(tabla, filtros), error: null }),
         maybeSingle: async () => {
-          if (tabla === "integration_properties") lecturasDeMapeo.push({ ...filtros });
-          if (tabla === "integration_properties" && mapeoFalla) return { data: null, error: mapeoFalla };
           const f = filas(tabla, filtros);
           // Como PostgREST: más de una fila en un `maybeSingle` es un error, no
           // la primera. Si el código pierde un filtro, eso se ve.
           if (f.length > 1) return { data: null, error: { code: "PGRST116" } };
           return { data: f[0] ?? null, error: null };
+        },
+        // La lectura del mapeo es una lista: la hace la regla del servicio
+        // compartido, que la pide con sus filtros y después mira cada fila.
+        then: (resolver: (v: unknown) => unknown) => {
+          if (tabla === "integration_properties") lecturasDeMapeo.push({ ...filtros });
+          const respuesta =
+            tabla === "integration_properties" && mapeoFalla
+              ? { data: null, error: mapeoFalla }
+              : { data: tabla === "integration_properties" && filtrosPerdidos ? filas(tabla, {}) : filas(tabla, filtros), error: null };
+          return Promise.resolve(respuesta).then(resolver);
         },
       };
       return cadena;
@@ -150,6 +165,7 @@ beforeEach(() => {
   miembroDe = [];
   lecturasDeMapeo = [];
   mapeoFalla = null;
+  filtrosPerdidos = false;
   llamadasAPublicar = 0;
   pedidosDeToken = 0;
   respuestaDelToken = { ok: true, accessToken: "ACCESO-de-la-agencia" };
@@ -242,15 +258,31 @@ describe("un mapeo que no se pudo leer no es un mapeo que falta", () => {
     expect(salidas).toBe(0);
   });
 
-  it("y PostgREST con más de una fila en el maybeSingle también es un fallo, no una ausencia", async () => {
-    // Es lo que devuelve la base si el código pierde un filtro: un error, que
-    // antes también terminaba en `falta: "mapeo"`.
+  it("cualquier código de error de la lectura es un 502, no una ausencia", async () => {
     miembroDe = [CLIENTE_A];
-    mapeoFalla = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned" };
+    mapeoFalla = { code: "08006", message: "connection failure" };
 
     const res = await publicar(ASSET_A);
 
     expect(res.status).toBe(502);
+    expect(pedidosDeToken).toBe(0);
+  });
+});
+
+describe("un filtro perdido no publica en la ficha de otro", () => {
+  it("la lectura devuelve la ficha de la agencia para el asset de B: la regla la descarta en la fila", async () => {
+    // Hasta la segunda revisión del #118 esto lo atajaba el `maybeSingle` de la
+    // ruta (más de una fila es un error). Hoy la lectura la hace la regla y es
+    // una lista: lo que la ataja es que la regla mira la organización, la
+    // superficie y `unmapped_at` de CADA fila, en vez de creérselo al filtro.
+    miembroDe = [AGENCIA, CLIENTE_B];
+    filtrosPerdidos = true;
+
+    const res = await publicar(ASSET_B);
+
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ falta: "mapeo" });
+    expect(armados).toEqual([]);
     expect(pedidosDeToken).toBe(0);
   });
 });
