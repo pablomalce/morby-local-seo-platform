@@ -32,6 +32,8 @@ export interface Database {
           organization_id: string;
           user_id: string;
           role: "owner" | "admin" | "manager" | "editor" | "viewer" | "client";
+          /** 0013: `archived` es una membresía a la que se le cortó el acceso. */
+          state: "active" | "archived";
           created_at: string;
         };
         Insert: Partial<Database["public"]["Tables"]["org_members"]["Row"]> & {
