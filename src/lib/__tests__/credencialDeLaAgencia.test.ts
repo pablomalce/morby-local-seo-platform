@@ -54,6 +54,20 @@
  * Supabase con un nombre armado en ejecución, o un `import()` de destino no
  * literal, son fallas por sí mismas — por ahí pasaría la próxima.
  *
+ * Y NO SÓLO POR ARCHIVO: POR SÍMBOLO (R14)
+ *
+ * Medido el 2026-10-11 en la segunda revisión del #118, con la suite entera en
+ * verde: una línea `export { agencyAccessToken } from "./tokenStore"` en la
+ * puerta le daba el token a cualquier módulo de datos nuevo «por la puerta», y
+ * una server action nueva en `property-actions.ts` —exento entero— lo pedía
+ * para cualquier property. Las dos pasaban porque la pared eximía ARCHIVOS. Ahora
+ * mide símbolos, con el verificador y a través de cualquier reexportación:
+ *
+ *   - `agencyAccessToken` y `resolveAccessToken` los usa SÓLO la puerta;
+ *   - la puerta exporta como valor su regla, `servirConLaAgencia`, y nada más;
+ *   - cada exención de conexión declara qué piezas de la credencial usa, y usa
+ *     exactamente ésas.
+ *
  * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
  *
  * Un detector ciego da el mismo verde que un árbol limpio. Antes de mirar `src`,
@@ -102,6 +116,12 @@ const LECTOR = "src/lib/integrations/google/agency.ts";
 const PUERTA = "src/lib/integrations/google/servicioCompartido.ts";
 const TOKEN_STORE = "src/lib/integrations/google/tokenStore.ts";
 const AGENCY_TOKEN = "src/lib/integrations/google/agencyToken.ts";
+const AGENCY_GUARD = "src/lib/integrations/google/agencyGuard.ts";
+const PROPERTY_ACTIONS = "src/lib/integrations/property-actions.ts";
+const PANTALLA_CLIENTE = "src/app/app/integrations/client.tsx";
+
+/** Los que PRODUCEN el token de la agencia. Escritos acá, como la variable. */
+const PRODUCTORES_DEL_TOKEN = [`${TOKEN_STORE}#agencyAccessToken`, `${TOKEN_STORE}#resolveAccessToken`];
 
 /**
  * Los módulos de CONEXIÓN: los que operan la credencial de la agencia, no leen
@@ -113,29 +133,41 @@ const AGENCY_TOKEN = "src/lib/integrations/google/agencyToken.ts";
  * por `servicioCompartido.ts`. Y una exención no se hereda: quien importe uno de
  * éstos para leer datos es una fuga.
  */
-const CONEXION: Array<{ modulo: string; porque: string }> = [
+const CONEXION: Array<{ modulo: string; usa: string[]; porque: string }> = [
   {
     modulo: "src/app/api/auth/google/start/route.ts",
+    usa: [`${AGENCY_GUARD}#esOperadorDeLaAgencia`],
     porque: "arranca el OAuth de la agencia, y sólo deja entrar a su operador (agencyGuard)",
   },
   {
     modulo: "src/app/api/auth/google/callback/route.ts",
+    usa: [`${AGENCY_GUARD}#esOperadorDeLaAgencia`, `${TOKEN_STORE}#saveAgencyToken`],
     porque: "guarda el token bajo la organización de la agencia (saveAgencyToken)",
   },
   {
     modulo: "src/app/app/integrations/page.tsx",
+    usa: [
+      `${PANTALLA_CLIENTE}#OperadaPorLaAgencia`,
+      `${PANTALLA_CLIENTE}#OrganizationIntegrations`,
+      `${PANTALLA_CLIENTE}#PlatformNotice`,
+      `${LECTOR}#resolveAgencyOrgId`,
+      `${AGENCY_TOKEN}#agencyTokenState`,
+    ],
     porque: "la pantalla de conexión: muestra el estado del token de la agencia, no datos de un cliente",
   },
   {
-    modulo: "src/app/app/integrations/client.tsx",
+    modulo: PANTALLA_CLIENTE,
+    usa: [`${PROPERTY_ACTIONS}#mapProperty`, `${PROPERTY_ACTIONS}#unmapProperty`],
     porque: "la mitad de cliente de la misma pantalla: llama a la server action del mapeo, no lee datos",
   },
   {
-    modulo: "src/lib/integrations/property-actions.ts",
+    modulo: PROPERTY_ACTIONS,
+    usa: [`${AGENCY_GUARD}#operadorDeLaAgencia`],
     porque: "server action del mapeo: sólo un operador de la agencia apunta una property a un cliente",
   },
   {
-    modulo: "src/lib/integrations/google/agencyGuard.ts",
+    modulo: AGENCY_GUARD,
+    usa: [`${LECTOR}#resolveAgencyOrgId`],
     porque: "el guardián de «sólo el operador de la agencia»: pregunta quién es la agencia para AUTORIZAR, no para elegir datos",
   },
 ];
@@ -145,6 +177,8 @@ const POLITICA: Politica = {
   lector: LECTOR,
   nadieLee: PROPERTIES_DE_LA_AGENCIA,
   puerta: PUERTA,
+  exportaLaPuerta: ["servirConLaAgencia"],
+  productoresDelToken: PRODUCTORES_DEL_TOKEN,
   custodia: {
     integration_token_secret: [TOKEN_STORE],
     refresh_integration_token: [TOKEN_STORE],
@@ -152,7 +186,7 @@ const POLITICA: Politica = {
     integration_tokens: [AGENCY_TOKEN],
     decrypted_secrets: [],
   },
-  conexion: CONEXION.map((c) => c.modulo),
+  conexion: CONEXION.map(({ modulo, usa }) => ({ modulo, usa })),
 };
 
 // ---------------------------------------------------------------------------
@@ -189,16 +223,41 @@ const VIRTUALES: Record<string, string> = {
     export async function estado(org: string) {
       return admin().from("integration_tokens").select("expires_at").eq("organization_id", org);
     }`,
+  // La puerta, con la reexportación de la segunda revisión del #118 puesta: el
+  // detector tiene que verla en lo que la puerta exporta y en quién la usa.
   "servicioCompartido.ts": `
     import { agencyAccessToken } from "./tokenStore";
-    export async function servir(mapeos: string[]) { return mapeos.length > 0 ? agencyAccessToken() : null; }`,
+    export async function servir(mapeos: string[]) { return mapeos.length > 0 ? agencyAccessToken() : null; }
+    export { agencyAccessToken } from "./tokenStore";`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
   "conexion.ts": `
-    import { agencyAccessToken } from "./tokenStore";
-    export const conectar = () => agencyAccessToken();`,
+    import { resolveAgencyOrgId } from "./agency";
+    export const conectar = () => resolveAgencyOrgId();`,
   "yaNoLlega.ts": `export const nada = 1;`,
+
+  // --- Por símbolo: lo que el grafo de archivos deja pasar (segunda revisión del #118).
+  "atajoPorLaPuerta.ts": `
+    import { agencyAccessToken } from "./servicioCompartido";
+    export const clics = () => agencyAccessToken();`,
+  "usaAbreviado.ts": `
+    import { agencyAccessToken } from "./servicioCompartido";
+    export const deps = { agencyAccessToken };`,
+  "reexportaTodo.ts": `export * from "./tokenStore";`,
+  "usaPorEstrella.ts": `
+    import { agencyAccessToken } from "./reexportaTodo";
+    export const clics = () => agencyAccessToken();`,
+  "usaPorNamespace.ts": `
+    import * as almacen from "./tokenStore";
+    export const clics = () => almacen.agencyAccessToken();`,
+  // Exento como conexión por resolveAgencyOrgId, y con una export nueva que
+  // pide el token: es property-actions.ts con su server action de más.
+  "conexionConToken.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import { agencyAccessToken } from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export async function clicsDeUnaProperty(propertyRef: string) { return { propertyRef, token: await agencyAccessToken() }; }`,
 
   // --- La variable, por las tres formas de la revisión del #118 y una más.
   "asConst.ts": `
@@ -257,6 +316,17 @@ const VIRTUALES: Record<string, string> = {
   "importDinamico.ts": `
     const destino = "./" + "tokenStore";
     export const token = async () => (await import(destino)).agencyAccessToken();`,
+  // Webpack se saca el query y carga tokenStore.ts; tsc no lo resuelve.
+  "importConQuery.js": `
+    import { agencyAccessToken } from "./tokenStore.ts?fallback";
+    export const clics = () => agencyAccessToken();`,
+  "importInexistente.ts": `
+    import { algo } from "./noExiste";
+    export const valor = () => algo;`,
+  // Next lo sirve como ruta: el segmento no empieza con «_». No es un test.
+  "app/api/clics__tests__/route.ts": `
+    import { agencyAccessToken } from "../../../tokenStore";
+    export async function GET() { return agencyAccessToken(); }`,
   "app/reports/template.tsx": `
     import { agencyAccessToken } from "../../tokenStore";
     export default async function Template({ children }: { children: unknown }) {
@@ -280,6 +350,17 @@ const VIRTUALES: Record<string, string> = {
   "controlPasaElEntorno.ts": `
     function leer(env: NodeJS.ProcessEnv) { return env.OTRA_VARIABLE; }
     export const valor = () => leer(process.env);`,
+  // Lo que resuelve el bundler y no es código del repo: un módulo de Node, el
+  // marcador de Next y una hoja de estilos.
+  "controlEstilos.ts": `
+    import "server-only";
+    import "./estilos.css";
+    import { randomUUID } from "node:crypto";
+    export const id = () => randomUUID();`,
+  // Un directorio __tests__ de verdad: carpeta privada para Next, y test.
+  "app/api/x/__tests__/ayuda.ts": `
+    import { agencyAccessToken } from "../../../../tokenStore";
+    export const ayuda = () => agencyAccessToken();`,
 };
 
 const POLITICA_VIRTUAL: Politica = {
@@ -294,7 +375,13 @@ const POLITICA_VIRTUAL: Politica = {
     integration_tokens: [`${V}/agencyToken.ts`],
     decrypted_secrets: [],
   },
-  conexion: [`${V}/conexion.ts`, `${V}/yaNoLlega.ts`],
+  exportaLaPuerta: ["servir"],
+  productoresDelToken: [`${V}/tokenStore.ts#agencyAccessToken`],
+  conexion: [
+    { modulo: `${V}/conexion.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
+    { modulo: `${V}/conexionConToken.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
+    { modulo: `${V}/yaNoLlega.ts`, usa: [] },
+  ],
 };
 
 let virtual: Veredicto;
@@ -313,8 +400,18 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
   const en = (nombres: string[]) => nombres.map((n) => `${V}/${n}`).sort();
   const archivosDe = (sitios: string[]) => [...new Set(sitios.map((s) => s.split(":")[0]))].sort();
 
-  it("analizó todas las fuentes, también el .js", () => {
-    expect(virtual.produccion).toEqual(en(Object.keys(VIRTUALES)));
+  it("analizó todas las fuentes, también los .js, y sólo el __tests__ de verdad es test", () => {
+    expect(virtual.produccion).toEqual(en(Object.keys(VIRTUALES).filter((n) => n !== "app/api/x/__tests__/ayuda.ts")));
+  });
+
+  it("un test es un segmento __tests__ exacto o un .test/.spec, no una subcadena", () => {
+    expect(esTest("src/app/api/clics__tests__/route.ts")).toBe(false);
+    expect(esTest("src/app/api/__tests__x/route.ts")).toBe(false);
+    expect(esTest("src/app/api/x/__tests__/route.ts")).toBe(true);
+    expect(esTest("src/lib/__tests__/a.ts")).toBe(true);
+    expect(esTest("src/lib/a.test.ts")).toBe(true);
+    expect(esTest("src/lib/a.spec.tsx")).toBe(true);
+    expect(esTest("src/test/server-only.stub.ts")).toBe(true);
   });
 
   it("la variable: el `as const`, la constante local, el .js, la importada y el destructuring", () => {
@@ -338,25 +435,62 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(virtual.esquemas).toEqual(["vault"]);
   });
 
-  it("el grafo: un import() que no se puede seguir", () => {
-    expect(archivosDe(virtual.sinResolver)).toEqual(en(["importDinamico.ts"]));
+  it("el grafo: un import() que no se puede seguir, uno con query y uno que no resuelve", () => {
+    expect(archivosDe(virtual.sinResolver)).toEqual(
+      en(["importConQuery.js", "importDinamico.ts", "importInexistente.ts"])
+    );
+    expect(virtual.sinResolver.join("\n")).toContain('"./tokenStore.ts?fallback": lleva ? o #');
   });
 
-  it("las fugas: template.tsx, instrumentation.ts, el .js reexportado, y quien importa una fuga", () => {
+  it("las fugas: template.tsx, instrumentation.ts, el .js reexportado, la ruta clics__tests__, y quien importa una fuga", () => {
     // Los que leen la variable o nombran la custodia ya están arriba, en su
     // propia regla; acá están los que LLEGAN a uno de ellos sin la puerta.
     const origenes = virtual.fugas.map((f) => f.split(" -> ")[0]).sort();
     expect(origenes).toEqual(
-      en(["app/reports/template.tsx", "instrumentation.ts", "reexporta.ts", "usaElSecreto.ts"])
+      en([
+        "app/api/clics__tests__/route.ts",
+        "app/reports/template.tsx",
+        "instrumentation.ts",
+        "reexporta.ts",
+        "reexportaTodo.ts",
+        "usaElSecreto.ts",
+        "usaPorEstrella.ts",
+        "usaPorNamespace.ts",
+      ])
     );
     // La exención no se hereda: instrumentation.ts llega POR la de conexión.
-    expect(virtual.fugas).toContain(
-      [`${V}/instrumentation.ts`, `${V}/conexion.ts`, `${V}/tokenStore.ts`].join(" -> ")
-    );
+    expect(virtual.fugas).toContain([`${V}/instrumentation.ts`, `${V}/conexion.ts`, `${V}/agency.ts`].join(" -> "));
+  });
+
+  it("por símbolo: quién usa el token, aunque llegue por la puerta o por una exención", () => {
+    // El grafo de archivos da por legítimos a atajoPorLaPuerta y usaAbreviado
+    // (llegan sólo por la puerta) y no mira adentro de conexionConToken (exento):
+    // los tres son las fugas de la segunda revisión del #118.
+    expect(virtual.usosDelToken).toEqual({
+      [`${V}/tokenStore.ts#agencyAccessToken`]: en([
+        "app/api/clics__tests__/route.ts",
+        "app/reports/template.tsx",
+        "atajoPorLaPuerta.ts",
+        "conexionConToken.ts",
+        "servicioCompartido.ts",
+        "usaAbreviado.ts",
+        "usaPorEstrella.ts",
+        "usaPorNamespace.ts",
+      ]),
+    });
+    expect(virtual.exportaLaPuerta).toEqual(["agencyAccessToken", "servir"]);
+    expect(analisisVirtual.lecturas.get(`${V}/reexportaTodo.ts`)!.exporta).toContain("agencyAccessToken");
+    expect(virtual.conexionUsa).toEqual({
+      [`${V}/conexion.ts`]: [`${V}/agency.ts#resolveAgencyOrgId`],
+      [`${V}/conexionConToken.ts`]: [`${V}/agency.ts#resolveAgencyOrgId`, `${V}/tokenStore.ts#agencyAccessToken`],
+      [`${V}/yaNoLlega.ts`]: [],
+    });
   });
 
   it("lo legítimo pasa: la ruta de datos por la puerta, la de conexión, y los controles", () => {
-    expect(virtual.porLaPuerta).toEqual(en(["datosLegitimos.ts"]));
+    expect(virtual.porLaPuerta).toEqual(en(["atajoPorLaPuerta.ts", "datosLegitimos.ts", "usaAbreviado.ts"]));
+    expect(analisisVirtual.lecturas.get(`${V}/controlEstilos.ts`)!.sinResolver).toEqual([]);
+    expect(analisisVirtual.lecturas.get(`${V}/controlSoloTipos.ts`)!.usa.size).toBe(0);
     const marcados = new Set([
       ...virtual.lectoresDe(VARIABLE),
       ...archivosDe(virtual.envOpaco),
@@ -513,8 +647,37 @@ describe("el árbol de src, leído del disco", () => {
       );
     });
 
-    it("ningún import se resuelve en ejecución", () => {
-      expect(real.sinResolver).toEqual([]);
+    it("todo import se resuelve, y antes de ejecutar: ninguno en ejecución, con query, ni a algo que no existe", () => {
+      expect(
+        real.sinResolver,
+        "Un especificador que tsc no resuelve no es un camino que la pared pueda seguir, y el bundler " +
+          "puede resolverlo igual (con un ?query, por ejemplo). Si es legítimo, va a RESUELVE_EL_BUNDLER con su razón."
+      ).toEqual([]);
+    });
+
+    it("sólo la puerta usa a los que producen el token", () => {
+      // Por SÍMBOLO y a través de cualquier reexportación: la segunda revisión
+      // del #118 reexportó `agencyAccessToken` desde la puerta y un módulo de
+      // datos nuevo lo usaba «por la puerta» con la suite en verde.
+      expect(
+        real.usosDelToken,
+        "agencyAccessToken() lo llama servirConLaAgencia() y nadie más: el token se presta sólo por su regla."
+      ).toEqual({ [`${TOKEN_STORE}#agencyAccessToken`]: [PUERTA], [`${TOKEN_STORE}#resolveAccessToken`]: [] });
+    });
+
+    it("la puerta exporta su regla y nada más", () => {
+      expect(real.exportaLaPuerta).toEqual(["servirConLaAgencia"]);
+    });
+
+    it("cada exención de conexión usa exactamente las piezas de la credencial que declara", () => {
+      // Exentar un ARCHIVO entero dejaba entrar cualquier export nuevo de ese
+      // archivo: una server action de más en property-actions.ts pedía el token
+      // para cualquier property con la suite en verde.
+      expect(
+        real.conexionUsa,
+        "Un módulo de conexión empezó a usar otra pieza de la credencial (o dejó de usar una). " +
+          "Si es una pieza nueva, es una decisión: va a CONEXION con su razón. Si es el token, no va: es un módulo de datos."
+      ).toEqual(Object.fromEntries(CONEXION.map((c) => [c.modulo, [...c.usa].sort()])));
     });
 
     it("sin la puerta en el medio, ningún módulo de datos llega a la credencial", () => {

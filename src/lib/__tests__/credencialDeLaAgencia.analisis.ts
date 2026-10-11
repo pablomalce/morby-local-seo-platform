@@ -35,8 +35,16 @@
  *                    misma resolución que usa `tsc` (los `paths` de tsconfig,
  *                    las extensiones, los `index`). Un `import type` se borra al
  *                    compilar y no es un camino;
- *   sinResolver      un `import()` o `require()` cuyo destino no es un literal:
- *                    un camino que el grafo no puede seguir;
+ *   sinResolver      un `import()` o `require()` cuyo destino no es un literal,
+ *                    y todo especificador literal que `tsc` no resuelve a un
+ *                    módulo del árbol ni a un paquete: un camino que el grafo no
+ *                    puede seguir. El mundo es cerrado también acá (ver abajo);
+ *   usa              los símbolos de VALOR exportados por OTRO módulo del árbol
+ *                    que este módulo usa, resueltos por el verificador hasta su
+ *                    declaración —a través de cualquier reexportación— como
+ *                    `ruta#nombre`;
+ *   exporta          los nombres que el módulo exporta como valor, también los
+ *                    reexportados;
  *   leeEnv           las claves del entorno que lee, con su tipo literal;
  *   envOpaco         las lecturas del entorno de clave desconocida, y los
  *                    `process.env` que se escapan a algo que no es un entorno;
@@ -47,6 +55,29 @@
  *                    nombre que no es literal;
  *   esquemas         los esquemas que pide con `.schema()`.
  *
+ * POR QUÉ TAMBIÉN SÍMBOLOS, Y NO SÓLO EL GRAFO DE ARCHIVOS
+ *
+ * El grafo dice qué MÓDULO llega a la credencial, y la pared exime módulos: la
+ * puerta, y los de conexión. Medido el 2026-10-11 en la revisión del #118 con
+ * la suite entera en verde: una línea `export { agencyAccessToken } from
+ * "./tokenStore"` en la puerta, y cualquier módulo de datos nuevo llegaba al
+ * token «por la puerta»; y una server action nueva en `property-actions.ts`
+ * —exento entero— pedía el token de la agencia para cualquier property. Las dos
+ * pasaban porque la unidad que se medía era el archivo, y lo que falla es el
+ * SÍMBOLO (R14). Con `usa` y `exporta` la pared pregunta quién usa
+ * `agencyAccessToken`, qué exporta la puerta y qué pieza de la credencial toca
+ * cada exención.
+ *
+ * Y POR QUÉ UN ESPECIFICADOR QUE NO RESUELVE ES UNA FALLA
+ *
+ * La versión anterior descartaba en silencio todo import que `tsc` no
+ * resolvía, igual que uno a un paquete. Medido en la misma revisión: un `.js` de
+ * `src` que importaba `../integrations/google/tokenStore.ts?fallback` llegaba al
+ * token sin que la pared lo viera, y `next build` lo empaquetaba —webpack se
+ * saca el `?query`, `tsc` no—. Ahora un especificador con `?` o `#`, o uno que
+ * no resuelve, va a `sinResolver`. Las únicas excepciones están escritas en
+ * `RESUELVE_EL_BUNDLER`, con su razón.
+ *
  * QUÉ NO VE, Y ESTÁ DICHO
  *
  * Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
@@ -56,6 +87,7 @@
  * la sostienen sus GRANT, que `defects_test.sql` mide.
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
+import { builtinModules } from "node:module";
 import path from "node:path";
 import ts from "typescript";
 
@@ -75,6 +107,8 @@ export const NOMBRES_DE_CUSTODIA = [
 export interface Lectura {
   importa: string[];
   sinResolver: string[];
+  usa: Set<string>;
+  exporta: string[];
   leeEnv: Set<string>;
   envOpaco: string[];
   custodia: Set<string>;
@@ -99,8 +133,38 @@ export function fuentesEn(dir: string): string[] {
   return salida;
 }
 
+/**
+ * Qué módulo es un test, y por eso no es producción.
+ *
+ * Por SEGMENTO exacto, no por subcadena. Medido el 2026-10-11 en la revisión
+ * del #118: con `r.includes("__tests__")`, `src/app/api/clics__tests__/route.ts`
+ * —que Next sirve como ruta, porque el segmento no empieza con `_`— quedaba
+ * fuera de la pared y llamaba a `agencyAccessToken()` con la suite en verde. Un
+ * directorio `__tests__` sí empieza con `_`: es una carpeta privada para Next y
+ * no se rutea.
+ */
 export const esTest = (r: string) =>
-  r.includes("__tests__") || /\.(test|spec)\.[cm]?[jt]sx?$/.test(r) || r.startsWith("src/test/");
+  /(^|\/)__tests__\//.test(r) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(r) || r.startsWith("src/test/");
+
+/**
+ * Especificadores que `tsc` no resuelve y el bundler sí, y que no llegan a
+ * código de este repositorio. La lista es cerrada: lo que no está acá y no
+ * resuelve es una falla de la pared.
+ */
+export const RESUELVE_EL_BUNDLER: ReadonlyArray<{ acepta: (especificador: string) => boolean; porque: string }> = [
+  {
+    acepta: (e) => e.startsWith("node:") && builtinModules.includes(e.slice("node:".length)),
+    porque: "un módulo de Node: `@types/node` lo declara como módulo ambiental, no como archivo",
+  },
+  {
+    acepta: (e) => e === "server-only" || e === "client-only",
+    porque: "Next los provee desde su copia compilada; no son un paquete de node_modules ni código del repo",
+  },
+  {
+    acepta: (e) => /^\.{1,2}\/[^?#]*\.(css|scss|sass)$/.test(e),
+    porque: "una hoja de estilos: la procesa el loader de CSS, no ejecuta JavaScript del repo",
+  },
+];
 
 /** Las opciones de `tsc`, leídas del `tsconfig.json` de verdad. */
 export function opcionesDelProyecto(raiz: string): ts.CompilerOptions {
@@ -192,12 +256,34 @@ export function analizar(
   const rel = (abs: string) => path.relative(raiz, abs).replace(/\\/g, "/");
   const enArbol = new Set(archivosAbs.map((a) => path.resolve(a)));
 
-  const resolver = (desde: string, especificador: string): string | null => {
+  // Adónde lleva un especificador LITERAL: un módulo del árbol, algo de afuera
+  // (un paquete, un JSON, un asset que el bundler procesa), o ninguna de las
+  // dos, y entonces es una falla con su motivo. Ver el encabezado: el mundo es
+  // cerrado.
+  type Destino = { arbol: string } | { afuera: true } | { falla: string };
+  const resolver = (desde: string, especificador: string): Destino => {
+    if (/[?#]/.test(especificador)) {
+      return { falla: "lleva ? o #: el bundler lo resuelve sacándoselo y tsc no" };
+    }
     const r = ts.resolveModuleName(especificador, desde, opciones, hostDeResolucion).resolvedModule;
-    if (!r) return null;
+    if (!r) {
+      if (RESUELVE_EL_BUNDLER.some((e) => e.acepta(especificador))) return { afuera: true };
+      return { falla: "tsc no lo resuelve" };
+    }
     const destino = path.resolve(r.resolvedFileName);
-    return enArbol.has(destino) ? rel(destino) : null;
+    if (enArbol.has(destino)) return { arbol: rel(destino) };
+    if (r.isExternalLibraryImport || destino.includes(`${path.sep}node_modules${path.sep}`)) return { afuera: true };
+    if (/\.json$/.test(destino)) return { afuera: true };
+    // Resuelve a un archivo del repo que la pared no analiza (una declaración
+    // `.d.ts` al lado de un `.js`, por ejemplo): en ejecución carga otra cosa.
+    return { falla: `resuelve a ${rel(destino)}, que la pared no analiza` };
   };
+
+  // Lo que exporta cada módulo del árbol, resuelto hasta la declaración: un
+  // símbolo usado cuenta si es uno de éstos (no una propiedad de un objeto que
+  // vino de otro módulo).
+  const resolverAlias = (s: ts.Symbol): ts.Symbol => (s.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(s) : s);
+  const exportado = new Map<ts.Symbol, string>();
 
   // ¿Este nodo ES un entorno? Preguntarle el tipo a cada expresión del árbol es
   // verificarlo entero dos veces (medido: 12 s sobre 30 mil identificadores). Las
@@ -242,12 +328,34 @@ export function analizar(
     .filter((f) => f.startsWith(raiz + path.sep) && !f.includes(`${path.sep}node_modules${path.sep}`) && !DECLARACION.test(f));
   for (const f of cargados) enArbol.add(f);
 
+  // Primero lo que exporta cada uno: el uso de abajo se compara contra esto.
+  const exportaDe = new Map<string, string[]>();
+  for (const abs of cargados) {
+    const sf = programa.getSourceFile(abs);
+    const modulo = sf && checker.getSymbolAtLocation(sf);
+    const nombres: string[] = [];
+    if (modulo) {
+      for (const e of checker.getExportsOfModule(modulo)) {
+        const destino = resolverAlias(e);
+        if (!(destino.flags & ts.SymbolFlags.Value)) continue;
+        nombres.push(e.getName());
+        const decl = destino.valueDeclaration ?? destino.declarations?.[0];
+        if (!decl) continue;
+        const archivo = path.resolve(decl.getSourceFile().fileName);
+        if (enArbol.has(archivo) && !exportado.has(destino)) exportado.set(destino, `${rel(archivo)}#${destino.getName()}`);
+      }
+    }
+    exportaDe.set(abs, nombres.sort());
+  }
+
   for (const abs of cargados) {
     const sf = programa.getSourceFile(abs);
     if (!sf) throw new Error(`el programa no cargó ${abs}`);
     const lectura: Lectura = {
       importa: [],
       sinResolver: [],
+      usa: new Set(),
+      exporta: [],
       leeEnv: new Set(),
       envOpaco: [],
       custodia: new Set(),
@@ -255,6 +363,11 @@ export function analizar(
       esquemas: new Set(),
     };
     const donde = (n: ts.Node) => `${rel(abs)}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}`;
+    const seguir = (n: ts.Node, especificador: string) => {
+      const d = resolver(abs, especificador);
+      if ("arbol" in d) lectura.importa.push(d.arbol);
+      else if ("falla" in d) lectura.sinResolver.push(`${donde(n)} ${JSON.stringify(especificador)}: ${d.falla}`);
+    };
     const tipoEntorno = (n: ts.Node) => esEntorno(checker, checker.getTypeAtLocation(n));
     const vistos = new Set<ts.Node>();
 
@@ -364,8 +477,7 @@ export function analizar(
       }
       // Los imports de valor.
       if (ts.isImportDeclaration(nodo) && ts.isStringLiteral(nodo.moduleSpecifier) && !soloTipos(nodo)) {
-        const d = resolver(abs, nodo.moduleSpecifier.text);
-        if (d) lectura.importa.push(d);
+        seguir(nodo, nodo.moduleSpecifier.text);
       }
       if (ts.isImportDeclaration(nodo)) return;
       if (
@@ -374,8 +486,7 @@ export function analizar(
         nodo.moduleSpecifier &&
         ts.isStringLiteral(nodo.moduleSpecifier)
       ) {
-        const d = resolver(abs, nodo.moduleSpecifier.text);
-        if (d) lectura.importa.push(d);
+        seguir(nodo, nodo.moduleSpecifier.text);
       }
       if (
         ts.isImportEqualsDeclaration(nodo) &&
@@ -383,8 +494,7 @@ export function analizar(
         ts.isExternalModuleReference(nodo.moduleReference) &&
         ts.isStringLiteral(nodo.moduleReference.expression)
       ) {
-        const d = resolver(abs, nodo.moduleReference.expression.text);
-        if (d) lectura.importa.push(d);
+        seguir(nodo, nodo.moduleReference.expression.text);
       }
       // `import("x")` y `require("x")`: también ejecutan x. Con un destino que
       // no es literal, el grafo no lo puede seguir, y eso es una falla.
@@ -394,8 +504,7 @@ export function analizar(
         if (esImport || esRequire) {
           const arg = nodo.arguments[0];
           if (arg && (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg))) {
-            const d = resolver(abs, arg.text);
-            if (d) lectura.importa.push(d);
+            seguir(nodo, arg.text);
           } else {
             lectura.sinResolver.push(`${donde(nodo)} ${nodo.getText(sf).slice(0, 80)}`);
           }
@@ -433,11 +542,27 @@ export function analizar(
       if (texto !== null) {
         for (const c of NOMBRES_DE_CUSTODIA) if (texto.includes(c)) lectura.custodia.add(c);
       }
+      // Los símbolos de otro módulo del árbol que este usa. Por el verificador y
+      // hasta la declaración: un `import { x } from "./puerta"` que la puerta
+      // reexporta de `tokenStore.ts` es un uso de `tokenStore.ts#x`.
+      if (ts.isIdentifier(nodo)) {
+        const padre = nodo.parent;
+        let s =
+          padre && ts.isShorthandPropertyAssignment(padre) && padre.name === nodo
+            ? checker.getShorthandAssignmentValueSymbol(padre)
+            : checker.getSymbolAtLocation(nodo);
+        if (s) {
+          s = resolverAlias(s);
+          const clave = exportado.get(s);
+          if (clave && !clave.startsWith(`${rel(abs)}#`)) lectura.usa.add(clave);
+        }
+      }
       // El entorno. Ver `esUnEntorno`: por símbolo, no por expresión.
       if (esUnEntorno(nodo)) usoDelEntorno(nodo);
       ts.forEachChild(nodo, visitar);
     };
     visitar(sf);
+    lectura.exporta = exportaDe.get(abs) ?? [];
     lecturas.set(rel(abs), lectura);
   }
 
@@ -469,6 +594,13 @@ export function camino(
   return null;
 }
 
+/** Un módulo de CONEXIÓN y las piezas de la credencial que puede usar, exactas. */
+export interface Exencion {
+  modulo: string;
+  /** `ruta#nombre` de cada símbolo de la superficie de la credencial que usa. */
+  usa: readonly string[];
+}
+
 /** Lo que una política declara: quién puede leer qué, y quién está exento de la pared. */
 export interface Politica {
   /** La variable de la agencia y su único lector. */
@@ -478,10 +610,18 @@ export interface Politica {
   nadieLee: readonly string[];
   /** La puerta: el único camino de un módulo de datos a la credencial. */
   puerta: string;
+  /** Lo que la puerta exporta como valor, exacto: su regla y nada más. */
+  exportaLaPuerta: readonly string[];
+  /** Los símbolos que PRODUCEN el token (`ruta#nombre`): sólo la puerta los usa. */
+  productoresDelToken: readonly string[];
   /** Quién puede nombrar cada pieza de la custodia. Una pieza sin dueños no la nombra nadie. */
   custodia: Readonly<Record<(typeof NOMBRES_DE_CUSTODIA)[number], readonly string[]>>;
-  /** Los módulos de CONEXIÓN: pueden llegar a la credencial sin pasar por la puerta. */
-  conexion: readonly string[];
+  /**
+   * Los módulos de CONEXIÓN: pueden llegar a la credencial sin pasar por la
+   * puerta, y SÓLO por los símbolos que declaran. Un módulo exento entero
+   * —«este archivo puede»— deja entrar cualquier export nuevo del archivo.
+   */
+  conexion: readonly Exencion[];
 }
 
 export interface Veredicto {
@@ -503,6 +643,16 @@ export interface Veredicto {
   vencidas: string[];
   /** Los módulos que llegan a una credencial sólo por la puerta. */
   porLaPuerta: string[];
+  /** Quién usa cada productor del token, en producción, fuera del módulo que lo declara. */
+  usosDelToken: Record<string, string[]>;
+  /** Lo que la puerta exporta como valor, medido. */
+  exportaLaPuerta: string[];
+  /**
+   * Los símbolos de la superficie de la credencial —lo que exportan el lector,
+   * los custodios, la puerta y los módulos de conexión— que usa cada módulo de
+   * conexión, medidos.
+   */
+  conexionUsa: Record<string, string[]>;
 }
 
 export function juzgar(a: Analisis, politica: Politica): Veredicto {
@@ -535,7 +685,8 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     ...lectoresDe(politica.variable),
     ...Object.values(custodios).flat(),
   ]);
-  const conexion = new Set(politica.conexion);
+  const modulosDeConexion = politica.conexion.map((c) => c.modulo);
+  const conexion = new Set(modulosDeConexion);
 
   const fugas: string[] = [];
   const porLaPuerta: string[] = [];
@@ -546,9 +697,21 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     if (!sin && camino(a.lecturas, r, sumideros, null)) porLaPuerta.push(r);
   }
 
-  const vencidas = politica.conexion.filter(
+  const vencidas = modulosDeConexion.filter(
     (c) => !produccion.has(c) || sumideros.has(c) || camino(a.lecturas, c, sumideros, politica.puerta) === null
   );
+
+  // Por símbolo (R14): lo que el grafo de archivos no distingue.
+  const usosDelToken: Record<string, string[]> = {};
+  for (const productor of politica.productoresDelToken) {
+    usosDelToken[productor] = prod.filter((r) => de(r).usa.has(productor));
+  }
+  const superficie = new Set([...sumideros, politica.puerta, ...modulosDeConexion]);
+  const enLaSuperficie = (simbolo: string) => superficie.has(simbolo.slice(0, simbolo.lastIndexOf("#")));
+  const conexionUsa: Record<string, string[]> = {};
+  for (const c of modulosDeConexion) {
+    conexionUsa[c] = a.lecturas.has(c) ? [...de(c).usa].filter(enLaSuperficie).sort() : [];
+  }
 
   return {
     produccion: prod,
@@ -562,6 +725,9 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     fugas,
     vencidas,
     porLaPuerta,
+    usosDelToken,
+    exportaLaPuerta: a.lecturas.get(politica.puerta)?.exporta ?? [],
+    conexionUsa,
   };
 }
 
