@@ -105,18 +105,19 @@ describe("el transporte del renderizado", () => {
     expect(b.tipo === "respuesta" && b.cuerpo.toString()).toBe("hola brotli");
   });
 
+  // Se afirma sobre el MOTIVO y no sobre el objeto entero: si el tope se
+  // rompe, el objeto trae 10 MB de cuerpo, y el diff de un `toEqual` contra él
+  // tumbaba el informe del runner en vez de dar un rojo legible (medido con la
+  // mutación «sin `maxOutputLength`»).
+  const motivo = (r: Awaited<ReturnType<typeof transporte>>) =>
+    r.tipo === "error" ? r.motivo : `respuesta de ${r.cuerpo.length} bytes`;
+
   it("una bomba de compresión se corta DESPUÉS de descomprimir: demasiado-grande", async () => {
-    expect(await transporte(pedido("/bomba", { maxBytes: 1024 * 1024 }))).toEqual({
-      tipo: "error",
-      motivo: "demasiado-grande",
-    });
+    expect(motivo(await transporte(pedido("/bomba", { maxBytes: 1024 * 1024 })))).toBe("demasiado-grande");
   });
 
   it("un cuerpo más grande que el tope se corta mientras llega", async () => {
-    expect(await transporte(pedido("/grande", { maxBytes: 1024 * 1024 }))).toEqual({
-      tipo: "error",
-      motivo: "demasiado-grande",
-    });
+    expect(motivo(await transporte(pedido("/grande", { maxBytes: 1024 * 1024 })))).toBe("demasiado-grande");
   });
 
   it("un origen que no contesta es timeout, con plazo TOTAL", async () => {
