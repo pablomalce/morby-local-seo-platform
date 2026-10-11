@@ -74,6 +74,53 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: npm run build
 
+  # La defensa SSRF del render de la auditoría AEO —el proxy que no existe, el
+  # resolvedor apagado, las banderas de WebRTC, el popup, las descargas— y la
+  # extracción de los dos lados del punto «contenido sin JavaScript» sólo se
+  # pueden probar con un Chromium de verdad: los tests de `verify` usan dobles
+  # del navegador y no ven una bandera borrada de `src/lib/aeo/chromium.ts`
+  # (SEC-1, GATE-5). Hasta este job, la integración se salteaba en el CI y un
+  # PR que sacara una capa mergeaba en verde.
+  #
+  # Corre con los DOS binarios: el Chrome del runner y el headless shell de
+  # `@sparticuz/chromium`, que es el que corre en Vercel y no escucha las mismas
+  # banderas (RV-1). Con AEO_INTEGRACION_OBLIGATORIA, un Chrome que falta es un
+  # rojo, no un salteo.
+  render:
+    name: render integration (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      AEO_INTEGRACION_OBLIGATORIA: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install
+        id: install
+        run: npm ci
+
+      - name: integración con el Chrome del runner
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          # Ubuntu 24.04 restringe los namespaces sin privilegios que usa el
+          # sandbox de Chrome; en el runner, que es efímero, se levanta.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable)"
+          "$CHROME" --version
+          AEO_CHROME_PATH="$CHROME" npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
+
+      - name: integración con el headless shell de producción
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          AEO_CHROMIUM_DE_PRODUCCION: "1"
+        run: npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
+
   # El esquema es la otra mitad del repo y hasta ahora nada lo verificaba: los
   # tests de arriba corren contra dobles, así que probaban la LÓGICA y nunca
   # que una policy aislara a un tenant de otro.

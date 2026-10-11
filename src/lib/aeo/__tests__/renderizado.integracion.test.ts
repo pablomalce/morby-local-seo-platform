@@ -39,8 +39,18 @@
  * `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, con su propio `npm ci`.
  *
  * Sin ninguna de las dos se saltea con el motivo escrito en el nombre del
- * bloque, y eso NO es un verde: el CI de este repo no las define, así que ahí
- * estos casos no corren.
+ * bloque, y eso NO es un verde. Por eso el CI tiene un job propio
+ * (`render` en `.github/workflows/ci.yml`) que corre este archivo con el Chrome
+ * del runner y con el headless shell de producción, y con
+ * `AEO_INTEGRACION_OBLIGATORIA=1`: ahí un Chrome que falta es ROJO, no un
+ * salteo (SEC-1, GATE-5). Antes el CI no las definía, y una bandera borrada
+ * de `chromium.ts` mergeaba en verde: los tests de `verify` usan dobles del
+ * navegador y no la pueden ver.
+ *
+ * En el CI, cada caso se reintenta una vez: MEDIDO, con la máquina cargada un
+ * arranque de Chromium pasó los 20 s y un caso dio `sin-navegador` o
+ * `timeout`, y al repetirlo pasó. Un reintento no esconde una regresión: una
+ * bandera borrada abre el canario las dos veces.
  */
 import dgram from "node:dgram";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -434,7 +444,13 @@ async function canarioDespues(ms = 1_000) {
 
 const TODOS_ENTRAN = Object.fromEntries(AGENTES_IA.map((a) => [a, true])) as LecturaDelSitio["acceso"];
 
-describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO})`, () => {
+describe.runIf(process.env.AEO_INTEGRACION_OBLIGATORIA === "1")("en el CI la integración es OBLIGATORIA", () => {
+  it("hay un Chromium con el que correrla: si falta, esto es rojo y no un salteo", () => {
+    expect(HAY_CHROME, MOTIVO).toBe(true);
+  });
+});
+
+describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO})`, { retry: process.env.CI ? 1 : 0 }, () => {
   it(
     "la página de CONTROL: servido casi cero, renderizado por encima del mínimo, punto ROJO",
     async () => {
