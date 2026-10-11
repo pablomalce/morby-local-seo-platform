@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { NextRequest } from "next/server";
 import { describe, expect, it, vi } from "vitest";
+import { middleware } from "@/middleware";
 import { contenidoSinJs, hallazgos, type Hallazgo, type LecturaDelSitio, type PuntosDeLaPuerta } from "../hallazgos";
 import {
   accesoDeLasIA,
@@ -42,18 +44,35 @@ const ROBOTS = readFileSync(path.join(RAIZ, "public", "robots.txt"), "utf8");
 // ─────────────────────────────────────────────────────────────────────────────
 // El despliegue, como contesta de verdad (medido con curl el 2026-10-11 contra
 // https://morby-local-seo-platform.vercel.app): `/aeo-control/` da 308 a
-// `/aeo-control`, que da 200 con este mismo HTML a CUALQUIER user-agent —
-// GPTBot, ClaudeBot y CCBot incluidos: Vercel no bloquea a nadie—, el
-// `robots.txt` es el de `public/`, y no hay `llms.txt`.
+// `/aeo-control`, que da 200 con este mismo HTML, el `robots.txt` es el de
+// `public/`, y no hay `llms.txt`. Vercel no bloquea a nadie: lo único que
+// contesta distinto según el user-agent es NUESTRO middleware, y por eso el
+// middleware de verdad corre acá antes que los archivos —como en Vercel,
+// después de la redirección de la barra— (GATE-6: 403 a PerplexityBot).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ORIGEN = "https://morby-local-seo-platform.vercel.app";
 
-function despliegue(pedido: PedidoHttp): RespuestaHttp {
+// El middleware pregunta por la sesión: acá no hay ninguna, y no sale a la red.
+vi.mock("@supabase/ssr", () => ({
+  createServerClient: () => ({ auth: { getUser: async () => ({ data: { user: null } }) } }),
+}));
+
+async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
   const vacio = Buffer.alloc(0);
+  if (pedido.url === `${ORIGEN}/aeo-control/`) {
+    return { tipo: "respuesta", status: 308, encabezados: { location: "/aeo-control" }, cuerpo: vacio };
+  }
+  const delMiddleware = await middleware(new NextRequest(pedido.url, { headers: pedido.encabezados }));
+  if (delMiddleware.headers.get("x-middleware-next") !== "1") {
+    return {
+      tipo: "respuesta",
+      status: delMiddleware.status,
+      encabezados: Object.fromEntries(delMiddleware.headers),
+      cuerpo: Buffer.from(await delMiddleware.arrayBuffer()),
+    };
+  }
   switch (pedido.url) {
-    case `${ORIGEN}/aeo-control/`:
-      return { tipo: "respuesta", status: 308, encabezados: { location: "/aeo-control" }, cuerpo: vacio };
     case `${ORIGEN}/aeo-control`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
     case `${ORIGEN}/robots.txt`:
@@ -95,7 +114,7 @@ vi.mock("@/lib/aeo/chromium", () => ({
     const reloj = relojVirtual();
     return {
       abrirNavegador: navegadorDoble({ reloj, htmlCrudo: domQueDibujaElControl() }).abrirNavegador,
-      transporte: async (pedido) => despliegue(pedido),
+      transporte: (pedido) => despliegue(pedido),
       resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
       ...reloj,
     };
@@ -214,9 +233,16 @@ describe("la página de control sale en rojo en los tres ejes", () => {
       const { status, cuerpo } = await auditarPorLaRuta(website);
       expect(status).toBe(200);
       expect(cuerpo.urlFinal).toBe(`${ORIGEN}/aeo-control`);
-      // Lo que el despliegue hace con cada agente: 200 a todos. El bloqueo
-      // vive SÓLO en el robots, y tiene que verse igual.
-      expect(Object.values(cuerpo.lectura.statusPorAgente ?? {})).toEqual([200, 200, 200, 200, 200]);
+      // Lo que el despliegue hace con cada agente: 403 a PerplexityBot —el
+      // middleware, GATE-6— y 200 al resto. GPTBot y ClaudeBot están
+      // bloqueados SÓLO en el robots, y tienen que verse igual.
+      expect(cuerpo.lectura.statusPorAgente).toEqual({
+        gptbot: 200,
+        claudebot: 200,
+        perplexitybot: 403,
+        "google-extended": 200,
+        ccbot: 200,
+      });
 
       // GATE-7: el color de cada punto viene en la respuesta, no se deduce de la prosa.
       expect(cuerpo.puntos).toEqual({ acceso: "rojo", contenidoSinJs: "rojo", schema: "rojo" });
@@ -224,8 +250,14 @@ describe("la página de control sale en rojo en los tres ejes", () => {
 
       const bloqueantes = cuerpo.hallazgos.filter((h) => h.gravedad === "bloqueante");
       const textos = bloqueantes.map((h) => h.quePasa).join(" | ");
-      expect(bloqueantes.length).toBe(3);
-      expect(textos, "eje 3: acceso").toMatch(/Bloqueados: gptbot, claudebot/);
+      expect(bloqueantes.length).toBe(4);
+      expect(textos, "eje 3: acceso, por el robots y por la petición").toMatch(/Bloqueados: gptbot, claudebot, perplexitybot\./);
+      // GATE-6: el agente que el robots deja entrar y el servidor rechaza. Sin
+      // la petición real con su user-agent, este hallazgo no existe.
+      expect(
+        bloqueantes.some((h) => /CDN|WAF/.test(h.donde) && /permite a perplexitybot.*403/.test(h.quePasa)),
+        "eje 3: el 403 de la petición real"
+      ).toBe(true);
       expect(
         bloqueantes.some((h) => /renderizado/.test(h.donde) && h.quePasa.includes(String(renderizado))),
         "eje 1: texto sin JS, con el número renderizado"

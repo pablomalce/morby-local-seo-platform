@@ -1,4 +1,5 @@
 import { createServerClient } from "@supabase/ssr";
+import { rechazoDelControlAeo } from "@/lib/aeo/paginaDeControl";
 import { DESTINO_POST_LOGIN } from "@/lib/auth/rutas";
 import { NextResponse, type NextRequest } from "next/server";
 
@@ -14,6 +15,13 @@ import { NextResponse, type NextRequest } from "next/server";
  * redirect to /login.
  */
 export async function middleware(request: NextRequest) {
+  // La página de control de la auditoría AEO le contesta 403 a un agente que
+  // su robots deja entrar: es lo que la hace refutar la petición por agente
+  // (GATE-6, `src/lib/aeo/paginaDeControl.ts`). Antes que la sesión: un
+  // rastreador no tiene ninguna.
+  const control = rechazoDelControlAeo(request);
+  if (control) return control;
+
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
