@@ -46,7 +46,12 @@
 # Escribe filas de verdad (las dos sesiones tienen que confirmar para medir algo)
 # en organizaciones propias, y las borra al salir, pase lo que pase. Los puntos 4
 # y 5 revierten y vuelven a aplicar la 0034 sobre la misma base: al salir, pase
-# lo que pase, la deja aplicada (con el archivo del repositorio).
+# lo que pase, la deja aplicada (con el archivo del repositorio) y con los EXECUTE
+# que tenían sus funciones. La migración sola no los da todos: en CI y en la
+# réplica, `app_role.sql` le da EXECUTE a `growthos_app` sobre TODAS las funciones
+# DESPUÉS de las migraciones, y revertir y reaplicar se los sacaba (medido: la
+# huella perdía `growthos_app=X` en las cuatro). Se guardan antes de revertir, se
+# devuelven después, y el último chequeo compara los permisos con los de antes.
 
 set -euo pipefail
 
@@ -76,14 +81,36 @@ disparo() {
 }
 aplicada() { if [[ "$(registro)" == "1" ]]; then echo "aplicada, trigger $(disparo)"; else echo "sin aplicar, trigger $(disparo)"; fi; }
 
+# Los EXECUTE de las cuatro funciones de la 0034, y los GRANT que los devuelven.
+FUNCIONES="'search_console_canonical', 'search_console_overlap',
+           'integration_properties_search_console_coverage', 'remap_integration_property'"
+permisos() {
+    sql -c "SELECT string_agg(p.proname || ' ' || coalesce(array_to_string(p.proacl::text[], ' '), 'default'),
+                              ' | ' ORDER BY p.proname)
+              FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ($FUNCIONES)"
+}
+grants_de_hoy() {
+    sql -c "SELECT coalesce(string_agg(format('GRANT EXECUTE ON FUNCTION %s TO %s;', p.oid::regprocedure,
+                                              CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                                   ELSE quote_ident(pg_get_userbyid(a.grantee)) END),
+                                       ' ' ORDER BY p.proname, a.o), '')
+              FROM pg_proc p
+              CROSS JOIN LATERAL aclexplode(p.proacl) WITH ORDINALITY AS a(grantor, grantee, privilege_type, is_grantable, o)
+             WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ($FUNCIONES)
+               AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner"
+}
+DEVOLVER=""
+reaplicar() {
+    $PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+    if [[ -n "$DEVOLVER" && "$(registro)" == "1" ]]; then sql -c "$DEVOLVER" >/dev/null; fi
+}
+
 limpiar() {
     sql -c "DELETE FROM public.organizations WHERE id IN (
                 SELECT organization_id FROM public.org_members WHERE user_id IN ($USUARIOS));
             DELETE FROM auth.users WHERE id IN ($USUARIOS);" >/dev/null 2>&1 || true
     # Los puntos 4 y 5 revierten la 0034: la base queda como la encontraron.
-    if [[ "$(registro 2>/dev/null)" == "0" ]]; then
-        $PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
-    fi
+    if [[ "$(registro 2>/dev/null)" == "0" ]]; then reaplicar; fi
 }
 trap limpiar EXIT
 limpiar
@@ -107,6 +134,8 @@ ORG7="$(sql -c "SELECT organization_id FROM public.org_members WHERE user_id = '
     || { echo "no se crearon las siete organizaciones" >&2; exit 1; }
 [[ "$(aplicada)" == "aplicada, trigger A" ]] \
     || { echo "la 0034 no está aplicada en esta base: $(aplicada)" >&2; exit 1; }
+PERMISOS_ANTES="$(permisos)"
+DEVOLVER="$(grants_de_hoy)"
 
 # Un INSERT como `service_role` (como `property-actions.ts`), que dice con qué
 # SQLSTATE murió en vez de abortar.
@@ -207,7 +236,7 @@ esperar "A confirmó su mapeo solapado mientras la migración esperaba" "2" "$VI
 esperar "la 0034, aplicada en el medio" "rechazada: el par solapado" "$R4"
 sql -c "UPDATE public.integration_properties SET unmapped_at = now()
         WHERE organization_id = '$ORG7' AND unmapped_at IS NULL" >/dev/null
-$PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+reaplicar
 esperar "la 0034, sin el par (contraprueba)" "aplicada, trigger A" "$(aplicada)"
 
 echo "==> 5. la migración fuera de READ COMMITTED"
@@ -217,8 +246,9 @@ SALIDA="$({ echo "SET default_transaction_isolation = 'repeatable read';"; cat "
 R5="$(aplicada)"
 [[ "$R5" == sin* ]] && grep -q "solo cuenta en READ COMMITTED" <<<"$SALIDA" && R5="rechazada: el aislamiento"
 esperar "la 0034 en REPEATABLE READ" "rechazada: el aislamiento" "$R5"
-$PSQL -v ON_ERROR_STOP=1 -q < "$MIGRACION" >/dev/null 2>&1 || true
+reaplicar
 esperar "la 0034 en READ COMMITTED (contraprueba)" "aplicada, trigger A" "$(aplicada)"
+esperar "los EXECUTE de sus cuatro funciones, como estaban" "$PERMISOS_ANTES" "$(permisos)"
 
 if [[ "$fallas" -gt 0 ]]; then
     echo "$fallas garantía(s) de la 0034 en rojo" >&2
