@@ -23,19 +23,37 @@
  *   --host-resolver-rules=MAP * ~NOTFOUND
  *                                        su resolvedor no contesta nada: un
  *                                        prefetch de DNS tampoco sale.
- *   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
- *                                        WebRTC no abre UDP por fuera del proxy.
+ *
+ *   --webrtc-ip-handling-policy=disable_non_proxied_udp
+ *                                        WebRTC no manda UDP por fuera del proxy.
+ *
+ * WEBRTC ES OTRA SALIDA, Y EL PROXY Y EL RESOLVEDOR NO LA CIERRAN. Un
+ * `RTCPeerConnection` con un servidor STUN manda UDP directo a la dirección que
+ * la página elija. MEDIDO con Chrome 154 y un canario UDP en loopback: 4
+ * paquetes sin banderas, 4 con el proxy y el resolvedor, y 4 con
+ * `--force-webrtc-ip-handling-policy` (la que suele recomendarse, que en este
+ * Chrome no hace nada y por eso no está). Lo cierran dos cosas, y cada una
+ * sola da 0: la bandera de arriba, y que el constructor no exista —`sinWebRtc`
+ * lo borra de cada documento ANTES de que corra el JavaScript de la página
+ * (`evaluateOnNewDocument`, que también llega a un `<iframe>` recién creado:
+ * sacar el constructor del `contentWindow` de un iframe en blanco da «not a
+ * constructor»)—. Lo medido es Chrome completo en la Mac; el binario de
+ * Vercel es headless shell, y ahí ninguna de las dos está medida.
  *
  * LAS DOS CAPAS SON REDUNDANTES A PROPÓSITO, y está medido. Contra el mismo
  * canario, con un `WebSocket` y dos `preconnect` a loopback: sin banderas, 4
  * conexiones; sólo el proxy (con `<-loopback>`), 0; sólo el resolvedor apagado,
  * 0 —`MAP *` alcanza también a las IP literales—; el proxy SIN `<-loopback>`,
  * 4. Cada capa basta sola, así que borrar una no pone rojo un test que corra
- * con las dos: por eso el test de integración arranca Chromium tres veces, con
- * las dos capas y con cada una sola (`capasDeRed`), y afirma cero conexiones en
- * las tres. Borrar una bandera de acá pone rojo el caso de su capa.
+ * con las dos: por eso el test de integración arranca Chromium con todas las
+ * capas y con cada una sola (`capasDeRed`, y WebRTC con su bandera sola y con
+ * su constructor borrado solo), y afirma cero en todas. Borrar una bandera de
+ * acá pone rojo el caso de su capa.
  *
- * Además: las descargas se deniegan por CDP, los service workers se saltean, y
+ * Además: las descargas se deniegan por CDP —MEDIDO: sin eso, una página que
+ * arma un `Blob` y hace clic en un `<a download>` escribe el archivo en disco, y
+ * esa descarga no pasa por la red ni por el transporte—, los service workers se
+ * saltean, y
  * de los argumentos de `@sparticuz/chromium` se sacan dos que no tienen nada
  * que ver con correr en Lambda: `--disable-web-security` (apaga CORS: la página
  * podría leer respuestas de otros orígenes que un navegador real no le
@@ -72,7 +90,7 @@ export const BANDERAS_SIN_RED = [
   "--proxy-server=http://127.0.0.1:1",
   "--proxy-bypass-list=<-loopback>",
   "--host-resolver-rules=MAP * ~NOTFOUND",
-  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--webrtc-ip-handling-policy=disable_non_proxied_udp",
   "--disable-background-networking",
   "--disable-component-update",
   "--disable-sync",
@@ -84,15 +102,34 @@ export const BANDERAS_SIN_RED = [
  * sola (ver el encabezado). Se derivan de `BANDERAS_SIN_RED`, no se copian: si
  * alguien borra una bandera de arriba, su capa queda sin ella y su caso cae.
  */
+const esProxy = (b: string) => b.startsWith("--proxy-");
+const esResolvedor = (b: string) => b.startsWith("--host-resolver-rules");
+const esWebRtc = (b: string) => b.startsWith("--webrtc-");
 export const capasDeRed = {
-  proxy: BANDERAS_SIN_RED.filter((b) => !b.startsWith("--host-resolver-rules")),
-  resolvedor: BANDERAS_SIN_RED.filter((b) => !b.startsWith("--proxy-")),
+  proxy: BANDERAS_SIN_RED.filter((b) => !esResolvedor(b) && !esWebRtc(b)),
+  resolvedor: BANDERAS_SIN_RED.filter((b) => !esProxy(b) && !esWebRtc(b)),
 };
 
 /** Lo que `@sparticuz/chromium` agrega y un render fiel no puede llevar. */
 const SIN_SEGURIDAD = new Set(["--disable-web-security", "--allow-running-insecure-content"]);
 
 const VENTANA = { width: 1366, height: 768 };
+
+/**
+ * Corre en cada documento antes que el JavaScript de la página: sin estos
+ * constructores no hay `RTCPeerConnection`, y sin él no hay UDP a ninguna parte.
+ * Ver el encabezado: es lo único que, medido, cierra esa salida.
+ */
+function sinWebRtc() {
+  for (const nombre of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "RTCIceCandidate"]) {
+    try {
+      delete (window as unknown as Record<string, unknown>)[nombre];
+    } catch {
+      // Una propiedad que no se deja borrar se tapa: lo que importa es que no construya.
+      Object.defineProperty(window, nombre, { value: undefined, configurable: false, writable: false });
+    }
+  }
+}
 
 async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador> {
   let cuerpo = req.postData();
@@ -136,10 +173,11 @@ function envolverPagina(page: Page): PaginaAbierta {
   };
 }
 
-function envolverNavegador(browser: Browser, cierreMs: number): NavegadorAbierto {
+function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boolean): NavegadorAbierto {
   return {
     async nuevaPagina() {
       const page = await browser.newPage();
+      if (quitarWebRtc) await page.evaluateOnNewDocument(sinWebRtc);
       await page.setViewport(VENTANA);
       // Se dice quién mira, sin el «Headless» que algunos WAF usan para
       // contestar otra página que la que ve una persona.
@@ -176,6 +214,11 @@ export interface OpcionesChromium {
    * Producción no lo pasa y arranca con `BANDERAS_SIN_RED` enteras.
    */
   banderas?: readonly string[];
+  /**
+   * Para el mismo test: `false` deja el constructor de WebRTC, y así se prueba
+   * la bandera de WebRTC sola. Producción no lo pasa.
+   */
+  quitarWebRtc?: boolean;
 }
 
 export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
@@ -223,7 +266,7 @@ export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
       await browser.close().catch(() => {});
       throw e;
     }
-    return envolverNavegador(browser, opciones.cierreMs ?? 5_000);
+    return envolverNavegador(browser, opciones.cierreMs ?? 5_000, opciones.quitarWebRtc ?? true);
   };
 }
 

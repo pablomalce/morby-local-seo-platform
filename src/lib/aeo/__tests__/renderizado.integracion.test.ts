@@ -10,7 +10,8 @@
  *     `public/aeo-control/index.html` que despliega Vercel, leído del disco—, una
  *     página SSR, redirecciones hostiles y una página llena de subrecursos que
  *     apuntan adentro;
- *   - el CANARIO cuenta CONEXIONES TCP, no pedidos HTTP. Un `WebSocket` o un
+ *   - el CANARIO cuenta CONEXIONES TCP y DATAGRAMAS UDP, no pedidos HTTP. Un
+ *     STUN de WebRTC manda UDP sin pasar por ningún proxy; un `WebSocket` o un
  *     `<link rel="preconnect">` abren un socket sin pedir nada, y MEDIDO al
  *     escribir esto: con la intercepción de puppeteer puesta y sin las
  *     banderas de `chromium.ts`, el canario contó 3 conexiones y un `UPGRADE`.
@@ -33,9 +34,11 @@
  * eso NO es un verde: el CI de este repo no la define, así que ahí estos casos
  * no corren.
  */
-import { existsSync, readFileSync } from "node:fs";
+import dgram from "node:dgram";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
@@ -60,9 +63,11 @@ const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>C
 
 let sitio: http.Server;
 let canario: http.Server;
+let canarioUdp: dgram.Socket;
 let puertoSitio = 0;
 let puertoCanario = 0;
-const enCanario = { conexiones: 0, pedidos: [] as string[] };
+let puertoUdp = 0;
+const enCanario = { conexiones: 0, pedidos: [] as string[], udp: 0 };
 
 function escuchar(servidor: http.Server): Promise<number> {
   return new Promise((listo) => servidor.listen(0, "127.0.0.1", () => listo((servidor.address() as AddressInfo).port)));
@@ -91,6 +96,21 @@ function paginaConSubrecursos(): string {
   try { new WebSocket("ws://169.254.169.254/ws"); } catch (e) {}
   try { new EventSource("http://127.0.0.1:${puertoCanario}/sse"); } catch (e) {}
   navigator.sendBeacon && navigator.sendBeacon("http://127.0.0.1/beacon", "x");
+  // WebRTC: UDP directo a un STUN en loopback, y el mismo intento con el
+  // constructor sacado de un iframe recién creado.
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${puertoUdp}" }] });
+    pc.createDataChannel("d");
+    pc.createOffer().then((o) => pc.setLocalDescription(o));
+  } catch (e) {}
+  try {
+    const f = document.createElement("iframe");
+    document.body.appendChild(f);
+    const R = f.contentWindow.RTCPeerConnection;
+    const pc2 = new R({ iceServers: [{ urls: "stun:127.0.0.1:${puertoUdp}" }] });
+    pc2.createDataChannel("d");
+    pc2.createOffer().then((o) => pc2.setLocalDescription(o));
+  } catch (e) {}
   new Worker(URL.createObjectURL(new Blob([
     "fetch('http://169.254.169.254/w').catch(()=>{}); try { new WebSocket('ws://127.0.0.1:${puertoCanario}/w') } catch (e) {}"
   ])));
@@ -115,6 +135,13 @@ beforeAll(async () => {
     socket.destroy();
   });
   puertoCanario = await escuchar(canario);
+  canarioUdp = dgram.createSocket("udp4");
+  canarioUdp.on("message", () => {
+    enCanario.udp += 1;
+  });
+  puertoUdp = await new Promise<number>((listo) =>
+    canarioUdp.bind(0, "127.0.0.1", () => listo(canarioUdp.address().port))
+  );
 
   sitio = http.createServer((req, res) => {
     const html = (cuerpo: string) => {
@@ -140,6 +167,16 @@ beforeAll(async () => {
       case "/redir-sana":
         res.writeHead(302, { location: "/ssr" });
         return res.end();
+      case "/descarga-blob":
+        // La descarga que arma el JavaScript no pasa por la red: ningún
+        // `Content-Disposition` que el transporte pueda rechazar.
+        return html(`<body><p>${"Página que descarga sola. ".repeat(30)}</p><script>
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(new Blob(["x".repeat(1000)]));
+          a.download = "aeo-descarga.txt";
+          document.body.appendChild(a);
+          a.click();
+        </script></body>`);
       case "/descarga":
         res.writeHead(200, { "content-type": "application/zip", "content-disposition": "attachment; filename=x.zip" });
         return res.end("PK");
@@ -155,19 +192,22 @@ afterAll(async () => {
   if (!HAY_CHROME) return;
   await new Promise((listo) => sitio.close(listo));
   await new Promise((listo) => canario.close(listo));
+  await new Promise<void>((listo) => canarioUdp.close(() => listo()));
 });
 
 beforeEach(() => {
   enCanario.conexiones = 0;
   enCanario.pedidos = [];
+  enCanario.udp = 0;
 });
 
 function deps(
-  banderas: readonly string[] = BANDERAS_SIN_RED
+  banderas: readonly string[] = BANDERAS_SIN_RED,
+  quitarWebRtc = true
 ): DependenciasRender & { aperturas: () => number; cierres: () => number } {
   let aperturas = 0;
   let cierres = 0;
-  const abrir = abrirChromium({ ejecutable: CHROME, banderas });
+  const abrir = abrirChromium({ ejecutable: CHROME, banderas, quitarWebRtc });
   return {
     abrirNavegador: async () => {
       const n = await abrir();
@@ -288,27 +328,35 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       const render = await medirRenderizado(`http://sitio.test${ruta}`, d, undefined, b);
       expect(render).toEqual({ estado: "fallo", codigo: "red-no-publica" });
       expect(b.bloqueados).toContainEqual({ url: destino, motivo: "red-no-publica" });
-      expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [] });
+      expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
       expect(d.cierres()).toBe(d.aperturas());
     },
     30_000
   );
 
   it.each([
-    ["las dos capas", BANDERAS_SIN_RED],
-    ["sólo el proxy inexistente", capasDeRed.proxy],
-    ["sólo el resolvedor apagado", capasDeRed.resolvedor],
+    ["todas las capas", BANDERAS_SIN_RED, true],
+    // TCP: sólo el proxy. WebRTC: sólo el constructor borrado.
+    ["sólo el proxy inexistente", capasDeRed.proxy, true],
+    // TCP: sólo el resolvedor. WebRTC: sólo el constructor borrado.
+    ["sólo el resolvedor apagado", capasDeRed.resolvedor, true],
+    // WebRTC: sólo la bandera, con el constructor intacto.
+    ["las banderas y el constructor de WebRTC intacto", BANDERAS_SIN_RED, false],
   ] as const)(
-    "SUBRECURSOS hostiles —loopback, metadata, 10.x, WebSocket, preconnect, worker— con %s: CERO conexiones al canario",
-    async (capa, banderas) => {
+    "SUBRECURSOS hostiles —loopback, metadata, 10.x, WebSocket, preconnect, worker, WebRTC— con %s: CERO conexiones al canario",
+    async (capa, banderas, quitarWebRtc) => {
       const b = bitacora();
-      const render = await medirRenderizado("http://sitio.test/subrecursos", deps(banderas), undefined, b);
+      const render = await medirRenderizado("http://sitio.test/subrecursos", deps(banderas, quitarWebRtc), undefined, b);
       const visto = await canarioDespues();
       console.log(`[ssrf ${capa}] render=${JSON.stringify(render)} bloqueados=${b.bloqueados.length} canario=${JSON.stringify(visto)}`);
 
       expect(render.estado).toBe("medido");
       if (render.estado === "medido") expect(render.caracteres).toBeGreaterThan(MINIMO_DE_TEXTO);
-      expect(visto, "ni un socket llegó a una dirección que no es pública").toEqual({ conexiones: 0, pedidos: [] });
+      expect(visto, "ni un socket ni un datagrama llegó a una dirección que no es pública").toEqual({
+        conexiones: 0,
+        pedidos: [],
+        udp: 0,
+      });
       // Y salió a la red SÓLO el documento, por la dirección pública.
       expect(sinFavicon(b.pedidos)).toEqual([{ url: "http://sitio.test/subrecursos", ip: PUBLICA }]);
       const motivos = new Set(b.bloqueados.map((x) => x.motivo));
@@ -330,13 +378,15 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     async () => {
       // El control del instrumento, como «el espía registra Y rechaza» en
       // `precondicionRutas.test.ts`: un cero medido por un canario que no puede
-      // ver nada se lee igual que un cero de verdad. Sin banderas, el
-      // interceptor sigue abortando todos los pedidos HTTP —por eso `pedidos`
-      // puede quedar vacío—, y aun así el WebSocket y los preconnect llegan.
-      const render = await medirRenderizado("http://sitio.test/subrecursos", deps([]));
+      // ver nada se lee igual que un cero de verdad. Sin banderas y con el
+      // constructor de WebRTC intacto, el interceptor sigue abortando todos los
+      // pedidos HTTP —por eso `pedidos` puede quedar vacío—, y aun así el
+      // WebSocket y los preconnect abren sockets, y el STUN manda datagramas.
+      const render = await medirRenderizado("http://sitio.test/subrecursos", deps([], false));
       const visto = await canarioDespues();
       console.log(`[ssrf sin banderas] render=${JSON.stringify(render)} canario=${JSON.stringify(visto)}`);
       expect(visto.conexiones).toBeGreaterThan(0);
+      expect(visto.udp).toBeGreaterThan(0);
     },
     30_000
   );
@@ -348,6 +398,37 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         estado: "fallo",
         codigo: "descarga",
       });
+    },
+    30_000
+  );
+
+  it(
+    "una descarga que arma el JavaScript (blob + `a.download`) no escribe nada en disco",
+    async () => {
+      // Esta no la para el transporte —no hay respuesta con `attachment`—: la
+      // para `Browser.setDownloadBehavior: deny` en `chromium.ts`. Para poder
+      // mirar dónde caería, el perfil es uno temporal con la carpeta de
+      // descargas apuntando adentro; nada toca ~/Downloads. MEDIDO: sin la
+      // negación, el archivo aparece en esa carpeta.
+      const perfil = mkdtempSync(path.join(os.tmpdir(), "aeo-perfil-"));
+      const descargas = path.join(perfil, "descargas");
+      mkdirSync(descargas);
+      mkdirSync(path.join(perfil, "Default"));
+      writeFileSync(
+        path.join(perfil, "Default", "Preferences"),
+        JSON.stringify({ download: { default_directory: descargas, prompt_for_download: false } })
+      );
+      try {
+        const render = await medirRenderizado(
+          "http://sitio.test/descarga-blob",
+          deps([...BANDERAS_SIN_RED, `--user-data-dir=${perfil}`])
+        );
+        expect(render.estado).toBe("medido");
+        await new Promise((listo) => setTimeout(listo, 1_000));
+        expect(readdirSync(descargas)).toEqual([]);
+      } finally {
+        rmSync(perfil, { recursive: true, force: true });
+      }
     },
     30_000
   );
