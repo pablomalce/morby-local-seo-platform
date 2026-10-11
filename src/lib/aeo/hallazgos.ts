@@ -207,6 +207,54 @@ export function esLegiblePorIA(lista: Hallazgo[]): boolean | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Los tres puntos de la puerta, con su color
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Los tres puntos que la puerta H2-GO-1 cuenta —«rojo 3 de 3», «verde 3 de 3»—,
+ * cada uno con su estado. Antes el color había que sacarlo de la prosa de los
+ * hallazgos (GATE-7): el test del control decidía los ejes con expresiones
+ * regulares sobre `quePasa`, y el eje del schema no tenía definido cuándo es
+ * verde.
+ */
+export interface PuntosDeLaPuerta {
+  acceso: EstadoDelPunto;
+  contenidoSinJs: EstadoDelPunto;
+  schema: EstadoDelPunto;
+}
+
+/**
+ * LAS REGLAS, una por punto:
+ *
+ *   - ACCESO: rojo si algún agente está bloqueado —por el robots, o porque el
+ *     servidor le contestó «no» a la petición con su user-agent—; si ninguno
+ *     lo está pero falta medir algo —un robots que no se pudo leer, un agente
+ *     sin respuesta, una lectura sin la petición por agente—, no medido; si
+ *     no, verde.
+ *   - CONTENIDO SIN JAVASCRIPT: el de `contenidoSinJs`.
+ *   - SCHEMA: rojo si el validador encontró errores, o si no hay ningún tipo
+ *     declarado —no hay nada que verificar—; no medido si la lectura no trae
+ *     el validador; verde si hay JSON-LD con tipos y sin errores. Que falte
+ *     alguno de los tipos que más rinden es un hallazgo IMPORTANTE, no un
+ *     schema inválido: no lo pone rojo.
+ */
+export function puntosDeLaPuerta(lectura: LecturaDelSitio): PuntosDeLaPuerta {
+  const bloqueado = AGENTES_IA.some(
+    (a) => lectura.acceso[a] === false || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+  );
+  const sinMedir = AGENTES_IA.some(
+    (a) => lectura.acceso[a] === null || (lectura.statusPorAgente?.[a] ?? null) === null
+  );
+  const errores = lectura.erroresDeSchema;
+  return {
+    acceso: bloqueado ? "rojo" : sinMedir ? "no-medido" : "verde",
+    contenidoSinJs: contenidoSinJs(lectura).estado,
+    schema:
+      errores === undefined ? "no-medido" : errores.length > 0 || lectura.schema.length === 0 ? "rojo" : "verde",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // El punto «contenido sin JavaScript»: servido contra renderizado
 // ─────────────────────────────────────────────────────────────────────────────
 

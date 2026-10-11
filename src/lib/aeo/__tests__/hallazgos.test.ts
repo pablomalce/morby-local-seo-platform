@@ -11,6 +11,7 @@ import {
   esLegiblePorIA,
   FRACCION_MINIMA_SERVIDA,
   hallazgos,
+  puntosDeLaPuerta,
   type LecturaDelSitio,
 } from "../hallazgos";
 
@@ -317,5 +318,50 @@ describe("el punto «contenido sin JavaScript»: servido contra renderizado", ()
     // Una página que no dibuja nada existe. Lo prohibido es inventar el cero
     // cuando no se midió, no informarlo cuando sí.
     expect(con(0, { estado: "medido", caracteres: 0 }).renderizado).toBe(0);
+  });
+});
+
+/**
+ * GATE-7: ni la respuesta ni la pantalla traían el color de cada punto, y
+ * «rojo 3 de 3» había que sacarlo de la prosa. Acá cada regla, con sus bordes.
+ */
+describe("GATE-7: los tres puntos de la puerta, cada uno con su estado", () => {
+  const CON_VALIDADOR: LecturaDelSitio = { ...SANO, erroresDeSchema: [] };
+
+  it("un sitio sano: verde en los tres", () => {
+    expect(puntosDeLaPuerta(CON_VALIDADOR)).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "verde" });
+  });
+
+  it("ACCESO: rojo por el robots, rojo por el HTTP con el robots abierto, y no medido sin respuesta", () => {
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, acceso: { ...TODOS_ENTRAN, gptbot: false } }).acceso).toBe("rojo");
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, statusPorAgente: { ...TODOS_200, ccbot: 403 } }).acceso).toBe("rojo");
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, statusPorAgente: { ...TODOS_200, ccbot: null } }).acceso).toBe("no-medido");
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, acceso: { ...TODOS_ENTRAN, ccbot: null } }).acceso).toBe("no-medido");
+    const vieja: LecturaDelSitio = { ...CON_VALIDADOR };
+    delete vieja.statusPorAgente;
+    expect(puntosDeLaPuerta(vieja).acceso, "sin la petición por agente no se sabe").toBe("no-medido");
+    // Un bloqueado es rojo aunque otro no se haya medido.
+    expect(
+      puntosDeLaPuerta({ ...CON_VALIDADOR, acceso: { ...TODOS_ENTRAN, gptbot: false }, statusPorAgente: { ...TODOS_200, ccbot: null } })
+        .acceso
+    ).toBe("rojo");
+  });
+
+  it("CONTENIDO: el mismo estado que `contenidoSinJs`", () => {
+    const js: LecturaDelSitio = { ...CON_VALIDADOR, caracteresSinJs: 40, caracteresRenderizados: { estado: "medido", caracteres: 1_677 } };
+    expect(puntosDeLaPuerta(js).contenidoSinJs).toBe("rojo");
+    const caido: LecturaDelSitio = { ...CON_VALIDADOR, caracteresRenderizados: { estado: "fallo", codigo: "subrecurso-timeout" } };
+    expect(puntosDeLaPuerta(caido).contenidoSinJs).toBe("no-medido");
+  });
+
+  it("SCHEMA: rojo con errores o sin ningún tipo; no medido sin el validador; verde aunque falte un tipo que rinde", () => {
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, erroresDeSchema: ["bloque 1: sin @context"] }).schema).toBe("rojo");
+    expect(puntosDeLaPuerta({ ...CON_VALIDADOR, schema: [] }).schema).toBe("rojo");
+    const sinValidador: LecturaDelSitio = { ...SANO };
+    delete sinValidador.erroresDeSchema;
+    expect(puntosDeLaPuerta(sinValidador).schema).toBe("no-medido");
+    const incompleto = { ...CON_VALIDADOR, schema: ["Organization"] };
+    expect(puntosDeLaPuerta(incompleto).schema).toBe("verde");
+    expect(hallazgos(incompleto).map((h) => h.gravedad)).toEqual(["importante"]);
   });
 });

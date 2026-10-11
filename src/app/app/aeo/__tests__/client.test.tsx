@@ -302,3 +302,36 @@ describe("la auditoría desde la pantalla", () => {
     expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
   });
 });
+
+describe("GATE-7: los tres puntos de la puerta, con su color", () => {
+  it("muestra cada punto con el estado que trae la respuesta, uno por uno", async () => {
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://ejemplo.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [],
+        puntos: { acceso: "rojo", contenidoSinJs: "no-medido", schema: "verde" },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("puntos")).toBeTruthy());
+    const puntos = screen.getAllByTestId("punto").map((p) => [p.dataset.punto, p.dataset.estado, p.textContent]);
+    expect(puntos).toEqual([
+      ["acceso", "rojo", "Acceso por rastreadorROJO"],
+      ["contenidoSinJs", "no-medido", "Contenido sin JavaScriptNO MEDIDO"],
+      ["schema", "verde", "Schema verificableVERDE"],
+    ]);
+  });
+
+  it("una respuesta sin puntos no los inventa", async () => {
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => expect(screen.getByTestId("resultado")).toBeTruthy());
+    expect(screen.queryByTestId("puntos")).toBeNull();
+  });
+});

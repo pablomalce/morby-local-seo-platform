@@ -11,7 +11,7 @@ import {
   tiposDeSchema,
 } from "@/lib/aeo/lectura";
 import { statusPorAgente } from "@/lib/aeo/peticion";
-import { esLegiblePorIA, hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { esLegiblePorIA, hallazgos, puntosDeLaPuerta, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
 import { medirRenderizado } from "@/lib/aeo/renderizado";
 import {
@@ -256,6 +256,9 @@ export async function POST(req: Request) {
         guardada: !errorGuardado,
         lectura,
         hallazgos: lista,
+        // El color de cada punto de la puerta H2-GO-1, para que «rojo 3 de 3»
+        // y «verde 3 de 3» se lean de un dato y no de la prosa (GATE-7).
+        puntos: puntosDeLaPuerta(lectura),
         // `true` sólo sin bloqueantes Y con todo medido; `null` es «no se
         // sabe». La pantalla dice «sin hallazgos» sólo con `true`.
         legible: esLegiblePorIA(lista),

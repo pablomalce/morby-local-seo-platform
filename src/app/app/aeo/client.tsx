@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Badge, Card, HudLabel } from "@/components/ui";
-import type { Gravedad, Hallazgo } from "@/lib/aeo/hallazgos";
+import type { EstadoDelPunto, Gravedad, Hallazgo, PuntosDeLaPuerta } from "@/lib/aeo/hallazgos";
 import type { ResultadoRenderizado } from "@/lib/aeo/renderizado";
 
 /**
@@ -51,6 +51,8 @@ interface Resultado {
   legible?: boolean | null;
   /** Si la corrida quedó en `aeo_audits`. Hoy, contra la base real, no (ver `DatosCrudos`). */
   guardada?: boolean;
+  /** El color de cada punto de la puerta. Opcional: una respuesta vieja no lo trae, y no se inventa. */
+  puntos?: PuntosDeLaPuerta;
   /** Opcional: una respuesta sin lectura no rompe la pantalla, y no muestra números. */
   lectura?: {
     caracteresSinJs: number;
@@ -113,6 +115,42 @@ function DatosCrudos({ lectura, guardada }: { lectura: NonNullable<Resultado["le
           Esta corrida no quedó guardada: lo que ves acá es lo único que hay de ella.
         </p>
       )}
+    </div>
+  );
+}
+
+const NOMBRE_DEL_PUNTO: Record<keyof PuntosDeLaPuerta, string> = {
+  acceso: "Acceso por rastreador",
+  contenidoSinJs: "Contenido sin JavaScript",
+  schema: "Schema verificable",
+};
+
+const TONO_DEL_PUNTO: Record<EstadoDelPunto, "critical" | "success" | "outline"> = {
+  rojo: "critical",
+  verde: "success",
+  "no-medido": "outline",
+};
+
+/**
+ * Los tres puntos de la puerta H2-GO-1, cada uno con su color: lo que la
+ * puerta cuenta («rojo 3 de 3», «verde 3 de 3») se lee acá, no de la prosa de
+ * los hallazgos (GATE-7).
+ */
+function Puntos({ puntos }: { puntos: PuntosDeLaPuerta }) {
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-2" data-testid="puntos">
+      {(Object.keys(NOMBRE_DEL_PUNTO) as Array<keyof PuntosDeLaPuerta>).map((p) => (
+        <div
+          key={p}
+          className="rounded-vulkan border border-metal-800 bg-metal-950 p-3"
+          data-testid="punto"
+          data-punto={p}
+          data-estado={puntos[p]}
+        >
+          <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">{NOMBRE_DEL_PUNTO[p]}</p>
+          <Badge variant={TONO_DEL_PUNTO[puntos[p]]}>{puntos[p] === "no-medido" ? "NO MEDIDO" : puntos[p].toUpperCase()}</Badge>
+        </div>
+      ))}
     </div>
   );
 }
@@ -234,6 +272,7 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
             {resultado.url}
           </p>
 
+          {resultado.puntos && <Puntos puntos={resultado.puntos} />}
           {resultado.lectura && <TextoComparado lectura={resultado.lectura} />}
           {resultado.lectura && <DatosCrudos lectura={resultado.lectura} guardada={resultado.guardada} />}
 

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { contenidoSinJs, hallazgos, type Hallazgo, type LecturaDelSitio } from "../hallazgos";
+import { contenidoSinJs, hallazgos, type Hallazgo, type LecturaDelSitio, type PuntosDeLaPuerta } from "../hallazgos";
 import {
   accesoDeLasIA,
   erroresDeSchema,
@@ -119,6 +119,8 @@ async function auditarPorLaRuta(website: string) {
       urlFinal: string;
       lectura: LecturaDelSitio;
       hallazgos: Hallazgo[];
+      puntos: PuntosDeLaPuerta;
+      legible: boolean | null;
     },
   };
 }
@@ -215,6 +217,10 @@ describe("la página de control sale en rojo en los tres ejes", () => {
       // Lo que el despliegue hace con cada agente: 200 a todos. El bloqueo
       // vive SÓLO en el robots, y tiene que verse igual.
       expect(Object.values(cuerpo.lectura.statusPorAgente ?? {})).toEqual([200, 200, 200, 200, 200]);
+
+      // GATE-7: el color de cada punto viene en la respuesta, no se deduce de la prosa.
+      expect(cuerpo.puntos).toEqual({ acceso: "rojo", contenidoSinJs: "rojo", schema: "rojo" });
+      expect(cuerpo.legible).toBe(false);
 
       const bloqueantes = cuerpo.hallazgos.filter((h) => h.gravedad === "bloqueante");
       const textos = bloqueantes.map((h) => h.quePasa).join(" | ");
