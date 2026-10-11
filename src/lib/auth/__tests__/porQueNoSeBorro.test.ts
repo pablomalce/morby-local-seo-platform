@@ -6,7 +6,13 @@
  * nuevo llegue a la pantalla sin frase.
  */
 import { describe, expect, it } from "vitest";
-import { explicarBaja, loQueYaNoEsta, NADA_BORRADO, type MotivoDeBaja } from "../porQueNoSeBorro";
+import {
+  explicarBaja,
+  FRASE_SIN_RESPUESTA,
+  loQueYaNoEsta,
+  NADA_BORRADO,
+  type MotivoDeBaja,
+} from "../porQueNoSeBorro";
 
 const MOTIVOS: MotivoDeBaja[] = [
   "sin-sesion",
@@ -43,21 +49,48 @@ describe("loQueYaNoEsta", () => {
   it("con algo borrado NO dice «nothing», y nombra cada cosa con su número", () => {
     const f = loQueYaNoEsta({ ajenas: 2, propias: 1 });
     expect(f).not.toMatch(/Nothing/);
-    expect(f).toMatch(/removed from 2 organizations you do not own/);
-    expect(f).toMatch(/1 organization you owned was deleted/);
+    expect(f).toMatch(/removed from 2 organizations that are not only yours/);
+    expect(f).toMatch(/1 organization that was only yours was deleted/);
     expect(f).toMatch(/login is still there/);
   });
 
   it("sólo ajenas, o sólo propias", () => {
-    expect(loQueYaNoEsta({ ajenas: 1, propias: 0 })).toMatch(/removed from 1 organization you do not own\. /);
-    expect(loQueYaNoEsta({ ajenas: 0, propias: 3 })).toMatch(/^Already done: 3 organizations you owned were deleted/);
+    expect(loQueYaNoEsta({ ajenas: 1, propias: 0 })).toMatch(/removed from 1 organization that is not only yours\. /);
+    expect(loQueYaNoEsta({ ajenas: 0, propias: 3 })).toMatch(
+      /^Already done: 3 organizations that were only yours were deleted/,
+    );
   });
 
   it("«no se sabe cuántas» (null) no es cero, y no inventa un número", () => {
     const f = loQueYaNoEsta({ ajenas: null, propias: null });
     expect(f).not.toMatch(/Nothing/);
     expect(f).not.toMatch(/\d/);
-    expect(f).toMatch(/removed from organizations you do not own/);
+    expect(f).toMatch(/removed from organizations that are not only yours/);
     expect(f).toMatch(/may have been deleted/);
+  });
+});
+
+describe("FRASE_SIN_RESPUESTA — la acción no contestó", () => {
+  it("no dice que no se borró nada, ni inventa lo que ya no está, y es distinta de toda frase con motivo", () => {
+    // Sin respuesta, la cadena pudo cortarse en cualquier paso o terminar: decir
+    // «Nothing was deleted» podría ser mentira, y un número también.
+    expect(FRASE_SIN_RESPUESTA).not.toMatch(/Nothing was deleted|Already done/);
+    expect(FRASE_SIN_RESPUESTA).not.toMatch(/\d/);
+    expect(FRASE_SIN_RESPUESTA).toMatch(/could not confirm whether your account was deleted/);
+    expect(FRASE_SIN_RESPUESTA).toMatch(/resumes where it stopped/);
+    const conMotivo = MOTIVOS.map((m) => explicarBaja(m, NADA_BORRADO));
+    expect(conMotivo).not.toContain(FRASE_SIN_RESPUESTA);
+  });
+});
+
+describe("las frases nombran de quién es cada organización", () => {
+  it("ninguna dice «you do not own» ni «you owned»: una compartida es suya también, y no se borra", () => {
+    // Con varios owners, «you do not own» era falso para la compartida de la que
+    // sale, y «you owned» para la que queda entera con la otra owner.
+    const todas = [
+      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: 2, propias: 1 })),
+      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: null, propias: null })),
+    ];
+    for (const f of todas) expect(f).not.toMatch(/you do not own|you owned/);
   });
 });

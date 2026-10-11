@@ -30,27 +30,30 @@
 
 /** Por qué la cuenta no se borró (o no se borró entera). */
 export type MotivoDeBaja =
-  /** No hay sesión: no se sabe de quién es la cuenta. */
+  /**
+   * No se pudo confirmar la sesión: no la hay, `getUser` contestó error o lanzó.
+   * No se sabe de quién es la cuenta. No se borró nada.
+   */
   | "sin-sesion"
   /** No se pudo leer qué implica borrarla (sus organizaciones, sus sellos). No se borró nada. */
   | "no-se-pudo-verificar"
   /**
-   * Aprobó contenido en una organización que no es suya. Su firma está en ese
+   * Aprobó contenido en una organización que no es sólo suya. Su firma está en ese
    * sello, y la base no deja borrar a quien firmó (el CHECK de la 0015 no acepta
    * un sello sin firmante). No se borró nada.
    */
   | "sello-en-otra-organizacion"
   /**
    * Publicó una versión de la ficha, verificó evidencia o aprobó una tarjeta en
-   * una organización que no es suya. La base rechaza su salida de esa
+   * una organización que no es sólo suya. La base rechaza su salida de esa
    * organización (0026 decisión 4, 0029 decisión 3). No se borró nada.
    */
   | "firma-en-otra-organizacion"
-  /** No se pudo salir de las organizaciones ajenas por otro motivo. No se borró nada. */
+  /** No se pudo salir de las organizaciones que no son sólo suyas, por otro motivo. No se borró nada. */
   | "no-se-pudo-salir"
-  /** Salió de las ajenas, y las propias no se pudieron borrar. A medias. */
+  /** Salió de las demás, y las propias no se pudieron borrar. A medias. */
   | "no-se-pudieron-borrar-las-propias"
-  /** Salió de las ajenas y las propias se borraron; el acceso no. A medias. */
+  /** Salió de las demás y las propias se borraron; el acceso no. A medias. */
   | "no-se-pudo-borrar-el-acceso";
 
 /**
@@ -58,26 +61,30 @@ export type MotivoDeBaja =
  * cuántas»: no es lo mismo que cero, y la frase no inventa un número.
  */
 export interface YaBorrado {
-  /** Membresías en organizaciones que NO eran suyas, ya quitadas. */
+  /**
+   * Membresías ya quitadas en organizaciones que NO eran sólo suyas: de otra
+   * persona, compartidas con otro owner activo, o de las que la habían
+   * archivado. Esas organizaciones siguen.
+   */
   ajenas: number | null;
-  /** Organizaciones suyas, ya borradas con todo lo que tenían. */
+  /** Organizaciones sólo suyas (owner activa, sin otro owner activo), ya borradas con todo. */
   propias: number | null;
 }
 
 export const NADA_BORRADO: YaBorrado = Object.freeze({ ajenas: 0, propias: 0 });
 
 const CABECERA: Record<MotivoDeBaja, string> = {
-  "sin-sesion": "Your account was not deleted: you are not signed in.",
+  "sin-sesion": "Your account was not deleted: we could not confirm that you are signed in.",
   "no-se-pudo-verificar":
     "Your account was not deleted: we could not check what deleting it involves.",
   "sello-en-otra-organizacion":
-    "Your account was not deleted: you approved content in an organization you do not own, and that approval is signed with your name.",
+    "Your account was not deleted: you approved content in an organization that is not only yours, and that approval is signed with your name.",
   "firma-en-otra-organizacion":
-    "Your account was not deleted: you published a company profile version, verified evidence or approved a task in an organization you do not own, and that record is signed with your name.",
+    "Your account was not deleted: you published a company profile version, verified evidence or approved a task in an organization that is not only yours, and that record is signed with your name.",
   "no-se-pudo-salir":
-    "Your account was not deleted: we could not remove you from the organizations you do not own.",
+    "Your account was not deleted: we could not remove you from the organizations that are not only yours.",
   "no-se-pudieron-borrar-las-propias":
-    "Your account was not fully deleted: we could not delete the organizations you own.",
+    "Your account was not fully deleted: we could not delete the organizations that are only yours.",
   "no-se-pudo-borrar-el-acceso": "Your account was not fully deleted: we could not delete your login.",
 };
 
@@ -103,14 +110,14 @@ export function loQueYaNoEsta(ya: YaBorrado): string {
   const partes: string[] = [];
   if (ya.ajenas !== 0) {
     partes.push(
-      `you were removed from ${cuantas(ya.ajenas, "organization", "organizations")} you do not own`,
+      `you were removed from ${cuantas(ya.ajenas, "organization that is not only yours", "organizations that are not only yours")}`,
     );
   }
   if (ya.propias !== 0) {
     partes.push(
       ya.propias === null
-        ? "the organizations you owned may have been deleted"
-        : `${cuantas(ya.propias, "organization", "organizations")} you owned ${ya.propias === 1 ? "was" : "were"} deleted with everything in ${ya.propias === 1 ? "it" : "them"}`,
+        ? "the organizations that were only yours may have been deleted"
+        : `${cuantas(ya.propias, "organization that was only yours", "organizations that were only yours")} ${ya.propias === 1 ? "was" : "were"} deleted with everything in ${ya.propias === 1 ? "it" : "them"}`,
     );
   }
   if (partes.length === 0) return "Nothing was deleted.";
@@ -121,3 +128,18 @@ export function loQueYaNoEsta(ya: YaBorrado): string {
 export function explicarBaja(motivo: MotivoDeBaja, ya: YaBorrado): string {
   return `${CABECERA[motivo]} ${loQueYaNoEsta(ya)} ${QUE_HACER[motivo]}`;
 }
+
+/**
+ * La acción no contestó: la pantalla no recibió ni un motivo ni un `redirect`.
+ * Lo pone SÓLO la pantalla (`client.tsx`), por eso no está en `MotivoDeBaja`:
+ * la acción nunca lo devuelve.
+ */
+export type MotivoEnPantalla = MotivoDeBaja | "sin-respuesta";
+
+/**
+ * Sin respuesta no se sabe qué pasó: la cadena pudo cortarse en cualquier paso,
+ * o terminar y perderse la respuesta. La frase no dice «no se borró nada» ni
+ * inventa lo que ya no está; dice que reintentar retoma.
+ */
+export const FRASE_SIN_RESPUESTA =
+  "We could not confirm whether your account was deleted: the request did not finish, so we cannot tell what is already gone. Try again: the deletion resumes where it stopped.";
