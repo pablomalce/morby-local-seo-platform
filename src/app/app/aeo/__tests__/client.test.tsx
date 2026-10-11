@@ -112,6 +112,18 @@ describe("la auditoría desde la pantalla", () => {
     );
   });
 
+  it("un destino rechazado (red interna, puerto raro) tiene su frase, y no se lee como sitio caído", async () => {
+    respuesta = { ok: false, status: 422, cuerpo: { ok: false, motivo: "destino-rechazado", detalle: "red-no-publica" } };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+    await waitFor(() => {
+      const texto = screen.getByTestId("error-auditoria").textContent ?? "";
+      expect(texto).toMatch(/no se audita \(red-no-publica\)/);
+      expect(texto).toMatch(/sitios públicos/);
+    });
+    expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
+  });
+
   it("muestra los DOS números, servido y renderizado, uno al lado del otro", async () => {
     // Es lo que la puerta H2-GO-1 pide del sitio real: no «poco» o «mucho»,
     // sino cuánto texto sin JavaScript frente a cuánto en el DOM renderizado.

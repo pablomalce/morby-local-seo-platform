@@ -10,23 +10,33 @@
  * llegue a la lectura y al hallazgo, y que un render que falla no tumbe la
  * auditoría ni se lea como verde.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   navegadorDoble,
   resolvedorDoble,
   transporteDoble,
   type OpcionesDoble,
 } from "@/lib/aeo/__tests__/navegadorDoble";
-import type { DependenciasRender } from "@/lib/aeo/renderizado";
+import type { DependenciasRender, PedidoHttp, RespuestaHttp } from "@/lib/aeo/renderizado";
+import { esIpPublica } from "@/lib/profile/evidenceCheck";
 
 const NEGOCIO = "7d703707-4f9d-43bf-9305-6bc22eddf45f";
 
 let usuario: { id: string } | null = { id: "u1" };
 let negocio: { id: string; organization_id: string; website: string | null } | null = null;
 let errorLectura: { message: string } | null = null;
+/** Los archivos que la ruta pidió con su propio user-agent: robots, portada, llms. */
 let pedidos: string[] = [];
-/** Qué contesta cada URL. `null` = falla la petición. */
-let respuestas: Record<string, string | null> = {};
+/** Qué contesta cada URL a la ruta. `null` = 404. Un objeto, una redirección. */
+let respuestas: Record<string, string | null | { status: number; location: string }> = {};
+/**
+ * TODO pedido que salió por el transporte, de quien sea —la ruta, los agentes o
+ * el navegador—, con la dirección a la que se conectó. Es lo que los casos de
+ * SSRF miran: ninguna de estas direcciones puede ser interna.
+ */
+let salidas: Array<{ url: string; ip: string; ua: string }> = [];
+/** `fetch` no se usa: todo sale por el transporte examinado. Lo que llegue acá es una fuga. */
+let fetchLlamados: string[] = [];
 
 // Lo que la ruta escribió en `aeo_audits`, para afirmar que la tabla que el
 // #93 creó tiene por fin quien la escriba, y con qué.
@@ -54,22 +64,58 @@ let opcionesNavegador: OpcionesDoble = {};
 let navegador = navegadorDoble();
 let redRender = transporteDoble({});
 
+let porAgente: string[] = [];
+let statusParaAgente: (ua: string) => number = () => 200;
+/** Para un agente, una redirección en vez de un status: `null` = no redirige. */
+let redireccionParaAgente: (ua: string) => string | null = () => null;
+
+const AGENTE_DE_LA_RUTA = "VulkanGrowthOS/1.0 (auditoria AEO)";
+
+/**
+ * Un solo transporte para todo, como en producción. Se reparte por quién
+ * pide: la ruta con su user-agent pide archivos; un agente de IA pregunta
+ * «¿y a éste cómo lo tratás?»; el resto es el navegador doble dibujando.
+ */
+async function transporte(pedido: PedidoHttp): Promise<RespuestaHttp> {
+  const ua = pedido.encabezados["user-agent"] ?? "";
+  salidas.push({ url: pedido.url, ip: pedido.ip, ua });
+  if (ua === AGENTE_DE_LA_RUTA) {
+    pedidos.push(pedido.url);
+    const r = respuestas[pedido.url];
+    if (r === null || r === undefined) return { tipo: "respuesta", status: 404, encabezados: {}, cuerpo: Buffer.from("") };
+    if (typeof r === "object") return { tipo: "respuesta", status: r.status, encabezados: { location: r.location }, cuerpo: Buffer.from("") };
+    return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(r) };
+  }
+  if (ua !== "doble") {
+    porAgente.push(ua);
+    const destino = redireccionParaAgente(ua);
+    if (destino) return { tipo: "respuesta", status: 302, encabezados: { location: destino }, cuerpo: Buffer.from("") };
+    return { tipo: "respuesta", status: statusParaAgente(ua), encabezados: {}, cuerpo: Buffer.from("") };
+  }
+  return redRender.transporte(pedido);
+}
+
+const DNS = {
+  "ejemplo.com": ["93.184.216.34"],
+  "otro-sitio.com": ["151.101.1.1"],
+  "interno.test": ["10.0.0.7"],
+  "mixto.test": ["93.184.216.34", "127.0.0.1"],
+};
+
 vi.mock("@/lib/aeo/chromium", () => ({
   dependenciasDeProduccion: (): DependenciasRender => {
     navegador = navegadorDoble(opcionesNavegador);
     redRender = transporteDoble(paginasRender);
     return {
       abrirNavegador: navegador.abrirNavegador,
-      transporte: redRender.transporte,
-      resolver: resolvedorDoble({ "ejemplo.com": ["93.184.216.34"], "otro-sitio.com": ["151.101.1.1"] }).resolver,
+      transporte,
+      resolver: resolvedorDoble(DNS).resolver,
     };
   },
 }));
 
 const { POST } = await import("../route");
 
-let porAgente: string[] = [];
-let statusParaAgente: (ua: string) => number = () => 200;
 let n = 0;
 function pedido(cuerpo: unknown): Request {
   n += 1;
@@ -95,35 +141,36 @@ beforeEach(() => {
   guardadas = [];
   errorGuardado = null;
   pedidos = [];
+  salidas = [];
+  fetchLlamados = [];
   porAgente = [];
   statusParaAgente = () => 200;
+  redireccionParaAgente = () => null;
   respuestas = {
     "https://ejemplo.com/robots.txt": "User-agent: *\nDisallow:",
     "https://ejemplo.com/": HTML_SANO,
     "https://ejemplo.com/llms.txt": "# llms",
   };
-  // Por defecto, el navegador ve la misma portada que el fetch: una página SSR.
+  // Por defecto, el navegador ve la misma portada que la ruta: una página SSR.
   paginasRender = { "https://ejemplo.com/": { cuerpo: HTML_SANO } };
   opcionesNavegador = {};
   navegador = navegadorDoble();
   redRender = transporteDoble({});
-  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
-    const ua = init ? new Headers(init.headers).get("user-agent") : null;
-    // Las peticiones por agente se registran aparte: no son «archivos que
-    // pide», son «cómo lo tratan», y un test de abajo las cuenta. Se
-    // distinguen por el user-agent: el propio de la auditoría pide archivos;
-    // cualquier otro es la ruta preguntando «¿y a éste cómo lo tratás?».
-    if (ua && !ua.startsWith("VulkanGrowthOS/")) {
-      porAgente.push(ua);
-      return { ok: true, status: statusParaAgente(ua), text: async () => "" } as Response;
-    }
-    pedidos.push(url);
-    const cuerpo = respuestas[url];
-    if (cuerpo === null || cuerpo === undefined) {
-      return { ok: false, status: 404, text: async () => "" } as Response;
-    }
-    return { ok: true, status: 200, text: async () => cuerpo } as Response;
+  vi.stubGlobal("fetch", async (url: string) => {
+    fetchLlamados.push(String(url));
+    throw new Error("la ruta no usa fetch: todo pedido pasa por el transporte examinado");
   });
+});
+
+afterEach(() => {
+  // En TODOS los casos: `fetch` sigue redirecciones y resuelve el nombre por
+  // su cuenta, sin examen. Un solo pedido por ahí es la fuga de SEC-1.
+  expect(fetchLlamados, "un pedido salió por fetch, sin examen de la dirección").toEqual([]);
+  // Y lo que salió por el transporte, salió a una dirección pública.
+  expect(
+    salidas.filter((x) => !esIpPublica(x.ip)),
+    "un pedido se conectó a una dirección que no es pública"
+  ).toEqual([]);
 });
 
 describe("qué audita, y de dónde saca la URL", () => {
@@ -320,5 +367,80 @@ describe("el DOM renderizado: la otra mitad del punto «contenido sin JavaScript
 
     expect(navegador.registro.aperturas).toBe(0);
     expect(redRender.pedidos).toHaveLength(0);
+  });
+});
+
+/**
+ * SEC-1. El sitio sale de `businesses.website`, y esa columna la escribe
+ * cualquier miembro de la organización: que venga del negocio no la vuelve
+ * segura. Antes, el `robots.txt`, la portada, el `llms.txt` y los cinco
+ * pedidos por agente iban por `fetch` con `redirect: "follow"` y sin mirar la
+ * dirección —reproducido con un canario: la portada trajo el cuerpo de un
+ * servicio interno detrás de un 302, y los cinco agentes devolvieron su status,
+ * que es un escáner de puertos—. Ahora cada salto pasa por el examen.
+ */
+describe("SEC-1: ningún pedido de la ruta llega a una dirección que no es pública", () => {
+  it.each([
+    ["http://127.0.0.1/", "red-no-publica"],
+    ["http://127.0.0.1:58602/secret", "puerto"],
+    ["http://169.254.169.254/latest/meta-data/", "red-no-publica"],
+    ["http://10.0.0.7/", "red-no-publica"],
+    ["http://[::1]/", "red-no-publica"],
+    ["http://2130706433/", "red-no-publica"],
+    ["http://interno.test/", "red-no-publica"],
+    ["http://mixto.test/", "red-no-publica"],
+    ["http://admin:clave@ejemplo.com/", "credenciales"],
+  ])("un negocio con el sitio en %s: 422 `destino-rechazado`, y CERO pedidos", async (sitio, motivo) => {
+    negocio = { id: NEGOCIO, organization_id: "org-1", website: sitio };
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ ok: false, motivo: "destino-rechazado", detalle: motivo });
+    expect(salidas, "ni robots, ni portada, ni llms, ni agentes, ni navegador").toEqual([]);
+    expect(navegador.registro.aperturas).toBe(0);
+  });
+
+  it("un sitio PÚBLICO que redirige la portada a la metadata: el destino no se pide", async () => {
+    respuestas["https://ejemplo.com/"] = { status: 302, location: "http://169.254.169.254/latest/meta-data/" };
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ ok: false, motivo: "destino-rechazado", detalle: "red-no-publica" });
+    expect(salidas.some((x) => x.url.includes("169.254.169.254"))).toBe(false);
+    expect(navegador.registro.aperturas).toBe(0);
+  });
+
+  it("una redirección a un NOMBRE que resuelve adentro se examina por su dirección, no por su nombre", async () => {
+    respuestas["https://ejemplo.com/"] = { status: 301, location: "http://interno.test/admin" };
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    expect((await res.json()).motivo).toBe("destino-rechazado");
+    expect(salidas.some((x) => x.url.includes("interno.test"))).toBe(false);
+  });
+
+  it("los AGENTES que el sitio redirige adentro quedan sin código: no hay oráculo de status", async () => {
+    // El caso del canario: el sitio público contesta 302 a un servicio
+    // interno sólo a los rastreadores. Antes, los cinco devolvían el status
+    // del servicio interno en `lectura.statusPorAgente`.
+    redireccionParaAgente = () => "http://127.0.0.1:58602/secret";
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    const cuerpo = (await res.json()) as { lectura: { statusPorAgente: Record<string, number | null> } };
+    expect(res.status).toBe(200);
+    expect(Object.values(cuerpo.lectura.statusPorAgente)).toEqual([null, null, null, null, null]);
+    expect(porAgente).toHaveLength(5);
+    expect(salidas.some((x) => x.url.includes("58602"))).toBe(false);
+  });
+
+  it("un `robots.txt` que redirige adentro no se lee, y dice por qué", async () => {
+    respuestas["https://ejemplo.com/robots.txt"] = { status: 302, location: "http://10.0.0.7/robots.txt" };
+    const cuerpo = await (await POST(pedido({ businessId: NEGOCIO }))).json();
+    expect(cuerpo.robotsLeido).toBe(false);
+    expect(cuerpo.motivoRobots).toBe("red-no-publica");
+    expect(salidas.some((x) => x.url.includes("10.0.0.7"))).toBe(false);
+  });
+
+  it("una redirección SANA se sigue, y su destino también pasa por el examen", async () => {
+    respuestas["https://ejemplo.com/"] = { status: 301, location: "/inicio" };
+    respuestas["https://ejemplo.com/inicio"] = HTML_SANO;
+    const res = await POST(pedido({ businessId: NEGOCIO }));
+    expect(res.status).toBe(200);
+    expect(pedidos).toEqual(expect.arrayContaining(["https://ejemplo.com/", "https://ejemplo.com/inicio"]));
   });
 });

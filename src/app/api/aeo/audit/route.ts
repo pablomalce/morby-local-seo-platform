@@ -13,6 +13,7 @@ import { statusPorAgente } from "@/lib/aeo/peticion";
 import { hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
 import { medirRenderizado } from "@/lib/aeo/renderizado";
+import { crearRedExaminada, MOTIVOS_DE_BLOQUEO, traerExaminado, type RedExaminada } from "@/lib/aeo/red";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -41,6 +42,14 @@ export const maxDuration = 60;
  * la IP de la plataforma. Se lee de `businesses` COMO EL USUARIO, así que la RLS
  * contesta la membresía y sólo se puede auditar el sitio de un cliente propio.
  *
+ * Y QUE VENGA DEL NEGOCIO NO LO HACE SEGURO: lo escribe cualquier miembro de
+ * la organización. Por eso TODO pedido de esta ruta —el `robots.txt`, la
+ * portada, el `llms.txt`, uno por agente y el render— examina la dirección de
+ * cada salto antes de conectarse, y sigue las redirecciones a mano, volviendo
+ * a examinar el destino (`red.ts`). Un sitio cargado como `http://10.0.0.7/`,
+ * o uno público que redirige a la metadata, se contesta `destino-rechazado`
+ * sin un solo pedido a esa dirección.
+ *
  * UN FALLO DE RED NO ES UN HALLAZGO
  *
  * Si el `robots.txt` no se pudo traer, eso NO es «permite a todos»: es que no se
@@ -53,27 +62,20 @@ const schema = z.object({ businessId: z.string().uuid() });
 /** Un sitio ajeno no tiene por qué contestar rápido, ni nosotros que esperarlo. */
 const TIMEOUT_MS = 8_000;
 
-async function traer(
-  url: string
-): Promise<{ ok: true; texto: string } | { ok: false; motivo: string }> {
-  const corte = new AbortController();
-  const reloj = setTimeout(() => corte.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      signal: corte.signal,
-      redirect: "follow",
-      headers: { "user-agent": "VulkanGrowthOS/1.0 (auditoria AEO)" },
-      cache: "no-store",
-    });
-    // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
-    // significa que el archivo no está, que es exactamente lo que se pregunta.
-    if (!res.ok) return { ok: false, motivo: `http ${res.status}` };
-    return { ok: true, texto: await res.text() };
-  } catch (e) {
-    return { ok: false, motivo: (e as Error).name === "AbortError" ? "timeout" : "sin-respuesta" };
-  } finally {
-    clearTimeout(reloj);
-  }
+/** Lo que se lee de un sitio ajeno, como mucho: lo mismo que el render. */
+const MAX_BYTES = 5 * 1024 * 1024;
+
+const AGENTE = "VulkanGrowthOS/1.0 (auditoria AEO)";
+
+type Traido = { ok: true; texto: string } | { ok: false; motivo: string; bloqueado: boolean };
+
+async function traer(red: RedExaminada, url: string): Promise<Traido> {
+  const t = await traerExaminado(red, url, { userAgent: AGENTE, timeoutMs: TIMEOUT_MS, maxBytes: MAX_BYTES });
+  if (!t.ok) return { ok: false, motivo: t.motivo, bloqueado: MOTIVOS_DE_BLOQUEO.has(t.motivo) };
+  // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
+  // significa que el archivo no está, que es exactamente lo que se pregunta.
+  if (t.status < 200 || t.status >= 300) return { ok: false, motivo: `http ${t.status}`, bloqueado: false };
+  return { ok: true, texto: t.cuerpo.toString("utf8") };
 }
 
 export async function POST(req: Request) {
@@ -115,15 +117,29 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, motivo: "sitio-ilegible" }, { status: 409 });
     }
 
+    // Las dependencias de red se arman una vez: el mismo resolvedor y el
+    // mismo transporte para los pedidos de la ruta y para el render.
+    const deps = dependenciasDeProduccion();
+    const red = crearRedExaminada(deps);
+
     const [robots, portada, llms] = await Promise.all([
-      traer(new URL("/robots.txt", base).toString()),
-      traer(base.toString()),
-      traer(new URL("/llms.txt", base).toString()),
+      traer(red, new URL("/robots.txt", base).toString()),
+      traer(red, base.toString()),
+      traer(red, new URL("/llms.txt", base).toString()),
     ]);
 
     // La portada es la única imprescindible: sin ella no hay ni schema ni texto
     // que medir, y devolver ceros sería inventar dos hallazgos.
     if (!portada.ok) {
+      // Un destino que el examen rechaza no es un sitio caído: es una
+      // dirección que esta ruta no pide —red interna, puerto raro, esquema
+      // que no es web—, y se dice distinto porque se arregla distinto.
+      if (portada.bloqueado) {
+        return NextResponse.json(
+          { ok: false, motivo: "destino-rechazado", detalle: portada.motivo },
+          { status: 422 }
+        );
+      }
       return NextResponse.json(
         { ok: false, motivo: "sitio-inalcanzable", detalle: portada.motivo },
         { status: 502 }
@@ -145,8 +161,8 @@ export async function POST(req: Request) {
     // falla vuelve como `{ estado: "fallo", codigo }`, y el hallazgo lo dice
     // como «no medido», no como un cero.
     const [statusAgentes, caracteresRenderizados] = await Promise.all([
-      statusPorAgente(base.toString()),
-      medirRenderizado(base.toString(), dependenciasDeProduccion()),
+      statusPorAgente(base.toString(), red),
+      medirRenderizado(base.toString(), deps),
     ]);
     const lectura: LecturaDelSitio = {
       acceso: accesoDeLasIA(textoRobots),

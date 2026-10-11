@@ -136,6 +136,12 @@ export interface PedidoHttp {
   timeoutMs: number;
   /** Bytes de cuerpo como máximo, ya descomprimido. Pasado eso, `demasiado-grande`. */
   maxBytes: number;
+  /**
+   * Sólo el status y los encabezados: el cuerpo no se lee y la conexión se
+   * corta. Lo usan los pedidos de la ruta que preguntan «¿cómo trata el sitio a
+   * este agente?» (`red.ts`), no el navegador, que necesita el cuerpo.
+   */
+  sinCuerpo?: boolean;
 }
 
 export type RespuestaHttp =

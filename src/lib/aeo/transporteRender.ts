@@ -28,6 +28,15 @@
  *     se infla a 1 GB es la bomba de compresión, y `maxOutputLength` la corta;
  *   - ninguna redirección se sigue acá: el 3xx vuelve al navegador, y el pedido
  *     al destino vuelve a pasar por el examen de `renderizado.ts`.
+ *
+ * NO ES SÓLO DEL NAVEGADOR
+ *
+ * Los pedidos que la ruta hace sin navegador —el `robots.txt`, la portada, el
+ * `llms.txt` y uno por agente de IA— usan este mismo transporte, a través de
+ * `red.ts`, que examina cada salto con el mismo examinador. Antes iban por
+ * `fetch` con `redirect: "follow"` y sin examen: un sitio cargado como
+ * `http://127.0.0.1:…`, o uno público que redirigía a la metadata, se pedía
+ * igual desde la función.
  */
 import http from "node:http";
 import https from "node:https";
@@ -65,6 +74,14 @@ function decodificar(cuerpo: Buffer, codificacion: string, maxBytes: number): Bu
     default:
       throw new Error(`codificación desconocida: ${codificacion}`);
   }
+}
+
+function copiar(encabezados: http.IncomingHttpHeaders): Record<string, string | string[]> {
+  const devueltos: Record<string, string | string[]> = {};
+  for (const [nombre, valor] of Object.entries(encabezados)) {
+    if (valor !== undefined) devueltos[nombre] = valor;
+  }
+  return devueltos;
 }
 
 export function crearTransporteRender(opciones: OpcionesTransporteRender = {}): Transporte {
@@ -133,6 +150,12 @@ export function crearTransporteRender(opciones: OpcionesTransporteRender = {}): 
       }
 
       req.on("response", (res) => {
+        if (pedido.sinCuerpo) {
+          terminar({ tipo: "respuesta", status: res.statusCode ?? 0, encabezados: copiar(res.headers), cuerpo: Buffer.alloc(0) });
+          res.destroy();
+          req.destroy();
+          return;
+        }
         const partes: Buffer[] = [];
         let leidos = 0;
         // Antes de descomprimir también hay tope: un cuerpo comprimido más
@@ -162,11 +185,7 @@ export function crearTransporteRender(opciones: OpcionesTransporteRender = {}): 
             terminar({ tipo: "error", motivo: tope ? "demasiado-grande" : "sin-respuesta" });
             return;
           }
-          const devueltos: Record<string, string | string[]> = {};
-          for (const [nombre, valor] of Object.entries(res.headers)) {
-            if (valor !== undefined) devueltos[nombre] = valor;
-          }
-          terminar({ tipo: "respuesta", status: res.statusCode ?? 0, encabezados: devueltos, cuerpo });
+          terminar({ tipo: "respuesta", status: res.statusCode ?? 0, encabezados: copiar(res.headers), cuerpo });
         });
       });
       req.on("error", (error: NodeJS.ErrnoException) => {

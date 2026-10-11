@@ -110,7 +110,9 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
             ? `El sitio no respondió (${cuerpo.detalle ?? "sin detalle"}). Eso NO significa que esté bien ni mal: no se pudo mirar.`
             : cuerpo.motivo === "sitio-ilegible"
               ? "La dirección cargada no es una URL válida."
-              : `No se pudo auditar (${res.status}).`;
+              : cuerpo.motivo === "destino-rechazado"
+                ? `La dirección del sitio no se audita (${cuerpo.detalle ?? "sin detalle"}): sólo se piden sitios públicos, por http o https, en los puertos 80 y 443. Si redirige, cada salto tiene que cumplirlo.`
+                : `No se pudo auditar (${res.status}).`;
       setError(dicho);
       return;
     }

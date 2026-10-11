@@ -10,6 +10,9 @@ import {
   tiposDeSchema,
 } from "../lectura";
 import { bloqueadoPorHttp, statusPorAgente, USER_AGENTS } from "../peticion";
+import { crearRedExaminada } from "../red";
+import type { Transporte } from "../renderizado";
+import { resolvedorDoble } from "./navegadorDoble";
 
 /**
  * H2-GO-1 — la auditoría contra una página que TIENE que salir en rojo.
@@ -86,16 +89,20 @@ describe("la página de control sale en rojo en los tres ejes", () => {
 
   it("eje 3b — el acceso se mide con una PETICIÓN real por agente, no leyendo el robots", async () => {
     const vistos: Array<{ ua: string; status: number }> = [];
-    const servidor = async (_url: string, init: RequestInit) => {
-      const ua = String(new Headers(init.headers).get("user-agent"));
+    const servidor: Transporte = async (pedido) => {
+      const ua = pedido.encabezados["user-agent"] ?? "";
       // Un CDN que dice «no» a GPTBot con el robots abierto: el caso que sólo
       // una petición real puede ver.
       const status = ua.includes("GPTBot") ? 403 : 200;
       vistos.push({ ua, status });
-      return { status } as Response;
+      return { tipo: "respuesta", status, encabezados: {}, cuerpo: Buffer.alloc(0) };
     };
+    const red = crearRedExaminada({
+      transporte: servidor,
+      resolver: resolvedorDoble({ "control.test": ["93.184.216.34"] }).resolver,
+    });
 
-    const status = await statusPorAgente("https://control.test/aeo-control/", servidor);
+    const status = await statusPorAgente("https://control.test/aeo-control/", red);
 
     expect(Object.keys(status).sort()).toEqual(Object.keys(USER_AGENTS).sort());
     expect(vistos.map((v) => v.ua)).toEqual(expect.arrayContaining(Object.values(USER_AGENTS)));
