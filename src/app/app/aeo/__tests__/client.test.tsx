@@ -170,6 +170,12 @@ describe("la auditoría desde la pantalla", () => {
     expect(screen.getByTestId("texto-servido").textContent).toBe("0 caracteres");
     expect(screen.getByTestId("texto-en-html").textContent).toMatch(/1\.?669/);
     expect(screen.getByTestId("texto-comparado").textContent).toMatch(/visible/);
+    // GATE-2: y el renderizado, CON `servidos` en la respuesta. El único caso
+    // que miraba esta caja venía sin `servidos`, así que mostrar el servido en
+    // el lugar del renderizado («0 frente a 0») pasaba la suite entera.
+    const renderizado = screen.getByTestId("texto-renderizado");
+    expect(renderizado.dataset.estado).toBe("medido");
+    expect(renderizado.textContent?.replace(/\D/g, "")).toBe("3171");
   });
 
   it("P6: muestra los datos CRUDOS aunque el sitio esté sano —código por agente, tipos y errores de schema—", async () => {
