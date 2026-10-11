@@ -1,6 +1,6 @@
 import type { AgenteIA } from "./lectura";
 import { AGENTES_IA } from "./lectura";
-import { traerExaminado, type RedExaminada } from "./red";
+import { PLAZO_POR_PEDIDO_DE_LA_RUTA_MS, traerExaminado, type RedExaminada } from "./red";
 
 /**
  * La petición REAL con el user-agent del rastreador, y el código que volvió.
@@ -31,7 +31,11 @@ export const USER_AGENTS: Record<AgenteIA, string> = {
 
 export type StatusPorAgente = Record<AgenteIA, number | null>;
 
-export async function statusPorAgente(url: string, red: RedExaminada, timeoutMs = 8_000): Promise<StatusPorAgente> {
+export async function statusPorAgente(
+  url: string,
+  red: RedExaminada,
+  timeoutMs = PLAZO_POR_PEDIDO_DE_LA_RUTA_MS
+): Promise<StatusPorAgente> {
   const salida = {} as StatusPorAgente;
   await Promise.all(
     AGENTES_IA.map(async (agente) => {

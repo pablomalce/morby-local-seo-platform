@@ -40,6 +40,15 @@ import {
   type Transporte,
 } from "./renderizado";
 
+/**
+ * El plazo de cada pedido que la ruta hace sin navegador —la portada, el
+ * `robots.txt`, el `llms.txt` y uno por agente—, TOTAL por cadena de
+ * redirecciones. Un sitio ajeno no tiene por qué contestar rápido, ni nosotros
+ * que esperarlo. Está acá, y no en la ruta, para que el presupuesto entero de
+ * la ruta se pueda sumar en un test (`renderizado.test.ts`, RT-2).
+ */
+export const PLAZO_POR_PEDIDO_DE_LA_RUTA_MS = 8_000;
+
 export interface RedExaminada {
   examinar: Examinador;
   transporte: Transporte;

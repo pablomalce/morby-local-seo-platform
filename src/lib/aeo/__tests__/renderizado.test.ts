@@ -389,6 +389,35 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
   });
 });
 
+/**
+ * RT-2. Medido con el headless shell de producción en AL2023 con 1 vCPU y
+ * `/tmp` vacío: el arranque en frío (descomprimir y lanzar) tardó 3,8, 6,0 y
+ * 7,1 s, y una página estática de Next.js, 13 a 22,9 s en frío —y una de 7
+ * corridas, 24,4 s y `timeout`—. Con 25 s de tope total, la primera auditoría
+ * de una instancia fría no medía, sin que el sitio cambiara.
+ */
+describe("RT-2: el presupuesto alcanza para un arranque en frío y una página lenta", () => {
+  it("arranque en frío de 7,1 s y una página que tarda 18 s en cargar: se MIDE (27 s en total, como el `timeout` de 27,3 s medido)", async () => {
+    const html = `<html><body><main><p>${"Texto servido por el servidor. ".repeat(60)}</p></main></body></html>`;
+    const { deps, reloj } = armar({ "http://sitio.test/": { cuerpo: html } }, { arranqueVirtualMs: 7_100, navegacionVirtualMs: 18_000 });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    expect(reloj.ahora()).toBeGreaterThan(25_000);
+  });
+
+  it("el peor caso de la ruta cabe en su maxDuration: la portada, el render entero y el cierre", async () => {
+    const { readFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const fuente = readFileSync(path.join(process.cwd(), "src", "app", "api", "aeo", "audit", "route.ts"), "utf8");
+    const maxDuration = Number(fuente.match(/export\s+const\s+maxDuration\s*=\s*(\d+)/)?.[1]);
+    const { PLAZO_POR_PEDIDO_DE_LA_RUTA_MS } = await import("../red");
+    expect(maxDuration).toBeGreaterThan(0);
+    // La portada va sola y antes; el render corre al lado del robots y los agentes.
+    const peorCaso = PLAZO_POR_PEDIDO_DE_LA_RUTA_MS + OPCIONES_RENDER.topeMs + OPCIONES_RENDER.cierreMs;
+    expect(peorCaso + 3_000, "tres segundos para la sesión, la base y la respuesta").toBeLessThanOrEqual(maxDuration * 1_000);
+  });
+});
+
 const SANO_PUNTO: LecturaDelSitio = {
   acceso: TODOS_ENTRAN,
   caracteresSinJs: 4_000,

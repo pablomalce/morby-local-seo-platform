@@ -14,15 +14,22 @@ import { statusPorAgente } from "@/lib/aeo/peticion";
 import { esLegiblePorIA, hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
 import { medirRenderizado } from "@/lib/aeo/renderizado";
-import { crearRedExaminada, MOTIVOS_DE_BLOQUEO, traerExaminado, type RedExaminada } from "@/lib/aeo/red";
+import {
+  crearRedExaminada,
+  MOTIVOS_DE_BLOQUEO,
+  PLAZO_POR_PEDIDO_DE_LA_RUTA_MS,
+  traerExaminado,
+  type RedExaminada,
+} from "@/lib/aeo/red";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 /**
  * La portada (8 s, redirecciones incluidas), y después, en paralelo, el
  * `robots.txt` y el `llms.txt` del origen al que llevó la portada (8 s), las
- * cinco por agente (8 s) y el render en Chromium (`renderizado.ts`: 25 s de
- * tope total, más 5 s para cerrar el navegador). Peor caso, unos 38 s.
+ * cinco por agente (8 s) y el render en Chromium (`renderizado.ts`: 40 s de
+ * tope total, más 5 s para cerrar el navegador). Peor caso, unos 53 s: la
+ * cuenta la suma `renderizado.test.ts` (RT-2).
  *
  * 59 y no 60, A PROPÓSITO: el builder de Vercel junta en UNA función las rutas
  * con la misma configuración. MEDIDO con `vercel inspect` sobre la preview de
@@ -73,7 +80,7 @@ export const maxDuration = 59;
 const schema = z.object({ businessId: z.string().uuid() });
 
 /** Un sitio ajeno no tiene por qué contestar rápido, ni nosotros que esperarlo. */
-const TIMEOUT_MS = 8_000;
+const TIMEOUT_MS = PLAZO_POR_PEDIDO_DE_LA_RUTA_MS;
 
 /** Lo que se lee de un sitio ajeno, como mucho: lo mismo que el render. */
 const MAX_BYTES = 5 * 1024 * 1024;

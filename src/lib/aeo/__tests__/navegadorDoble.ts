@@ -132,6 +132,13 @@ export interface OpcionesDoble {
   arranqueFalla?: boolean;
   /** El arranque tarda esto antes de devolver el navegador. */
   arranqueMs?: number;
+  /**
+   * El arranque y la navegación de la pestaña con JavaScript, en tiempo
+   * VIRTUAL (avanzan `reloj`): un arranque en frío y una página lenta, sin
+   * que el test duerma (RT-2).
+   */
+  arranqueVirtualMs?: number;
+  navegacionVirtualMs?: number;
   /** `navegar` no termina nunca: un sitio que no llega al `load`. */
   navegacionColgada?: boolean;
   /** `nuevaPagina` tira: el navegador murió entre el arranque y la pestaña. */
@@ -203,6 +210,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       async navegar(url) {
         if (!atender) throw new Error("el doble necesita el interceptor antes de navegar");
         if (opciones.navegacionColgada) await new Promise(() => {});
+        if (!sinJs && opciones.navegacionVirtualMs) await opciones.reloj?.esperar?.(opciones.navegacionVirtualMs);
 
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
@@ -281,6 +289,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
 
   const abrirNavegador: AbrirNavegador = async () => {
     if (opciones.arranqueMs) await new Promise((r) => setTimeout(r, opciones.arranqueMs));
+    if (opciones.arranqueVirtualMs) await opciones.reloj?.esperar?.(opciones.arranqueVirtualMs);
     if (opciones.arranqueFalla) throw new Error("no hay Chromium");
     registro.aperturas += 1;
     const navegador: NavegadorAbierto = {

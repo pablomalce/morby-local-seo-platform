@@ -143,13 +143,21 @@
  *
  * EL TIEMPO
  *
- * `TOPE_MS` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
+ * `topeMs` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
  * Chromium la primera vez—, navegación, quietud, recorrido, lectura y la
  * pestaña sin JavaScript. La ruta lo corre en paralelo con los pedidos por
- * agente, después de traer la portada (8 s), así que el peor caso es 8 + 25 +
- * 5 de cierre = 38 s, dentro de los 59 s de `maxDuration` de la ruta (59 y no
- * 60 a propósito: ver la ruta). El navegador se cierra en `finally`, también
- * cuando vence el plazo, y si el cierre se cuelga `chromium.ts` mata el proceso.
+ * agente, después de traer la portada (8 s), así que el peor caso es 8 + 40 +
+ * 5 de cierre = 53 s, dentro de los 59 s de `maxDuration` de la ruta (59 y no
+ * 60 a propósito: ver la ruta; `renderizado.test.ts` suma la cuenta). El
+ * navegador se cierra en `finally`, también cuando vence el plazo, y si el
+ * cierre se cuelga `chromium.ts` mata el proceso.
+ *
+ * 40 y no 25 (RT-2). MEDIDO con el headless shell de producción en AL2023 con
+ * 1 vCPU: el arranque en frío tardó hasta 7,1 s, una página estática de
+ * Next.js hasta 22,9 s en frío —y una de siete corridas, `timeout` a los
+ * 24,4 s—, y la web de Vulkan 27,3 s en caliente (`timeout`). Con 25 s, la
+ * primera auditoría de una instancia fría no medía sin que el sitio cambiara,
+ * y la puerta pide rojo 3/3 y verde 3/3 en la MISMA corrida.
  *
  * LO QUE ESTE ARCHIVO NO SABE
  *
@@ -333,7 +341,7 @@ export interface OpcionesRender {
 }
 
 export const OPCIONES_RENDER: OpcionesRender = {
-  topeMs: 25_000,
+  topeMs: 40_000,
   plazoPorPedidoMs: 8_000,
   quietudMs: 3_000,
   desplazarMs: 2_000,
