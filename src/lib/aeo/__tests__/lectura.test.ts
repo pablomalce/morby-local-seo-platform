@@ -83,6 +83,57 @@ describe("quién puede entrar según robots.txt", () => {
   });
 });
 
+/**
+ * GATE-4: la coincidencia de RFC 9309, no un prefijo. `aplica` hacía sólo
+ * `startsWith`, y además cualquier `Allow` que coincidiera le ganaba a un
+ * `Disallow`. Medido con vitest: `Disallow: /*` dejaba entrar a GPTBot en la
+ * raíz, y `Allow: /` más `Disallow: /aeo-control` lo dejaba entrar a
+ * `/aeo-control`. Con el status por agente en 200, la ruta decía «Los
+ * rastreadores entran» sobre páginas bloqueadas.
+ */
+describe("GATE-4: la coincidencia de RFC 9309 —comodines, fin de ruta y la regla más larga—", () => {
+  it("`*` coincide con cualquier secuencia: `Disallow: /*` bloquea todo, y `/*control` bloquea /aeo-control", () => {
+    expect(agentePuede("User-agent: GPTBot\nDisallow: /*", "gptbot", "/")).toBe(false);
+    expect(agentePuede("User-agent: GPTBot\nDisallow: /*", "gptbot", "/aeo-control")).toBe(false);
+    expect(agentePuede("User-agent: GPTBot\nDisallow: /*control", "gptbot", "/aeo-control")).toBe(false);
+    expect(agentePuede("User-agent: GPTBot\nDisallow: /*control", "gptbot", "/precios")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /*.pdf", "gptbot", "/docs/folleto.pdf")).toBe(false);
+  });
+
+  it("`$` ancla el final: `/aeo-control$` bloquea /aeo-control y no /aeo-control/otra", () => {
+    const robots = "User-agent: GPTBot\nDisallow: /aeo-control$";
+    expect(agentePuede(robots, "gptbot", "/aeo-control")).toBe(false);
+    expect(agentePuede(robots, "gptbot", "/aeo-control/otra")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /*.php$", "gptbot", "/index.php")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: /*.php$", "gptbot", "/index.php?x=1")).toBe(true);
+  });
+
+  it("gana la regla MÁS LARGA, no la primera ni la de `Allow`: `Allow: /` y `Disallow: /aeo-control`", () => {
+    const robots = "User-agent: GPTBot\nAllow: /\nDisallow: /aeo-control";
+    expect(agentePuede(robots, "gptbot", "/aeo-control")).toBe(false);
+    expect(agentePuede(robots, "gptbot", "/")).toBe(true);
+    // Y al revés: la excepción más larga abre dentro de lo bloqueado.
+    const excepcion = "User-agent: *\nDisallow: /privado\nAllow: /privado/publico";
+    expect(agentePuede(excepcion, "gptbot", "/privado/publico/nota")).toBe(true);
+    expect(agentePuede(excepcion, "gptbot", "/privado/otra")).toBe(false);
+  });
+
+  it("a IGUAL largo gana `Allow`, que es como RFC 9309 resuelve el empate", () => {
+    expect(agentePuede("User-agent: *\nDisallow: /pagina\nAllow: /pagina", "gptbot", "/pagina")).toBe(true);
+    expect(agentePuede("User-agent: *\nAllow: /pagina\nDisallow: /pagina", "gptbot", "/pagina")).toBe(true);
+  });
+
+  it("los caracteres de una expresión regular en la ruta se toman literales", () => {
+    expect(agentePuede("User-agent: *\nDisallow: /a.b", "gptbot", "/axb")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /a.b", "gptbot", "/a.b/c")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: /(x)?", "gptbot", "/(x)?y")).toBe(false);
+  });
+
+  it("`/robots.txt` siempre se puede leer, aunque el robots lo prohíba", () => {
+    expect(agentePuede("User-agent: *\nDisallow: /", "gptbot", "/robots.txt")).toBe(true);
+  });
+});
+
 describe("los tipos de schema declarados", () => {
   it("lee un JSON-LD simple", () => {
     const html = `<script type="application/ld+json">{"@type":"LocalBusiness"}</script>`;

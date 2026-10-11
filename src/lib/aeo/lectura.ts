@@ -85,15 +85,27 @@ function parsear(robots: string): Grupo[] {
 }
 
 /**
- * Si una ruta cae bajo un patrón de `robots.txt`.
+ * Si una ruta cae bajo un patrón de `robots.txt`, con la coincidencia de RFC
+ * 9309 (§2.2.3): `*` es cualquier secuencia de caracteres, un `$` al final
+ * ancla el fin de la ruta, y todo lo demás se compara literal desde el
+ * principio.
  *
  * Un `Disallow:` VACÍO no bloquea nada — es la manera estándar de decir «pasá»,
  * y tratarlo como prefijo vacío bloquearía el sitio entero. Es el error que hace
  * que una herramienta informe «bloqueado» sobre un sitio abierto.
+ *
+ * Antes esto era `startsWith` (GATE-4): `Disallow: /*` no bloqueaba ni la raíz,
+ * y `Disallow: /aeo-control$` no bloqueaba `/aeo-control`.
  */
 function aplica(patron: string, ruta: string): boolean {
   if (patron === "") return false;
-  return ruta.startsWith(patron);
+  const anclado = patron.endsWith("$");
+  const cuerpo = anclado ? patron.slice(0, -1) : patron;
+  const expresion = cuerpo
+    .split("*")
+    .map((tramo) => tramo.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`^${expresion}${anclado ? "$" : ""}`).test(ruta);
 }
 
 /**
@@ -104,9 +116,15 @@ function aplica(patron: string, ruta: string): boolean {
  * `Disallow: /` general se leyera como bloqueo aunque el sitio permita al agente
  * explícitamente.
  *
- * Y a igualdad, gana `Allow` sobre `Disallow`, que es cómo se abre una excepción.
+ * Dentro de los grupos que aplican, gana la regla MÁS LARGA que coincide —la
+ * más específica, en octetos del patrón— y, a igual largo, `Allow` (RFC 9309
+ * §2.2.2). Antes ganaba cualquier `Allow` que coincidiera, y con `Allow: /` y
+ * `Disallow: /aeo-control` la página de control salía abierta (GATE-4).
  */
 export function agentePuede(robots: string, agente: string, ruta = "/"): boolean {
+  // RFC 9309 §2.2.2: `/robots.txt` se puede leer siempre.
+  if (ruta === "/robots.txt") return true;
+
   const grupos = parsear(robots);
   const nombre = agente.toLowerCase();
 
@@ -117,10 +135,18 @@ export function agentePuede(robots: string, agente: string, ruta = "/"): boolean
   // NO es una prohibición.
   if (aplicables.length === 0) return true;
 
-  const permite = aplicables.some((g) => g.permite.some((p) => aplica(p, ruta)));
-  if (permite) return true;
-
-  return !aplicables.some((g) => g.bloquea.some((p) => aplica(p, ruta)));
+  const reglas = aplicables.flatMap((g) => [
+    ...g.permite.map((patron) => ({ patron, permite: true })),
+    ...g.bloquea.map((patron) => ({ patron, permite: false })),
+  ]);
+  let gana: { largo: number; permite: boolean } | null = null;
+  for (const { patron, permite } of reglas) {
+    if (!aplica(patron, ruta)) continue;
+    const largo = new TextEncoder().encode(patron).length;
+    if (!gana || largo > gana.largo || (largo === gana.largo && permite)) gana = { largo, permite };
+  }
+  // Ninguna regla coincide: se permite.
+  return gana?.permite ?? true;
 }
 
 /** Qué agentes de IA pueden entrar, uno por uno. */
