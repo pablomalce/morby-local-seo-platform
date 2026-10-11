@@ -1,4 +1,4 @@
--- A hundred and eighty isolation checks against the Growth OS schema — executable.
+-- A hundred and eighty-two isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -9965,10 +9965,169 @@ SELECT 227, 'un asset sellado se muda de organización o de negocio con la firma
   FROM s33 WHERE bloque = 227;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 400 y 401. La baja de cuenta no borra a medias lo que la base va a rechazar
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: la premisa de la verificación previa de `deleteMyAccount`
+-- (src/lib/auth/account-actions.ts), que es la única regla de la base que esa
+-- función copia a mano.
+--
+-- Medido el 2026-10-11 en la réplica, cada paso en su propia transacción como un
+-- pedido de PostgREST: con el orden de entonces (propias → membresías → acceso),
+-- una persona que había sellado contenido en una organización AJENA perdía sus
+-- organizaciones y sus membresías, y el borrado de `auth.users` moría con 23514
+-- en `content_assets_approval_check`. El `ON DELETE SET NULL` de `approved_by`
+-- (0015) choca con el CHECK de la misma 0015, que no acepta un sello sin
+-- firmante: quedaba sólo el login.
+--
+-- Los otros rechazos (publicó, verificó o aprobó una tarjeta en una ajena) caen
+-- en la SALIDA de la ajena —bloques 119 y 132— y la función ahora sale de las
+-- ajenas antes de borrar nada, en una sentencia. Éste es el único que llega
+-- recién en `auth.users`, después del último paso que se puede ordenar; por eso
+-- la función lo busca ANTES (sellos de la persona fuera de sus organizaciones)
+-- y se niega sin borrar nada.
+--
+-- Una verificación copiada a mano envejece en silencio. El 400 mira por catálogo
+-- que las FK hacia `auth.users` sean las que la función conoce: una nueva —una
+-- que se niegue, o un SET NULL contra otro CHECK— pone esto en rojo y obliga a
+-- decidir si la función tiene que verificarla también. El 401 mide el rechazo
+-- que la función copia, y su contracara: un sello en una organización PROPIA no
+-- traba nada, porque la cascada se lo lleva antes.
+
+-- ── 400 ──────────────────────────────────────────────────────────────────────
+-- Las FK hacia `auth.users` desde fuera de `auth` (las de GoTrue son suyas y
+-- cascadean). Hoy, medidas igual en hosted el 2026-10-11 por catálogo:
+--   activity_logs.actor_id   SET NULL  — columna nullable, sin CHECK: pasa;
+--   content_assets.approved_by SET NULL — choca con el CHECK: la verificación;
+--   org_members.user_id      CASCADE   — la función ya sacó las membresías.
+RESET ROLE;
+
+INSERT INTO defect_report
+SELECT 400, 'hay una FK hacia auth.users que deleteMyAccount no conoce, y su rechazo llegaría después de borrar',
+       coalesce(fks, '') <> 'activity_logs.actor_id:n content_assets.approved_by:n org_members.user_id:c',
+       CASE WHEN coalesce(fks, '') = 'activity_logs.actor_id:n content_assets.approved_by:n org_members.user_id:c'
+            THEN 'las tres FK hacia auth.users son las que la función conoce: ' || fks
+            ELSE 'FK hacia auth.users, por catálogo (tabla.columna:acción): [' || coalesce(fks, '') ||
+                 ']. Si apareció una, decidí si deleteMyAccount la tiene que verificar antes de borrar ' ||
+                 'y actualizá este bloque' END
+  FROM (SELECT string_agg(format('%s.%s:%s', c.conrelid::regclass, a.attname, c.confdeltype), ' '
+                          ORDER BY format('%s.%s', c.conrelid::regclass, a.attname)) AS fks
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+         WHERE c.contype = 'f'
+           AND c.confrelid = 'auth.users'::regclass
+           AND c.connamespace <> 'auth'::regnamespace) x;
+
+-- ── 401 ──────────────────────────────────────────────────────────────────────
+-- FIXTURE PROPIA: ursula (la que se va), umberto (el mismo armado, con el sello
+-- en SU organización) y valeria (dueña de la ajena). ursula y umberto son
+-- manager en la de valeria. Ningún otro bloque las toca.
+--
+-- Los sellos los pone `postgres`, que la 0033 exime de firmar como sí mismo: es
+-- la fila que deja `/api/content/approve`, escrita sin pasar por la sesión.
+--
+-- Cuatro bajas, cada una la secuencia de `deleteMyAccount` SIN la verificación
+-- —salir de las ajenas, borrar las propias, borrar de `auth.users`— en una
+-- subtransacción que `al_commit()` deshace:
+--   a. ursula, con el sello en la ajena: muere con 23514 en el CHECK de la 0015;
+--   b. umberto, con el sello en la suya: pasa (la cascada lo borra primero);
+--   c. ursula, después de que la ajena VUELVE EL ASSET A BORRADOR: pasa;
+--   d. ursula, después de que la ajena lo RE-FIRMA a nombre de valeria: pasa.
+-- c y d son los dos caminos que la pantalla le nombra a la persona («re-approve
+-- that content under another name or return it to draft»): si alguno no
+-- destrabara, la frase mentiría.
+INSERT INTO auth.users (id, email) VALUES
+    ('d0400000-0400-4400-8400-000000000a01', 'ursula@example.test'),
+    ('d0400000-0400-4400-8400-000000000a02', 'umberto@example.test'),
+    ('d0400000-0400-4400-8400-000000000a03', 'valeria@example.test');
+
+CREATE TEMP TABLE b401 AS
+SELECT (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0400000-0400-4400-8400-000000000a01' AND role = 'owner') AS org_ursula,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0400000-0400-4400-8400-000000000a02' AND role = 'owner') AS org_umberto,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0400000-0400-4400-8400-000000000a03' AND role = 'owner') AS org_valeria;
+
+INSERT INTO org_members (organization_id, user_id, role)
+SELECT org_valeria, 'd0400000-0400-4400-8400-000000000a01'::uuid, 'manager' FROM b401
+UNION ALL
+SELECT org_valeria, 'd0400000-0400-4400-8400-000000000a02'::uuid, 'manager' FROM b401;
+
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0400000-0400-4400-8400-000000000b01'::uuid, org_valeria, 'Negocio de valeria' FROM b401
+UNION ALL
+SELECT 'd0400000-0400-4400-8400-000000000b02'::uuid, org_umberto, 'Negocio de umberto' FROM b401;
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'd0400000-0400-4400-8400-000000000c01'::uuid, org_valeria, 'd0400000-0400-4400-8400-000000000b01'::uuid,
+       'en', 'post', 'Sellado por ursula', 'cuerpo', 'draft' FROM b401
+UNION ALL
+SELECT 'd0400000-0400-4400-8400-000000000c02'::uuid, org_umberto, 'd0400000-0400-4400-8400-000000000b02'::uuid,
+       'en', 'post', 'Sellado por umberto', 'cuerpo', 'draft' FROM b401;
+
+UPDATE content_assets
+   SET status = 'approved', approved_hash = payload_hash, approved_at = now(),
+       approved_by = CASE id WHEN 'd0400000-0400-4400-8400-000000000c01'
+                             THEN 'd0400000-0400-4400-8400-000000000a01'::uuid
+                             ELSE 'd0400000-0400-4400-8400-000000000a02'::uuid END
+ WHERE id IN ('d0400000-0400-4400-8400-000000000c01', 'd0400000-0400-4400-8400-000000000c02');
+
+-- Anti-vacuidad: los dos sellos puestos, cada uno donde se dice, y las dos
+-- membresías en la ajena. Sin el sello de ursula el (a) pediría un rechazo a un
+-- CHECK que no tiene nada que mirar.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM content_assets c, b401
+         WHERE (c.id = 'd0400000-0400-4400-8400-000000000c01' AND c.organization_id = org_valeria
+                AND c.approved_by = 'd0400000-0400-4400-8400-000000000a01' AND c.status = 'approved')
+            OR (c.id = 'd0400000-0400-4400-8400-000000000c02' AND c.organization_id = org_umberto
+                AND c.approved_by = 'd0400000-0400-4400-8400-000000000a02' AND c.status = 'approved')) <> 2
+       OR (SELECT count(*) FROM org_members m, b401
+            WHERE m.organization_id = org_valeria AND m.role = 'manager'
+              AND m.user_id IN ('d0400000-0400-4400-8400-000000000a01',
+                                'd0400000-0400-4400-8400-000000000a02')) <> 2 THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture del bloque 401 no pobló sus sellos o sus membresías';
+    END IF;
+END
+$$;
+
+-- La secuencia de `deleteMyAccount` para una persona, sin la verificación.
+CREATE OR REPLACE FUNCTION pg_temp.b401_baja(p_user uuid, p_antes text DEFAULT '')
+RETURNS text
+LANGUAGE sql AS $$
+    SELECT pg_temp.al_commit(p_antes || format(
+        'DELETE FROM public.org_members WHERE user_id = %L AND role <> ''owner''; '
+        'DELETE FROM public.organizations WHERE id IN '
+        '(SELECT organization_id FROM public.org_members WHERE user_id = %L AND role = ''owner''); '
+        'DELETE FROM auth.users WHERE id = %L;', p_user, p_user, p_user), 'postgres');
+$$;
+
+SELECT set_config('qa.b401a', pg_temp.b401_baja('d0400000-0400-4400-8400-000000000a01'), true);
+SELECT set_config('qa.b401b', pg_temp.b401_baja('d0400000-0400-4400-8400-000000000a02'), true);
+SELECT set_config('qa.b401c', pg_temp.b401_baja('d0400000-0400-4400-8400-000000000a01',
+           'UPDATE public.content_assets SET status = ''draft'', approved_hash = NULL, approved_by = NULL, '
+           'approved_at = NULL WHERE id = ''d0400000-0400-4400-8400-000000000c01''; '), true);
+SELECT set_config('qa.b401d', pg_temp.b401_baja('d0400000-0400-4400-8400-000000000a01',
+           'UPDATE public.content_assets SET approved_by = ''d0400000-0400-4400-8400-000000000a03'' '
+           'WHERE id = ''d0400000-0400-4400-8400-000000000c01''; '), true);
+
+INSERT INTO defect_report
+SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante, o el que traba es otro, o el remedio no destraba',
+       NOT (a LIKE '23514 |%"content_assets_approval_check"%' AND b = 'paso' AND c = 'paso' AND d = 'paso'),
+       CASE WHEN a LIKE '23514 |%"content_assets_approval_check"%' AND b = 'paso' AND c = 'paso' AND d = 'paso'
+            THEN 'ursula, con un sello en la ajena, muere en auth.users con 23514 en el CHECK de la 0015 ' ||
+                 'después de salir y de borrar la suya; umberto, con el sello en la suya, pasa; ' ||
+                 'y ursula pasa si la ajena vuelve el asset a borrador o lo re-firma'
+            ELSE 'sello en la ajena: ' || a || ' / sello en la propia: ' || b ||
+                 ' / devuelto a borrador: ' || c || ' / re-firmado por valeria: ' || d END
+  FROM (SELECT current_setting('qa.b401a') AS a, current_setting('qa.b401b') AS b,
+               current_setting('qa.b401c') AS c, current_setting('qa.b401d') AS d) x;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and eighty checks were written, so a hundred
--- and eighty rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: a hundred and eighty-two checks were written, so a hundred
+-- and eighty-two rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
@@ -9976,8 +10135,10 @@ SELECT 227, 'un asset sellado se muda de organización o de negocio con la firma
 -- todavía estaban en PRs abiertos, para que los tres frentes no chocaran al
 -- mergearse. Y del 216 al 300 por lo mismo: los de la 0032 (H2-GO-3) se
 -- escribieron con la 0031 en un PR abierto. Los de la 0033 siguen la misma
--- regla desde el 220, escritos con la 0032 en un PR abierto. El conteo de
--- abajo es de FILAS, no el número más alto: 143 + 17 + 12 + 8.
+-- regla desde el 220, escritos con la 0032 en un PR abierto. Los 400 y 401
+-- (la baja de cuenta) no son de una migración: arrancan en 400 para no chocar
+-- con ningún rango de migración abierto. El conteo de abajo es de FILAS, no el
+-- número más alto: 143 + 17 + 12 + 8 + 2.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -9992,8 +10153,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 180 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 180 checks recorded a result.', checks;
+    IF checks <> 182 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 182 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -10004,11 +10165,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 180 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 182 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 180 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 182 checks green: the schema prevents every one of them.';
 END
 $$;
 

@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { AlertTriangle, Download, LogOut, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { deleteMyAccount, exportMyData, signOutAction } from "@/lib/auth/account-actions";
+import type { MotivoDeBaja } from "@/lib/auth/porQueNoSeBorro";
 
 export function ExportButton() {
   const [pending, start] = useTransition();
@@ -56,14 +57,18 @@ export function DeleteAccountButton() {
   const [confirming, setConfirming] = useState(false);
   const [confirmInput, setConfirmInput] = useState("");
   const [pending, start] = useTransition();
-  const [error, setError] = useState<string | null>(null);
+  // El motivo con nombre y su frase, tal como vuelven de la acción: la frase ya
+  // dice qué quedó borrado si la cadena se cortó a la mitad, y la pantalla no
+  // la reemplaza por un «Delete failed» genérico. Si la baja termina, la acción
+  // redirige y esto no se usa.
+  const [fallo, setFallo] = useState<{ motivo: MotivoDeBaja; message: string } | null>(null);
 
   function handleConfirm() {
-    setError(null);
+    setFallo(null);
     start(async () => {
       const res = await deleteMyAccount();
       if (res && !res.ok) {
-        setError(res.message ?? "Delete failed");
+        setFallo({ motivo: res.motivo, message: res.message });
       }
     });
   }
@@ -121,8 +126,15 @@ export function DeleteAccountButton() {
               {pending ? "Deleting..." : "CONFIRM DELETE"}
             </Button>
           </div>
-          {error && (
-            <p className="font-mono text-[10px] uppercase tracking-hud text-red-400">{error}</p>
+          {fallo && (
+            <p
+              role="alert"
+              data-testid="error-baja"
+              data-motivo={fallo.motivo}
+              className="text-[11px] leading-relaxed text-red-300"
+            >
+              {fallo.message}
+            </p>
           )}
         </div>
       )}
