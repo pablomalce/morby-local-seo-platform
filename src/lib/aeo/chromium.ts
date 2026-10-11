@@ -87,6 +87,10 @@
  * de auditoría importa este archivo, y el barrido de rutas, el build y cada
  * pedido que no llega a renderizar no tienen por qué cargar un navegador.
  */
+import { existsSync } from "node:fs";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Browser, HTTPRequest, LaunchOptions, Page } from "puppeteer-core";
 import { resolverDns } from "@/lib/profile/nodeTransport";
 import type {
@@ -259,11 +263,50 @@ function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boo
  * espera a la primera. Si la descompresión falla, la promesa se olvida y la
  * próxima apertura lo vuelve a intentar.
  *
- * Lo que esto NO cubre, dicho: una instancia congelada a mitad de la
- * descompresión deja un `/tmp/chromium` parcial que `executablePath()` va a
- * dar por bueno en la invocación siguiente. Eso no se midió.
+ * Y UNA DESCOMPRESIÓN QUE NO TERMINÓ NO SE DA POR BUENA (RT-3). Un proceso que
+ * muere a mitad de la descompresión —un plazo vencido, una instancia
+ * reciclada— deja `/tmp` con un `chromium` a medio escribir, y `al2023/` y
+ * `fonts/` sin extraer o a medias: `@sparticuz/chromium` mira sólo si el
+ * archivo EXISTE (`build/index.js`, y cada `inflate` igual con su carpeta).
+ * MEDIDO en un contenedor AL2023 con 1 vCPU: 30 MB del binario escritos en
+ * `/tmp/chromium` dejaron la instancia en `sin-navegador` para siempre —3 de
+ * 3 corridas—, y `al2023/` y `fonts/` nunca se extrajeron. Por eso, al
+ * terminar la descompresión se escribe una MARCA, y si al empezar no está,
+ * lo que haya de una descompresión anterior se borra antes de pedir la ruta.
+ * Una instancia que ya tiene la marca reusa lo descomprimido.
  */
 let rutaDeSparticuz: Promise<string> | undefined;
+
+/** La marca de una descompresión TERMINADA, al lado de lo descomprimido. */
+export const MARCA_DE_DESCOMPRESION = "aeo-chromium-completo";
+
+/**
+ * Lo que `@sparticuz/chromium` 153 extrae en `tmpdir()`: el binario, las dos
+ * carpetas de sus tar (`al2023.tar.br` → `al2023/lib/…`, `fonts.tar.br` →
+ * `fonts/…`) y los cinco archivos de `swiftshader.tar.br`, que van sueltos.
+ * Listado de `node_modules/@sparticuz/chromium/bin/*.tar.br`; la versión está
+ * fijada exacta, y con otra hay que volver a listarlo.
+ */
+const DESCOMPRIMIDO = [
+  "chromium",
+  "al2023",
+  "fonts",
+  "libEGL.so",
+  "libGLESv2.so",
+  "libvk_swiftshader.so",
+  "libvulkan.so.1",
+  "vk_swiftshader_icd.json",
+];
+
+async function descomprimirSinRestos(chromium: SparticuzChromium, dir: string): Promise<string> {
+  const marca = path.join(dir, MARCA_DE_DESCOMPRESION);
+  if (!existsSync(marca)) {
+    await Promise.all(DESCOMPRIMIDO.map((n) => rm(path.join(dir, n), { recursive: true, force: true })));
+  }
+  const ruta = await chromium.executablePath();
+  await writeFile(marca, "");
+  return ruta;
+}
 
 function ejecutableDeSparticuz(cargar: () => Promise<string>): Promise<string> {
   rutaDeSparticuz ??= cargar().catch((e: unknown) => {
@@ -295,6 +338,12 @@ export interface OpcionesChromium {
   paquetes?: () => Promise<{ puppeteer: PuppeteerLanzador; chromium: () => Promise<SparticuzChromium> }>;
   /** Para el mismo test: la plataforma, que fuera de Linux sin Chrome local no arranca nada. */
   plataforma?: NodeJS.Platform;
+  /**
+   * Dónde descomprime `@sparticuz/chromium`: `tmpdir()`, que es lo que el
+   * paquete usa. Los tests pasan una carpeta propia, para que la limpieza de
+   * restos (RT-3) no toque el `tmpdir()` de la máquina.
+   */
+  dirTemporal?: string;
 }
 
 /** Lo que este archivo usa de `puppeteer-core`. */
@@ -335,7 +384,7 @@ export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
       // Sin WebGL: no cambia el texto, y ahorra descomprimir SwiftShader en
       // cada arranque en frío.
       chromium.setGraphicsMode = false;
-      executablePath = await ejecutableDeSparticuz(() => chromium.executablePath());
+      executablePath = await ejecutableDeSparticuz(() => descomprimirSinRestos(chromium, opciones.dirTemporal ?? tmpdir()));
       headless = "shell";
       args = [...chromium.args.filter((a) => !SIN_SEGURIDAD.has(a)), ...sinRed];
     }
