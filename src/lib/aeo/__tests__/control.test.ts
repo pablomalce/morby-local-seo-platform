@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 import { contenidoSinJs, hallazgos, type Hallazgo, type LecturaDelSitio } from "../hallazgos";
 import {
   accesoDeLasIA,
-  contarCaracteres,
   erroresDeSchema,
   MINIMO_DE_TEXTO,
   textoSinJavaScript,
@@ -65,16 +64,17 @@ function despliegue(pedido: PedidoHttp): RespuestaHttp {
 }
 
 /**
- * Lo que dibuja el `<script>` de la página de control, sacado de la página
- * misma: se ejecuta contra un `document` que sólo guarda el `innerHTML`, y se
- * quitan las etiquetas como lo haría `innerText` (un salto entre el `<h1>` y el
- * `<p>`). Con Chrome 154, `renderizado.integracion.test.ts` midió 1677.
+ * El DOM de la página de control DESPUÉS de su `<script>`, sacado de la página
+ * misma: el script se ejecuta contra un `document` que sólo guarda el
+ * `innerHTML` de `#app`, y ese HTML se pone donde el navegador lo pondría. Es
+ * lo que `page.content()` devuelve en la pestaña con JavaScript; con Chrome
+ * 154, `renderizado.integracion.test.ts` lo mide de verdad.
  */
-function textoQueDibujaElControl(): string {
+function domQueDibujaElControl(): string {
   const script = [...CONTROL.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
   const app = { innerHTML: "" };
   new Function("document", script)({ getElementById: () => app });
-  return app.innerHTML.replace(/<\/h1>/g, "\n").replace(/<[^>]+>/g, "");
+  return CONTROL.replace('<div id="app"></div>', `<div id="app">${app.innerHTML}</div>`);
 }
 
 let negocioControl = { id: "", organization_id: "org-control", website: "" };
@@ -94,7 +94,7 @@ vi.mock("@/lib/aeo/chromium", () => ({
   dependenciasDeProduccion: (): DependenciasRender => {
     const reloj = relojVirtual();
     return {
-      abrirNavegador: navegadorDoble({ reloj, textoCrudo: textoQueDibujaElControl() }).abrirNavegador,
+      abrirNavegador: navegadorDoble({ reloj, htmlCrudo: domQueDibujaElControl() }).abrirNavegador,
       transporte: async (pedido) => despliegue(pedido),
       resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
       ...reloj,
@@ -206,8 +206,8 @@ describe("la página de control sale en rojo en los tres ejes", () => {
       // ClaudeBot y la ruta `/aeo-control/`: el despliegue no devuelve ninguna
       // de las dos cosas, y la ruta leía el robots en "/". Por el POST, con
       // las respuestas reales, el eje de acceso salía VERDE (P1).
-      const texto = textoQueDibujaElControl();
-      expect(contarCaracteres(texto)).toBeGreaterThan(MINIMO_DE_TEXTO);
+      const renderizado = textoSinJavaScript(domQueDibujaElControl());
+      expect(renderizado).toBeGreaterThan(MINIMO_DE_TEXTO);
 
       const { status, cuerpo } = await auditarPorLaRuta(website);
       expect(status).toBe(200);
@@ -221,7 +221,7 @@ describe("la página de control sale en rojo en los tres ejes", () => {
       expect(bloqueantes.length).toBe(3);
       expect(textos, "eje 3: acceso").toMatch(/Bloqueados: gptbot, claudebot/);
       expect(
-        bloqueantes.some((h) => /renderizado/.test(h.donde) && h.quePasa.includes(String(contarCaracteres(texto)))),
+        bloqueantes.some((h) => /renderizado/.test(h.donde) && h.quePasa.includes(String(renderizado))),
         "eje 1: texto sin JS, con el número renderizado"
       ).toBe(true);
       expect(textos, "eje 2: schema inválido").toMatch(/JSON-LD.*error/i);

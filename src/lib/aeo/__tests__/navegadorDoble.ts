@@ -7,12 +7,16 @@
  * Lo que la medición necesita de un navegador es: pedir el documento, seguir
  * las redirecciones que se le ENTREGAN (pidiendo el destino, que vuelve a pasar
  * por el interceptor), pedir los subrecursos que el documento declara, y
- * dibujar texto con lo que le llegó. Este doble hace eso con reglas escritas:
+ * devolver su DOM serializado con lo que le llegó. Este doble hace eso con
+ * reglas escritas:
  *
- *   - el texto «servido» es el del documento sin etiquetas ni `<script>`;
- *   - cada `<script src>` y cada `data-fetch` que el interceptor ENTREGÓ suma su
- *     cuerpo al texto, como si el JavaScript lo escribiera en el DOM. Uno que el
- *     interceptor abortó no suma nada;
+ *   - la pestaña SIN JavaScript devuelve el documento tal cual llegó. Como
+ *     Chromium con el JavaScript apagado, PIDE las hojas de estilo, las
+ *     imágenes y los marcos —también los que están dentro de `<noscript>`,
+ *     que sin JavaScript son elementos— y no los scripts;
+ *   - en la pestaña CON JavaScript, cada `<script src>` y cada `data-fetch` que
+ *     el interceptor ENTREGÓ agrega su cuerpo al DOM, como si el JavaScript lo
+ *     escribiera. Uno que el interceptor abortó no agrega nada;
  *   - `<img src>` se pide como `image`, `<iframe src>` como `document` de un
  *     marco que no es el principal.
  *
@@ -78,24 +82,9 @@ export function resolvedorDoble(tabla: Record<string, string[] | (() => string[]
   return { resolver, consultas };
 }
 
-function textoDelHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ");
-}
-
-/**
- * Lo que la pestaña SIN JavaScript «ve»: el HTML sin scripts, sin `<noscript>`
- * y sin los elementos ocultos por CSS en línea o por `hidden` (sin anidar: al
- * doble le alcanza con eso). Es la regla del lado servido de `renderizado.ts`.
- */
-function textoVisibleSinJs(html: string): string {
-  return textoDelHtml(
-    html
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-      .replace(/<(\w+)[^>]*(?:\shidden\b|display:\s*none)[^>]*>[\s\S]*?<\/\1>/gi, " ")
-  );
+/** Un texto que el «JavaScript» escribe en el DOM, como lo serializaría el navegador. */
+function escrito(texto: string): string {
+  return `<div>${texto.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</div>`;
 }
 
 /**
@@ -124,7 +113,7 @@ export interface OpcionesDoble {
   /** Texto que aparece SÓLO si la página se recorrió: lo que un `IntersectionObserver` dibuja al verse. */
   textoAlVerse?: string;
   /** El reloj de `textoTardio`. Sin él, el tardío nunca aparece. */
-  reloj?: { ahora: () => number };
+  reloj?: { ahora: () => number; esperar?: (ms: number) => Promise<void> };
   /** El arranque falla, como un Chromium que no está. */
   arranqueFalla?: boolean;
   /** El arranque tarda esto antes de devolver el navegador. */
@@ -134,10 +123,11 @@ export interface OpcionesDoble {
   /** `nuevaPagina` tira: el navegador murió entre el arranque y la pestaña. */
   paginaFalla?: boolean;
   /**
-   * Reemplaza el texto dibujado CON JavaScript: para probar la normalización
-   * con un `innerText` exacto. La pestaña sin JavaScript no lo usa.
+   * Reemplaza el DOM serializado de la pestaña CON JavaScript: lo que el
+   * navegador devolvería después de correr la página. La pestaña sin
+   * JavaScript no lo usa: ella devuelve el documento que llegó.
    */
-  textoCrudo?: string;
+  htmlCrudo?: string;
   /** La pestaña SIN JavaScript no se puede abrir: el lado servido queda sin medir. */
   paginaSinJsFalla?: boolean;
 }
@@ -148,6 +138,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     cierres: 0,
     /** Cada pedido que el navegador hizo, y cómo terminó. */
     pedidos: [] as Array<{ url: string; tipo: string; desenlace: Desenlace["tipo"] }>,
+    /** El DOM que dibujó la pestaña con JavaScript, serializado. */
     textoDibujado: null as string | null,
     /** Cuántas veces se recorrió una página de arriba abajo. */
     recorridos: 0,
@@ -181,7 +172,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
 
   function pagina(sinJs: boolean): PaginaAbierta {
     let atender: ((p: PedidoDelNavegador) => Promise<void>) | null = null;
-    let texto = "";
+    let html = "";
     let navegadoEn: number | null = null;
     let recorrida = false;
 
@@ -207,30 +198,40 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         }
         if (!documento) throw new Error("net::ERR_TOO_MANY_REDIRECTS");
 
-        const html = documento.cuerpo.toString("utf8");
+        const documentoHtml = documento.cuerpo.toString("utf8");
         if (sinJs) {
           // Sin JavaScript no corre ningún script: ni los que el documento
-          // trae, ni los tardíos, ni los que dibujan al verse.
-          texto = textoVisibleSinJs(html);
+          // trae, ni los tardíos, ni los que dibujan al verse. Lo demás sí se
+          // pide, y no cambia el DOM.
+          for (const [patron, tipo] of [
+            [/<link[^>]*rel="stylesheet"[^>]*\shref="([^"]+)"/g, "stylesheet"],
+            [/<img[^>]*\ssrc="([^"]+)"/g, "image"],
+            [/<iframe[^>]*\ssrc="([^"]+)"/g, "document"],
+          ] as const) {
+            for (const m of documentoHtml.matchAll(patron)) await emitir(atender, new URL(m[1], actual).toString(), tipo, false);
+          }
+          html = documentoHtml;
           registro.paginasSinJs += 1;
           return;
         }
-        const partes = [textoDelHtml(html)];
+        const partes = [documentoHtml];
+        // Con JavaScript, el contenido de `<noscript>` es texto: no pide nada.
+        const conJs = documentoHtml.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
         const declarados: Array<{ url: string; tipo: string; principal: boolean }> = [];
-        for (const m of html.matchAll(/<script[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "script", principal: false });
-        for (const m of html.matchAll(/data-fetch="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "fetch", principal: false });
-        for (const m of html.matchAll(/<img[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "image", principal: false });
-        for (const m of html.matchAll(/<iframe[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "document", principal: false });
+        for (const m of conJs.matchAll(/<script[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "script", principal: false });
+        for (const m of conJs.matchAll(/data-fetch="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "fetch", principal: false });
+        for (const m of conJs.matchAll(/<img[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "image", principal: false });
+        for (const m of conJs.matchAll(/<iframe[^>]*\ssrc="([^"]+)"/g)) declarados.push({ url: m[1], tipo: "document", principal: false });
 
         for (const r of declarados) {
           const absoluta = new URL(r.url, actual).toString();
           const d = await emitir(atender, absoluta, r.tipo, r.principal);
           if (d.tipo === "respondido" && (r.tipo === "script" || r.tipo === "fetch")) {
-            partes.push(d.cuerpo.toString("utf8"));
+            partes.push(escrito(d.cuerpo.toString("utf8")));
           }
         }
-        texto = partes.join(" ");
-        registro.textoDibujado = texto;
+        html = partes.join("\n");
+        registro.textoDibujado = html;
         navegadoEn = opciones.reloj?.ahora() ?? null;
       },
       async esperarQuietud() {},
@@ -238,15 +239,15 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         recorrida = true;
         registro.recorridos += 1;
       },
-      async textoVisible() {
-        if (sinJs) return texto;
-        const base = opciones.textoCrudo ?? texto;
+      async html() {
+        if (sinJs) return html;
+        const base = opciones.htmlCrudo ?? html;
         const ahora = opciones.reloj?.ahora();
         const tardio = (opciones.textoTardio ?? [])
           .filter((t) => navegadoEn !== null && ahora !== undefined && ahora - navegadoEn >= t.enMs)
-          .map((t) => t.texto);
-        const alVerse = recorrida && opciones.textoAlVerse ? [opciones.textoAlVerse] : [];
-        return [base, ...tardio, ...alVerse].join(" ");
+          .map((t) => escrito(t.texto));
+        const alVerse = recorrida && opciones.textoAlVerse ? [escrito(opciones.textoAlVerse)] : [];
+        return [base, ...tardio, ...alVerse].join("\n");
       },
     };
   }

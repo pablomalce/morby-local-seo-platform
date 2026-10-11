@@ -149,9 +149,11 @@ describe("la auditoría desde la pantalla", () => {
     expect(renderizado.textContent?.replace(/\D/g, "")).toBe("1677");
   });
 
-  it("P4: con el visible sin JavaScript medido, muestra ÉSE como servido, y el del HTML al lado", async () => {
-    // El mega-menú oculto: 1 669 en el HTML, 0 visibles. Mostrar 1 669 como
-    // «servido» diría que el rastreador tiene texto que ninguna persona ve.
+  it("con `servidos` en la respuesta, muestra ÉSE como servido —el del mismo documento— y el renderizado al lado", async () => {
+    // El render midió 1 671 en el HTML del documento y 4 860 en su DOM; la
+    // ruta, con otro user-agent, trajo un HTML de 1 669. La puerta pide «los
+    // caracteres del HTML sin ejecutar JS frente a los del DOM renderizado»,
+    // y los dos tienen que salir del mismo documento.
     respuesta = {
       ok: true,
       status: 200,
@@ -161,15 +163,14 @@ describe("la auditoría desde la pantalla", () => {
         robotsLeido: true,
         motivoRobots: null,
         hallazgos: [],
-        lectura: { caracteresSinJs: 1669, caracteresRenderizados: { estado: "medido", caracteres: 3171, servidos: 0 } },
+        lectura: { caracteresSinJs: 1669, caracteresRenderizados: { estado: "medido", caracteres: 3171, servidos: 1671 } },
       },
     };
     render(<AuditoriaAeo businessId={NEGOCIO} />);
     fireEvent.click(screen.getByTestId("auditar"));
     await waitFor(() => expect(screen.getByTestId("texto-comparado")).toBeTruthy());
-    expect(screen.getByTestId("texto-servido").textContent).toBe("0 caracteres");
-    expect(screen.getByTestId("texto-en-html").textContent).toMatch(/1\.?669/);
-    expect(screen.getByTestId("texto-comparado").textContent).toMatch(/visible/);
+    expect(screen.getByTestId("texto-servido").textContent?.replace(/\D/g, "")).toBe("1671");
+    expect(screen.getByTestId("texto-comparado").textContent).toMatch(/texto del HTML/);
     // GATE-2: y el renderizado, CON `servidos` en la respuesta. El único caso
     // que miraba esta caja venía sin `servidos`, así que mostrar el servido en
     // el lugar del renderizado («0 frente a 0») pasaba la suite entera.

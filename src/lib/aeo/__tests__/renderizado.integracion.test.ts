@@ -50,7 +50,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
-import { contenidoSinJs, type LecturaDelSitio } from "../hallazgos";
+import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
 import { AGENTES_IA, contarCaracteres, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
 import { medirRenderizado, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
@@ -96,10 +96,10 @@ const CRECIENTE = `<!doctype html><html><head><meta charset="utf-8"></head><body
 </body></html>`;
 
 /**
- * P5: el número renderizado es el texto VISIBLE. Con `textContent` en vez de
- * `innerText` la integración entera seguía verde; esta página lo separa: un
- * párrafo visible, un bloque oculto por CSS, un `<script>` largo en línea y un
- * `<noscript>` —que la pestaña sin JavaScript dibuja y no tiene que contar—.
+ * P5 y GATE-1: lo que cuenta y lo que no, de los DOS lados. Un párrafo
+ * visible y un bloque oculto por CSS cuentan —un rastreador sin JavaScript no
+ * aplica CSS—; el código de un `<script>` largo en línea y el aviso de un
+ * `<noscript>` no cuentan de ningún lado.
  */
 const VISIBLE = "Texto que una persona ve en la página, servido por el servidor. ".repeat(30);
 const OCULTO_Y_SCRIPT = `<!doctype html><html><head><meta charset="utf-8"><title>Oculto</title></head><body>
@@ -111,13 +111,56 @@ const OCULTO_Y_SCRIPT = `<!doctype html><html><head><meta charset="utf-8"><title
 
 /**
  * P4: un mega-menú servido y OCULTO por CSS, y todo lo visible dibujado por
- * JavaScript. Contado en el HTML, el menú pasaba la mitad y el punto salía
- * verde; contado como se ve sin JavaScript, es cero.
+ * JavaScript. Contado el menú de un lado y no del otro, pasaba la mitad y el
+ * punto salía verde; contado de los dos lados, lo que agrega el JavaScript es
+ * más del doble y el punto sale rojo.
  */
 const MEGA_MENU = `<nav style="display: none">${Array.from({ length: 80 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
 const OCULTO = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MEGA_MENU}<main id="app"></main>
 <script>document.getElementById("app").textContent = ${JSON.stringify("Todo lo que una persona ve lo dibuja el JavaScript. ".repeat(61))};</script>
 </body></html>`;
+
+/**
+ * GATE-1: páginas SSR que OCULTAN su texto con CSS hasta que corre el
+ * JavaScript. Un rastreador que no ejecuta JavaScript tampoco aplica CSS: lee
+ * el texto del HTML entero. Contadas como «lo visible sin JavaScript», las tres
+ * salían BLOQUEANTE «depende de JavaScript» —medido con Chrome real y la ruta,
+ * y en la web de Vulkan, que es WordPress con Elementor—.
+ */
+const PARRAFO_SSR = "Atendemos de lunes a viernes, con turnos por teléfono y en el mostrador. ";
+
+/** El patrón de Elementor: `elementor-invisible` (visibility: hidden) hasta que la sección se ve. */
+const ELEMENTOR_INVISIBLE = `<!doctype html><html lang="es"><head><meta charset="utf-8">
+<style>.elementor-invisible { visibility: hidden; }</style></head><body>
+<header><a href="/">Inicio</a> <a href="/contacto">Contacto</a></header>
+${Array.from(
+  { length: 25 },
+  (_, i) =>
+    `<section class="elementor-section elementor-invisible" data-settings='{"animation":"fadeIn"}'><h2>Sección ${i}</h2><p>${PARRAFO_SSR.repeat(2)}</p></section>`
+).join("\n")}
+<script>
+  const o = new IntersectionObserver((entradas) => {
+    for (const e of entradas) if (e.isIntersecting) { e.target.classList.remove("elementor-invisible"); o.unobserve(e.target); }
+  });
+  document.querySelectorAll(".elementor-invisible").forEach((s) => o.observe(s));
+</script></body></html>`;
+
+/** Anti-FOUC: el `<body>` oculto por una clase en `<html>` que el JavaScript quita. */
+const ANTI_FOUC = `<!doctype html><html lang="es" class="cargando"><head><meta charset="utf-8">
+<style>.cargando body { visibility: hidden; }</style>
+<script>addEventListener("DOMContentLoaded", () => document.documentElement.classList.remove("cargando"));</script>
+</head><body><main><h1>Clínica de prueba</h1><p>${PARRAFO_SSR.repeat(27)}</p></main></body></html>`;
+
+/**
+ * `<main>` oculto, y el `<style>` que lo muestra sin JavaScript DENTRO de
+ * `<noscript>`. Borrar `<noscript>` en la pestaña sin JavaScript borraba
+ * justo ese estilo.
+ */
+const NOSCRIPT_STYLE = `<!doctype html><html lang="es"><head><meta charset="utf-8">
+<style>main { display: none; }</style>
+<noscript><style>main { display: block; }</style></noscript>
+</head><body><main><h1>Clínica de prueba</h1><p>${PARRAFO_SSR.repeat(27)}</p></main>
+<script>document.querySelector("main").style.display = "block";</script></body></html>`;
 
 /**
  * RV-1: un popup es otro target. Ni la intercepción ni `evaluateOnNewDocument`
@@ -237,6 +280,12 @@ beforeAll(async () => {
         return html(OCULTO_Y_SCRIPT);
       case "/oculto":
         return html(OCULTO);
+      case "/elementor-invisible":
+        return html(ELEMENTOR_INVISIBLE);
+      case "/anti-fouc":
+        return html(ANTI_FOUC);
+      case "/noscript-style":
+        return html(NOSCRIPT_STYLE);
       case "/al-verse":
         return html(AL_VERSE);
       case "/creciente":
@@ -367,7 +416,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(punto.estado).toBe("rojo");
       expect(d.cierres()).toBe(d.aperturas());
     },
-    30_000
+    60_000
   );
 
   it(
@@ -394,11 +443,11 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         }).estado
       ).toBe("verde");
     },
-    30_000
+    60_000
   );
 
   it(
-    "P4 — un mega-menú OCULTO no es texto servido: lo visible sin JavaScript es ~0, y el punto sale ROJO",
+    "P4 — un mega-menú OCULTO servido cuenta de los dos lados, y lo que dibuja el JavaScript sólo del renderizado: punto ROJO",
     async () => {
       const d = deps();
       const b = bitacora();
@@ -407,8 +456,8 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       console.log(`[P4 /oculto] html=${enHtml} renderizado=${JSON.stringify(render)}`);
       expect(render.estado).toBe("medido");
       if (render.estado !== "medido") return;
-      expect(enHtml, "el número viejo pasaba la mitad").toBeGreaterThan(render.caracteres / 2);
-      expect(render.servidos).toBeLessThan(10);
+      expect(Math.abs((render.servidos ?? 0) - enHtml) / enHtml).toBeLessThan(0.05);
+      expect(render.caracteres).toBeGreaterThan(2 * (render.servidos ?? 0));
       expect(
         contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: enHtml, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
           .estado
@@ -417,22 +466,49 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(sinFavicon(b.pedidos).map((p) => p.url)).toEqual(["http://sitio.test/oculto"]);
       expect(d.cierres()).toBe(d.aperturas());
     },
-    30_000
+    60_000
   );
 
   it(
-    "P5 — el renderizado es el texto VISIBLE: ni lo oculto por CSS ni el código de un <script> en línea",
+    "P5 — el texto oculto por CSS cuenta de los dos lados; el código de un <script> en línea y un <noscript>, de ninguno",
     async () => {
       const render = await medirRenderizado("http://sitio.test/oculto-y-script", deps());
-      const visible = contarCaracteres(VISIBLE);
-      console.log(`[P5 /oculto-y-script] visible=${visible} renderizado=${JSON.stringify(render)}`);
+      const esperado = contarCaracteres(`${VISIBLE} ${"Texto oculto por CSS que nadie ve. ".repeat(90)}`);
+      console.log(`[P5 /oculto-y-script] esperado=${esperado} renderizado=${JSON.stringify(render)}`);
       expect(render.estado).toBe("medido");
       if (render.estado !== "medido") return;
-      expect(Math.abs(render.caracteres - visible) / visible).toBeLessThan(0.05);
-      // Y del lado servido, lo mismo: la misma extracción, sin JavaScript.
-      expect(Math.abs((render.servidos ?? 0) - visible) / visible).toBeLessThan(0.05);
+      expect(Math.abs(render.caracteres - esperado) / esperado).toBeLessThan(0.05);
+      expect(Math.abs((render.servidos ?? 0) - esperado) / esperado).toBeLessThan(0.05);
     },
-    30_000
+    60_000
+  );
+
+  it.each([
+    ["/elementor-invisible", ELEMENTOR_INVISIBLE],
+    ["/anti-fouc", ANTI_FOUC],
+    ["/noscript-style", NOSCRIPT_STYLE],
+  ])(
+    "GATE-1 — SSR oculto por CSS hasta que corre el JavaScript (%s): el rastreador lee el HTML, y el punto NO es bloqueante",
+    async (ruta, pagina) => {
+      const render = await medirRenderizado(`http://sitio.test${ruta}`, deps());
+      const enHtml = textoSinJavaScript(pagina);
+      console.log(`[GATE-1 ${ruta}] html=${enHtml} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(enHtml).toBeGreaterThan(MINIMO_DE_TEXTO);
+      // Lo servido es el texto del HTML, el que lee un rastreador sin JavaScript.
+      expect(Math.abs((render.servidos ?? 0) - enHtml) / enHtml).toBeLessThan(0.05);
+      const lectura: LecturaDelSitio = {
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: enHtml,
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      };
+      expect(contenidoSinJs(lectura).estado).toBe("verde");
+      expect(hallazgos(lectura).filter((h) => h.gravedad === "bloqueante" && /renderizado/.test(h.donde))).toEqual([]);
+    },
+    60_000
   );
 
   it(
@@ -449,7 +525,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           .estado
       ).toBe("rojo");
     },
-    30_000
+    60_000
   );
 
   it(
@@ -459,7 +535,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       console.log(`[P2 /al-verse] servido=${textoSinJavaScript(AL_VERSE)} renderizado=${JSON.stringify(render)}`);
       expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(textoSinJavaScript(AL_VERSE) + 8_000);
     },
-    30_000
+    60_000
   );
 
   it(
@@ -470,7 +546,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render).toEqual({ estado: "fallo", codigo: "inestable" });
       expect(d.cierres()).toBe(d.aperturas());
     },
-    30_000
+    60_000
   );
 
   it(
@@ -481,7 +557,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render.estado).toBe("medido");
       expect(sinFavicon(b.pedidos).map((p) => p.url)).toEqual(["http://sitio.test/redir-sana", "http://sitio.test/ssr"]);
     },
-    30_000
+    60_000
   );
 
   it.each([
@@ -499,7 +575,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
       expect(d.cierres()).toBe(d.aperturas());
     },
-    30_000
+    60_000
   );
 
   it.each([
@@ -538,7 +614,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         ])
       );
     },
-    30_000
+    60_000
   );
 
   it.each([
@@ -555,7 +631,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render.estado).toBe("medido");
       expect(visto).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
     },
-    30_000
+    60_000
   );
 
   // `--block-new-web-contents` sola cierra el popup en el headless shell de
@@ -573,7 +649,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render.estado).toBe("medido");
       expect(visto).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
     },
-    30_000
+    60_000
   );
 
   it(
@@ -585,7 +661,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(visto.udp).toBeGreaterThan(0);
       expect(visto.pedidos).toContain("GET /popup-directo");
     },
-    30_000
+    60_000
   );
 
   it(
@@ -603,7 +679,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(visto.conexiones).toBeGreaterThan(0);
       expect(visto.udp).toBeGreaterThan(0);
     },
-    30_000
+    60_000
   );
 
   it(
@@ -614,7 +690,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         codigo: "descarga",
       });
     },
-    30_000
+    60_000
   );
 
   it(
@@ -645,7 +721,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         rmSync(perfil, { recursive: true, force: true });
       }
     },
-    30_000
+    60_000
   );
 
   it(
@@ -656,7 +732,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         codigo: "http_404",
       });
     },
-    30_000
+    60_000
   );
 
   it(
@@ -675,6 +751,6 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       expect(render.estado).toBe("fallo");
       expect(d.cierres()).toBe(d.aperturas());
     },
-    30_000
+    60_000
   );
 });

@@ -167,7 +167,7 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
   };
 }
 
-function envolverPagina(page: Page, sinJavaScript: boolean): PaginaAbierta {
+function envolverPagina(page: Page): PaginaAbierta {
   return {
     async interceptar(atender) {
       await page.setBypassServiceWorker(true);
@@ -202,17 +202,13 @@ function envolverPagina(page: Page, sinJavaScript: boolean): PaginaAbierta {
         }, timeoutMs)
         .catch(() => {});
     },
-    async textoVisible() {
-      // Sin JavaScript, `<noscript>` se dibuja; con JavaScript, no. Se saca
-      // para que los dos lados cuenten lo mismo. Sólo en la pestaña sin
-      // JavaScript: ahí ningún script de la página ve el cambio.
-      if (sinJavaScript) {
-        return page.evaluate(() => {
-          document.querySelectorAll("noscript").forEach((n) => n.remove());
-          return document.body?.innerText ?? "";
-        });
-      }
-      return page.evaluate(() => document.body?.innerText ?? "");
+    async html() {
+      // La serialización del DOM, sin tocarlo: la extracción del texto es la
+      // de `renderizado.ts` (`textoSinJavaScript`), y no aplica CSS. Antes
+      // esto era `innerText` y, en la pestaña sin JavaScript, borraba los
+      // `<noscript>` —y con ellos el `<style>` que muestra el contenido sin
+      // JavaScript— (GATE-1).
+      return page.content();
     },
   };
 }
@@ -229,7 +225,7 @@ function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boo
       // contestar otra página que la que ve una persona.
       const agente = (await browser.userAgent()).replace("HeadlessChrome", "Chrome");
       await page.setUserAgent({ userAgent: `${agente} VulkanGrowthOS/1.0 (auditoria AEO; renderizado)` });
-      return envolverPagina(page, sinJavaScript);
+      return envolverPagina(page);
     },
     async cerrar() {
       const proceso = browser.process();

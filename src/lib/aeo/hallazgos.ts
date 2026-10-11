@@ -222,11 +222,12 @@ export type EstadoDelPunto = "rojo" | "verde" | "no-medido";
 export interface PuntoContenidoSinJs {
   estado: EstadoDelPunto;
   /**
-   * El número servido con el que se decidió: el texto VISIBLE sin JavaScript
-   * si el render lo midió, y si no, el del HTML sin etiquetas.
+   * El número servido con el que se decidió: los caracteres de texto del HTML
+   * sin ejecutar JavaScript, del MISMO documento que el renderizado si el
+   * render lo midió (`servidos`), y si no, del HTML que trajo la ruta.
    */
   servido: number;
-  /** El texto del HTML sin etiquetas, que cuenta también lo oculto por CSS. */
+  /** Los caracteres de texto del HTML que trajo la ruta (`caracteresSinJs`). */
   servidoEnHtml: number;
   /** `null` si el renderizado no se midió: no es un cero. */
   renderizado: number | null;
@@ -251,34 +252,29 @@ export interface PuntoContenidoSinJs {
  *     y 300 renderizados: no depende de JavaScript, y aun así un motor no tiene
  *     qué citar. Ese rojo se dice distinto, porque se arregla en otro lugar.
  *
- * Los dos números salen de la MISMA extracción —`innerText` de la misma
- * página, con el JavaScript prendido y apagado (`renderizado.ts`)—, así que lo
- * oculto por CSS no cuenta de ningún lado. La mitad deja afuera un banner de
- * cookies o un chat dibujados en el cliente sobre una página real, y atrapa la
- * página de control, que no muestra nada sin JavaScript y dibuja más de 1 600.
+ * Los dos números salen de la MISMA extracción —`textoSinJavaScript` sobre el
+ * DOM del mismo documento, con el JavaScript apagado y prendido
+ * (`renderizado.ts`)—, y ninguna aplica CSS: un rastreador sin JavaScript lee
+ * también el texto que una hoja de estilos oculta (GATE-1). La mitad deja
+ * afuera un banner de cookies o un chat dibujados en el cliente sobre una
+ * página real, y atrapa la página de control, que no trae nada sin
+ * JavaScript y dibuja más de 1 600.
  *
- * Lo que la mitad NO atrapa, dicho: un boilerplate visible servido (un menú)
- * que llega a la mitad de lo renderizado. MEDIDO con Chrome 154: menú visible
- * de 1 675 y contenido sólo-JS de 1 623 da 0,51 y sale verde. Subir el umbral
- * es un juicio sobre cuánto JavaScript legítimo tolera una página SSR (un
- * banner de 800 sobre 2 000 ya es 0,71), y no se toca acá.
+ * Lo que la mitad NO atrapa, dicho: un boilerplate servido (un menú) que llega
+ * a la mitad de lo renderizado. MEDIDO con Chrome 154: menú de 1 675 y
+ * contenido sólo-JS de 1 623 da 0,51 y sale verde (GATE-8). Subir el umbral, o
+ * separar el menú del contenido, es un juicio sobre cuánto JavaScript legítimo
+ * tolera una página SSR (un banner de 800 sobre 2 000 ya es 0,71), y no se
+ * toca acá.
  */
-/** Si el HTML trae bastante más de lo que se ve sin JavaScript, se dice: es texto oculto por CSS. */
-function oculto(servido: number, servidoEnHtml: number): string {
-  return servidoEnHtml > servido * 1.1 + 50
-    ? ` El HTML trae ${servidoEnHtml}, pero lo que no se ve sin JavaScript (oculto por CSS) no cuenta.`
-    : "";
-}
 
 export function contenidoSinJs(lectura: LecturaDelSitio): PuntoContenidoSinJs {
   const render = lectura.caracteresRenderizados;
   const servidoEnHtml = lectura.caracteresSinJs;
-  // Del lado servido manda lo VISIBLE sin JavaScript, medido con la misma
-  // extracción que el renderizado (P4). El número del HTML cuenta lo que el
-  // CSS oculta, y con él un mega-menú `display: none` pintaba de verde una
-  // página cuyo texto visible venía entero del JavaScript. Se usa sólo cuando
-  // el render no se midió —y entonces sólo puede dar rojo, porque lo visible
-  // nunca es más que lo que hay en el HTML—.
+  // Del lado servido manda el número del MISMO documento que se renderizó,
+  // contado por el mismo navegador (`servidos`). El de la ruta —el HTML que
+  // trajo con su propio user-agent— es la misma extracción sobre un pedido
+  // aparte, y se usa sólo cuando el render no se midió.
   const servido = render?.estado === "medido" && render.servidos !== undefined ? render.servidos : servidoEnHtml;
   const renderizado = render?.estado === "medido" ? render.caracteres : null;
   const motivoNoMedido = render === undefined ? "lectura sin renderizado" : render.estado === "fallo" ? render.codigo : null;
@@ -328,7 +324,7 @@ export function contenidoSinJs(lectura: LecturaDelSitio): PuntoContenidoSinJs {
       renderizado,
       hallazgo: {
         gravedad: "bloqueante",
-        quePasa: `Sin ejecutar JavaScript la página muestra ${servido} caracteres de texto; renderizada, ${renderizado}.${oculto(servido, servidoEnHtml)} El texto que ve una persona no existe, o no alcanza, para un rastreador.`,
+        quePasa: `Sin ejecutar JavaScript el HTML trae ${servido} caracteres de texto; renderizado, el DOM tiene ${renderizado}. El texto que agrega el JavaScript no existe para un rastreador.`,
         queHacer:
           "Los rastreadores de IA no ejecutan JavaScript: leen sólo lo que viene en el HTML. Se arregla renderizando en el servidor el contenido que importa.",
         donde: "el renderizado del sitio",

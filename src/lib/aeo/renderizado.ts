@@ -9,19 +9,31 @@
  * tiene 300, y es un defecto de JavaScript si renderizada tiene 3 000.
  *
  * Esto abre la URL en Chromium sin interfaz, espera a que el documento cargue y
- * la red se aquiete, y cuenta `document.body.innerText` con la MISMA función
- * que cuenta el lado servido (`contarCaracteres` de `lectura.ts`).
+ * la red se aquiete, y cuenta el texto del DOM con la MISMA función que cuenta
+ * el HTML servido (`textoSinJavaScript` de `lectura.ts`) sobre la
+ * serialización del DOM (`html()`, que en Chromium es `page.content()`).
  *
- * Y EL LADO SERVIDO TAMBIÉN SE MIDE ACÁ, CON LA MISMA EXTRACCIÓN. Contar el
- * HTML servido sacándole las etiquetas (`textoSinJavaScript`) cuenta lo que
- * el CSS oculta, y `innerText` no: MEDIDO con Chrome 154 (P4), una página con
- * un mega-menú `display: none` de 1 671 caracteres servidos y TODO lo visible
- * (3 189) dibujado por JavaScript salía VERDE —1 671 es más de la mitad de
- * 3 189— aunque una persona no vea ni una letra que no venga del JavaScript.
- * Por eso, con el mismo navegador, se abre una segunda pestaña con el
- * JavaScript APAGADO, se le entrega el mismo documento que recibió la primera
- * (de la caché de esta medición: no se pide dos veces) y se cuenta su
- * `innerText`, sin `<noscript>`: es el texto que se VE sin ejecutar nada.
+ * Y EL LADO SERVIDO TAMBIÉN SE MIDE ACÁ, CON LA MISMA EXTRACCIÓN. Con el mismo
+ * navegador se abre una segunda pestaña con el JavaScript APAGADO, se le
+ * entrega el mismo documento que recibió la primera (de la caché de esta
+ * medición: no se pide dos veces) y se cuenta su DOM con la misma función. Es
+ * el número que la puerta nombra —«los caracteres de texto del HTML sin
+ * ejecutar JS»— leído del mismo documento que el renderizado.
+ *
+ * NINGÚN LADO APLICA CSS, A PROPÓSITO (GATE-1). Un rastreador que no ejecuta
+ * JavaScript tampoco aplica CSS: lee el texto del HTML entero, también el que
+ * una hoja de estilos oculta. Contar «lo visible sin JavaScript» (`innerText`)
+ * ponía BLOQUEANTE a las páginas SSR que ocultan su texto hasta que corre el
+ * JavaScript —`elementor-invisible`, un anti-FOUC en `<html>`, un `<style>`
+ * dentro de `<noscript>`—: MEDIDO con Chrome 154 y la ruta, la web de Vulkan
+ * (WordPress con Elementor) salía 1 550 servidos contra 4 405, y con el HTML
+ * son 5 447. Y del lado renderizado tampoco se aplica: si sólo un lado contara
+ * lo oculto, la diferencia la inventaría la extracción. Así, un mega-menú
+ * `display: none` servido cuenta de los dos lados, y lo que el JavaScript
+ * agrega —visible u oculto— cuenta sólo del renderizado: es texto que el
+ * rastreador no recibe. MEDIDO con Chrome 154: P4 sigue rojo (1 669 servidos
+ * contra 4 841), y `elementor-invisible`, el anti-FOUC y el `<style>` en
+ * `<noscript>` salen verdes (servido igual a renderizado).
  *
  * TRES ESTADOS, Y NINGÚN CERO INVENTADO
  *
@@ -121,7 +133,7 @@
  * resuelve a `10.x`— con dobles, y además con el Chromium de verdad.
  */
 import { esIpPublica, type Resolucion } from "@/lib/profile/evidenceCheck";
-import { contarCaracteres } from "./lectura";
+import { textoSinJavaScript } from "./lectura";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // El resultado
@@ -157,12 +169,13 @@ export type CodigoDeFallo =
 export type ResultadoRenderizado =
   | {
       estado: "medido";
-      /** El texto visible CON JavaScript. */
+      /** Los caracteres de texto del DOM CON JavaScript (sin aplicar CSS). */
       caracteres: number;
       /**
-       * El texto visible SIN JavaScript: el mismo documento en una pestaña con
-       * el JavaScript apagado, con la misma extracción. Opcional para que las
-       * lecturas viejas sigan valiendo; sin él, la regla usa el conteo del HTML.
+       * Los caracteres de texto del HTML SIN JavaScript: el mismo documento en
+       * una pestaña con el JavaScript apagado, con la misma extracción.
+       * Opcional para que las lecturas viejas sigan valiendo; sin él, la regla
+       * usa el conteo del HTML que trajo la ruta.
        */
       servidos?: number;
     }
@@ -238,15 +251,19 @@ export interface PaginaAbierta {
    * perezosa) se dibuja. Nunca rechaza.
    */
   desplazar(timeoutMs: number): Promise<void>;
-  /** `document.body.innerText`, crudo: la normalización es de este archivo. */
-  textoVisible(): Promise<string>;
+  /**
+   * El DOM serializado, tal como está ahora (`page.content()`). La extracción
+   * del texto es de este archivo —`textoSinJavaScript`, la misma del HTML
+   * servido—, no del navegador: ver «NINGÚN LADO APLICA CSS» arriba.
+   */
+  html(): Promise<string>;
 }
 
 export interface NavegadorAbierto {
   /**
    * `javascript: false` es la pestaña del lado servido: no corre ningún
-   * script, y `textoVisible` no cuenta `<noscript>` (que sin JavaScript sí se
-   * dibuja) para contar lo mismo que el lado renderizado.
+   * script. Su `<noscript>` se parsea como elementos y el de la pestaña con
+   * JavaScript como texto crudo; `textoSinJavaScript` lo saca de los dos.
    */
   nuevaPagina(opciones?: { javascript?: boolean }): Promise<PaginaAbierta>;
   /** Cierra, y si no cierra a tiempo, mata. Nunca rechaza. */
@@ -369,11 +386,11 @@ export function crearExaminador(resolver: Resolvedor): Examinador {
 const METODOS = new Set(["GET", "HEAD", "POST", "OPTIONS"]);
 
 /**
- * Tipos de recurso que no cambian `innerText`: una imagen, un video o una
- * fuente no agregan ni quitan un carácter de texto visible. Se abortan para que
- * el presupuesto de tiempo y de bytes vaya a lo que sí lo cambia —el documento,
- * los scripts, el CSS (que puede ocultar texto) y los datos que traen los
- * scripts—. El `alt` de una imagen tampoco está en `innerText`.
+ * Tipos de recurso que no cambian el texto del DOM: una imagen, un video o una
+ * fuente no agregan ni quitan un carácter. Se abortan para que el presupuesto
+ * de tiempo y de bytes vaya a lo que sí lo cambia —el documento, los scripts y
+ * los datos que traen los scripts—. El `alt` de una imagen es un atributo, y
+ * tampoco cuenta.
  */
 const SIN_TEXTO = new Set(["image", "media", "font"]);
 
@@ -440,7 +457,17 @@ export function crearInterceptor(
   restanteMs: () => number,
   senal: AbortSignal,
   examinar: Examinador = crearExaminador(deps.resolver),
-  cache: { guardarEn?: CacheDeRespuestas; servirDesde?: CacheDeRespuestas } = {}
+  pestana: {
+    guardarEn?: CacheDeRespuestas;
+    servirDesde?: CacheDeRespuestas;
+    /**
+     * La pestaña sin JavaScript: sólo el documento. Sin scripts que corran,
+     * ningún subrecurso cambia el texto de su DOM —el CSS ya no cuenta, y un
+     * marco no está en la serialización del principal—, así que no sale nada
+     * más a la red.
+     */
+    soloDocumento?: boolean;
+  } = {}
 ) {
   let bytesTotales = 0;
 
@@ -465,12 +492,14 @@ export function crearInterceptor(
       if (ESQUEMAS_LOCALES.has(url.protocol)) return await pedido.continuar();
       if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
       if (!METODOS.has(pedido.metodo.toUpperCase())) return await bloquear("metodo");
-      if (!pedido.esDocumentoPrincipal && SIN_TEXTO.has(pedido.tipo)) return await bloquear("sin-texto");
+      if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || pestana.soloDocumento)) {
+        return await bloquear("sin-texto");
+      }
       if (senal.aborted) return await bloquear("presupuesto");
 
       // La pestaña sin JavaScript recibe lo MISMO que recibió la primera, sin
       // volver a la red: el examen ya se hizo cuando se pidió.
-      const guardada = pedido.metodo.toUpperCase() === "GET" ? cache.servirDesde?.get(url.toString()) : undefined;
+      const guardada = pedido.metodo.toUpperCase() === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
       if (guardada) {
         if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
         return await pedido.responder(guardada);
@@ -509,7 +538,7 @@ export function crearInterceptor(
         if (!DE_LA_RESPUESTA.has(nombre.toLowerCase())) devueltos[nombre.toLowerCase()] = valor;
       }
       const entregada = { status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo };
-      if (pedido.metodo.toUpperCase() === "GET") cache.guardarEn?.set(url.toString(), entregada);
+      if (pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(url.toString(), entregada);
       await pedido.responder(entregada);
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
@@ -530,7 +559,7 @@ function fallo(codigo: CodigoDeFallo): ResultadoRenderizado {
 const dormir = (ms: number) => new Promise<void>((listo) => setTimeout(listo, Math.max(ms, 0)));
 
 /**
- * Lee el texto visible hasta que su MÁXIMO deje de crecer durante
+ * Lee el texto del DOM hasta que su MÁXIMO deje de crecer durante
  * `quietudDomMs`, y devuelve ese máximo. Si el tope llega con el texto todavía
  * creciendo, `inestable`: el número de ese momento es parcial, y un parcial
  * del lado renderizado es un verde inventado.
@@ -543,7 +572,7 @@ async function leerCuandoSeQuede(
   esperar: (ms: number) => Promise<void>
 ): Promise<number | "inestable" | "plazo"> {
   const inicio = ahora();
-  let maximo = contarCaracteres(await pagina.textoVisible());
+  let maximo = textoSinJavaScript(await pagina.html());
   let crecioEn = inicio;
   while (ahora() - crecioEn < opciones.quietudDomMs) {
     // Al tope: si el texto creció mientras se miraba, sigue creciendo y el
@@ -551,7 +580,7 @@ async function leerCuandoSeQuede(
     // entera, es el presupuesto el que no alcanzó, no la página.
     if (ahora() - inicio >= topeMs) return crecioEn === inicio ? "plazo" : "inestable";
     await esperar(opciones.sondeoMs);
-    const n = contarCaracteres(await pagina.textoVisible());
+    const n = textoSinJavaScript(await pagina.html());
     if (n > maximo) {
       maximo = n;
       crecioEn = ahora();
@@ -686,22 +715,28 @@ export async function medirRenderizado(
       if (caracteres === "inestable") return fallo("inestable");
       if (caracteres === "plazo") return fallo("timeout");
 
-      // El lado servido, con la misma extracción: ver el encabezado (P4). Si
-      // no se puede medir, el resultado no se da: el número del HTML cuenta
-      // lo oculto, y con él la página del mega-menú vuelve a salir verde.
+      // El lado servido, del MISMO documento y con la misma extracción: ver
+      // el encabezado. Si no se puede medir, el resultado no se da: un número
+      // servido de otro documento (el que trajo la ruta, con otro
+      // user-agent) compararía dos páginas que pueden no ser la misma.
       const servida = nuevaBitacora();
       try {
         const sinJs = await vivo.navegador.nuevaPagina({ javascript: false });
         await sinJs.interceptar(
-          crearInterceptor(deps, opciones, servida, restante, corte.signal, examinar, { servirDesde: respuestas })
+          crearInterceptor(deps, opciones, servida, restante, corte.signal, examinar, {
+            servirDesde: respuestas,
+            soloDocumento: true,
+          })
         );
         await sinJs.navegar(destino.toString(), Math.max(restante(), 1));
         bitacora.pedidos.push(...servida.pedidos);
-        bitacora.bloqueados.push(...servida.bloqueados);
+        // Lo que la pestaña sin JavaScript no pidió a propósito (todo lo que no
+        // es el documento) no es un hallazgo: sería ruido en la bitácora.
+        bitacora.bloqueados.push(...servida.bloqueados.filter((b) => b.motivo !== "sin-texto"));
         if (servida.falloDocumento || servida.statusDocumento === null || servida.statusDocumento >= 400) {
           return fallo("lectura-servida");
         }
-        const servidos = contarCaracteres(await sinJs.textoVisible());
+        const servidos = textoSinJavaScript(await sinJs.html());
         return { estado: "medido", caracteres, servidos };
       } catch {
         return fallo(corte.signal.aborted ? "timeout" : "lectura-servida");

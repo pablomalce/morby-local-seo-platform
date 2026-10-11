@@ -298,16 +298,18 @@ describe("el punto «contenido sin JavaScript»: servido contra renderizado", ()
     expect(con(400, { estado: "medido", caracteres: 499 }).hallazgo?.donde).toMatch(/contenido/);
   });
 
-  it("P4: con el lado servido VISIBLE medido, manda ése, no el del HTML", () => {
-    // El mega-menú oculto: 1 671 en el HTML, 0 visibles, 3 189 dibujados.
-    const oculto = con(1_671, { estado: "medido", caracteres: 3_189, servidos: 0 });
-    expect(oculto.estado).toBe("rojo");
-    expect(oculto.servido).toBe(0);
-    expect(oculto.servidoEnHtml).toBe(1_671);
-    expect(oculto.hallazgo?.quePasa).toMatch(/El HTML trae 1671/);
-    // Y al revés no regala nada: visible bajo, HTML alto, sigue rojo.
+  it("con `servidos` medido en el mismo documento, manda ése, no el del pedido aparte de la ruta", () => {
+    // El render midió 1 669 servidos y 4 841 en el DOM (el mega-menú oculto
+    // cuenta de los dos lados, P4, Chrome 154); la ruta, con otro
+    // user-agent, trajo otro HTML. Decide el del mismo documento.
+    const mismo = con(4_000, { estado: "medido", caracteres: 4_841, servidos: 1_669 });
+    expect(mismo.estado).toBe("rojo");
+    expect(mismo.servido).toBe(1_669);
+    expect(mismo.servidoEnHtml).toBe(4_000);
+    expect(mismo.hallazgo?.quePasa).toMatch(/el HTML trae 1669 caracteres/);
+    // Y al revés no regala nada: el del documento bajo, el de la ruta alto, sigue rojo.
     expect(con(4_000, { estado: "medido", caracteres: 4_000, servidos: 100 }).estado).toBe("rojo");
-    // Una lectura vieja, sin el visible, decide con el HTML como antes.
+    // Una lectura vieja, sin `servidos`, decide con el HTML de la ruta como antes.
     expect(con(1_671, { estado: "medido", caracteres: 3_189 }).estado).toBe("verde");
   });
 
