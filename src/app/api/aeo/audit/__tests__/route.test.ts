@@ -97,6 +97,7 @@ async function transporte(pedido: PedidoHttp): Promise<RespuestaHttp> {
 
 const DNS = {
   "ejemplo.com": ["93.184.216.34"],
+  "www.ejemplo.com": ["93.184.216.35"],
   "otro-sitio.com": ["151.101.1.1"],
   "interno.test": ["10.0.0.7"],
   "mixto.test": ["93.184.216.34", "127.0.0.1"],
@@ -442,5 +443,44 @@ describe("SEC-1: ningún pedido de la ruta llega a una dirección que no es púb
     const res = await POST(pedido({ businessId: NEGOCIO }));
     expect(res.status).toBe(200);
     expect(pedidos).toEqual(expect.arrayContaining(["https://ejemplo.com/", "https://ejemplo.com/inicio"]));
+  });
+});
+
+/**
+ * P1. El robots se lee para la página que se audita: la del ÚLTIMO salto de la
+ * portada, con el `robots.txt` de SU origen. Antes se leía en "/" del sitio
+ * cargado, y una página bloqueada que no fuera la raíz salía con todos adentro.
+ */
+describe("P1: el acceso se decide para la URL final, con el robots de su origen", () => {
+  it("un sitio cargado con ruta: el robots se pregunta por ESA ruta, no por la raíz", async () => {
+    negocio = { id: NEGOCIO, organization_id: "org-1", website: "https://ejemplo.com/blog" };
+    respuestas["https://ejemplo.com/blog"] = HTML_SANO;
+    respuestas["https://ejemplo.com/robots.txt"] = "User-agent: GPTBot\nDisallow: /blog\n\nUser-agent: *\nDisallow:";
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as {
+      lectura: { acceso: Record<string, boolean> };
+      hallazgos: Array<{ gravedad: string; quePasa: string }>;
+    };
+    expect(cuerpo.lectura.acceso.gptbot).toBe(false);
+    expect(cuerpo.lectura.acceso.claudebot).toBe(true);
+    expect(cuerpo.hallazgos.some((h) => h.gravedad === "bloqueante" && /Bloqueados: gptbot/.test(h.quePasa))).toBe(true);
+  });
+
+  it("una portada que redirige a otro origen: manda el robots del DESTINO, y su ruta", async () => {
+    respuestas["https://ejemplo.com/"] = { status: 301, location: "https://www.ejemplo.com/inicio" };
+    respuestas["https://www.ejemplo.com/inicio"] = HTML_SANO;
+    // El origen cargado deja entrar a todos; el que sirve la página, no a GPTBot.
+    respuestas["https://www.ejemplo.com/robots.txt"] = "User-agent: GPTBot\nDisallow: /inicio";
+    respuestas["https://www.ejemplo.com/llms.txt"] = "# llms";
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as {
+      urlFinal: string;
+      lectura: { acceso: Record<string, boolean>; tieneLlmsTxt: boolean };
+    };
+    expect(cuerpo.urlFinal).toBe("https://www.ejemplo.com/inicio");
+    expect(cuerpo.lectura.acceso.gptbot).toBe(false);
+    expect(cuerpo.lectura.tieneLlmsTxt).toBe(true);
+    expect(pedidos).toEqual(
+      expect.arrayContaining(["https://www.ejemplo.com/robots.txt", "https://www.ejemplo.com/llms.txt"])
+    );
+    expect(pedidos).not.toContain("https://ejemplo.com/robots.txt");
   });
 });

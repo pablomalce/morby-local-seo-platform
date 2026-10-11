@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
+import { describe, expect, it, vi } from "vitest";
+import { contenidoSinJs, hallazgos, type Hallazgo, type LecturaDelSitio } from "../hallazgos";
 import {
   accesoDeLasIA,
+  contarCaracteres,
   erroresDeSchema,
   MINIMO_DE_TEXTO,
   textoSinJavaScript,
@@ -11,8 +12,8 @@ import {
 } from "../lectura";
 import { bloqueadoPorHttp, statusPorAgente, USER_AGENTS } from "../peticion";
 import { crearRedExaminada } from "../red";
-import type { Transporte } from "../renderizado";
-import { resolvedorDoble } from "./navegadorDoble";
+import type { DependenciasRender, PedidoHttp, RespuestaHttp, Transporte } from "../renderizado";
+import { navegadorDoble, resolvedorDoble } from "./navegadorDoble";
 
 /**
  * H2-GO-1 — la auditoría contra una página que TIENE que salir en rojo.
@@ -38,6 +39,85 @@ import { resolvedorDoble } from "./navegadorDoble";
 const RAIZ = process.cwd();
 const CONTROL = readFileSync(path.join(RAIZ, "public", "aeo-control", "index.html"), "utf8");
 const ROBOTS = readFileSync(path.join(RAIZ, "public", "robots.txt"), "utf8");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// El despliegue, como contesta de verdad (medido con curl el 2026-10-11 contra
+// https://morby-local-seo-platform.vercel.app): `/aeo-control/` da 308 a
+// `/aeo-control`, que da 200 con este mismo HTML a CUALQUIER user-agent —
+// GPTBot, ClaudeBot y CCBot incluidos: Vercel no bloquea a nadie—, el
+// `robots.txt` es el de `public/`, y no hay `llms.txt`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ORIGEN = "https://morby-local-seo-platform.vercel.app";
+
+function despliegue(pedido: PedidoHttp): RespuestaHttp {
+  const vacio = Buffer.alloc(0);
+  switch (pedido.url) {
+    case `${ORIGEN}/aeo-control/`:
+      return { tipo: "respuesta", status: 308, encabezados: { location: "/aeo-control" }, cuerpo: vacio };
+    case `${ORIGEN}/aeo-control`:
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
+    case `${ORIGEN}/robots.txt`:
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/plain" }, cuerpo: Buffer.from(ROBOTS) };
+    default:
+      return { tipo: "respuesta", status: 404, encabezados: {}, cuerpo: vacio };
+  }
+}
+
+/**
+ * Lo que dibuja el `<script>` de la página de control, sacado de la página
+ * misma: se ejecuta contra un `document` que sólo guarda el `innerHTML`, y se
+ * quitan las etiquetas como lo haría `innerText` (un salto entre el `<h1>` y el
+ * `<p>`). Con Chrome 154, `renderizado.integracion.test.ts` midió 1677.
+ */
+function textoQueDibujaElControl(): string {
+  const script = [...CONTROL.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
+  const app = { innerHTML: "" };
+  new Function("document", script)({ getElementById: () => app });
+  return app.innerHTML.replace(/<\/h1>/g, "\n").replace(/<[^>]+>/g, "");
+}
+
+let negocioControl = { id: "", organization_id: "org-control", website: "" };
+let ipControl = 0;
+
+vi.mock("@/lib/supabase/server", () => ({
+  createSupabaseServerClient: async () => ({
+    auth: { getUser: async () => ({ data: { user: { id: "u-control" } } }) },
+    from: () => ({
+      select: () => ({ eq: () => ({ maybeSingle: async () => ({ data: negocioControl, error: null }) }) }),
+      insert: async () => ({ error: null }),
+    }),
+  }),
+}));
+
+vi.mock("@/lib/aeo/chromium", () => ({
+  dependenciasDeProduccion: (): DependenciasRender => ({
+    abrirNavegador: navegadorDoble({ textoCrudo: textoQueDibujaElControl() }).abrirNavegador,
+    transporte: async (pedido) => despliegue(pedido),
+    resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
+  }),
+}));
+
+async function auditarPorLaRuta(website: string) {
+  const { POST } = await import("@/app/api/aeo/audit/route");
+  negocioControl = { id: "5a0e7d1c-4b8e-4f43-9c35-0d6b8f3b2a11", organization_id: "org-control", website };
+  ipControl += 1;
+  const res = await POST(
+    new Request("http://localhost/api/aeo/audit", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": `10.9.0.${ipControl}` },
+      body: JSON.stringify({ businessId: negocioControl.id }),
+    })
+  );
+  return {
+    status: res.status,
+    cuerpo: (await res.json()) as {
+      urlFinal: string;
+      lectura: LecturaDelSitio;
+      hallazgos: Hallazgo[];
+    },
+  };
+}
 
 describe("la página de control sale en rojo en los tres ejes", () => {
   it("eje 1 — sin JavaScript no hay texto: el HTML servido está vacío", () => {
@@ -78,10 +158,14 @@ describe("la página de control sale en rojo en los tres ejes", () => {
   });
 
   it("eje 3a — el robots.txt lo bloquea para los agentes declarados, y sólo para ellos", () => {
-    const acceso = accesoDeLasIA(ROBOTS, "/aeo-control/");
-    expect(acceso.gptbot).toBe(false);
-    expect(acceso.claudebot).toBe(false);
-    expect(acceso.perplexitybot, "el resto entra: el bloqueo es selectivo a propósito").toBe(true);
+    // Con y sin la barra: el despliegue redirige la primera a la segunda, y
+    // la segunda es la URL que de verdad se sirve.
+    for (const ruta of ["/aeo-control", "/aeo-control/"]) {
+      const acceso = accesoDeLasIA(ROBOTS, ruta);
+      expect(acceso.gptbot, ruta).toBe(false);
+      expect(acceso.claudebot, ruta).toBe(false);
+      expect(acceso.perplexitybot, "el resto entra: el bloqueo es selectivo a propósito").toBe(true);
+    }
     // La raíz del sitio sigue abierta para todos: la página de control no
     // puede costarle posicionamiento al producto que la aloja.
     expect(Object.values(accesoDeLasIA(ROBOTS, "/")).every(Boolean)).toBe(true);
@@ -111,30 +195,34 @@ describe("la página de control sale en rojo en los tres ejes", () => {
     expect(bloqueadoPorHttp(status.claudebot)).toBe(false);
   });
 
-  it("los tres ejes juntos: tres hallazgos bloqueantes, uno por eje", () => {
-    const lectura: LecturaDelSitio = {
-      acceso: accesoDeLasIA(ROBOTS, "/aeo-control/"),
-      statusPorAgente: {
-        gptbot: 403,
-        claudebot: 403,
-        perplexitybot: 200,
-        "google-extended": 200,
-        ccbot: 200,
-      },
-      caracteresSinJs: textoSinJavaScript(CONTROL),
-      schema: tiposDeSchema(CONTROL),
-      erroresDeSchema: erroresDeSchema(CONTROL),
-      tieneLlmsTxt: false,
-    };
+  it.each([`${ORIGEN}/aeo-control/`, `${ORIGEN}/aeo-control`])(
+    "los tres ejes juntos, POR LA RUTA y con lo que contesta el despliegue (%s): tres bloqueantes, uno por eje",
+    async (website) => {
+      // Antes este caso armaba la lectura a mano, con 403 para GPTBot y
+      // ClaudeBot y la ruta `/aeo-control/`: el despliegue no devuelve ninguna
+      // de las dos cosas, y la ruta leía el robots en "/". Por el POST, con
+      // las respuestas reales, el eje de acceso salía VERDE (P1).
+      const texto = textoQueDibujaElControl();
+      expect(contarCaracteres(texto)).toBeGreaterThan(MINIMO_DE_TEXTO);
 
-    const bloqueantes = hallazgos(lectura).filter((h) => h.gravedad === "bloqueante");
-    const textos = bloqueantes.map((h) => h.quePasa).join(" | ");
+      const { status, cuerpo } = await auditarPorLaRuta(website);
+      expect(status).toBe(200);
+      expect(cuerpo.urlFinal).toBe(`${ORIGEN}/aeo-control`);
+      // Lo que el despliegue hace con cada agente: 200 a todos. El bloqueo
+      // vive SÓLO en el robots, y tiene que verse igual.
+      expect(Object.values(cuerpo.lectura.statusPorAgente ?? {})).toEqual([200, 200, 200, 200, 200]);
 
-    expect(bloqueantes.length).toBeGreaterThanOrEqual(3);
-    expect(textos, "eje 3: acceso").toMatch(/Bloqueados: gptbot, claudebot/);
-    expect(textos, "eje 1: texto sin JS").toMatch(/JavaScript|texto/i);
-    expect(textos, "eje 2: schema inválido").toMatch(/JSON-LD.*error/i);
-  });
+      const bloqueantes = cuerpo.hallazgos.filter((h) => h.gravedad === "bloqueante");
+      const textos = bloqueantes.map((h) => h.quePasa).join(" | ");
+      expect(bloqueantes.length).toBe(3);
+      expect(textos, "eje 3: acceso").toMatch(/Bloqueados: gptbot, claudebot/);
+      expect(
+        bloqueantes.some((h) => /renderizado/.test(h.donde) && h.quePasa.includes(String(contarCaracteres(texto)))),
+        "eje 1: texto sin JS, con el número renderizado"
+      ).toBe(true);
+      expect(textos, "eje 2: schema inválido").toMatch(/JSON-LD.*error/i);
+    }
+  );
 
   it("un servidor que contesta 403 al user-agent con el robots ABIERTO es bloqueante igual", () => {
     // Ésta es la mutación que la puerta nombra: leer sólo el robots deja este

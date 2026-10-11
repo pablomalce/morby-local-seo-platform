@@ -18,10 +18,11 @@ import { crearRedExaminada, MOTIVOS_DE_BLOQUEO, traerExaminado, type RedExaminad
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 /**
- * Tres peticiones a un sitio ajeno (8 s), y después, en paralelo, las cinco por
- * agente (8 s) y el render en Chromium (`renderizado.ts`: 25 s de tope total,
- * más 5 s para cerrar el navegador). Peor caso, unos 38 s: 60 es el techo de
- * Vercel Hobby y deja lugar para la escritura.
+ * La portada (8 s, redirecciones incluidas), y después, en paralelo, el
+ * `robots.txt` y el `llms.txt` del origen al que llevó la portada (8 s), las
+ * cinco por agente (8 s) y el render en Chromium (`renderizado.ts`: 25 s de
+ * tope total, más 5 s para cerrar el navegador). Peor caso, unos 38 s: 60 es
+ * el techo de Vercel Hobby y deja lugar para la escritura.
  */
 export const maxDuration = 60;
 
@@ -67,7 +68,9 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 const AGENTE = "VulkanGrowthOS/1.0 (auditoria AEO)";
 
-type Traido = { ok: true; texto: string } | { ok: false; motivo: string; bloqueado: boolean };
+type Traido =
+  | { ok: true; texto: string; /** La URL del último salto. */ url: string }
+  | { ok: false; motivo: string; bloqueado: boolean };
 
 async function traer(red: RedExaminada, url: string): Promise<Traido> {
   const t = await traerExaminado(red, url, { userAgent: AGENTE, timeoutMs: TIMEOUT_MS, maxBytes: MAX_BYTES });
@@ -75,7 +78,7 @@ async function traer(red: RedExaminada, url: string): Promise<Traido> {
   // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
   // significa que el archivo no está, que es exactamente lo que se pregunta.
   if (t.status < 200 || t.status >= 300) return { ok: false, motivo: `http ${t.status}`, bloqueado: false };
-  return { ok: true, texto: t.cuerpo.toString("utf8") };
+  return { ok: true, texto: t.cuerpo.toString("utf8"), url: t.url };
 }
 
 export async function POST(req: Request) {
@@ -122,11 +125,7 @@ export async function POST(req: Request) {
     const deps = dependenciasDeProduccion();
     const red = crearRedExaminada(deps);
 
-    const [robots, portada, llms] = await Promise.all([
-      traer(red, new URL("/robots.txt", base).toString()),
-      traer(red, base.toString()),
-      traer(red, new URL("/llms.txt", base).toString()),
-    ]);
+    const portada = await traer(red, base.toString());
 
     // La portada es la única imprescindible: sin ella no hay ni schema ni texto
     // que medir, y devolver ceros sería inventar dos hallazgos.
@@ -146,10 +145,15 @@ export async function POST(req: Request) {
       );
     }
 
-    // Un `robots.txt` que no se pudo traer se trata como AUSENTE, que es lo que
-    // el estándar dice: sin robots, se permite. Y se informa que no se leyó, para
-    // que nadie confunda «permite» con «no se pudo mirar».
-    const textoRobots = robots.ok ? robots.texto : "";
+    // La página que se audita es la del ÚLTIMO salto de la portada, y el
+    // `robots.txt` que la gobierna es el de SU origen, preguntado por SU ruta.
+    // Leerlo en "/" del sitio cargado dejaba en verde a toda página que no
+    // fuera la raíz: la de control de la puerta H2-GO-1 —bloqueada en el
+    // robots para GPTBot y ClaudeBot— salía con todos los agentes adentro,
+    // porque "/" no cae bajo `Disallow: /aeo-control` y además el despliegue
+    // redirige `/aeo-control/` a `/aeo-control`.
+    const final = new URL(portada.url);
+    const rutaFinal = `${final.pathname}${final.search}`;
 
     // La petición REAL con cada user-agent. No reemplaza la lectura del
     // robots: la complementa con lo que el servidor hace de verdad, que es lo
@@ -160,12 +164,20 @@ export async function POST(req: Request) {
     // contesta no se arranca un navegador— y nunca rechaza: un render que
     // falla vuelve como `{ estado: "fallo", codigo }`, y el hallazgo lo dice
     // como «no medido», no como un cero.
-    const [statusAgentes, caracteresRenderizados] = await Promise.all([
+    const [robots, llms, statusAgentes, caracteresRenderizados] = await Promise.all([
+      traer(red, new URL("/robots.txt", final).toString()),
+      traer(red, new URL("/llms.txt", final).toString()),
       statusPorAgente(base.toString(), red),
       medirRenderizado(base.toString(), deps),
     ]);
+
+    // Un `robots.txt` que no se pudo traer se trata como AUSENTE, que es lo que
+    // el estándar dice: sin robots, se permite. Y se informa que no se leyó, para
+    // que nadie confunda «permite» con «no se pudo mirar».
+    const textoRobots = robots.ok ? robots.texto : "";
+
     const lectura: LecturaDelSitio = {
-      acceso: accesoDeLasIA(textoRobots),
+      acceso: accesoDeLasIA(textoRobots, rutaFinal),
       statusPorAgente: statusAgentes,
       caracteresSinJs: textoSinJavaScript(portada.texto),
       caracteresRenderizados,
@@ -199,6 +211,7 @@ export async function POST(req: Request) {
       {
         ok: true,
         url: base.toString(),
+        urlFinal: final.toString(),
         robotsLeido: robots.ok,
         motivoRobots: robots.ok ? null : robots.motivo,
         guardada: !errorGuardado,
