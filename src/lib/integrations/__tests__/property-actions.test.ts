@@ -46,7 +46,11 @@ let errorDeMembresiaEn: string | null = null;
  * el fallo del UPDATE tape al del INSERT, y el test del 23505 pasaría midiendo
  * el paso equivocado. Ya pasó al escribir este archivo.
  */
-let errorPorVerbo: { update?: { code?: string; message: string }; insert?: { code?: string; message: string } } = {};
+let errorPorVerbo: {
+  update?: { code?: string; message: string };
+  insert?: { code?: string; message: string };
+  rpc?: { code?: string; message: string };
+} = {};
 
 /** Cada operación, con el cliente que la hizo. Es lo que se afirma. */
 let operaciones: {
@@ -63,6 +67,11 @@ const AJENA = "33333333-3333-4333-8333-333333333333";
 function clienteFalso(cliente: "sesion" | "servicio") {
   return {
     auth: { getUser: async () => ({ data: { user: usuario } }) },
+    // Una RPC es UNA escritura, y se registra con su nombre y sus argumentos.
+    rpc: async (nombre: string, args: Record<string, unknown>) => {
+      operaciones.push({ cliente, tabla: nombre, verbo: "rpc", valores: args, filtros: {} });
+      return { data: null, error: errorPorVerbo.rpc ?? null };
+    },
     from(tabla: string) {
       const filtros: Record<string, unknown> = {};
       let verbo = "select";
@@ -248,7 +257,7 @@ describe("quién puede escribir un mapeo", () => {
 });
 
 describe("el privilegio: el mapeo se escribe desde el servidor", () => {
-  it("el INSERT va por el cliente de servicio y nunca por el de sesión", async () => {
+  it("el remapeo va por el cliente de servicio, en UNA llamada a la RPC de la 0034, y nunca por el de sesión", async () => {
     const { mapProperty } = await acciones();
     const res = await mapProperty({
       organizationId: ORG,
@@ -257,15 +266,15 @@ describe("el privilegio: el mapeo se escribe desde el servidor", () => {
     });
 
     expect(res).toEqual({ ok: true });
-    const insert = escrituras().find((o) => o.verbo === "insert");
-    expect(insert, "no se insertó el mapeo").toBeDefined();
-    expect(insert!.cliente).toBe("servicio");
-    expect(insert!.tabla).toBe("integration_properties");
-    expect(insert!.valores).toEqual({
-      organization_id: ORG,
-      provider: "ga4",
-      property_ref: "properties/123456789",
-    });
+    expect(escrituras()).toEqual([
+      {
+        cliente: "servicio",
+        tabla: "remap_integration_property",
+        verbo: "rpc",
+        valores: { p_organization_id: ORG, p_provider: "ga4", p_property_ref: "properties/123456789" },
+        filtros: {},
+      },
+    ]);
     expect(escrituraDeSesion(), "algo se escribió con la llave del navegador").toHaveLength(0);
   });
 
@@ -330,42 +339,52 @@ describe("la forma canónica se comprueba antes de escribir", () => {
       surface: "ga4",
       propertyRef: "  properties/123456789 ",
     });
-    const insert = escrituras().find((o) => o.verbo === "insert");
-    expect(insert!.valores!.property_ref).toBe("properties/123456789");
+    const remapeo = escrituras().find((o) => o.verbo === "rpc");
+    expect(remapeo!.valores!.p_property_ref).toBe("properties/123456789");
   });
 });
 
-describe("remapear: primero se desmapea, después se inserta", () => {
-  it("el desmapeo ocurre ANTES del insert", async () => {
-    // El índice `integration_properties_one_live_per_provider` rechaza el INSERT
-    // mientras el anterior siga vivo, así que al revés no funciona nunca. Y como
-    // los dos pasos no son una transacción, la caída en el medio deja al cliente
-    // SIN mapear —que no muestra nada de nadie— en vez de con dos mapeos vivos,
-    // que es la mitad de los reportes con los números del sitio equivocado.
-    const { mapProperty } = await acciones();
-    await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/1" });
+describe("remapear es UNA transacción: un choque no deja a la organización sin su mapeo", () => {
+  // Segunda revisión del #118 (F5), medido con este mismo doble: con un 23P01
+  // en el INSERT, las escrituras eran [update unmapped_at, insert] y ninguna
+  // tercera que devolviera el mapeo. La organización quedaba SIN su mapeo vivo
+  // anterior, que era válido, y el mensaje no lo decía. Ahora el desmapeo y el
+  // INSERT son una sola llamada (`remap_integration_property`, 0034), y que la
+  // base revierta el desmapeo cuando el INSERT choca lo mide el bloque 240 de
+  // `supabase/qa/defects_test.sql`. Lo que se mide acá es que no quede ningún
+  // paso suelto de este lado del cable.
+  for (const [codigo, esperado] of [
+    ["23P01", "property-overlaps"],
+    ["23505", "property-taken"],
+    ["23514", "bad-shape"],
+  ] as const) {
+    it(`con un ${codigo}, la única escritura fue la RPC: no hay un desmapeo suelto que quede hecho`, async () => {
+      errorPorVerbo = { rpc: { code: codigo, message: "choca" } };
+      const { mapProperty } = await acciones();
 
-    const orden = escrituras().map((o) => o.verbo);
-    expect(orden).toEqual(["update", "insert"]);
+      const res = await mapProperty({
+        organizationId: ORG,
+        surface: "search_console",
+        propertyRef: "https://www.ejemplo.test/",
+      });
 
-    const update = escrituras()[0];
-    expect(update.filtros).toMatchObject({
-      organization_id: ORG,
-      provider: "ga4",
-      unmapped_at: null,
+      expect(res).toMatchObject({ ok: false, code: esperado });
+      expect(escrituras().map((o) => `${o.verbo} ${o.tabla}`)).toEqual(["rpc remap_integration_property"]);
+      // Y lo dice: el operador no tiene que ir a ver si su cliente quedó sin mapeo.
+      expect(res.ok === false && res.message).toContain("El mapeo anterior de esta organización sigue como estaba.");
+      expect(revalidatePath).not.toHaveBeenCalled();
     });
-  });
+  }
 
-  it("si el desmapeo falla no se inserta", async () => {
-    errorPorVerbo = { update: { message: "no se pudo" } };
+  it("sin la 0034 en la base (la función no existe), no se toca nada y lo dice", async () => {
+    errorPorVerbo = { rpc: { code: "PGRST202", message: "Could not find the function" } };
     const { mapProperty } = await acciones();
-    const res = await mapProperty({
-      organizationId: ORG,
-      surface: "ga4",
-      propertyRef: "properties/1",
-    });
-    expect(res).toMatchObject({ code: "write-failed" });
-    expect(escrituras().some((o) => o.verbo === "insert")).toBe(false);
+
+    const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/1" });
+
+    expect(res).toMatchObject({ ok: false, code: "write-failed" });
+    expect(res.ok === false && res.message).toContain("0034");
+    expect(escrituras().map((o) => o.verbo)).toEqual(["rpc"]);
   });
 });
 
@@ -374,7 +393,7 @@ describe("la unicidad global, que es la fuga rechazada", () => {
     // Acá 23505 sólo puede ser la unicidad GLOBAL: la de
     // `(organization_id, provider)` se despejó en el paso anterior. Decir «error
     // al guardar» dejaría al operador reintentando lo mismo para siempre.
-    errorPorVerbo = { insert: { code: "23505", message: "duplicate key value" } };
+    errorPorVerbo = { rpc: { code: "23505", message: "duplicate key value" } };
     const { mapProperty } = await acciones();
     const res = await mapProperty({
       organizationId: ORG,
@@ -391,7 +410,7 @@ describe("la unicidad global, que es la fuga rechazada", () => {
     // los dos, y son el mismo tráfico. La 0034 lo rechaza con 23P01, y el
     // operador tiene que leer «se solapa», no «ya está mapeada» —no hay un texto
     // idéntico que buscar— ni «error al guardar».
-    errorPorVerbo = { insert: { code: "23P01", message: "se solapa con la de otra organización" } };
+    errorPorVerbo = { rpc: { code: "23P01", message: "se solapa con la de otra organización" } };
     const { mapProperty } = await acciones();
     const res = await mapProperty({
       organizationId: ORG,
@@ -402,8 +421,23 @@ describe("la unicidad global, que es la fuga rechazada", () => {
     expect(res.ok === false && res.message).toContain("se solapa");
   });
 
+  it("un 23514 es la forma canónica de Search Console de la 0034, y se dice así", async () => {
+    // `validarPropertyRef` deja pasar `https://bücher.example/`: tiene la forma
+    // de la 0017. La 0034 no le encuentra forma canónica (el host no es ASCII)
+    // y lo rechaza con 23514; el operador tiene que leer qué escribir.
+    errorPorVerbo = { rpc: { code: "23514", message: "sin forma canónica" } };
+    const { mapProperty } = await acciones();
+    const res = await mapProperty({
+      organizationId: ORG,
+      surface: "search_console",
+      propertyRef: "https://bücher.example/",
+    });
+    expect(res).toMatchObject({ code: "bad-shape" });
+    expect(res.ok === false && res.message).toContain("punycode");
+  });
+
   it("cualquier otro fallo de la base no se disfraza de conflicto de property", async () => {
-    errorPorVerbo = { insert: { code: "42501", message: "permission denied" } };
+    errorPorVerbo = { rpc: { code: "42501", message: "permission denied" } };
     const { mapProperty } = await acciones();
     const res = await mapProperty({
       organizationId: ORG,
@@ -497,7 +531,7 @@ describe("quién mapea: el rol, no sólo la membresía (H4.1, D4)", () => {
       const res = await mapProperty({ organizationId: ORG, surface: "ga4", propertyRef: "properties/123456789" });
 
       expect(res).toEqual({ ok: true });
-      expect(escrituras().some((o) => o.verbo === "insert" && o.cliente === "servicio")).toBe(true);
+      expect(escrituras().some((o) => o.verbo === "rpc" && o.cliente === "servicio")).toBe(true);
     });
   }
 
@@ -650,9 +684,9 @@ describe("la llave es de la agencia: owner de la organización destino no alcanz
       const res = await mapProperty({ organizationId: P, surface: "ga4", propertyRef: "properties/123456789" });
 
       expect(res).toEqual({ ok: true });
-      const insert = escrituras().find((o) => o.verbo === "insert");
-      expect(insert?.cliente).toBe("servicio");
-      expect(insert?.valores).toMatchObject({ organization_id: P, property_ref: "properties/123456789" });
+      const remapeo = escrituras().find((o) => o.verbo === "rpc");
+      expect(remapeo?.cliente).toBe("servicio");
+      expect(remapeo?.valores).toMatchObject({ p_organization_id: P, p_property_ref: "properties/123456789" });
     });
   }
 });
