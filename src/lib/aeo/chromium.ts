@@ -251,6 +251,32 @@ function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boo
   };
 }
 
+/**
+ * La ruta al binario de `@sparticuz/chromium`, UNA descompresión por proceso.
+ *
+ * `executablePath()` devuelve `/tmp/chromium` apenas el archivo EXISTE, y el
+ * archivo existe desde que se abre el stream que lo escribe, no desde que
+ * termina. MEDIDO (RV-2) en un contenedor AL2023 con 1 vCPU y `/tmp` vacío:
+ * dos auditorías en frío a la vez —en Fluid compute comparten instancia—
+ * dieron `spawn ETXTBSY` en 2 de 3 corridas, porque la segunda lanzó un
+ * binario a medio escribir. Con una sola promesa por proceso, la segunda
+ * espera a la primera. Si la descompresión falla, la promesa se olvida y la
+ * próxima apertura lo vuelve a intentar.
+ *
+ * Lo que esto NO cubre, dicho: una instancia congelada a mitad de la
+ * descompresión deja un `/tmp/chromium` parcial que `executablePath()` va a
+ * dar por bueno en la invocación siguiente. Eso no se midió.
+ */
+let rutaDeSparticuz: Promise<string> | undefined;
+
+function ejecutableDeSparticuz(cargar: () => Promise<string>): Promise<string> {
+  rutaDeSparticuz ??= cargar().catch((e: unknown) => {
+    rutaDeSparticuz = undefined;
+    throw e;
+  });
+  return rutaDeSparticuz;
+}
+
 export interface OpcionesChromium {
   /** Un Chrome local. Sin esto, `AEO_CHROME_PATH`; sin eso, el de `@sparticuz/chromium`. */
   ejecutable?: string;
@@ -291,7 +317,7 @@ export function abrirChromium(opciones: OpcionesChromium = {}): AbrirNavegador {
       // Sin WebGL: no cambia el texto, y ahorra descomprimir SwiftShader en
       // cada arranque en frío.
       chromium.setGraphicsMode = false;
-      executablePath = await chromium.executablePath();
+      executablePath = await ejecutableDeSparticuz(() => chromium.executablePath());
       headless = "shell";
       args = [...chromium.args.filter((a) => !SIN_SEGURIDAD.has(a)), ...sinRed];
     }
