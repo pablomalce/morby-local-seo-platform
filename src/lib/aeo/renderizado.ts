@@ -128,9 +128,9 @@
  * el despliegue real, 3 de 43 renders salieron `medido` con chunks de Next.js
  * en `timeout` (uno con «Application error» como todo el texto). Por eso:
  *
- *   1. si al leer queda alguno de esos pedidos EN VUELO, se lo espera (con
- *      tope: su propio plazo) y se vuelve a leer; si no termina,
- *      `subrecurso-pendiente`;
+ *   1. si al leer queda alguno de esos pedidos EN VUELO, se lo espera y se
+ *      vuelve a leer, mientras quede presupuesto; si se acaba con algo en
+ *      vuelo, `subrecurso-pendiente`;
  *   2. si alguno no llegó, `subrecurso-<motivo>`, sin número: el punto queda
  *      «no medido», nunca verde.
  *
@@ -800,18 +800,17 @@ export async function medirRenderizado(
       if (typeof caracteres !== "number") return caracteres;
 
       // RT-1: lo que escribe el texto tiene que haber LLEGADO. Lo que sigue en
-      // vuelo se espera —como mucho su propio plazo— y se vuelve a leer; dos
-      // rondas, para que una página que pide datos sin parar no las vuelva
-      // infinitas.
-      for (let ronda = 0; bitacora.enVuelo > 0 && ronda < 2; ronda++) {
-        const desde = ahora();
-        const hasta = Math.min(opciones.plazoPorPedidoMs, Math.max(restante() - 1_000, 0));
-        while (bitacora.enVuelo > 0 && ahora() - desde < hasta) await esperar(opciones.sondeoMs);
-        if (bitacora.enVuelo > 0) break;
+      // vuelo se espera y se vuelve a leer, mientras quede presupuesto: cada
+      // pedido tiene su propio plazo, así que lo que no termina es una página
+      // que no deja de pedir, y al acabarse el presupuesto se dice
+      // `subrecurso-pendiente`. Una página que pide cada tanto (un sondeo
+      // corto) se lee en un momento en que no hay nada en vuelo.
+      while (bitacora.enVuelo > 0) {
+        while (bitacora.enVuelo > 0 && restante() > 1_000) await esperar(opciones.sondeoMs);
+        if (bitacora.enVuelo > 0) return fallo("subrecurso-pendiente");
         caracteres = await leer();
         if (typeof caracteres !== "number") return caracteres;
       }
-      if (bitacora.enVuelo > 0) return fallo("subrecurso-pendiente");
       const perdido = bitacora.noLlegaron[0];
       if (perdido) return fallo(`subrecurso-${perdido.motivo}`);
 
