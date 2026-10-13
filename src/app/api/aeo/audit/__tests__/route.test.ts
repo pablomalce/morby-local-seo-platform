@@ -304,6 +304,30 @@ describe("lo que la puerta H2-GO-1 exige de la ruta", () => {
     ]);
   });
 
+  /**
+   * PU-5 (b): la fila guardaba `lectura.caracteresSinJs` —el HTML que trajo la
+   * ruta con su user-agent— mientras el punto decide con `servidos`, el
+   * MISMO documento que se renderizó. Si el sitio sirve otra cosa a cada uno,
+   * el dato crudo guardado no era el que decidió el color.
+   */
+  it("PU-5: `caracteres_sin_js` guarda el número servido que DECIDIÓ el punto, no el del HTML de la ruta", async () => {
+    // Al navegador le llega una portada más corta que a la ruta.
+    paginasRender = { "https://ejemplo.com/": { cuerpo: `<html><body><p>${"servido al navegador ".repeat(40)}</p></body></html>` } };
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as {
+      lectura: { caracteresSinJs: number; caracteresRenderizados: { estado: string; servidos?: number } };
+    };
+    const servidos = cuerpo.lectura.caracteresRenderizados.servidos;
+    expect(cuerpo.lectura.caracteresRenderizados.estado).toBe("medido");
+    expect(servidos).not.toBe(cuerpo.lectura.caracteresSinJs);
+    expect(guardadas[0].caracteres_sin_js).toBe(servidos);
+
+    // Sin render, el que decide es el de la ruta, y es el que se guarda.
+    guardadas = [];
+    opcionesNavegador = { arranqueFalla: true };
+    const sinRender = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as { lectura: { caracteresSinJs: number } };
+    expect(guardadas[0].caracteres_sin_js).toBe(sinRender.lectura.caracteresSinJs);
+  });
+
   it("si guardar falla, la auditoría igual se devuelve y lo dice", async () => {
     errorGuardado = { message: "rls" };
 

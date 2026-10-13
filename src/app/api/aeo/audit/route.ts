@@ -11,7 +11,7 @@ import {
   tiposDeSchema,
 } from "@/lib/aeo/lectura";
 import { statusPorAgente } from "@/lib/aeo/peticion";
-import { esLegiblePorIA, hallazgos, puntosDeLaPuerta, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { contenidoSinJs, esLegiblePorIA, hallazgos, puntosDeLaPuerta, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
 import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
 import { medirRenderizado } from "@/lib/aeo/renderizado";
 import {
@@ -258,7 +258,11 @@ export async function POST(req: Request) {
       url: base.toString(),
       robots_leido: robots.ok,
       acceso: { robots: lectura.acceso, http: statusAgentes },
-      caracteres_sin_js: lectura.caracteresSinJs,
+      // El número servido que DECIDIÓ el punto: el del mismo documento que
+      // se renderizó (`servidos`) si el render midió, y si no, el del HTML de
+      // la ruta. Antes se guardaba siempre el de la ruta, y el dato crudo no
+      // era el que pintó el color (PU-5).
+      caracteres_sin_js: contenidoSinJs(lectura).servido,
       schema_encontrado: { tipos: lectura.schema, errores: lectura.erroresDeSchema },
       llms_txt: llms.ok,
     });
