@@ -41,6 +41,15 @@ export interface LecturaDelSitio {
    * «entra»: es la misma regla que `caracteresRenderizados`.
    */
   statusPorAgente?: Record<AgenteIA, number | null>;
+  /**
+   * La LÍNEA DE BASE de `statusPorAgente`: el status con el que la portada le
+   * contestó a la ruta —la misma URL, con el user-agent de la auditoría—,
+   * después de las redirecciones. Con una base 2xx, un agente que no termina
+   * en 2xx es un agente al que el sitio trata distinto: rechazado, sea cual
+   * sea el código (PU-1). Sin base, un código raro no se puede leer y queda
+   * «no medido». Opcional para que las lecturas viejas sigan valiendo.
+   */
+  statusPortada?: number;
   /** Caracteres de texto del HTML SERVIDO, sin ejecutar JavaScript. */
   caracteresSinJs: number;
   /**
@@ -56,9 +65,32 @@ export interface LecturaDelSitio {
   tieneLlmsTxt: boolean;
 }
 
-/** Códigos con los que un sitio le dice a un rastreador «vos no». */
+/** Códigos con los que un sitio le dice a un rastreador «vos no», haya línea de base o no. */
 function bloqueadoPorHttp(status: number | null | undefined): boolean {
   return status === 401 || status === 403 || status === 429 || status === 451;
+}
+
+const es2xx = (status: number) => status >= 200 && status < 300;
+
+/**
+ * Lo que la petición REAL con el user-agent de un agente dice de él.
+ *
+ *   - `entra`: terminó en 2xx, después de las redirecciones;
+ *   - `rechazado`: un código que dice «vos no» (401, 403, 429, 451), o
+ *     CUALQUIER otro que no sea 2xx cuando la portada le contestó 2xx a la
+ *     auditoría. Antes sólo contaban los cuatro de la lista, y un 503 a GPTBot
+ *     —con lo que Wordfence bloquea en un WordPress— con la portada en 200
+ *     salía VERDE, `legible` y sin un bloqueante (PU-1, reproducido por la
+ *     ruta con 503, 404, 406 y 500);
+ *   - `no-medido`: no contestó, o contestó algo que sin línea de base no se
+ *     puede leer —un 503 para todos es un sitio caído, no uno que bloquea—.
+ */
+function veredictoHttp(lectura: LecturaDelSitio, agente: AgenteIA): "entra" | "rechazado" | "no-medido" {
+  const status = lectura.statusPorAgente?.[agente] ?? null;
+  if (status === null) return "no-medido";
+  if (es2xx(status)) return "entra";
+  if (bloqueadoPorHttp(status)) return "rechazado";
+  return lectura.statusPortada !== undefined && es2xx(lectura.statusPortada) ? "rechazado" : "no-medido";
 }
 
 /**
@@ -87,15 +119,16 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
   // petición real con su user-agent. La segunda condición es la que la puerta
   // H2-GO-1 exige, y la que ninguna lista escrita a mano puede satisfacer.
   const bloqueados = AGENTES_IA.filter(
-    (a) => lectura.acceso[a] === false || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+    (a) => lectura.acceso[a] === false || veredictoHttp(lectura, a) === "rechazado"
   );
   const bloqueadosSoloPorHttp = AGENTES_IA.filter(
-    (a) => lectura.acceso[a] === true && bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+    (a) => lectura.acceso[a] === true && veredictoHttp(lectura, a) === "rechazado"
   );
   if (bloqueadosSoloPorHttp.length > 0) {
+    const base = lectura.statusPortada !== undefined ? ` (a la auditoría, con su propio user-agent, le contesta ${lectura.statusPortada})` : "";
     salida.push({
       gravedad: "bloqueante",
-      quePasa: `El robots.txt permite a ${bloqueadosSoloPorHttp.join(", ")}, pero el servidor les contesta ${bloqueadosSoloPorHttp.map((a) => lectura.statusPorAgente?.[a]).join("/")} cuando llegan con su user-agent.`,
+      quePasa: `El robots.txt permite a ${bloqueadosSoloPorHttp.join(", ")}, pero el servidor les contesta ${bloqueadosSoloPorHttp.map((a) => lectura.statusPorAgente?.[a]).join("/")} cuando llegan con su user-agent${base}.`,
       queHacer:
         "El bloqueo no está en el robots: está en el CDN, el WAF o una regla de bots del hosting. Es el caso que una auditoría que sólo lee robots.txt no ve nunca.",
       donde: "el panel del CDN o del WAF (reglas de bots), no el robots.txt",
@@ -126,16 +159,24 @@ export function hallazgos(lectura: LecturaDelSitio): Hallazgo[] {
   // robots que dio timeout como «permite a todos»: con los cinco pedidos
   // caídos y el robots sin leer, la ruta devolvía cero hallazgos y la
   // pantalla decía «los rastreadores entran» (P3).
-  const sinHttp = AGENTES_IA.filter(
-    (a) => !bloqueados.includes(a) && (lectura.statusPorAgente?.[a] ?? null) === null
-  );
+  const sinHttp = AGENTES_IA.filter((a) => !bloqueados.includes(a) && veredictoHttp(lectura, a) === "no-medido");
   if (sinHttp.length > 0) {
+    const sinRespuesta = sinHttp.filter((a) => (lectura.statusPorAgente?.[a] ?? null) === null);
+    const sinBase = sinHttp.filter((a) => !sinRespuesta.includes(a));
+    const partes = [
+      sinRespuesta.length > 0
+        ? `El sitio no le contestó a ${sinRespuesta.join(", ")} cuando llegó con su user-agent (timeout, red, o una redirección que no se pudo seguir): no se sabe si entra.`
+        : null,
+      sinBase.length > 0
+        ? `A ${sinBase.map((a) => `${a} le contestó ${lectura.statusPorAgente?.[a]}`).join(", ")}, y no hay una portada en 2xx con qué compararlo: no se sabe si es un bloqueo o un sitio caído.`
+        : null,
+    ].filter((p): p is string => p !== null);
     salida.push({
       gravedad: "no-medido",
       quePasa:
         lectura.statusPorAgente === undefined
           ? "La lectura no trae la petición con el user-agent de cada rastreador: no se sabe cómo los trata el servidor."
-          : `El sitio no le contestó a ${sinHttp.join(", ")} cuando llegó con su user-agent (timeout, red, o una redirección que no se pudo seguir): no se sabe si entra.`,
+          : partes.join(" "),
       queHacer:
         "Volver a correr la auditoría. Esto NO es un verde: un WAF que corta o deja colgados a los rastreadores se ve exactamente así, y no se puede distinguir de un fallo de red pasajero sin otra medición.",
       donde: "la auditoría, no el sitio",
@@ -227,7 +268,9 @@ export interface PuntosDeLaPuerta {
  * LAS REGLAS, una por punto:
  *
  *   - ACCESO: rojo si algún agente está bloqueado —por el robots, o porque el
- *     servidor le contestó «no» a la petición con su user-agent—; si ninguno
+ *     servidor le contestó «no» a la petición con su user-agent: un 401, 403,
+ *     429 o 451, o cualquier código que no sea 2xx con la portada en 2xx
+ *     (`veredictoHttp`)—; si ninguno
  *     lo está pero falta medir algo —un robots que no se pudo leer, un agente
  *     sin respuesta, una lectura sin la petición por agente—, no medido; si
  *     no, verde.
@@ -240,11 +283,9 @@ export interface PuntosDeLaPuerta {
  */
 export function puntosDeLaPuerta(lectura: LecturaDelSitio): PuntosDeLaPuerta {
   const bloqueado = AGENTES_IA.some(
-    (a) => lectura.acceso[a] === false || bloqueadoPorHttp(lectura.statusPorAgente?.[a])
+    (a) => lectura.acceso[a] === false || veredictoHttp(lectura, a) === "rechazado"
   );
-  const sinMedir = AGENTES_IA.some(
-    (a) => lectura.acceso[a] === null || (lectura.statusPorAgente?.[a] ?? null) === null
-  );
+  const sinMedir = AGENTES_IA.some((a) => lectura.acceso[a] === null || veredictoHttp(lectura, a) === "no-medido");
   const errores = lectura.erroresDeSchema;
   return {
     acceso: bloqueado ? "rojo" : sinMedir ? "no-medido" : "verde",

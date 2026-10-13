@@ -88,7 +88,7 @@ const MAX_BYTES = 5 * 1024 * 1024;
 const AGENTE = "VulkanGrowthOS/1.0 (auditoria AEO)";
 
 type Traido =
-  | { ok: true; texto: string; /** La URL del último salto. */ url: string }
+  | { ok: true; texto: string; /** La URL del último salto. */ url: string; status: number }
   | { ok: false; motivo: string; bloqueado: boolean; /** El status, si hubo respuesta. */ status: number | null };
 
 async function traer(red: RedExaminada, url: string): Promise<Traido> {
@@ -99,7 +99,7 @@ async function traer(red: RedExaminada, url: string): Promise<Traido> {
   if (t.status < 200 || t.status >= 300) {
     return { ok: false, motivo: `http ${t.status}`, bloqueado: false, status: t.status };
   }
-  return { ok: true, texto: t.cuerpo.toString("utf8"), url: t.url };
+  return { ok: true, texto: t.cuerpo.toString("utf8"), url: t.url, status: t.status };
 }
 
 /**
@@ -230,6 +230,11 @@ export async function POST(req: Request) {
       acceso,
       ...(robotsNoMedido ? { robotsNoMedido } : {}),
       statusPorAgente: statusAgentes,
+      // La línea de base de cada agente: la MISMA URL, pedida con el
+      // user-agent de la auditoría. Llegar acá ya exige que sea 2xx, así que
+      // un agente que no termina en 2xx es uno al que el sitio trata distinto
+      // (PU-1: un 503 de Wordfence a GPTBot salía verde).
+      statusPortada: portada.status,
       caracteresSinJs: textoSinJavaScript(portada.texto),
       caracteresRenderizados,
       schema: tiposDeSchema(portada.texto),

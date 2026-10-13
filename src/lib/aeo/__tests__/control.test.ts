@@ -56,6 +56,11 @@ const ORIGEN = "https://morby-local-seo-platform.vercel.app";
 
 /** El `robots.txt` que sirve el despliegue: el de `public/`, salvo en el caso de GATE-4. */
 let robotsDelDespliegue = ROBOTS;
+/**
+ * Un WAF delante de las páginas (PU-1): el código que le contesta a un
+ * user-agent, o `null` para dejarlo pasar. Wordfence bloquea con 503.
+ */
+let wafDelDespliegue: (ua: string) => number | null = () => null;
 
 // El middleware pregunta por la sesión: acá no hay ninguna, y no sale a la red.
 vi.mock("@supabase/ssr", () => ({
@@ -78,6 +83,8 @@ async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
       cuerpo: Buffer.from(await delMiddleware.arrayBuffer()),
     };
   }
+  const delWaf = pedido.url.startsWith(`${ORIGEN}/aeo-`) ? wafDelDespliegue(pedido.encabezados["user-agent"] ?? "") : null;
+  if (delWaf !== null) return { tipo: "respuesta", status: delWaf, encabezados: {}, cuerpo: Buffer.alloc(0) };
   switch (pedido.url) {
     case `${ORIGEN}/aeo-control`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
@@ -353,6 +360,30 @@ describe("GATE-4: el control bloqueado con comodines sale rojo en el acceso, por
       expect(cuerpo.hallazgos.map((h) => h.quePasa).join(" | ")).toMatch(/Bloqueados: gptbot, claudebot, perplexitybot\./);
     } finally {
       robotsDelDespliegue = ROBOTS;
+    }
+  });
+});
+
+/**
+ * PU-1, por la ruta: la página SANA con un WAF que le contesta a GPTBot con
+ * un código fuera de la lista de «vos no». Antes: `RUTA-S2 gptbot=503
+ * puntos={acceso:verde,…} legible=true bloqueantes=0`, y lo mismo con 404, 406
+ * y 500.
+ */
+describe("PU-1: la sana con un WAF que le contesta 503 sólo a GPTBot sale ROJA en el acceso, por la ruta", () => {
+  it.each([503, 404, 406, 500])("GPTBot recibe %i", async (codigo) => {
+    wafDelDespliegue = (ua) => (ua.includes("GPTBot") ? codigo : null);
+    try {
+      const { status, cuerpo } = await auditarPorLaRuta(`${ORIGEN}/aeo-sana/`);
+      expect(status).toBe(200);
+      expect(cuerpo.lectura.statusPorAgente?.gptbot).toBe(codigo);
+      expect(cuerpo.lectura.statusPortada).toBe(200);
+      expect(cuerpo.puntos).toEqual({ acceso: "rojo", contenidoSinJs: "verde", schema: "verde" });
+      expect(cuerpo.legible).toBe(false);
+      const bloqueantes = cuerpo.hallazgos.filter((h) => h.gravedad === "bloqueante");
+      expect(bloqueantes.map((h) => h.quePasa).join(" | ")).toMatch(new RegExp(`permite a gptbot, pero el servidor les contesta ${codigo}`));
+    } finally {
+      wafDelDespliegue = () => null;
     }
   });
 });

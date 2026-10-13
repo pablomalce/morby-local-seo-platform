@@ -365,3 +365,52 @@ describe("GATE-7: los tres puntos de la puerta, cada uno con su estado", () => {
     expect(hallazgos(incompleto).map((h) => h.gravedad)).toEqual(["importante"]);
   });
 });
+
+/**
+ * PU-1: el verde falso del acceso. Un agente con un código que no fuera 401,
+ * 403, 429 ni 451 —un 503 de Wordfence, un 404, un 406, un 500— con la
+ * portada en 200 salía VERDE, `legible` y sin ningún bloqueante: reproducido
+ * por la ruta con la página sana y GPTBot en 503 (`control.test.ts`). La
+ * comparación es contra la LÍNEA DE BASE: la portada, misma URL, con el
+ * user-agent de la auditoría.
+ */
+describe("PU-1: un agente que no termina en 2xx con la portada en 2xx está rechazado, sea cual sea el código", () => {
+  const MEDIDO: LecturaDelSitio = { ...SANO, erroresDeSchema: [], statusPortada: 200 };
+  const SIN_BASE: LecturaDelSitio = { ...SANO, erroresDeSchema: [] };
+
+  it.each([503, 404, 406, 500, 302, 418])("GPTBot recibe %i y la portada 200: acceso ROJO, bloqueante y no legible", (codigo) => {
+    const lectura = { ...MEDIDO, statusPorAgente: { ...TODOS_200, gptbot: codigo } };
+    expect(puntosDeLaPuerta(lectura).acceso).toBe("rojo");
+    const lista = hallazgos(lectura);
+    const bloqueante = lista.find((h) => h.gravedad === "bloqueante" && /CDN|WAF/.test(h.donde));
+    expect(bloqueante?.quePasa).toContain(`les contesta ${codigo}`);
+    expect(bloqueante?.quePasa).toContain("le contesta 200");
+    expect(esLegiblePorIA(lista)).toBe(false);
+  });
+
+  it("cualquier 2xx entra: un 204 o un 206 con la portada en 200 no es un rechazo", () => {
+    const lectura = { ...MEDIDO, statusPorAgente: { ...TODOS_200, gptbot: 204, ccbot: 206 } };
+    expect(puntosDeLaPuerta(lectura)).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "verde" });
+    expect(hallazgos(lectura)).toEqual([]);
+  });
+
+  it("sin línea de base, un 503 no se puede leer: NO MEDIDO, nunca verde", () => {
+    const lectura = { ...SIN_BASE, statusPorAgente: { ...TODOS_200, gptbot: 503 } };
+    expect(puntosDeLaPuerta(lectura).acceso).toBe("no-medido");
+    const lista = hallazgos(lectura);
+    expect(lista.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(lista[0].quePasa).toMatch(/gptbot le contestó 503.*no hay una portada en 2xx/);
+    expect(esLegiblePorIA(lista)).toBeNull();
+  });
+
+  it("con la portada fuera de 2xx tampoco: un sitio caído para todos no es uno que bloquea", () => {
+    const lectura = { ...MEDIDO, statusPortada: 503, statusPorAgente: { ...TODOS_200, gptbot: 503 } };
+    expect(puntosDeLaPuerta(lectura).acceso).toBe("no-medido");
+  });
+
+  it("los cuatro códigos de «vos no» siguen siendo rechazo aunque no haya línea de base", () => {
+    for (const codigo of [401, 403, 429, 451]) {
+      expect(puntosDeLaPuerta({ ...SIN_BASE, statusPorAgente: { ...TODOS_200, claudebot: codigo } }).acceso, String(codigo)).toBe("rojo");
+    }
+  });
+});
