@@ -77,6 +77,8 @@ const MOTIVO = DE_PRODUCCION
     : "SALTEADO: no hay Chrome — exportá AEO_CHROME_PATH, o AEO_CHROMIUM_DE_PRODUCCION=1 en Linux";
 
 const PUBLICA = "93.184.216.34";
+/** Una IPv6 pública (la de 1.1.1.1), sólo para el examen: el socket va a 100::1. */
+const IPV6_SIN_RUTA = "2606:4700:4700::1111";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
@@ -341,6 +343,8 @@ beforeAll(async () => {
         return html(hibrida(`<script src="/app.js"></script>`));
       case "/hibrida-lenta":
         return html(hibrida(`<script src="/app-lento.js"></script>`));
+      case "/hibrida-v6":
+        return html(hibrida(`<script src="https://cdn-v6.test/app.js"></script>`));
       case "/hibrida-grande":
         return html(hibrida(`<script src="/app-grande.js"></script>`));
       case "/hibrida-chunk":
@@ -454,9 +458,17 @@ function deps(
     // Lo que pasó el examen con la dirección pública va al sitio; cualquier
     // otra dirección, al canario. Producción no pasa `conectarA`.
     transporte: crearTransporteRender({
-      conectarA: ({ ip }) => ({ ip: "127.0.0.1", puerto: ip === PUBLICA ? puertoSitio : puertoCanario }),
+      // PU-3: la IPv6 PÚBLICA de `cdn-v6.test` pasa el examen, y el socket se
+      // abre de verdad a 100::1 (RFC 6666, descarte): en un host sin ruta
+      // IPv6 —esta Mac, el runner del CI, la función de Vercel— falla en el
+      // acto, y en uno con ruta no llega a ninguna parte. Nunca sale a internet.
+      conectarA: ({ ip }) =>
+        ip === IPV6_SIN_RUTA
+          ? { ip: "100::1", puerto: 443 }
+          : { ip: "127.0.0.1", puerto: ip === PUBLICA ? puertoSitio : puertoCanario },
     }),
     resolver: resolvedorDoble({
+      "cdn-v6.test": [IPV6_SIN_RUTA],
       "sitio.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
@@ -596,6 +608,31 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       if (render.estado !== "medido") return;
       expect(Math.abs(render.caracteres - esperado) / esperado).toBeLessThan(0.05);
       expect(Math.abs((render.servidos ?? 0) - esperado) / esperado).toBeLessThan(0.05);
+    },
+    60_000
+  );
+
+  it(
+    "PU-3 — el bundle en un CDN sólo IPv6, sin ruta IPv6: NO es una medición, y el proceso no ve ninguna excepción",
+    async () => {
+      // Reproducido por la revisión con Chrome 154: `render 529/529`, punto
+      // VERDE, `noLlegaron=[]` y un `uncaughtException` EHOSTUNREACH.
+      const noCapturadas: unknown[] = [];
+      const anotar = (e: unknown) => noCapturadas.push(e);
+      process.on("uncaughtException", anotar);
+      try {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/hibrida-v6", deps(), undefined, b);
+        console.log(`[PU-3 /hibrida-v6] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/app.js"]);
+        await new Promise((listo) => setTimeout(listo, 100));
+        expect(noCapturadas).toEqual([]);
+      } finally {
+        process.off("uncaughtException", anotar);
+      }
     },
     60_000
   );
