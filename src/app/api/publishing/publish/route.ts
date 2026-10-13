@@ -2,11 +2,9 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { agencyAccessToken } from "@/lib/integrations/google/tokenStore";
-import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
+import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
 import { publicar, type Destino, type Publicador } from "@/lib/publishing/transport";
 import { permisoEn } from "@/lib/org/rol";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { quienLlama } from "@/lib/api/sesion";
 
 export const dynamic = "force-dynamic";
@@ -57,7 +55,18 @@ export const runtime = "nodejs";
  * organización. Si falta cualquiera, esta ruta NO arma el publicador y
  * `publicar()` contesta `sin-transporte` — un fallo con nombre, no un éxito
  * silencioso ni un cero inventado. Ese camino ya está probado en `transport.ts`
- * desde la #74.
+ * desde la #74. Y la respuesta dice cuál faltó (`falta`: `cuenta`, `mapeo` o
+ * `token`), porque son tres arreglos distintos.
+ *
+ * El mapeo va ANTES que el token, y no es un detalle de orden: el token de la
+ * agencia se presta sólo a una organización con mapeo vivo
+ * (`servicioCompartido.ts`). Sin `locations/N` propio, el asset de un cliente no
+ * se publica con el token de la agencia ni en la ficha de la agencia, y el
+ * token ni se pide.
+ *
+ * Y el publicador lo arma la regla, no esta ruta: el token de la agencia no
+ * llega acá (cuarta revisión del #118). Lo que vuelve es un publicador atado a
+ * la ficha del mapeo y a los assets de ESA organización.
  *
  * Al 2026-09-10 falta la cuota de Business Profile y falta el mapeo de la ficha,
  * así que en producción esta ruta contesta `sin-transporte` hoy. **Eso es lo
@@ -132,7 +141,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, motivo: "no-aprobado" }, { status: 409 });
     }
 
-    const publicador = await armarPublicador(supabase, asset.organization_id, asset.body);
+    const armado = await armarPublicador(asset.organization_id, asset.body);
+
+    // Un mapeo que no se pudo leer no es un mapeo que falta, igual que el asset
+    // de más arriba: 502 y nada más, antes de reservar nada en el ledger. Decir
+    // `falta: "mapeo"` mandaría a mapear una organización que puede estar
+    // mapeada — medido así en la revisión del #118 con un 57014 (timeout).
+    if ("ilegible" in armado) return NextResponse.json({ error: "mapping unreadable" }, { status: 502 });
+
+    const publicador = "publicador" in armado ? armado.publicador : undefined;
 
     const resultado = await publicar(
       {
@@ -147,6 +164,14 @@ export async function POST(req: Request) {
     );
 
     if (resultado.ok) return NextResponse.json(resultado, { status: 200 });
+
+    // `sin-transporte` dice que no hubo con qué publicar; `falta` dice POR QUÉ, y
+    // son tres arreglos distintos. El que importa acá es `mapeo`: una
+    // organización sin su `locations/N` vivo NO se publica con lo de la agencia
+    // —ni con su token ni con una ficha por defecto—, y lo dice con nombre.
+    if (resultado.motivo === "sin-transporte" && "falta" in armado) {
+      return NextResponse.json({ ...resultado, falta: armado.falta }, { status: 503 });
+    }
 
     // Cada motivo con su código, y ninguno con 200.
     //
@@ -167,45 +192,65 @@ export async function POST(req: Request) {
 }
 
 /**
- * El publicador, o `undefined` si falta cualquiera de las tres piezas.
+ * Qué pieza faltó para armar el publicador. Ver `falta` en la respuesta.
  *
- * Devolver `undefined` es una respuesta, no una omisión: `publicar()` la lee
- * como `sin-transporte` y deja constancia. Lo que NO hace este archivo es
- * inventar un valor por defecto para seguir adelante — una cuenta inventada
- * publicaría en la ficha de otro, y un `locationRef` inventado es exactamente el
- * defecto que la `0017` existe para impedir.
+ *   cuenta  `GOOGLE_BUSINESS_ACCOUNT_ID` no está puesta;
+ *   mapeo   ESTA organización no tiene `locations/N` vivo — y entonces el token
+ *           de la agencia ni se pide (`servicioCompartido.ts`);
+ *   token   la organización está mapeada y el token de la agencia no se pudo
+ *           resolver. El motivo fino no viaja: es estado de la agencia, no del
+ *           cliente que pidió publicar.
+ *
+ * Y una cuarta respuesta que NO es una pieza que falta: el mapeo no se pudo
+ * leer (`{ ilegible: true }`). No se sabe si falta, así que no se dice que
+ * falta: la ruta contesta 502 «mapping unreadable», como con el asset.
+ */
+type Falta = "cuenta" | "mapeo" | "token";
+
+/**
+ * El publicador, o qué pieza faltó.
+ *
+ * Que falte es una respuesta, no una omisión: `publicar()` lee la ausencia de
+ * publicador como `sin-transporte` y deja constancia. Lo que NO hace este
+ * archivo es inventar un valor por defecto para seguir adelante — una cuenta
+ * inventada publicaría en la ficha de otro, y un `locationRef` inventado es
+ * exactamente el defecto que la `0017` existe para impedir.
  */
 async function armarPublicador(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
   organizationId: string,
   cuerpo: string
-): Promise<Publicador | undefined> {
+): Promise<{ publicador: Publicador } | { falta: Falta } | { ilegible: true }> {
   const accountId = process.env.GOOGLE_BUSINESS_ACCOUNT_ID;
-  if (!accountId) return undefined;
+  if (!accountId) return { falta: "cuenta" };
 
-  // El mapeo vivo de ESTA organización. `unmapped_at is null` es lo que
-  // distingue el mapeo actual del historial: la `0017` guarda los dos.
-  const { data: propiedad } = await supabase
-    .from("integration_properties")
-    .select("property_ref")
-    .eq("organization_id", organizationId)
-    .eq("provider", DESTINO)
-    .is("unmapped_at", null)
-    .maybeSingle();
+  // La ficha y el token salen juntos de la regla, que LEE el mapeo ella misma:
+  // el vivo de ESTA organización y de Business Profile, con la sesión de quien
+  // publica (`unmapped_at is null` distingue el mapeo actual del historial; la
+  // `0017` guarda los dos). Sin mapeo propio no hay ficha, y entonces el token
+  // de la agencia no se resuelve. Con el mapeo ilegible, tampoco: antes una
+  // lectura caída se convertía en «no hay ficha».
+  const servicio = await servirConLaAgencia(organizationId, { superficie: DESTINO });
+  if (!servicio.token.ok && servicio.token.reason === "mapping-unreadable") return { ilegible: true };
 
-  const locationRef = propiedad?.property_ref;
-  if (!locationRef) return undefined;
+  const locationRef = servicio.mapeos.find((m) => m.provider === DESTINO)?.propertyRef;
+  if (!locationRef) return { falta: "mapeo" };
+  if (!servicio.token.ok) return { falta: "token" };
 
-  const token = await agencyAccessToken();
-  if (!token.ok) return undefined;
-
-  return publicadorDeBusinessProfile({
-    accessToken: token.accessToken,
-    accountId,
-    // El texto y la ficha ya se resolvieron acá arriba, con el cliente de sesión
-    // y en la misma operación que decidió publicar. `leerDatos` existe para que
-    // el publicador no sepa de dónde salen, no para volver a buscarlos.
-    leerDatos: async () => ({ cuerpo, locationRef }),
-    fetcher: fetch,
-  });
+  // El publicador lo arma la regla, con el token adentro: esta ruta no lo ve
+  // (cuarta revisión del #118). Publica en la ficha del mapeo y sólo un asset de
+  // ESTA organización. El texto ya se resolvió acá arriba, con el cliente de
+  // sesión y en la misma operación que decidió publicar.
+  const publicador = servicio.publicadorDeFicha(locationRef, { accountId, cuerpo });
+  // La regla acaba de decir que la ficha es de esta organización y que hay
+  // token: un `null` acá es un contrato roto, y se contesta como lo que más se le
+  // parece —sin ficha con qué publicar— en vez de inventar otra.
+  //
+  // Mutante equivalente, medido con `mutar.sh` (D12, cuarta revisión del #118):
+  // devolver `publicador!` acá sobrevive, y es porque este estado no se alcanza
+  // —`locationRef` sale de una copia de los mismos mapeos contra los que la regla
+  // compara— y, si se alcanzara, tampoco se publica nada: `publicar()` sin
+  // publicador contesta `sin-transporte`. Lo único que cambia es la etiqueta
+  // `falta` del 503.
+  if (!publicador) return { falta: "mapeo" };
+  return { publicador };
 }

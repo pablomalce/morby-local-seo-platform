@@ -21,8 +21,11 @@
 
 import type { DataSourceHealth, DataSourceStatus } from "./types";
 
-/** Las fuentes del reporte. `note` es prosa sobre ellas, no una de ellas. */
-export type DataSourceKey = Exclude<keyof DataSourceHealth, "note">;
+/**
+ * Las fuentes del reporte. `note` es prosa sobre ellas, y `motivos` el porqué de
+ * algunas: ninguna de las dos es una fuente.
+ */
+export type DataSourceKey = Exclude<keyof DataSourceHealth, "note" | "motivos">;
 
 /**
  * El orden es el de la ficha del reporte, y la lista es el denominador: un

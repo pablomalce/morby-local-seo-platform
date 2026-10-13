@@ -45,7 +45,7 @@ const ORG = "018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1a00";
 const NEGOCIO = "018f3a1c-7b2e-7c31-9f4a-2b6d5e8c1c11";
 
 /** Las filas que `integration_properties` devuelve. Cada test la define. */
-let filasDeMapeo: { provider: string; property_ref: string }[] = [];
+let filasDeMapeo: { organization_id?: string; provider: string; property_ref: string }[] = [];
 /** Un fallo de lectura del mapeo, cuando el test lo pide. */
 let errorDeMapeo: { message: string } | null = null;
 /** Hay sesión, o el reporte es de demostración. */
@@ -86,7 +86,14 @@ const createSupabaseServerClient = vi.fn(async () => ({
 
     const respuesta = () => {
       if (tabla === "integration_properties") {
-        return { data: errorDeMapeo ? null : filasDeMapeo, error: errorDeMapeo };
+        // Las filas son de ORG salvo que digan otra cosa, y el doble respeta el
+        // filtro por organización como lo respeta la base: desde que la regla del
+        // servicio compartido compara `organization_id`, una fila sin esa columna
+        // no se sirve, y un doble que la omitiera mediría otra cosa.
+        const filas = filasDeMapeo
+          .map((f) => ({ organization_id: ORG, ...f }))
+          .filter((f) => filtros.organization_id === undefined || f.organization_id === filtros.organization_id);
+        return { data: errorDeMapeo ? null : filas, error: errorDeMapeo };
       }
       if (tabla === "businesses") return { data: NEGOCIO_EN_BASE, error: null };
       return { data: [], error: null };
@@ -405,10 +412,11 @@ describe("las tres fuentes de Google salen del mapeo, no de una palabra", () => 
     expect(rep!.dataSourceHealth.searchConsole).toBe("missing");
   });
 
-  it("un fallo al leer el mapeo no tumba el reporte", async () => {
-    // Las otras dos fuentes y el motor entero siguen sirviendo. La pérdida
-    // aceptada está escrita en `readPropertyMappings`: las tres salen como si no
-    // hubiera mapeo, que es menos preciso y no es falso.
+  it("un fallo al leer el mapeo no tumba el reporte, y no se disfraza de «sin mapear»", async () => {
+    // Las otras dos fuentes y el motor entero siguen sirviendo. Hasta la
+    // revisión del #118 las tres salían `missing`, «como si no hubiera mapeo»,
+    // y eso SÍ era falso: «sin conectar» manda a mapear una organización que
+    // puede estar mapeada. Ahora es `error`, con su motivo.
     process.env.GOOGLE_CLIENT_ID = "no-es-real.apps.googleusercontent.com";
     process.env.GOOGLE_CLIENT_SECRET = "no-es-real";
     errorDeMapeo = { message: "la lectura falló" };
@@ -416,7 +424,8 @@ describe("las tres fuentes de Google salen del mapeo, no de una palabra", () => 
     const rep = await generar();
 
     expect(rep, "el reporte se cayó entero por una integración").not.toBeNull();
-    expect(rep!.dataSourceHealth.ga4).toBe("missing");
+    expect(rep!.dataSourceHealth.ga4).toBe("error");
+    expect(rep!.dataSourceHealth.motivos?.ga4).toBe("mapping-unreadable");
   });
 
   it("en modo demostración no pregunta por el mapeo de nadie", async () => {
