@@ -172,6 +172,10 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
     cuerpo,
     tipo: req.resourceType(),
     esDocumentoPrincipal: req.isNavigationRequest() && req.frame() === page.mainFrame(),
+    // El marco que pide (RT-4). En un `<iframe>` de otro sitio —que Chromium
+    // corre en otro proceso— puppeteer igual lo da: es el marco hijo, con su
+    // URL. Sin marco (un worker), `null`, y eso cuenta como de la página.
+    urlDelMarco: req.frame()?.url() ?? null,
     continuar: () => req.continue(),
     abortar: () => req.abort("blockedbyclient"),
     responder: (r) => req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }),

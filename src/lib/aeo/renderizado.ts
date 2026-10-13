@@ -144,6 +144,39 @@
  * (PU-3). Tampoco cuenta lo que no escribe texto: imágenes, fuentes, CSS y
  * videos.
  *
+ * NI LO QUE PIDE UN MARCO DE OTRO SITIO (RT-4)
+ *
+ * Lo que decide es DESDE DÓNDE sale el pedido, no sólo su tipo. Cuentan los
+ * de la página, los de sus marcos del mismo sitio —su JavaScript puede
+ * escribir en ella— y los que no salen de un marco (un worker le pasa los
+ * datos a la página). No cuentan los que salen de un marco de OTRO sitio, ni
+ * la navegación de ese marco: la política del mismo origen no le deja
+ * escribir en el DOM de la página, y su propio contenido no está en la
+ * serialización (`chromium.ts`, PU-2). Ante la duda —un marco `about:blank`,
+ * `blob:` o sin URL— cuenta. El sitio se aproxima hacia arriba (los dos
+ * últimos rótulos del nombre): se cuenta de más, nunca de menos.
+ *
+ * MEDIDO contra la web real. https://vulkan-studios.com salía
+ * `subrecurso-sin-respuesta` en producción (2 de 2), y acá con Chrome 155 con
+ * todo lo de la página entregado. El que no llegaba era un `fetch` a
+ * `brunhild.challenges.cloudflare.com` —un nombre con SÓLO registros AAAA—
+ * desde el desafío de Cloudflare, dentro del reproductor de
+ * `player.vimeo.com`, dentro de la página: sin ruta IPv6 no llega, y un Chrome
+ * normal en una red sin IPv6 tampoco lo trae (`net::ERR_ADDRESS_UNREACHABLE`).
+ * Con el headless shell 153 en un contenedor AL2023 salía
+ * `subrecurso-presupuesto` 3 de 3: los `xhr` del video de Vimeo y de los
+ * cinco reproductores de YouTube se esperaban como si escribieran texto, y
+ * bajaban 25 MB contra 1,35 MB de la página. Con esta regla, 10 de 11
+ * corridas con los dos binarios dieron `medido`, 5 892 renderizados contra
+ * 5 456 servidos; la otra, un script DE LA PÁGINA que no conectó en 8 s, y
+ * eso sigue siendo `subrecurso-timeout`. Por lo mismo, los bytes de esos
+ * marcos salen de un presupuesto aparte (`maxBytesDeOtrosSitios`): no le
+ * quitan bytes a la página.
+ *
+ * Lo que NO cubre, dicho: un marco de otro sitio que le pasa datos a la
+ * página con `postMessage` y la página escribe texto con ellos. Si a ese
+ * marco no le llegó algo, la página escribe menos y no se ve.
+ *
  * EL TIEMPO
  *
  * `topeMs` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
@@ -282,6 +315,15 @@ export interface PedidoDelNavegador {
   tipo: string;
   /** La navegación del documento de la pestaña, incluido cada salto de redirección. */
   esDocumentoPrincipal: boolean;
+  /**
+   * La URL del documento del MARCO desde el que sale el pedido: la de la
+   * página para lo que pide la página, la de un `<iframe>` para lo que pide
+   * ese marco (RT-4). `null` si no sale de un marco —un worker— o no se sabe.
+   * En la navegación de un marco (`document` que no es el principal) no se
+   * usa: ahí el marco todavía tiene el documento anterior, y manda la URL del
+   * pedido.
+   */
+  urlDelMarco: string | null;
   /** Sólo para lo que no sale a la red: `data:`, `blob:`, `about:`. */
   continuar(): Promise<void>;
   abortar(): Promise<void>;
@@ -355,7 +397,16 @@ export interface OpcionesRender {
   /** Cuánto se espera al cierre antes de matar el proceso. */
   cierreMs: number;
   maxBytesPorRespuesta: number;
+  /** Bytes de lo que pide la PÁGINA —el documento, sus subrecursos y sus marcos del mismo sitio—, sumados. */
   maxBytesTotales: number;
+  /**
+   * Bytes de lo que piden los marcos de OTRO SITIO, sumados, en un
+   * presupuesto aparte: no escriben el texto que se cuenta (RT-4), y no le
+   * pueden quitar bytes a la página. MEDIDO en https://vulkan-studios.com:
+   * sus cinco reproductores de YouTube y uno de Vimeo bajaron de 8,4 a 25 MB
+   * por corrida, contra 1,35 MB de la página.
+   */
+  maxBytesDeOtrosSitios: number;
 }
 
 export const OPCIONES_RENDER: OpcionesRender = {
@@ -369,6 +420,7 @@ export const OPCIONES_RENDER: OpcionesRender = {
   cierreMs: 5_000,
   maxBytesPorRespuesta: 5 * 1024 * 1024,
   maxBytesTotales: 25 * 1024 * 1024,
+  maxBytesDeOtrosSitios: 10 * 1024 * 1024,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,8 +565,48 @@ export function nuevaBitacora(): Bitacora {
  */
 const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "document"]);
 
-function escribeTexto(pedido: PedidoDelNavegador): boolean {
-  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo);
+/**
+ * El sitio de un host, aproximado HACIA ARRIBA: la IP tal cual, o los dos
+ * últimos rótulos del nombre (`player.vimeo.com` → `vimeo.com`). Dos marcos
+ * que comparten dominio registrable —lo único con lo que `document.domain`
+ * los deja tocarse— comparten siempre esos dos rótulos; al revés no
+ * (`a.co.uk` y `b.co.uk`), y entonces se los trata como del mismo sitio:
+ * se cuentan de más, que empuja a «no medido», nunca a verde (RT-4).
+ */
+function sitioAproximado(hostname: string): string {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (ipLiteral(host) !== null) return host;
+  return host.split(".").slice(-2).join(".");
+}
+
+/**
+ * Si el pedido sale de un marco de OTRO SITIO que la página, o es la
+ * navegación de un marco a otro sitio (RT-4). Ante la duda, `false`: un
+ * pedido sin marco (un worker de la página puede traer datos y pasárselos),
+ * un marco `about:blank`, `blob:` o `srcdoc` —heredan el origen de quien lo
+ * creó— y una página que todavía no se conoce cuentan como de la página.
+ */
+function deOtroSitio(pedido: PedidoDelNavegador, pagina: URL | null): boolean {
+  if (pagina === null) return false;
+  const desde = pedido.tipo === "document" ? pedido.url : pedido.urlDelMarco;
+  if (!desde) return false;
+  let marco: URL;
+  try {
+    marco = new URL(desde);
+  } catch {
+    return false;
+  }
+  if (!ESQUEMAS_DE_RED.has(marco.protocol)) return false;
+  return sitioAproximado(marco.hostname) !== sitioAproximado(pagina.hostname);
+}
+
+/**
+ * Si un pedido puede cambiar el texto que se cuenta: es de un tipo que lo
+ * escribe y sale de un lugar desde el que se puede escribir en la página.
+ * `pagina` es la URL del documento principal, el último salto de su cadena.
+ */
+function escribeTexto(pedido: PedidoDelNavegador, pagina: URL | null): boolean {
+  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo) && !deOtroSitio(pedido, pagina);
 }
 
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
@@ -554,6 +646,11 @@ export function crearInterceptor(
   } = {}
 ) {
   let bytesTotales = 0;
+  let bytesDeOtrosSitios = 0;
+  // La URL del documento principal, del último salto de su cadena: contra
+  // ella se decide si un marco es de otro sitio (RT-4).
+  let pagina: URL | null = null;
+  const escribe = (pedido: PedidoDelNavegador) => escribeTexto(pedido, pagina);
 
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
     // Si este pedido ya tiene un desenlace decidido —se bloqueó con su
@@ -564,7 +661,7 @@ export function crearInterceptor(
       decidido = true;
       bitacora.bloqueados.push({ url: pedido.url, motivo });
       if (
-        escribeTexto(pedido) &&
+        escribe(pedido) &&
         (motivo === "timeout" ||
           motivo === "sin-respuesta" ||
           motivo === "tls" ||
@@ -588,6 +685,7 @@ export function crearInterceptor(
       } catch {
         return await bloquear("esquema");
       }
+      if (pedido.esDocumentoPrincipal) pagina = url;
 
       if (ESQUEMAS_LOCALES.has(url.protocol)) {
         decidido = true;
@@ -614,7 +712,11 @@ export function crearInterceptor(
       if (!examen.ok) return await bloquear(examen.motivo);
 
       const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
-      const quedan = opciones.maxBytesTotales - bytesTotales;
+      // Lo de un marco de otro sitio sale de su propio presupuesto (RT-4).
+      const ajeno = !pedido.esDocumentoPrincipal && deOtroSitio(pedido, pagina);
+      const quedan = ajeno
+        ? opciones.maxBytesDeOtrosSitios - bytesDeOtrosSitios
+        : opciones.maxBytesTotales - bytesTotales;
       if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
 
       const encabezados: Record<string, string> = {};
@@ -626,7 +728,7 @@ export function crearInterceptor(
       // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
       // la lectura no se da por buena mientras un pedido que escribe texto
       // siga en camino.
-      const cuenta = escribeTexto(pedido);
+      const cuenta = escribe(pedido);
       if (cuenta) bitacora.enVuelo += 1;
       try {
         let respuesta: RespuestaHttp;
@@ -649,7 +751,7 @@ export function crearInterceptor(
           // `medido` y VERDE.
           respuesta = { tipo: "error", motivo: "sin-respuesta" };
         }
-        await entregar(respuesta, url.toString());
+        await entregar(respuesta, url.toString(), ajeno);
       } finally {
         if (cuenta) bitacora.enVuelo -= 1;
       }
@@ -660,17 +762,18 @@ export function crearInterceptor(
       // Y si escribe texto y no tenía desenlace —tiró el examen, o el
       // navegador no aceptó la respuesta (`responder` tira con un encabezado
       // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
-      if (!decidido && escribeTexto(pedido)) {
+      if (!decidido && escribe(pedido)) {
         bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta" });
       }
       await pedido.abortar().catch(() => {});
     }
 
-    async function entregar(respuesta: RespuestaHttp, clave: string) {
+    async function entregar(respuesta: RespuestaHttp, clave: string, ajeno: boolean) {
       if (respuesta.tipo === "error") return await bloquear(respuesta.motivo);
       if (esDescarga(respuesta.encabezados)) return await bloquear("descarga");
 
-      bytesTotales += respuesta.cuerpo.length;
+      if (ajeno) bytesDeOtrosSitios += respuesta.cuerpo.length;
+      else bytesTotales += respuesta.cuerpo.length;
       if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = respuesta.status;
 
       const devueltos: Record<string, string | string[]> = {};

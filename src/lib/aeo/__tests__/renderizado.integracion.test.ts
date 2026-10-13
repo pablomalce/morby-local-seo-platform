@@ -79,6 +79,12 @@ const MOTIVO = DE_PRODUCCION
 const PUBLICA = "93.184.216.34";
 /** Una IPv6 pública (la de 1.1.1.1), sólo para el examen: el socket va a 100::1. */
 const IPV6_SIN_RUTA = "2606:4700:4700::1111";
+/**
+ * RT-4: la dirección pública de los marcos de OTRO SITIO (`video.test`,
+ * `reto.test`). Pasa el examen y el socket va al mismo SITIO local, que
+ * contesta por la ruta: el origen lo decide la URL, no el servidor.
+ */
+const PUBLICA_DE_TERCEROS = "151.101.1.1";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
@@ -185,6 +191,19 @@ const BUNDLE = `document.getElementById("app").textContent = ${JSON.stringify(CO
 function hibrida(script: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>${script}</body></html>`;
 }
+
+/**
+ * RT-4: la forma de https://vulkan-studios.com que salía `subrecurso-sin-respuesta`.
+ * La página trae su bundle y un reproductor de otro sitio (`player.vimeo.com`);
+ * adentro del reproductor, el desafío de otro sitio más
+ * (`challenges.cloudflare.com`) hace un `fetch` a un nombre con SÓLO registros
+ * AAAA (`brunhild.challenges.cloudflare.com`), que sin ruta IPv6 no llega
+ * —tampoco a un Chrome normal en la misma red: `net::ERR_ADDRESS_UNREACHABLE`—.
+ */
+const CON_VIDEO = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/embed"></iframe>`);
+const EMBED = `<!doctype html><html><body><p>Reproductor</p><iframe src="http://reto.test/reto"></iframe></body></html>`;
+const RETO = `<!doctype html><html><body><p>Desafío</p>
+<script>fetch("https://cdn-v6.test/sonda").catch(() => {});</script></body></html>`;
 
 /**
  * PU-2: el contenido real dibujado por JavaScript DENTRO de un shadow root
@@ -345,6 +364,19 @@ beforeAll(async () => {
         return html(hibrida(`<script src="/app-lento.js"></script>`));
       case "/hibrida-v6":
         return html(hibrida(`<script src="https://cdn-v6.test/app.js"></script>`));
+      case "/con-video":
+        return html(CON_VIDEO);
+      case "/embed":
+        return html(EMBED);
+      case "/reto":
+        return html(RETO);
+      case "/con-video-caido":
+        return html(hibrida(`<script src="/app.js"></script><iframe src="https://cdn-v6.test/embed"></iframe>`));
+      case "/con-marco-propio":
+        return html(hibrida(`<script src="/app.js"></script><iframe src="/marco-propio"></iframe>`));
+      case "/marco-propio":
+        // Un marco del MISMO origen: su JavaScript puede escribir en la página.
+        return html(`<!doctype html><html><body><script src="https://cdn-v6.test/widget.js"></script></body></html>`);
       case "/hibrida-grande":
         return html(hibrida(`<script src="/app-grande.js"></script>`));
       case "/hibrida-chunk":
@@ -465,10 +497,12 @@ function deps(
       conectarA: ({ ip }) =>
         ip === IPV6_SIN_RUTA
           ? { ip: "100::1", puerto: 443 }
-          : { ip: "127.0.0.1", puerto: ip === PUBLICA ? puertoSitio : puertoCanario },
+          : { ip: "127.0.0.1", puerto: ip === PUBLICA || ip === PUBLICA_DE_TERCEROS ? puertoSitio : puertoCanario },
     }),
     resolver: resolvedorDoble({
       "cdn-v6.test": [IPV6_SIN_RUTA],
+      "video.test": [PUBLICA_DE_TERCEROS],
+      "reto.test": [PUBLICA_DE_TERCEROS],
       "sitio.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
@@ -636,6 +670,62 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     },
     60_000
   );
+
+  describe("RT-4 — lo que pide un marco de OTRO SITIO no decide si la página se midió", () => {
+    const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+      contenidoSinJs({
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: textoSinJavaScript(CON_VIDEO),
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      }).estado;
+    const noLlego = (b: Bitacora, url: string) =>
+      b.bloqueados.some((x) => x.url === url && (x.motivo === "sin-respuesta" || x.motivo === "timeout"));
+
+    it(
+      "el caso de vulkan-studios.com: el `fetch` sólo-IPv6 del desafío, dentro del reproductor, no deja la página sin número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-video", deps(), undefined, b);
+        console.log(`[RT-4 /con-video] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        // El marco del desafío PIDIÓ, y no le llegó: si no, esto no prueba nada.
+        expect(noLlego(b, "https://cdn-v6.test/sonda")).toBe(true);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        // Y el bundle de la página se contó: el punto sale ROJO.
+        expect(punto(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "el documento de un marco de otro sitio que no llega tampoco decide: la página se mide",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-video-caido", deps(), undefined, b);
+        console.log(`[RT-4 /con-video-caido] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(noLlego(b, "https://cdn-v6.test/embed")).toBe(true);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+      },
+      60_000
+    );
+
+    it(
+      "lo que no le llega a un marco del MISMO origen sigue dejando la página sin número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-marco-propio", deps(), undefined, b);
+        console.log(`[RT-4 /con-marco-propio] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/widget.js"]);
+      },
+      60_000
+    );
+  });
 
   it.each(["/sombra-abierta", "/sombra-cerrada"])(
     "PU-2 — el contenido dibujado por JavaScript en un shadow root (%s) cuenta del lado renderizado: punto ROJO",

@@ -18,7 +18,14 @@
  *     el interceptor ENTREGÓ agrega su cuerpo al DOM, como si el JavaScript lo
  *     escribiera. Uno que el interceptor abortó no agrega nada;
  *   - `<img src>` se pide como `image`, `<iframe src>` como `document` de un
- *     marco que no es el principal.
+ *     marco que no es el principal;
+ *   - cada pedido dice desde qué marco sale (`urlDelMarco`): el documento de
+ *     la pestaña, salvo un pedido en segundo plano con `marco`, que sale del
+ *     `<iframe>` con esa URL —un widget de otro sitio y lo que pide adentro
+ *     (RT-4)—. Lo que pide un marco no se escribe en el DOM de la página. La
+ *     navegación de un `<iframe>` sale de `about:blank`, como en Chromium:
+ *     MEDIDO con Chrome 155 y el headless shell 153, el marco que navega
+ *     todavía no tiene la URL a la que va.
  *
  * Así, si la guarda deja pasar un subrecurso a la metadata, el texto dibujado
  * trae lo que «contestó» la metadata y el transporte registra el pedido: las
@@ -157,7 +164,18 @@ export interface OpcionesDoble {
    * los espere: un chunk perezoso, los datos de una hidratación. Si llegan,
    * su cuerpo se escribe en el DOM cuando llegan (RT-1).
    */
-  enSegundoPlano?: Array<{ url: string; tipo: string }>;
+  enSegundoPlano?: Array<{
+    url: string;
+    tipo: string;
+    /**
+     * La URL del marco desde el que sale el pedido, si no es la página: lo
+     * que pide un `<iframe>` por dentro (RT-4). Lo que trae no se escribe en
+     * el DOM de la página, como en Chromium: el contenido de un marco no está
+     * en la serialización del documento. `null` es un pedido SIN marco —un
+     * worker de la página—, y lo que trae sí se escribe: el worker se lo pasa.
+     */
+    marco?: string | null;
+  }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
    * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
@@ -184,7 +202,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     atender: (p: PedidoDelNavegador) => Promise<void>,
     url: string,
     tipo: string,
-    esDocumentoPrincipal: boolean
+    esDocumentoPrincipal: boolean,
+    urlDelMarco: string | null
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
@@ -194,6 +213,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       encabezados: { accept: "*/*", "user-agent": "doble" },
       tipo,
       esDocumentoPrincipal,
+      urlDelMarco,
       continuar: async () => resolver({ tipo: "continuado" }),
       abortar: async () => resolver({ tipo: "abortado" }),
       responder: async (r) => {
@@ -226,7 +246,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
         for (let saltos = 0; saltos < 10 && !documento; saltos++) {
-          const d = await emitir(atender, actual, "document", true);
+          const d = await emitir(atender, actual, "document", true, urlDelDocumento || null);
           if (d.tipo !== "respondido") throw new Error(`net::ERR_BLOCKED_BY_CLIENT at ${actual}`);
           const destino = d.encabezados.location;
           if (d.status >= 300 && d.status < 400 && typeof destino === "string") {
@@ -248,7 +268,9 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
             [/<img[^>]*\ssrc="([^"]+)"/g, "image"],
             [/<iframe[^>]*\ssrc="([^"]+)"/g, "document"],
           ] as const) {
-            for (const m of documentoHtml.matchAll(patron)) await emitir(atender, new URL(m[1], actual).toString(), tipo, false);
+            for (const m of documentoHtml.matchAll(patron)) {
+              await emitir(atender, new URL(m[1], actual).toString(), tipo, false, tipo === "document" ? "about:blank" : actual);
+            }
           }
           html = documentoHtml;
           registro.paginasSinJs += 1;
@@ -265,7 +287,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
 
         for (const r of declarados) {
           const absoluta = new URL(r.url, actual).toString();
-          const d = await emitir(atender, absoluta, r.tipo, r.principal);
+          const d = await emitir(atender, absoluta, r.tipo, r.principal, r.tipo === "document" ? "about:blank" : actual);
           if (d.tipo === "respondido" && (r.tipo === "script" || r.tipo === "fetch")) {
             partes.push(escrito(d.cuerpo.toString("utf8")));
           }
@@ -274,8 +296,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         registro.textoDibujado = html;
         navegadoEn = opciones.reloj?.ahora() ?? null;
         for (const r of opciones.enSegundoPlano ?? []) {
-          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false).then((d) => {
-            if (d.tipo !== "respondido") return;
+          const deUnMarco = typeof r.marco === "string";
+          const marco = r.marco === null ? null : deUnMarco ? new URL(r.marco as string, actual).toString() : actual;
+          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false, marco).then((d) => {
+            if (d.tipo !== "respondido" || deUnMarco) return;
             html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
             registro.textoDibujado = html;
           });
