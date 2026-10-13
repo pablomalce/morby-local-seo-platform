@@ -38,6 +38,7 @@ import type {
   PedidoHttp,
   Resolvedor,
   RespuestaHttp,
+  SalidaPropia,
   Transporte,
 } from "../renderizado";
 
@@ -157,7 +158,12 @@ export interface OpcionesDoble {
    * los espere: un chunk perezoso, los datos de una hidratación. Si llegan,
    * su cuerpo se escribe en el DOM cuando llegan (RT-1).
    */
-  enSegundoPlano?: Array<{ url: string; tipo: string }>;
+  enSegundoPlano?: Array<{ url: string; tipo: string; metodo?: string; cuerpo?: string }>;
+  /**
+   * Lo que la pestaña con JavaScript intenta abrir SIN pasar por el
+   * interceptor —un `WebSocket`—, como lo avisaría Chromium por CDP (F3).
+   */
+  salidasPropias?: Array<{ url: string; tipo: SalidaPropia }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
    * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
@@ -184,14 +190,17 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     atender: (p: PedidoDelNavegador) => Promise<void>,
     url: string,
     tipo: string,
-    esDocumentoPrincipal: boolean
+    esDocumentoPrincipal: boolean,
+    metodo = "GET",
+    cuerpo?: string
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
     const pedido: PedidoDelNavegador = {
       url,
-      metodo: "GET",
+      metodo,
       encabezados: { accept: "*/*", "user-agent": "doble" },
+      ...(cuerpo !== undefined ? { cuerpo } : {}),
       tipo,
       esDocumentoPrincipal,
       continuar: async () => resolver({ tipo: "continuado" }),
@@ -215,6 +224,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     let recorrida = false;
 
     return {
+      salidasPropias() {
+        // Sólo la pestaña que corre JavaScript abre sockets, y sólo después de navegar.
+        return !sinJs && urlDelDocumento !== "" ? [...(opciones.salidasPropias ?? [])] : [];
+      },
       async interceptar(a) {
         atender = a;
       },
@@ -274,7 +287,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         registro.textoDibujado = html;
         navegadoEn = opciones.reloj?.ahora() ?? null;
         for (const r of opciones.enSegundoPlano ?? []) {
-          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false).then((d) => {
+          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false, r.metodo, r.cuerpo).then((d) => {
             if (d.tipo !== "respondido") return;
             html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
             registro.textoDibujado = html;

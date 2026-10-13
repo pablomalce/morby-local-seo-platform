@@ -44,6 +44,10 @@ const DNS = {
   "metadata.test": ["169.254.169.254"],
   "mixto.test": [PUBLICA, "127.0.0.1"],
   "localhost": ["127.0.0.1", "::1"],
+  "api.sitio.test": [PUBLICA],
+  "video.test": [OTRA_PUBLICA],
+  "mio.app.test": [PUBLICA],
+  "otro.app.test": [OTRA_PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -339,14 +343,10 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
   });
 
-  it("los datos que trae el JavaScript (`fetch`) y un marco cuentan igual que un script", async () => {
+  it("los datos que trae el JavaScript (`fetch`) cuentan igual que un script", async () => {
     const conDatos = `<html><body>${MENU}<main data-fetch="/api/contenido"></main></body></html>`;
     const datos = armar({ "http://sitio.test/": { cuerpo: conDatos }, "http://sitio.test/api/contenido": { error: "timeout" } });
     expect(await medirRenderizado("http://sitio.test/", datos.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
-
-    const conMarco = `<html><body>${MENU}<iframe src="/widget"></iframe></body></html>`;
-    const marco = armar({ "http://sitio.test/": { cuerpo: conMarco }, "http://sitio.test/widget": { error: "tls" } });
-    expect(await medirRenderizado("http://sitio.test/", marco.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-tls" });
   });
 
   /**
@@ -406,12 +406,122 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect(red.pedidos[0]).toMatchObject({ ip: PUBLICA, alternativas: [OTRA_PUBLICA, "2606:4700:4700::1111"] });
   });
 
-  it("lo que la POLÍTICA rechaza no es «no llegó»: un script a una red privada deja medir", async () => {
-    const html = `<html><body>${MENU}<script src="http://interno.test/interno.js"></script><img src="/foto.jpg"></body></html>`;
-    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html }, "http://interno.test/interno.js": { cuerpo: "x" } });
+  /**
+   * F2: lo que la POLÍTICA no deja salir y escribe texto es contenido que la
+   * auditoría no vio. MEDIDO por la revisión con Chrome 155: un menú de 619 y
+   * `fetch("https://sitio.test:8443/api/contenido")`, que escribía 4 499, daban
+   * `bloqueados=[puerto]`, `noLlegaron=[]`, `medido 619/619` y VERDE. Y la
+   * mutación que sumaba `puerto` a la lista sobrevivía a los 292 tests: ninguno
+   * fijaba el caso.
+   */
+  it.each([
+    ["puerto", `<main data-fetch="https://sitio.test:8443/api/contenido"></main>`, "https://sitio.test:8443/api/contenido", "fetch"],
+    ["puerto", `<script src="https://cdn.test:8443/app.js"></script>`, "https://cdn.test:8443/app.js", "script"],
+    ["esquema", `<script src="ftp://cdn.test/app.js"></script>`, "ftp://cdn.test/app.js", "script"],
+    ["credenciales", `<script src="http://u:p@cdn.test/app.js"></script>`, "http://u:p@cdn.test/app.js", "script"],
+    ["red-no-publica", `<script src="http://interno.test/interno.js"></script>`, "http://interno.test/interno.js", "script"],
+  ] as const)(
+    "F2 — lo que escribe texto y la política rechaza (%s) NO LLEGÓ: `subrecurso-<motivo>`, y el punto queda «no medido»",
+    async (motivo, etiqueta, url, tipo) => {
+      const html = `<html><body>${MENU}${etiqueta}<img src="http://10.1.2.3/foto.jpg"></body></html>`;
+      const { deps, bitacora, red } = armar({ "http://sitio.test/": { cuerpo: html }, [url]: { cuerpo: CONTENIDO } });
+      const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+      expect(render).toEqual({ estado: "fallo", codigo: `subrecurso-${motivo}` });
+      expect(bitacora.noLlegaron).toEqual([{ url, tipo, motivo }]);
+      // Y la política sigue siendo la política: no salió.
+      expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+      expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe(
+        "no-medido"
+      );
+    }
+  );
+
+  it("F2 — un método que escribe (PUT) en un pedido de datos tampoco llegó: `subrecurso-metodo`", async () => {
+    const { deps, bitacora } = armar(
+      { "http://sitio.test/": { cuerpo: `<html><body>${MENU}</body></html>` }, "http://sitio.test/api": { cuerpo: CONTENIDO } },
+      { enSegundoPlano: [{ url: "/api", tipo: "fetch", metodo: "PUT" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-metodo",
+    });
+  });
+
+  it("F2 — lo que NO cuenta: una imagen a una red privada (no escribe texto) y un nombre que NO EXISTE", async () => {
+    const html = `<html><body>${MENU}<img src="http://10.1.2.3/foto.jpg"><script src="http://nadie.test/app.js"></script></body></html>`;
+    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html } });
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
     expect(render.estado).toBe("medido");
     expect(bitacora.noLlegaron).toEqual([]);
+    expect(bitacora.bloqueados).toEqual(
+      expect.arrayContaining([
+        { url: "http://10.1.2.3/foto.jpg", motivo: "sin-texto" },
+        { url: "http://nadie.test/app.js", motivo: "no-resuelve" },
+      ])
+    );
+  });
+
+  /**
+   * F1: un marco no se carga. Su texto no cuenta de ningún lado, y su red
+   * agotaba el presupuesto: MEDIDO contra vulkan-studios.com, los iframes de
+   * YouTube y Vimeo pedían 26,8 MB y el render salía «no medido» 4 de 5 veces.
+   */
+  it("F1 — un iframe de video que NO TERMINA y pesa más que el tope no se pide: el render MIDE, y la híbrida es ROJA", async () => {
+    const html = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script>
+      <iframe src="https://video.test/embed/123"></iframe><iframe src="/widget"></iframe></body></html>`;
+    const { deps, bitacora, red, dns } = armar({
+      "http://sitio.test/": { cuerpo: html },
+      "http://sitio.test/app.js": { cuerpo: CONTENIDO },
+      "https://video.test/embed/123": { error: "timeout" },
+      "http://sitio.test/widget": { error: "demasiado-grande" },
+    });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe("rojo");
+    // Ni el transporte ni el DNS vieron los marcos.
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/", "http://sitio.test/app.js"]);
+    expect(dns.consultas).not.toContain("video.test");
+    expect(bitacora.bloqueados).toEqual(
+      expect.arrayContaining([
+        { url: "https://video.test/embed/123", motivo: "sin-texto" },
+        { url: "http://sitio.test/widget", motivo: "sin-texto" },
+      ])
+    );
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  /**
+   * F3: lo que la página abre por fuera del interceptor. MEDIDO por la revisión
+   * con Chrome 155: un menú de 619 y un `WebSocket` que escribía 4 499 daban
+   * `medido 619/619`, `bloqueados=[]`, `noLlegaron=[]` y VERDE; con un
+   * `EventSource` en stream, `bloqueados=[{eventos, timeout}]` y otra vez
+   * `noLlegaron=[]`.
+   */
+  it("F3 — un WebSocket que la página intentó abrir deja el render sin número: `subrecurso-websocket`", async () => {
+    const { deps, bitacora, navegador } = armar(
+      { "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main></body></html>` } },
+      { salidasPropias: [{ url: "ws://sitio.test/ws", tipo: "websocket" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-websocket",
+    });
+    expect(bitacora.salidasPropias).toEqual([{ url: "ws://sitio.test/ws", tipo: "websocket" }]);
+    expect(navegador.registro.cierres).toBe(1);
+  });
+
+  it("F3 — un EventSource escribe texto: si no llegó, `subrecurso-<motivo>`; si llegó, lo que trae se cuenta", async () => {
+    const pagina = { "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main></body></html>` } };
+    const corte = armar({ ...pagina, "http://sitio.test/eventos": { error: "timeout" } }, { enSegundoPlano: [{ url: "/eventos", tipo: "eventsource" }] });
+    expect(await medirRenderizado("http://sitio.test/", corte.deps, OPCIONES_RENDER, corte.bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-timeout",
+    });
+    expect(corte.bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/eventos", tipo: "eventsource", motivo: "timeout" }]);
+
+    const llega = armar({ ...pagina, "http://sitio.test/eventos": { cuerpo: CONTENIDO } }, { enSegundoPlano: [{ url: "/eventos", tipo: "eventsource" }] });
+    const render = await medirRenderizado("http://sitio.test/", llega.deps);
+    expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(contarCaracteres(CONTENIDO));
   });
 
   it("un chunk que todavía está EN VUELO al leer se espera, y lo que trae se cuenta: el punto sale ROJO, no verde", async () => {
@@ -443,6 +553,122 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     );
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "subrecurso-pendiente" });
     expect(navegador.registro.cierres).toBe(1);
+  });
+});
+
+/**
+ * SEC-A2: el render no es un relé. MEDIDO por la revisión con Chrome 155 y las
+ * banderas de producción: una página con 3 000 `fetch` no-cors a un tercero y
+ * un `POST` simple le hizo `pedidosAlTercero=3000 picoConcurrente=580` y el
+ * `POST` con `body=datos-de-la-pagina`, y el render salió «medido». Con 10
+ * auditorías por minuto e instancia, unos 30 000 pedidos por minuto desde las
+ * IP de la plataforma.
+ */
+describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y de POST a otros sitios", () => {
+  const PAGINA = { "http://sitio.test/": { cuerpo: "<html><body><p>hola</p></body></html>" } };
+
+  it("3 000 pedidos de la página a un tercero: salen `maxPedidos` (el documento incluido), y el resto no llegó", async () => {
+    // Cuerpos vacíos: lo que se mide es cuántos salen, no el texto (con texto,
+    // el DOM del doble crece mientras llegan y la lectura no ve quietud).
+    const urls = Array.from({ length: 3_000 }, (_, i) => `http://cdn.test/p${i}`);
+    const { deps, red, bitacora } = armar(
+      { ...PAGINA, ...Object.fromEntries(urls.map((u) => [u, { cuerpo: "" }])) },
+      { enSegundoPlano: urls.map((url) => ({ url, tipo: "fetch" })) }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(red.pedidos).toHaveLength(OPCIONES_RENDER.maxPedidos);
+    expect(OPCIONES_RENDER.maxPedidos).toBe(200);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    expect(bitacora.noLlegaron).toHaveLength(3_000 - (OPCIONES_RENDER.maxPedidos - 1));
+  });
+
+  it("como mucho `maxConcurrencia` pedidos a la vez: el resto ESPERA su turno, no se pierde, y la página se mide", async () => {
+    const urls = Array.from({ length: 100 }, (_, i) => `http://cdn.test/c${i}`);
+    const { deps, bitacora } = armar(
+      (reloj) => ({ ...PAGINA, ...Object.fromEntries(urls.map((u) => [u, { cuerpo: "", llegaCuando: () => reloj.alcanzar(500) }])) }),
+      { enSegundoPlano: urls.map((url) => ({ url, tipo: "fetch" })) }
+    );
+    let enCurso = 0;
+    let pico = 0;
+    const transporte = deps.transporte;
+    deps.transporte = async (pedido) => {
+      enCurso += 1;
+      pico = Math.max(pico, enCurso);
+      try {
+        return await transporte(pedido);
+      } finally {
+        enCurso -= 1;
+      }
+    };
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    expect(OPCIONES_RENDER.maxConcurrencia).toBe(16);
+    expect(pico).toBe(OPCIONES_RENDER.maxConcurrencia);
+    expect(bitacora.picoConcurrente).toBe(OPCIONES_RENDER.maxConcurrencia);
+    expect(bitacora.pedidos).toHaveLength(101);
+  });
+
+  it("POST a OTRO sitio: como mucho `maxPostsAjenos`, con cuerpo acotado; un `ping` no sale nunca", async () => {
+    const posts = Array.from({ length: 25 }, () => ({ url: "http://cdn.test/collect", tipo: "fetch", metodo: "POST", cuerpo: "datos-de-la-pagina" }));
+    const { deps, red, bitacora } = armar(
+      { ...PAGINA, "http://cdn.test/collect": { cuerpo: "ok" } },
+      {
+        enSegundoPlano: [
+          ...posts,
+          { url: "http://cdn.test/beacon", tipo: "ping", metodo: "POST", cuerpo: "x" },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    const alTercero = red.pedidos.filter((p) => p.url.startsWith("http://cdn.test/"));
+    expect(alTercero).toHaveLength(OPCIONES_RENDER.maxPostsAjenos);
+    expect(alTercero.every((p) => p.metodo === "POST" && p.cuerpo === "datos-de-la-pagina")).toBe(true);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://cdn.test/beacon", motivo: "sin-texto" });
+
+    // Un cuerpo de más de `maxCuerpoAjeno` no sale, aunque sea el primero.
+    const grande = armar(
+      { ...PAGINA, "http://cdn.test/collect": { cuerpo: "ok" } },
+      { enSegundoPlano: [{ url: "http://cdn.test/collect", tipo: "xhr", metodo: "POST", cuerpo: "x".repeat(OPCIONES_RENDER.maxCuerpoAjeno + 1) }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", grande.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    expect(grande.red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+  });
+
+  it("POST al MISMO sitio —el nombre del documento o un subdominio suyo— no tiene ese tope: GraphQL lee con POST", async () => {
+    const posts = Array.from({ length: 25 }, (_, i) => ({
+      url: i % 2 === 0 ? "http://api.sitio.test/graphql" : "/graphql",
+      tipo: "fetch",
+      metodo: "POST",
+      cuerpo: `{"query":"{ pagina(id: ${i}) { texto } }"}`,
+    }));
+    const { deps, red } = armar(
+      { ...PAGINA, "http://api.sitio.test/graphql": { cuerpo: "texto" }, "http://sitio.test/graphql": { cuerpo: "texto" } },
+      { enSegundoPlano: posts }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    expect(red.pedidos.filter((p) => p.metodo === "POST")).toHaveLength(25);
+  });
+
+  it("«el mismo sitio» nunca SUBE de nivel: `otro.app.test` no es del sitio de `mio.app.test`", async () => {
+    const opciones = { ...OPCIONES_RENDER, maxPostsAjenos: 0 };
+    const { deps, red } = armar(
+      {
+        "http://mio.app.test/": { cuerpo: "<p>hola</p>" },
+        "http://mio.app.test/api": { cuerpo: "propio" },
+        "http://otro.app.test/api": { cuerpo: "ajeno" },
+      },
+      {
+        enSegundoPlano: [
+          { url: "http://mio.app.test/api", tipo: "xhr", metodo: "POST", cuerpo: "a" },
+          { url: "http://otro.app.test/api", tipo: "ping", metodo: "GET" },
+          { url: "http://otro.app.test/api", tipo: "xhr", metodo: "POST", cuerpo: "b" },
+        ],
+      }
+    );
+    expect(await medirRenderizado("http://mio.app.test/", deps, opciones)).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    expect(red.pedidos.map((p) => `${p.metodo} ${p.url}`)).toEqual(["GET http://mio.app.test/", "POST http://mio.app.test/api"]);
   });
 });
 
@@ -583,7 +809,7 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
   });
 
-  it("los SUBRECURSOS a 127.0.0.1, 169.254.169.254 y 10.x se abortan, y la página se mide igual", async () => {
+  it("los SUBRECURSOS a 127.0.0.1, 169.254.169.254 y 10.x se abortan, y el render queda sin número: no se vio lo que traían (F2)", async () => {
     const html = `<html><body><p>${"Texto real del sitio. ".repeat(40)}</p>
       <script src="http://127.0.0.1/loopback.js"></script>
       <script src="http://169.254.169.254/latest/meta-data/iam.js"></script>
@@ -605,7 +831,9 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     });
 
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-    expect(render.estado).toBe("medido");
+    // Antes «medido»: lo que esos scripts escribían no estaba, y el número se
+    // daba igual. Ahora, contenido que no se vio es «no medido» (F2).
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-red-no-publica" });
 
     // Ninguna dirección que no sea pública llegó al transporte.
     expect(red.pedidos.map((p) => p.url).sort()).toEqual(["http://cdn.test/legitimo.js", "http://sitio.test/"]);
@@ -622,7 +850,8 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
       // Una A pública y otra privada: alcanza con UNA para rechazar.
       "http://mixto.test/mixto.js": "red-no-publica",
       "http://metadata.test/latest/user-data": "red-no-publica",
-      "http://localhost/": "red-no-publica",
+      // Un marco no se carga, vaya adonde vaya: ni se examina (F1).
+      "http://localhost/": "sin-texto",
       // Las imágenes no cambian `innerText`: no salen, sin mirar adónde iban.
       "http://10.1.2.3/pixel.gif": "sin-texto",
     });

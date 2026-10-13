@@ -81,6 +81,7 @@ const PUBLICA = "93.184.216.34";
 const IPV6_SIN_RUTA = "2606:4700:4700::1111";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
+const HIBRIDA_DE_CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-hibrida", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
 <body><main><h1>Clínica de prueba</h1>
 <p>${"Atendemos de lunes a viernes, con turnos por teléfono y en el mostrador. ".repeat(30)}</p>
@@ -239,6 +240,30 @@ function paginaConPopup(): string {
 </body></html>`;
 }
 
+/**
+ * F1: la página híbrida con dos marcos que SÍ cargan red: uno de «video» en
+ * otro nombre y uno del mismo sitio. Adentro, un script que tarda más que el
+ * plazo y un segmento más grande que el tope, como los de YouTube y Vimeo que
+ * agotaban el presupuesto contra vulkan-studios.com.
+ */
+const EMBED = `<!doctype html><html><body><p>Reproductor</p><script src="/video-lento.js"></script>
+<script>fetch("/segmento-grande").then((r) => r.arrayBuffer()).catch(() => {});</script></body></html>`;
+
+/** F2, F3: un menú servido y el contenido detrás de algo que la auditoría no ve. */
+function conMenu(script: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main><script>${script}</script></body></html>`;
+}
+const ESCRIBIR = `(t) => { document.getElementById("app").textContent = t; }`;
+
+/** SEC-A2: la página que usa el render como relé contra un tercero. */
+const RELEVO = conMenu(`for (let i = 0; i < 3000; i++) fetch("http://tercero.test/p" + i, { mode: "no-cors" }).catch(() => {});`);
+const POSTS_AJENOS = conMenu(`
+  for (let i = 0; i < 25; i++) fetch("http://tercero.test/post", { method: "POST", mode: "no-cors", body: "datos-de-la-pagina" }).catch(() => {});
+  fetch("http://tercero.test/post-grande", { method: "POST", mode: "no-cors", body: "x".repeat(100000) }).catch(() => {});`);
+
+/** Lo que el tercero recibió, contado en el servidor: pedidos, el pico a la vez y los POST. */
+const enTercero = { pedidos: 0, enCurso: 0, pico: 0, posts: [] as string[] };
+
 let sitio: http.Server;
 let canario: http.Server;
 let canarioUdp: dgram.Socket;
@@ -322,6 +347,23 @@ beforeAll(async () => {
   );
 
   sitio = http.createServer((req, res) => {
+    if (req.headers.host === "tercero.test") {
+      // SEC-A2: el tercero cuenta lo que le llega, y retiene cada respuesta
+      // 50 ms para que la concurrencia se vea.
+      enTercero.pedidos += 1;
+      enTercero.enCurso += 1;
+      enTercero.pico = Math.max(enTercero.pico, enTercero.enCurso);
+      const partes: Buffer[] = [];
+      req.on("data", (p: Buffer) => partes.push(p));
+      req.on("end", () => {
+        if (req.method === "POST") enTercero.posts.push(`${req.url} ${Buffer.concat(partes).length}`);
+        setTimeout(() => {
+          enTercero.enCurso -= 1;
+          res.end("ok");
+        }, 50);
+      });
+      return;
+    }
     const html = (cuerpo: string) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(cuerpo);
@@ -370,6 +412,47 @@ beforeAll(async () => {
       case "/app-grande.js":
         res.writeHead(200, { "content-type": "text/javascript" });
         return res.end(`${BUNDLE}\n/* ${"relleno ".repeat(15_000)} */`);
+      case "/hibrida-de-control":
+        return html(HIBRIDA_DE_CONTROL);
+      case "/hibrida-con-marco":
+        return html(hibrida(`<script src="/app.js"></script><iframe src="http://video.sitio.test/embed"></iframe><iframe src="/embed"></iframe>`));
+      case "/embed":
+        return html(EMBED);
+      case "/video-lento.js": {
+        const reloj = setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/javascript" });
+          res.end("void 0;");
+        }, 3_000);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
+      case "/segmento-grande":
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        return res.end(Buffer.alloc(6 * 1024 * 1024, 7));
+      case "/puerto-fetch":
+        return html(conMenu(`fetch("https://sitio.test:8443/api/contenido").then((r) => r.text()).then(${ESCRIBIR}).catch(() => {});`));
+      case "/puerto-script":
+        return html(hibrida(`<script src="https://cdn.sitio.test:8443/app.js"></script>`));
+      case "/websocket":
+        return html(conMenu(`try { const s = new WebSocket("ws://sitio.test/ws"); s.onmessage = (e) => (${ESCRIBIR})(e.data); } catch (e) {}`));
+      case "/websocket-worker":
+        return html(
+          conMenu(`const w = new Worker(URL.createObjectURL(new Blob([
+            "try { const s = new WebSocket('ws://sitio.test/ws-worker'); s.onmessage = (e) => postMessage(e.data); } catch (e) {}"
+          ])));
+          w.onmessage = (e) => (${ESCRIBIR})(e.data);`)
+        );
+      case "/eventsource":
+        return html(conMenu(`const es = new EventSource("/eventos"); es.onmessage = (e) => (${ESCRIBIR})(e.data);`));
+      case "/eventos":
+        // Un stream que no termina: manda un evento y deja la conexión abierta.
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${CONTENIDO_DEL_BUNDLE}\n\n`);
+        return;
+      case "/relevo":
+        return html(RELEVO);
+      case "/posts-ajenos":
+        return html(POSTS_AJENOS);
       case "/sombra-abierta":
         return html(enSombra("open"));
       case "/sombra-cerrada":
@@ -434,6 +517,10 @@ beforeEach(() => {
   enCanario.conexiones = 0;
   enCanario.pedidos = [];
   enCanario.udp = 0;
+  enTercero.pedidos = 0;
+  enTercero.enCurso = 0;
+  enTercero.pico = 0;
+  enTercero.posts = [];
 });
 
 function deps(
@@ -470,6 +557,8 @@ function deps(
     resolver: resolvedorDoble({
       "cdn-v6.test": [IPV6_SIN_RUTA],
       "sitio.test": [PUBLICA],
+      "video.sitio.test": [PUBLICA],
+      "tercero.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
     }).resolver,
@@ -811,6 +900,117 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
   );
 
   it(
+    "F5 — el control HÍBRIDO de `public/aeo-hibrida/`: lo servido pasa el mínimo, y el punto sale ROJO por la proporción",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/hibrida-de-control", deps());
+      const enHtml = textoSinJavaScript(HIBRIDA_DE_CONTROL);
+      console.log(`[F5 /hibrida-de-control] html=${enHtml} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(render.servidos ?? 0).toBeGreaterThan(MINIMO_DE_TEXTO);
+      expect(render.caracteres).toBeGreaterThan(3 * (render.servidos ?? 0));
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: enHtml, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+    },
+    60_000
+  );
+
+  it(
+    "F1 — una página híbrida con dos iframes que cargan un script lento y un segmento de 6 MB: los marcos NO se piden, y se MIDE ROJA",
+    async () => {
+      const b = bitacora();
+      const render = await medirRenderizado("http://sitio.test/hibrida-con-marco", deps(), { ...OPCIONES_RENDER, plazoPorPedidoMs: 1_500 }, b);
+      console.log(`[F1 /hibrida-con-marco] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+      expect(render.estado).toBe("medido");
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: textoSinJavaScript(hibrida("")), caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+      expect(sinFavicon(b.pedidos).map((p) => p.url)).toEqual(["http://sitio.test/hibrida-con-marco", "http://sitio.test/app.js"]);
+      expect(b.bloqueados).toEqual(
+        expect.arrayContaining([
+          { url: "http://video.sitio.test/embed", motivo: "sin-texto" },
+          { url: "http://sitio.test/embed", motivo: "sin-texto" },
+        ])
+      );
+      expect(b.noLlegaron).toEqual([]);
+    },
+    60_000
+  );
+
+  it.each([
+    ["/puerto-fetch", "https://sitio.test:8443/api/contenido", "fetch"],
+    ["/puerto-script", "https://cdn.sitio.test:8443/app.js", "script"],
+  ])(
+    "F2 — el contenido detrás de un puerto que no es 80/443 (%s): NO LLEGÓ, `subrecurso-puerto`, y el punto no sale verde",
+    async (ruta, url, tipo) => {
+      const b = bitacora();
+      const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+      console.log(`[F2 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-puerto" });
+      expect(b.noLlegaron).toEqual([{ url, tipo, motivo: "puerto" }]);
+      expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+    },
+    60_000
+  );
+
+  it.each(["/websocket", "/websocket-worker"])(
+    "F3 — el contenido por WebSocket (%s) nunca llega: Chromium avisa el intento, y es `subrecurso-websocket`",
+    async (ruta) => {
+      const b = bitacora();
+      const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+      console.log(`[F3 ${ruta}] renderizado=${JSON.stringify(render)} salidasPropias=${JSON.stringify(b.salidasPropias)}`);
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-websocket" });
+      expect(b.salidasPropias.map((x) => x.url)).toEqual([ruta === "/websocket" ? "ws://sitio.test/ws" : "ws://sitio.test/ws-worker"]);
+      expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+    },
+    60_000
+  );
+
+  it(
+    "F3 — el contenido por un EventSource que no termina: escribe texto, no llegó, y el render no da número",
+    async () => {
+      const b = bitacora();
+      const render = await medirRenderizado("http://sitio.test/eventsource", deps(), { ...OPCIONES_RENDER, plazoPorPedidoMs: 1_500 }, b);
+      console.log(`[F3 /eventsource] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+      expect(render.estado).toBe("fallo");
+      if (render.estado === "fallo") expect(["subrecurso-timeout", "subrecurso-pendiente"]).toContain(render.codigo);
+    },
+    60_000
+  );
+
+  it(
+    "SEC-A2 — 3 000 `fetch` a un tercero: le llegan como mucho `maxPedidos`, nunca más de `maxConcurrencia` a la vez, y el render no da número",
+    async () => {
+      const b = bitacora();
+      const render = await medirRenderizado("http://sitio.test/relevo", deps(), undefined, b);
+      await new Promise((listo) => setTimeout(listo, 300));
+      console.log(`[SEC-A2 /relevo] renderizado=${JSON.stringify(render)} tercero=${JSON.stringify({ ...enTercero, posts: enTercero.posts.length })} pico=${b.picoConcurrente}`);
+      expect(enTercero.pedidos).toBeGreaterThan(0);
+      expect(enTercero.pedidos).toBeLessThanOrEqual(OPCIONES_RENDER.maxPedidos - 1);
+      expect(enTercero.pico).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+      expect(b.picoConcurrente).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    },
+    60_000
+  );
+
+  it(
+    "SEC-A2 — 25 POST a un tercero y uno de 100 KB: le llegan `maxPostsAjenos`, ninguno grande",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/posts-ajenos", deps());
+      await new Promise((listo) => setTimeout(listo, 300));
+      console.log(`[SEC-A2 /posts-ajenos] renderizado=${JSON.stringify(render)} posts=${JSON.stringify(enTercero.posts.slice(0, 3))}… (${enTercero.posts.length})`);
+      expect(enTercero.posts).toHaveLength(OPCIONES_RENDER.maxPostsAjenos);
+      expect(enTercero.posts.every((p) => p === `/post ${"datos-de-la-pagina".length}`)).toBe(true);
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    },
+    60_000
+  );
+
+  it(
     "una redirección SANA se sigue: la entrega el transporte y la pide el navegador",
     async () => {
       const b = bitacora();
@@ -855,8 +1055,10 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       const visto = await canarioDespues();
       console.log(`[ssrf ${capa}] render=${JSON.stringify(render)} bloqueados=${b.bloqueados.length} canario=${JSON.stringify(visto)}`);
 
-      expect(render.estado).toBe("medido");
-      if (render.estado === "medido") expect(render.caracteres).toBeGreaterThan(MINIMO_DE_TEXTO);
+      // F2: los scripts a direcciones internas escriben texto que no se vio, y
+      // el render queda sin número. El examen de red de abajo es el mismo.
+      expect(render.estado).toBe("fallo");
+      if (render.estado === "fallo") expect(render.codigo).toMatch(/^subrecurso-(red-no-publica|puerto)$/);
       expect(visto, "ni un socket ni un datagrama llegó a una dirección que no es pública").toEqual({
         conexiones: 0,
         pedidos: [],

@@ -86,7 +86,15 @@
  *      redirección a `127.0.0.1` es un pedido más, y se aborta como cualquiera;
  *   6. una respuesta que se declara descarga (`Content-Disposition:
  *      attachment`) no se entrega, y además el navegador tiene las descargas
- *      denegadas (`chromium.ts`).
+ *      denegadas (`chromium.ts`);
+ *   7. el render no es un relé (SEC-A2): como mucho `maxPedidos` pedidos a la
+ *      red por medición y `maxConcurrencia` a la vez —el resto espera su
+ *      turno—, y un `POST` a otro sitio que el del documento, como mucho
+ *      `maxPostsAjenos` y con un cuerpo de hasta `maxCuerpoAjeno` bytes.
+ *      MEDIDO por la revisión con Chrome 155: una página con 3 000 `fetch` a un
+ *      tercero le hizo 3 000 pedidos, 580 a la vez, y un `POST` con el cuerpo
+ *      que eligió la página, y el render salió `medido`. Lo que pasa los topes
+ *      se aborta como `presupuesto` y, si escribe texto, no llegó.
  *
  * La URL inicial pasa por el mismo examen ANTES de arrancar el navegador: un
  * sitio cargado como `http://10.0.0.7/` no cuesta un Chromium, y la consulta
@@ -135,14 +143,48 @@
  *   2. si alguno no llegó, `subrecurso-<motivo>`, sin número: el punto queda
  *      «no medido», nunca verde.
  *
- * Lo que NO cuenta como «no llegó»: lo que se rechazó por política —una red
- * que no es pública, un puerto, un esquema, un método que escribe—, que un
- * navegador del público tampoco recibiría de esta auditoría, y un nombre que
- * NO EXISTE (`no-resuelve`: NXDOMAIN, o sin registros). Un DNS que no contestó
- * —timeout, SERVFAIL— SÍ cuenta (`dns-sin-respuesta`): antes los dos eran
- * `no-resuelve`, y un bundle cuyo CDN tuvo un timeout de DNS quedaba fuera
- * (PU-3). Tampoco cuenta lo que no escribe texto: imágenes, fuentes, CSS y
- * videos.
+ * Y LO QUE LA POLÍTICA RECHAZA TAMPOCO LLEGÓ (F2). Un pedido que escribe texto
+ * y el examen no deja salir —un puerto que no es 80/443, un esquema, unas
+ * credenciales, un método que escribe, una red que no es pública, el tope de
+ * pedidos— es contenido que esta auditoría NO VIO, y un navegador del público
+ * sí puede recibirlo: un `fetch` a `https://sitio:8443/api` le llega a una
+ * persona. Antes eso no contaba como «no llegó», y MEDIDO con Chrome 155 por la
+ * revisión: un menú servido de 619 y el contenido de 4 499 detrás de ese
+ * `fetch` daban `medido 619/619` y el punto VERDE. Ahora es
+ * `subrecurso-<motivo>`, y el punto queda «no medido».
+ *
+ * Lo ÚNICO que no cuenta como «no llegó» es un nombre que NO EXISTE
+ * (`no-resuelve`: NXDOMAIN, o sin registros): un navegador del público tampoco
+ * lo recibe. Un DNS que no contestó —timeout, SERVFAIL— SÍ cuenta
+ * (`dns-sin-respuesta`, PU-3). Y no cuenta lo que no escribe texto: imágenes,
+ * fuentes, videos, los `ping` de `sendBeacon`, y los MARCOS.
+ *
+ * LOS MARCOS NO SE CARGAN (F1). Su texto no cuenta de ningún lado —la
+ * serialización del documento no trae lo de un `<iframe>`, ver `chromium.ts`—,
+ * y su red sí costaba: MEDIDO contra vulkan-studios.com con el código anterior,
+ * 1 de 5 corridas midió. Los iframes de YouTube, Vimeo y Turnstile pedían
+ * `base.js` de 1,6 MB tres veces, segmentos de video de 2,6 MB y `log_event`,
+ * todo contado como «escribe texto»: el presupuesto de 25 MB y 40 s se iba en
+ * marcos cuyo texto nunca se cuenta, y el render salía «no medido». Un
+ * `document` que no es el principal se aborta como `sin-texto`, antes del
+ * examen y sin consulta DNS. MEDIDO con esto, en la Mac con Chrome 155 y la
+ * red real: 9 de 10 corridas contra vulkan-studios.com midieron (5 892
+ * renderizados contra 5 456 servidos, 33 pedidos, entre 14 y 41 s); la otra,
+ * tres scripts del propio WordPress en `timeout`, que es el sitio y no los
+ * marcos. Lo que sigue contando es lo que pide un marco que
+ * NO sale a la red —`about:blank`, `srcdoc`, `data:`—: ése sí puede escribir en
+ * el documento principal, porque es del mismo origen.
+ *
+ * NI UN WEBSOCKET (F3). Un `WebSocket` no pasa por el interceptor: muere en el
+ * proxy que no existe y no deja rastro en la bitácora. MEDIDO por la revisión:
+ * un menú de 619 y un `WebSocket` que escribía 4 499 daban `medido 619/619` y
+ * VERDE. El navegador avisa cada intento (`salidasPropias`, por CDP: lo dice
+ * Chromium, no la página) y un intento deja el render sin número
+ * (`subrecurso-websocket`). Es estricto a propósito: un chat que abre un
+ * `WebSocket` desde el documento principal también deja la página «no
+ * medida», y es el precio de no dar un verde sin haber visto lo que el socket
+ * traía. `EventSource` sí pasa por el interceptor y cuenta como cualquier
+ * pedido que escribe texto.
  *
  * EL TIEMPO
  *
@@ -194,11 +236,27 @@ export type MotivoDeBloqueo =
 export type MotivoDeTransporte = "timeout" | "sin-respuesta" | "tls" | "demasiado-grande";
 
 /**
+ * Por qué un pedido que escribe texto NO LLEGÓ (RT-1): el transporte no lo
+ * trajo, se pasó un tope, o la política no lo dejó salir (F2). Todo menos un
+ * nombre que no existe (`no-resuelve`), que tampoco le llega a un navegador
+ * del público.
+ */
+export type MotivoDeNoLlegada =
+  | MotivoDeTransporte
+  | Exclude<MotivoDeBloqueo, "no-resuelve">
+  | "presupuesto"
+  | "metodo"
+  | "descarga";
+
+/** Lo que la página intentó abrir por fuera del interceptor, y Chromium avisó (F3). */
+export type SalidaPropia = "websocket" | "webtransport";
+
+/**
  * Lista cerrada más `http_<status>`. Un motivo libre sería texto, y lo que se
  * hace con esto es decidir un color.
  */
-/** Un pedido que escribe texto y no llegó, o que seguía en vuelo al leer (RT-1). */
-export type MotivoDeSubrecurso = MotivoDeTransporte | "presupuesto" | "pendiente" | "dns-sin-respuesta";
+/** Un pedido que escribe texto y no llegó, que seguía en vuelo al leer, o un socket propio (RT-1, F3). */
+export type MotivoDeSubrecurso = MotivoDeNoLlegada | "pendiente" | SalidaPropia;
 
 export type CodigoDeFallo =
   | "timeout"
@@ -313,6 +371,12 @@ export interface PaginaAbierta {
    * del HTML servido—, no del navegador: ver «NINGÚN LADO APLICA CSS» arriba.
    */
   html(): Promise<string>;
+  /**
+   * Lo que la página —o un worker suyo— intentó abrir SIN pasar por
+   * `interceptar`: un `WebSocket` o un `WebTransport`, que el navegador sin
+   * red nunca conecta. Lo avisa Chromium (F3); la página no lo puede borrar.
+   */
+  salidasPropias(): Array<{ url: string; tipo: SalidaPropia }>;
 }
 
 export interface NavegadorAbierto {
@@ -356,8 +420,25 @@ export interface OpcionesRender {
   cierreMs: number;
   maxBytesPorRespuesta: number;
   maxBytesTotales: number;
+  /** Pedidos a la red por medición, como mucho (SEC-A2). Pasado esto, `presupuesto`. */
+  maxPedidos: number;
+  /** Pedidos en el transporte a la vez, como mucho (SEC-A2). El resto espera turno. */
+  maxConcurrencia: number;
+  /** Pedidos con cuerpo (`POST`) a OTRO sitio que el del documento, como mucho (SEC-A2). */
+  maxPostsAjenos: number;
+  /** Bytes de cuerpo de un pedido a otro sitio, como mucho (SEC-A2). */
+  maxCuerpoAjeno: number;
 }
 
+/**
+ * Los topes de SEC-A2 son un juicio, como los demás, y están escritos acá:
+ * 200 pedidos alcanzan con margen para una página real —sin imágenes, fuentes,
+ * videos ni marcos, que no salen—, MEDIDO contra vulkan-studios.com: 33
+ * pedidos. 16 a la vez no frenan una página con 60 scripts. Y 20 `POST` a
+ * otros sitios dejan pasar la analítica que manda por `fetch`/XHR (Clarity,
+ * Segment) sin que el render sea un relé: con el tope de la ruta (10
+ * auditorías por minuto), como mucho 200 por minuto por instancia, y de 64 KB.
+ */
 export const OPCIONES_RENDER: OpcionesRender = {
   topeMs: 40_000,
   plazoPorPedidoMs: 8_000,
@@ -369,6 +450,10 @@ export const OPCIONES_RENDER: OpcionesRender = {
   cierreMs: 5_000,
   maxBytesPorRespuesta: 5 * 1024 * 1024,
   maxBytesTotales: 25 * 1024 * 1024,
+  maxPedidos: 200,
+  maxConcurrencia: 16,
+  maxPostsAjenos: 20,
+  maxCuerpoAjeno: 64 * 1024,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -448,7 +533,13 @@ export function crearExaminador(resolver: Resolvedor): Examinador {
 // El interceptor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Los métodos que una página usa para LEER. El resto escribe, y no se manda. */
+/**
+ * Los métodos que se mandan. `PUT`, `DELETE`, `PATCH` y el resto no salen
+ * nunca. `POST` SÍ sale —GraphQL y muchas APIs leen con `POST`, y la analítica
+ * escribe con él—, pero a otro sitio que el del documento sólo dentro de
+ * `maxPostsAjenos` y `maxCuerpoAjeno` (SEC-A2): con cuerpo elegido por la
+ * página, sin tope, el render era un relé desde las IP de la plataforma.
+ */
 const METODOS = new Set(["GET", "HEAD", "POST", "OPTIONS"]);
 
 /**
@@ -456,9 +547,11 @@ const METODOS = new Set(["GET", "HEAD", "POST", "OPTIONS"]);
  * fuente no agregan ni quitan un carácter. Se abortan para que el presupuesto
  * de tiempo y de bytes vaya a lo que sí lo cambia —el documento, los scripts y
  * los datos que traen los scripts—. El `alt` de una imagen es un atributo, y
- * tampoco cuenta.
+ * tampoco cuenta. Un `ping` (`sendBeacon`, `<a ping>`) y un reporte de CSP
+ * tampoco: la página no puede leer su respuesta, y son justo el `POST` con
+ * cuerpo propio que hace del render un relé (SEC-A2).
  */
-const SIN_TEXTO = new Set(["image", "media", "font"]);
+const SIN_TEXTO = new Set(["image", "media", "font", "ping", "csp_violation_report"]);
 
 /** Encabezados que no se reenvían: son del salto, o los pone el transporte. */
 const DEL_SALTO = new Set([
@@ -494,27 +587,69 @@ export interface Bitacora {
   /** Si un salto del documento principal no salió, por qué. */
   falloDocumento: CodigoDeFallo | null;
   /**
-   * Los pedidos que ESCRIBEN texto (scripts, datos, marcos) y no llegaron por
-   * el transporte o por el presupuesto. Uno solo deja el render sin número.
+   * Los pedidos que ESCRIBEN texto (scripts y los datos que traen) y no
+   * llegaron: por el transporte, por un tope o por la política (F2). Uno solo
+   * deja el render sin número.
    */
-  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeTransporte | "presupuesto" | "dns-sin-respuesta" }>;
-  /** Cuántos de esos pedidos están en el transporte ahora mismo. */
+  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeNoLlegada }>;
+  /** Cuántos de esos pedidos están en camino ahora mismo: esperando turno o en el transporte. */
   enVuelo: number;
+  /** El máximo de pedidos que estuvieron en el transporte A LA VEZ (SEC-A2). */
+  picoConcurrente: number;
+  /** Lo que la página intentó abrir por fuera del interceptor (F3). */
+  salidasPropias: Array<{ url: string; tipo: SalidaPropia }>;
+}
+
+type MotivoDelBloqueo = Bitacora["bloqueados"][number]["motivo"];
+
+/** Un bloqueo que, si el pedido escribe texto, es contenido que no llegó (F2). */
+function esNoLlegada(motivo: MotivoDelBloqueo): motivo is MotivoDeNoLlegada {
+  return motivo !== "no-resuelve" && motivo !== "sin-texto";
 }
 
 export function nuevaBitacora(): Bitacora {
-  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null, noLlegaron: [], enVuelo: 0 };
+  return {
+    bloqueados: [],
+    pedidos: [],
+    statusDocumento: null,
+    falloDocumento: null,
+    noLlegaron: [],
+    enVuelo: 0,
+    picoConcurrente: 0,
+    salidasPropias: [],
+  };
 }
 
 /**
  * Los tipos de pedido con los que el JavaScript de la página escribe texto en
- * el DOM: el código, los datos que el código trae, y un marco (`document` que
- * no es el principal), que puede ser del mismo origen y escribir en él.
+ * el DOM: el código, y los datos que el código trae —también por
+ * `EventSource` (F3)—. Un `document` que no es el principal ya no está: los
+ * marcos no se cargan (F1). Lo que pide un marco que no sale a la red
+ * (`about:blank`, `srcdoc`) sí cuenta, porque es del mismo origen y puede
+ * escribir en el documento principal.
  */
-const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "document"]);
+const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "eventsource"]);
 
 function escribeTexto(pedido: PedidoDelNavegador): boolean {
   return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo);
+}
+
+/** Un marco: un documento que no es el de la pestaña. No se carga (F1). */
+function esMarco(pedido: PedidoDelNavegador): boolean {
+  return !pedido.esDocumentoPrincipal && pedido.tipo === "document";
+}
+
+/**
+ * Si `host` es del mismo sitio que el documento: el mismo nombre, o un
+ * subdominio del documento sin su `www.`. `api.ejemplo.com` es del sitio de
+ * `www.ejemplo.com`; `otro.vercel.app` NO es del de `mio.vercel.app`, y no
+ * hace falta la lista de sufijos públicos para saberlo: nunca se sube de
+ * nivel, sólo se baja.
+ */
+function mismoSitio(host: string, delDocumento: string | null): boolean {
+  if (delDocumento === null) return false;
+  const base = delDocumento.startsWith("www.") ? delDocumento.slice(4) : delDocumento;
+  return host === delDocumento || host === base || host.endsWith(`.${base}`);
 }
 
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
@@ -554,24 +689,44 @@ export function crearInterceptor(
   } = {}
 ) {
   let bytesTotales = 0;
+  // SEC-A2: cuántos pedidos salieron a la red, cuántos `POST` a otros sitios,
+  // y el turno de los que esperan para entrar al transporte.
+  let pedidosALaRed = 0;
+  let postsAjenos = 0;
+  let enCurso = 0;
+  const enEspera: Array<() => void> = [];
+  // Si el presupuesto vence, los que esperan turno se despiertan para abortarse.
+  senal.addEventListener("abort", () => enEspera.splice(0).forEach((despertar) => despertar()), { once: true });
+  /** El nombre del documento de la pestaña: contra él se decide qué es «otro sitio». */
+  let hostDelDocumento: string | null = null;
+
+  /** Un lugar en el transporte, o `false` si el presupuesto venció esperándolo. */
+  async function tomarTurno(): Promise<boolean> {
+    while (enCurso >= opciones.maxConcurrencia && !senal.aborted) {
+      await new Promise<void>((despertar) => enEspera.push(despertar));
+    }
+    if (senal.aborted) return false;
+    enCurso += 1;
+    bitacora.picoConcurrente = Math.max(bitacora.picoConcurrente, enCurso);
+    return true;
+  }
+
+  function soltarTurno() {
+    enCurso -= 1;
+    enEspera.shift()?.();
+  }
 
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
     // Si este pedido ya tiene un desenlace decidido —se bloqueó con su
     // motivo, o se le entregó la respuesta—. Lo que tire ANTES de eso, en el
     // `catch` de abajo, es un pedido que no llegó y nadie anotó (PU-3).
     let decidido = false;
-    const bloquear = async (motivo: Bitacora["bloqueados"][number]["motivo"]) => {
+    const bloquear = async (motivo: MotivoDelBloqueo) => {
       decidido = true;
       bitacora.bloqueados.push({ url: pedido.url, motivo });
-      if (
-        escribeTexto(pedido) &&
-        (motivo === "timeout" ||
-          motivo === "sin-respuesta" ||
-          motivo === "tls" ||
-          motivo === "demasiado-grande" ||
-          motivo === "presupuesto" ||
-          motivo === "dns-sin-respuesta")
-      ) {
+      // F2: TODO lo que escribe texto y no salió, no llegó —también lo que la
+      // política no dejó salir—, salvo un nombre que no existe.
+      if (escribeTexto(pedido) && esNoLlegada(motivo)) {
         bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo });
       }
       if (pedido.esDocumentoPrincipal && motivo !== "sin-texto") {
@@ -593,8 +748,13 @@ export function crearInterceptor(
         decidido = true;
         return await pedido.continuar();
       }
+      // F1: un marco que sale a la red no se carga, sea cual sea su esquema o
+      // su destino —antes del examen, así que ni consulta DNS—. Su texto no
+      // cuenta de ningún lado, y su red se comía el presupuesto.
+      if (esMarco(pedido)) return await bloquear("sin-texto");
       if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
-      if (!METODOS.has(pedido.metodo.toUpperCase())) return await bloquear("metodo");
+      const metodo = pedido.metodo.toUpperCase();
+      if (!METODOS.has(metodo)) return await bloquear("metodo");
       if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || pestana.soloDocumento)) {
         return await bloquear("sin-texto");
       }
@@ -602,7 +762,7 @@ export function crearInterceptor(
 
       // La pestaña sin JavaScript recibe lo MISMO que recibió la primera, sin
       // volver a la red: el examen ya se hizo cuando se pidió.
-      const guardada = pedido.metodo.toUpperCase() === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
+      const guardada = metodo === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
       if (guardada) {
         if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
         await pedido.responder(guardada);
@@ -613,29 +773,45 @@ export function crearInterceptor(
       const examen = await examinar(url, senal);
       if (!examen.ok) return await bloquear(examen.motivo);
 
-      const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
-      const quedan = opciones.maxBytesTotales - bytesTotales;
-      if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
+      // SEC-A2: el render no es un relé. Un tope de pedidos por medición, y
+      // un `POST` a otro sitio sólo dentro de su propio tope y con un cuerpo
+      // acotado. Lo que pasa un tope es `presupuesto`: si escribe texto, no
+      // llegó, y el render queda sin número.
+      if (pedidosALaRed >= opciones.maxPedidos) return await bloquear("presupuesto");
+      if (metodo === "POST" && !mismoSitio(url.hostname, hostDelDocumento)) {
+        const largo = Buffer.byteLength(pedido.cuerpo ?? "");
+        if (postsAjenos >= opciones.maxPostsAjenos || largo > opciones.maxCuerpoAjeno) return await bloquear("presupuesto");
+        postsAjenos += 1;
+      }
+      pedidosALaRed += 1;
+      if (pedido.esDocumentoPrincipal) hostDelDocumento = url.hostname;
 
       const encabezados: Record<string, string> = {};
       for (const [nombre, valor] of Object.entries(pedido.encabezados)) {
         if (!DEL_SALTO.has(nombre.toLowerCase())) encabezados[nombre.toLowerCase()] = valor;
       }
 
-      bitacora.pedidos.push({ url: pedido.url, ip: examen.ip });
-      // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
-      // la lectura no se da por buena mientras un pedido que escribe texto
-      // siga en camino.
+      // En vuelo desde que pide turno hasta que el navegador lo tiene (o se
+      // aborta): la lectura no se da por buena mientras un pedido que escribe
+      // texto siga en camino, tampoco si está esperando turno.
       const cuenta = escribeTexto(pedido);
       if (cuenta) bitacora.enVuelo += 1;
+      let turno = false;
       try {
+        turno = await tomarTurno();
+        if (!turno) return await bloquear("presupuesto");
+        const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
+        const quedan = opciones.maxBytesTotales - bytesTotales;
+        if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
+
+        bitacora.pedidos.push({ url: pedido.url, ip: examen.ip });
         let respuesta: RespuestaHttp;
         try {
           respuesta = await deps.transporte({
             url: url.toString(),
             ip: examen.ip,
             ...(examen.alternativas ? { alternativas: examen.alternativas } : {}),
-            metodo: pedido.metodo.toUpperCase(),
+            metodo,
             encabezados,
             cuerpo: pedido.cuerpo,
             timeoutMs: plazo,
@@ -651,6 +827,7 @@ export function crearInterceptor(
         }
         await entregar(respuesta, url.toString());
       } finally {
+        if (turno) soltarTurno();
         if (cuenta) bitacora.enVuelo -= 1;
       }
     } catch {
@@ -871,6 +1048,11 @@ export async function medirRenderizado(
       }
       const perdido = bitacora.noLlegaron[0];
       if (perdido) return fallo(`subrecurso-${perdido.motivo}`);
+      // F3: lo que la página intentó abrir sin pasar por el interceptor —un
+      // `WebSocket`— nunca conectó, y lo que iba a traer no está en el DOM.
+      bitacora.salidasPropias.push(...pagina.salidasPropias());
+      const propia = bitacora.salidasPropias[0];
+      if (propia) return fallo(`subrecurso-${propia.tipo}`);
 
       // El lado servido, del MISMO documento y con la misma extracción: ver
       // el encabezado. Si no se puede medir, el resultado no se da: un número

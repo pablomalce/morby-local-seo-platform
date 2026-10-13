@@ -99,6 +99,7 @@ import type {
   NavegadorAbierto,
   PaginaAbierta,
   PedidoDelNavegador,
+  SalidaPropia,
 } from "./renderizado";
 import { crearTransporteRender } from "./transporteRender";
 
@@ -178,10 +179,56 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
   };
 }
 
-function envolverPagina(page: Page): PaginaAbierta {
-  // Una sesión de CDP por pestaña, para serializar con las sombras (`html`).
-  let sesion: Promise<CDPSession> | undefined;
+/**
+ * Lo que la pestaña intenta abrir SIN pasar por la intercepción (F3): un
+ * `WebSocket` o un `WebTransport`. El navegador no tiene red, así que nunca
+ * conectan, y lo que iban a traer no está en el DOM: sin este aviso, eso no
+ * dejaba rastro y el render salía `medido` —MEDIDO por la revisión con Chrome
+ * 155: un menú de 619 y un `WebSocket` que escribía 4 499, `medido 619/619`
+ * y VERDE—.
+ *
+ * Lo avisa Chromium por CDP (`Network.webSocketCreated`), no la página: un
+ * envoltorio en JavaScript lo podría deshacer la página, y no llega a los
+ * workers. MEDIDO con Chrome 155: el evento sale en la sesión de la pestaña
+ * para el documento y sus marcos, y en la del WORKER para el socket que abre
+ * un worker. Por eso se escucha también cada worker, y SINCRÓNICAMENTE en
+ * `workercreated`: puppeteer lo emite antes de soltar el worker
+ * (`Runtime.runIfWaitingForDebugger`), así que el `Network.enable` le llega
+ * antes que su primera línea.
+ *
+ * Lo que NO ve, dicho: un `SharedWorker`, que no es de la pestaña. Su red
+ * tampoco sale (el proxy que no existe), pero si trajera el contenido, el
+ * render no se enteraría.
+ */
+async function vigilarSalidasPropias(
+  page: Page,
+  sesion: CDPSession
+): Promise<Array<{ url: string; tipo: SalidaPropia }>> {
+  const salidas: Array<{ url: string; tipo: SalidaPropia }> = [];
+  const escuchar = (cdp: CDPSession) => {
+    cdp.on("Network.webSocketCreated", (e) => salidas.push({ url: e.url, tipo: "websocket" }));
+    cdp.on("Network.webTransportCreated", (e) => salidas.push({ url: e.url, tipo: "webtransport" }));
+  };
+  escuchar(sesion);
+  await sesion.send("Network.enable");
+  page.on("workercreated", (worker) => {
+    escuchar(worker.client);
+    void worker.client.send("Network.enable").catch(() => {});
+  });
+  return salidas;
+}
+
+function envolverPagina(
+  page: Page,
+  vigilada?: { sesion: CDPSession; salidas: Array<{ url: string; tipo: SalidaPropia }> }
+): PaginaAbierta {
+  // Una sesión de CDP por pestaña, para serializar con las sombras (`html`):
+  // la de la vigilancia si la hay, y si no, una que se abre al leer.
+  let sesion: Promise<CDPSession> | undefined = vigilada ? Promise.resolve(vigilada.sesion) : undefined;
   return {
+    salidasPropias() {
+      return [...(vigilada?.salidas ?? [])];
+    },
     async interceptar(atender) {
       await page.setBypassServiceWorker(true);
       await page.setRequestInterception(true);
@@ -236,10 +283,11 @@ function envolverPagina(page: Page): PaginaAbierta {
       //
       // Lo que sigue sin contar, dicho: el contenido de los MARCOS
       // (`<iframe>`, también `srcdoc`), que ninguna serialización del
-      // documento trae. La pestaña sin JavaScript no los carga, y contarlos
-      // sólo del lado renderizado pondría rojo a cualquier página SSR con un
-      // mapa o un video incrustado; distinguir el marco que crea el
-      // JavaScript del servido es una decisión aparte.
+      // documento trae. Contarlos sólo del lado renderizado pondría rojo a
+      // cualquier página SSR con un mapa o un video incrustado; distinguir el
+      // marco que crea el JavaScript del servido es una decisión aparte. Y
+      // como su texto no cuenta, NINGUNA de las dos pestañas los carga si
+      // salen a la red (`renderizado.ts`, F1): su red agotaba el presupuesto.
       sesion ??= page.createCDPSession();
       const cdp = await sesion;
       const { root } = await cdp.send("DOM.getDocument", { depth: 0 });
@@ -261,7 +309,10 @@ function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boo
       // contestar otra página que la que ve una persona.
       const agente = (await browser.userAgent()).replace("HeadlessChrome", "Chrome");
       await page.setUserAgent({ userAgent: `${agente} VulkanGrowthOS/1.0 (auditoria AEO; renderizado)` });
-      return envolverPagina(page);
+      // Sin JavaScript no hay quien abra un socket: sólo se vigila la otra.
+      if (sinJavaScript) return envolverPagina(page);
+      const sesion = await page.createCDPSession();
+      return envolverPagina(page, { sesion, salidas: await vigilarSalidasPropias(page, sesion) });
     },
     async cerrar() {
       const proceso = browser.process();
