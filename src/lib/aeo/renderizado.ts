@@ -156,6 +156,17 @@
  * `blob:` o sin URL— cuenta. El sitio se aproxima hacia arriba (los dos
  * últimos rótulos del nombre): se cuenta de más, nunca de menos.
  *
+ * La página es el documento CONFIRMADO de la pestaña (`urlDeLaPagina`, que
+ * `chromium.ts` lee de `page.mainFrame().url()`), y no el último PEDIDO de
+ * navegación. Reproducido por la revisión con Chrome 155 y el headless shell
+ * 153 (FV-1): una página que mandaba la pestaña a otro sitio con una
+ * navegación que no se confirma —un 204, un archivo que Chromium trata como
+ * descarga, un `window.stop()`— seguía siendo el documento que se lee, pero
+ * sus propios `fetch` se juzgaban «de otro sitio»: el que no llegaba no
+ * contaba, y salía `medido 1249/1249`, VERDE. Y lo que se decide de un pedido
+ * se decide al entrar: uno de la página que estaba en vuelo cuando la pestaña
+ * intentó irse cuenta igual si después no llega.
+ *
  * MEDIDO contra la web real. https://vulkan-studios.com salía
  * `subrecurso-sin-respuesta` en producción (2 de 2), y acá con Chrome 155 con
  * todo lo de la página entregado. El que no llegaba era un `fetch` a
@@ -324,6 +335,16 @@ export interface PedidoDelNavegador {
    * pedido.
    */
   urlDelMarco: string | null;
+  /**
+   * La URL del documento CONFIRMADO de la pestaña cuando sale el pedido —el
+   * que se lee—, no la del último PEDIDO de navegación (RT-4, FV-1). Una
+   * navegación de la pestaña que no se confirma —un 204, una descarga
+   * denegada, un `window.stop()`, una que sigue en vuelo— no cambia el
+   * documento ni esto. `null`, o una URL que no es `http(s)` —`about:blank`
+   * antes de la primera navegación—, no dice de qué sitio es la página, y el
+   * pedido cuenta como de ella.
+   */
+  urlDeLaPagina: string | null;
   /** Sólo para lo que no sale a la red: `data:`, `blob:`, `about:`. */
   continuar(): Promise<void>;
   abortar(): Promise<void>;
@@ -579,34 +600,42 @@ function sitioAproximado(hostname: string): string {
   return host.split(".").slice(-2).join(".");
 }
 
+/** La URL si es `http(s)`; si no lo es, o no es una URL, `null`. */
+function urlDeRed(url: string | null): URL | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return ESQUEMAS_DE_RED.has(u.protocol) ? u : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Si el pedido sale de un marco de OTRO SITIO que la página, o es la
  * navegación de un marco a otro sitio (RT-4). Ante la duda, `false`: un
  * pedido sin marco (un worker de la página puede traer datos y pasárselos),
  * un marco `about:blank`, `blob:` o `srcdoc` —heredan el origen de quien lo
  * creó— y una página que todavía no se conoce cuentan como de la página.
+ *
+ * La página es `urlDeLaPagina`, el documento CONFIRMADO de la pestaña y no el
+ * último pedido de navegación (FV-1, ver el encabezado). Se decide sólo con
+ * lo que el pedido trae, sin estado del interceptor.
  */
-function deOtroSitio(pedido: PedidoDelNavegador, pagina: URL | null): boolean {
-  if (pagina === null) return false;
-  const desde = pedido.tipo === "document" ? pedido.url : pedido.urlDelMarco;
-  if (!desde) return false;
-  let marco: URL;
-  try {
-    marco = new URL(desde);
-  } catch {
-    return false;
-  }
-  if (!ESQUEMAS_DE_RED.has(marco.protocol)) return false;
-  return sitioAproximado(marco.hostname) !== sitioAproximado(pagina.hostname);
+function deOtroSitio(pedido: PedidoDelNavegador): boolean {
+  if (pedido.esDocumentoPrincipal) return false;
+  const pagina = urlDeRed(pedido.urlDeLaPagina);
+  const desde = urlDeRed(pedido.tipo === "document" ? pedido.url : pedido.urlDelMarco);
+  if (pagina === null || desde === null) return false;
+  return sitioAproximado(desde.hostname) !== sitioAproximado(pagina.hostname);
 }
 
 /**
  * Si un pedido puede cambiar el texto que se cuenta: es de un tipo que lo
  * escribe y sale de un lugar desde el que se puede escribir en la página.
- * `pagina` es la URL del documento principal, el último salto de su cadena.
  */
-function escribeTexto(pedido: PedidoDelNavegador, pagina: URL | null): boolean {
-  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo) && !deOtroSitio(pedido, pagina);
+function escribeTexto(pedido: PedidoDelNavegador): boolean {
+  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo) && !deOtroSitio(pedido);
 }
 
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
@@ -647,12 +676,15 @@ export function crearInterceptor(
 ) {
   let bytesTotales = 0;
   let bytesDeOtrosSitios = 0;
-  // La URL del documento principal, del último salto de su cadena: contra
-  // ella se decide si un marco es de otro sitio (RT-4).
-  let pagina: URL | null = null;
-  const escribe = (pedido: PedidoDelNavegador) => escribeTexto(pedido, pagina);
 
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
+    // Si escribe el texto que se cuenta, y si sale de otro sitio (RT-4): se
+    // decide UNA vez, al entrar, con lo que el pedido trae. Antes se volvía a
+    // juzgar al fallar contra el último pedido de navegación, y un `fetch` de
+    // la página que estaba en vuelo cuando la pestaña intentó irse a otro
+    // sitio se descartaba al no llegar (FV-1).
+    const escribe = escribeTexto(pedido);
+    const ajeno = deOtroSitio(pedido);
     // Si este pedido ya tiene un desenlace decidido —se bloqueó con su
     // motivo, o se le entregó la respuesta—. Lo que tire ANTES de eso, en el
     // `catch` de abajo, es un pedido que no llegó y nadie anotó (PU-3).
@@ -661,7 +693,7 @@ export function crearInterceptor(
       decidido = true;
       bitacora.bloqueados.push({ url: pedido.url, motivo });
       if (
-        escribe(pedido) &&
+        escribe &&
         (motivo === "timeout" ||
           motivo === "sin-respuesta" ||
           motivo === "tls" ||
@@ -685,7 +717,6 @@ export function crearInterceptor(
       } catch {
         return await bloquear("esquema");
       }
-      if (pedido.esDocumentoPrincipal) pagina = url;
 
       if (ESQUEMAS_LOCALES.has(url.protocol)) {
         decidido = true;
@@ -713,7 +744,6 @@ export function crearInterceptor(
 
       const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
       // Lo de un marco de otro sitio sale de su propio presupuesto (RT-4).
-      const ajeno = !pedido.esDocumentoPrincipal && deOtroSitio(pedido, pagina);
       const quedan = ajeno
         ? opciones.maxBytesDeOtrosSitios - bytesDeOtrosSitios
         : opciones.maxBytesTotales - bytesTotales;
@@ -728,8 +758,7 @@ export function crearInterceptor(
       // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
       // la lectura no se da por buena mientras un pedido que escribe texto
       // siga en camino.
-      const cuenta = escribe(pedido);
-      if (cuenta) bitacora.enVuelo += 1;
+      if (escribe) bitacora.enVuelo += 1;
       try {
         let respuesta: RespuestaHttp;
         try {
@@ -751,9 +780,9 @@ export function crearInterceptor(
           // `medido` y VERDE.
           respuesta = { tipo: "error", motivo: "sin-respuesta" };
         }
-        await entregar(respuesta, url.toString(), ajeno);
+        await entregar(respuesta, url.toString());
       } finally {
-        if (cuenta) bitacora.enVuelo -= 1;
+        if (escribe) bitacora.enVuelo -= 1;
       }
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
@@ -762,13 +791,13 @@ export function crearInterceptor(
       // Y si escribe texto y no tenía desenlace —tiró el examen, o el
       // navegador no aceptó la respuesta (`responder` tira con un encabezado
       // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
-      if (!decidido && escribe(pedido)) {
+      if (!decidido && escribe) {
         bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta" });
       }
       await pedido.abortar().catch(() => {});
     }
 
-    async function entregar(respuesta: RespuestaHttp, clave: string, ajeno: boolean) {
+    async function entregar(respuesta: RespuestaHttp, clave: string) {
       if (respuesta.tipo === "error") return await bloquear(respuesta.motivo);
       if (esDescarga(respuesta.encabezados)) return await bloquear("descarga");
 

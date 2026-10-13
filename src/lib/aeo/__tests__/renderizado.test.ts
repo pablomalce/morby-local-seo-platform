@@ -49,6 +49,8 @@ const DNS = {
   "video.test": [OTRA_PUBLICA],
   "solo-v6.test": ["2606:4700::6812:1092"],
   "www.mudado.test": [PUBLICA],
+  // FV-1: el otro sitio al que la página manda la pestaña, sin confirmarse.
+  "otro.test": [OTRA_PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -547,6 +549,8 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
         tipo,
         esDocumentoPrincipal,
         urlDelMarco,
+        // La pestaña ya tiene la página confirmada, salvo mientras la pide.
+        urlDeLaPagina: esDocumentoPrincipal ? null : "http://sitio.test/",
         continuar: async () => void (desenlaces[url] = "continuado"),
         abortar: async () => void (desenlaces[url] = "abortado"),
         responder: async () => void (desenlaces[url] = "respondido"),
@@ -582,6 +586,81 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
       enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://sitio.test/w" }],
     });
     expect((await medirRenderizado("http://sitio.test/", delViejo.deps)).estado).toBe("medido");
+  });
+
+  /**
+   * FV-1, RED-121-1, F1. Reproducido por la revisión con Chrome 155 y con el
+   * headless shell 153: el sitio de la página salía del último PEDIDO de
+   * navegación de la pestaña, no del documento que se lee. Una página que
+   * manda la pestaña a otro sitio que no se confirma —un 204, una descarga
+   * denegada, un `window.stop()`, una navegación que sigue en vuelo— y
+   * después hace un `fetch` propio que no llega salía `medido 1249/1249`,
+   * punto VERDE y `noLlegaron=[]`. En main, `subrecurso-sin-respuesta`.
+   */
+  it.each([
+    ["un 204", { status: 204 }],
+    ["una navegación que sigue en vuelo", { llegaCuando: () => new Promise<void>(() => {}) }],
+  ] as const)(
+    "una navegación de la PESTAÑA que no se confirma (%s) no cambia el sitio de la página: su `fetch` que no llega la deja sin número",
+    async (_caso, destino) => {
+      const { deps, bitacora, red } = armar(
+        { ...SITIO, "http://otro.test/vacio": destino },
+        {
+          enSegundoPlano: [
+            { url: "http://otro.test/vacio", tipo: "document", principal: true },
+            { url: "http://solo-v6.test/sonda", tipo: "fetch" },
+          ],
+        }
+      );
+      const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+      // La navegación SALIÓ por el transporte: si no, esto no prueba nada.
+      expect(red.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+      expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta" }]);
+    }
+  );
+
+  it("y un pedido de la página que estaba EN VUELO cuando la pestaña intentó irse tampoco se descarta al no llegar", async () => {
+    // El `fetch` sale con la página, la pestaña intenta irse a los 1 000 ms y
+    // el `fetch` falla a los 3 000. Lo que se decidió al salir no cambia:
+    // antes, `bloquear` lo volvía a juzgar contra la navegación nueva.
+    const { deps, bitacora } = armar(
+      (reloj) => ({
+        ...SITIO,
+        "http://otro.test/vacio": { status: 204 },
+        "http://sitio.test/api/datos": { error: "sin-respuesta", llegaCuando: () => reloj.alcanzar(3_000) },
+      }),
+      {
+        enSegundoPlano: [
+          { url: "/api/datos", tipo: "fetch" },
+          { url: "http://otro.test/vacio", tipo: "document", principal: true, enMs: 1_000 },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(bitacora.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/api/datos", tipo: "fetch", motivo: "sin-respuesta" }]);
+  });
+
+  it("y si el `fetch` LLEGA después de esa navegación, lo que escribe se cuenta: la página sigue siendo la misma, punto ROJO", async () => {
+    // El control: la navegación no se confirmó, el documento es el de la
+    // página, y el `fetch` que llega escribe en él. Sin esto, los dos casos
+    // de arriba podrían ser rojos porque la navegación rompió la medición.
+    const { deps, bitacora } = armar(
+      { ...SITIO, "http://otro.test/vacio": { status: 204 }, "http://sitio.test/api/datos": { cuerpo: "Datos del negocio. ".repeat(20) } },
+      {
+        enSegundoPlano: [
+          { url: "http://otro.test/vacio", tipo: "document", principal: true },
+          { url: "/api/datos", tipo: "fetch" },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(textoSinJavaScript(CON_VIDEO) + contarCaracteres(CONTENIDO));
+    expect(rojo(render)).toBe("rojo");
   });
 });
 
@@ -873,6 +952,7 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
         tipo: "fetch",
         esDocumentoPrincipal: false,
         urlDelMarco: "http://sitio.test/",
+        urlDeLaPagina: "http://sitio.test/",
         continuar: async () => void vistos.push(`${metodo} continuado`),
         abortar: async () => void vistos.push(`${metodo} abortado`),
         responder: async () => void vistos.push(`${metodo} respondido`),

@@ -25,7 +25,13 @@
  *     (RT-4)—. Lo que pide un marco no se escribe en el DOM de la página. La
  *     navegación de un `<iframe>` sale de `about:blank`, como en Chromium:
  *     MEDIDO con Chrome 155 y el headless shell 153, el marco que navega
- *     todavía no tiene la URL a la que va.
+ *     todavía no tiene la URL a la que va;
+ *   - cada pedido dice también cuál es el documento CONFIRMADO de la pestaña
+ *     (`urlDeLaPagina`): el del último salto de la navegación que llegó, como
+ *     `page.mainFrame().url()`. Una navegación de la pestaña en segundo plano
+ *     (`principal`) sale y se entrega, pero NO se confirma —un 204, una
+ *     descarga, un `window.stop()`—: el documento, su DOM y esa URL siguen
+ *     siendo los de antes (FV-1).
  *
  * Así, si la guarda deja pasar un subrecurso a la metadata, el texto dibujado
  * trae lo que «contestó» la metadata y el transporte registra el pedido: las
@@ -134,7 +140,7 @@ export interface OpcionesDoble {
   /** Texto que aparece SÓLO si la página se recorrió: lo que un `IntersectionObserver` dibuja al verse. */
   textoAlVerse?: string;
   /** El reloj de `textoTardio`. Sin él, el tardío nunca aparece. */
-  reloj?: { ahora: () => number; esperar?: (ms: number) => Promise<void> };
+  reloj?: { ahora: () => number; esperar?: (ms: number) => Promise<void>; alcanzar?: (ms: number) => Promise<void> };
   /** El arranque falla, como un Chromium que no está. */
   arranqueFalla?: boolean;
   /** El arranque tarda esto antes de devolver el navegador. */
@@ -175,6 +181,15 @@ export interface OpcionesDoble {
      * worker de la página—, y lo que trae sí se escribe: el worker se lo pasa.
      */
     marco?: string | null;
+    /**
+     * Una navegación de la PESTAÑA (`location.href = …`) que no se confirma:
+     * sale como documento principal, el interceptor la atiende, y el
+     * documento sigue siendo el de antes —como un 204, una descarga denegada
+     * o un `window.stop()` en Chromium (FV-1)—.
+     */
+    principal?: boolean;
+    /** Sale cuando el reloj llega a `enMs`, y no apenas termina la navegación (necesita `reloj.alcanzar`). */
+    enMs?: number;
   }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
@@ -203,7 +218,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     url: string,
     tipo: string,
     esDocumentoPrincipal: boolean,
-    urlDelMarco: string | null
+    urlDelMarco: string | null,
+    urlDeLaPagina: string | null
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
@@ -214,6 +230,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       tipo,
       esDocumentoPrincipal,
       urlDelMarco,
+      urlDeLaPagina,
       continuar: async () => resolver({ tipo: "continuado" }),
       abortar: async () => resolver({ tipo: "abortado" }),
       responder: async (r) => {
@@ -246,7 +263,9 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
         for (let saltos = 0; saltos < 10 && !documento; saltos++) {
-          const d = await emitir(atender, actual, "document", true, urlDelDocumento || null);
+          // Mientras la cadena no termina, la pestaña sigue en el documento
+          // anterior: nada confirmado todavía, o el de una navegación previa.
+          const d = await emitir(atender, actual, "document", true, urlDelDocumento || null, urlDelDocumento || null);
           if (d.tipo !== "respondido") throw new Error(`net::ERR_BLOCKED_BY_CLIENT at ${actual}`);
           const destino = d.encabezados.location;
           if (d.status >= 300 && d.status < 400 && typeof destino === "string") {
@@ -269,7 +288,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
             [/<iframe[^>]*\ssrc="([^"]+)"/g, "document"],
           ] as const) {
             for (const m of documentoHtml.matchAll(patron)) {
-              await emitir(atender, new URL(m[1], actual).toString(), tipo, false, tipo === "document" ? "about:blank" : actual);
+              await emitir(atender, new URL(m[1], actual).toString(), tipo, false, tipo === "document" ? "about:blank" : actual, actual);
             }
           }
           html = documentoHtml;
@@ -287,7 +306,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
 
         for (const r of declarados) {
           const absoluta = new URL(r.url, actual).toString();
-          const d = await emitir(atender, absoluta, r.tipo, r.principal, r.tipo === "document" ? "about:blank" : actual);
+          const d = await emitir(atender, absoluta, r.tipo, r.principal, r.tipo === "document" ? "about:blank" : actual, actual);
           if (d.tipo === "respondido" && (r.tipo === "script" || r.tipo === "fetch")) {
             partes.push(escrito(d.cuerpo.toString("utf8")));
           }
@@ -298,11 +317,24 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         for (const r of opciones.enSegundoPlano ?? []) {
           const deUnMarco = typeof r.marco === "string";
           const marco = r.marco === null ? null : deUnMarco ? new URL(r.marco as string, actual).toString() : actual;
-          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false, marco).then((d) => {
-            if (d.tipo !== "respondido" || deUnMarco) return;
-            html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
-            registro.textoDibujado = html;
-          });
+          const principal = r.principal === true;
+          const at = atender;
+          // La URL de la página se lee al SALIR el pedido, como en Chromium.
+          const salir = () =>
+            emitir(at, new URL(r.url, actual).toString(), r.tipo, principal, marco, urlDelDocumento || null).then((d) => {
+              // Una navegación de la pestaña que no se confirma no cambia el
+              // documento: ni su DOM ni su URL.
+              if (d.tipo !== "respondido" || deUnMarco || principal) return;
+              html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
+              registro.textoDibujado = html;
+            });
+          if (r.enMs === undefined) {
+            void salir();
+          } else {
+            const alcanzar = opciones.reloj?.alcanzar;
+            if (!alcanzar) throw new Error("el doble necesita `reloj.alcanzar` para un pedido con `enMs`");
+            void alcanzar(r.enMs).then(salir);
+          }
         }
       },
       async esperarQuietud() {},

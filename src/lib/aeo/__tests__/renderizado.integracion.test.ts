@@ -206,6 +206,34 @@ const RETO = `<!doctype html><html><body><p>Desafío</p>
 <script>fetch("https://cdn-v6.test/sonda").catch(() => {});</script></body></html>`;
 
 /**
+ * FV-1, RED-121-1, F1: la página manda la PESTAÑA a otro sitio y esa
+ * navegación NO se confirma —un 204, un archivo que Chromium trata como
+ * descarga (las descargas están denegadas), un `window.stop()`—: el documento
+ * que se lee sigue siendo la página. Después la página pide sus datos y los
+ * escribe en `#app`. Reproducido por la revisión con Chrome 155 y el headless
+ * shell 153: con los datos en un nombre sólo-IPv6, `medido 1249/1249`, punto
+ * VERDE y `noLlegaron=[]`, porque el sitio de la página salía del último
+ * PEDIDO de navegación y el `fetch` propio pasaba por uno de otro sitio.
+ */
+function seVa(destino: string, datos: string, detener = false): string {
+  return hibrida(`<script>addEventListener("load", () => {
+  setTimeout(() => {
+    location.href = ${JSON.stringify(destino)};
+    ${detener ? "setTimeout(() => window.stop(), 100);" : ""}
+  }, 200);
+  setTimeout(() => {
+    fetch(${JSON.stringify(datos)}).then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {});
+  }, 1200);
+});</script>`);
+}
+
+/** FV-1: el pedido propio sale ANTES de que la pestaña intente irse, y no llega después. */
+const SE_VA_EN_VUELO = hibrida(`<script>addEventListener("load", () => {
+  fetch("/corta-tarde").then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {});
+  setTimeout(() => { location.href = "http://otro.test/vacio"; }, 300);
+});</script>`);
+
+/**
  * PU-2: el contenido real dibujado por JavaScript DENTRO de un shadow root
  * (Lit, Stencil, LWC), con un menú servido. `page.content()` es `outerHTML`
  * y no serializa los shadow roots: MEDIDO por la revisión con Chrome 154, el
@@ -377,6 +405,43 @@ beforeAll(async () => {
       case "/marco-propio":
         // Un marco del MISMO origen: su JavaScript puede escribir en la página.
         return html(`<!doctype html><html><body><script src="https://cdn-v6.test/widget.js"></script></body></html>`);
+      case "/se-va-204":
+        return html(seVa("http://otro.test/vacio", "https://cdn-v6.test/datos"));
+      case "/se-va-descarga":
+        return html(seVa("http://otro.test/catalogo.zip", "https://cdn-v6.test/datos"));
+      case "/se-va-detenida":
+        return html(seVa("http://otro.test/lento", "https://cdn-v6.test/datos", true));
+      case "/se-va-en-vuelo":
+        return html(SE_VA_EN_VUELO);
+      case "/se-va-y-llega":
+        return html(seVa("http://otro.test/vacio", "/datos"));
+      case "/vacio":
+        // 204: Chromium no confirma la navegación, y la pestaña se queda en la página.
+        res.writeHead(204);
+        return res.end();
+      case "/catalogo.zip":
+        // Sin `Content-Disposition`: el interceptor lo entrega, y Chromium lo
+        // trata como descarga, que está denegada. Tampoco se confirma.
+        res.writeHead(200, { "content-type": "application/zip" });
+        return res.end("PK\u0003\u0004");
+      case "/lento": {
+        const reloj = setTimeout(() => {
+          res.writeHead(204);
+          res.end();
+        }, 2_000);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
+      case "/datos":
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        return res.end(CONTENIDO_DEL_BUNDLE);
+      case "/corta-tarde": {
+        // Contesta NADA: corta la conexión a los 1,5 s, con la pestaña ya
+        // intentando irse a otro sitio.
+        const reloj = setTimeout(() => req.socket.destroy(), 1_500);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
       case "/hibrida-grande":
         return html(hibrida(`<script src="/app-grande.js"></script>`));
       case "/hibrida-chunk":
@@ -503,6 +568,7 @@ function deps(
       "cdn-v6.test": [IPV6_SIN_RUTA],
       "video.test": [PUBLICA_DE_TERCEROS],
       "reto.test": [PUBLICA_DE_TERCEROS],
+      "otro.test": [PUBLICA_DE_TERCEROS],
       "sitio.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
@@ -722,6 +788,70 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         if (render.estado !== "fallo") return;
         expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
         expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/widget.js"]);
+      },
+      60_000
+    );
+  });
+
+  describe("FV-1 — una navegación de la PESTAÑA que no se confirma no cambia de qué sitio es la página", () => {
+    const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+      contenidoSinJs({
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: textoSinJavaScript(hibrida("")),
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      }).estado;
+
+    it.each([
+      ["/se-va-204", "http://otro.test/vacio", "un 204"],
+      ["/se-va-descarga", "http://otro.test/catalogo.zip", "un archivo que Chromium trata como descarga"],
+      ["/se-va-detenida", "http://otro.test/lento", "una navegación cortada con `window.stop()`"],
+    ])(
+      "%s: la pestaña intenta irse a otro sitio (%s, %s) y el `fetch` propio que no llega deja la página sin número",
+      async (ruta, destino) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[FV-1 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        // La navegación salió por el transporte: si no, esto no prueba nada.
+        expect(b.pedidos.map((p) => p.url)).toContain(destino);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/datos"]);
+        expect(punto(render)).toBe("no-medido");
+      },
+      60_000
+    );
+
+    it(
+      "y un pedido de la página que estaba EN VUELO cuando la pestaña intentó irse tampoco se descarta al no llegar",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/se-va-en-vuelo", deps(), undefined, b);
+        console.log(`[FV-1 /se-va-en-vuelo] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(b.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/corta-tarde"]);
+      },
+      60_000
+    );
+
+    it(
+      "el control: con los datos al alcance, la misma página se mide y lo que escriben se cuenta —ROJO—",
+      async () => {
+        // Sin esto, los rojos de arriba podrían venir de que la navegación
+        // rompe la medición y no de que el `fetch` propio cuenta.
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/se-va-y-llega", deps(), undefined, b);
+        console.log(`[FV-1 /se-va-y-llega] renderizado=${JSON.stringify(render)}`);
+        expect(b.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+        expect(render.estado).toBe("medido");
+        if (render.estado !== "medido") return;
+        expect(render.caracteres).toBeGreaterThan((render.servidos ?? 0) + contarCaracteres(CONTENIDO_DEL_BUNDLE) - 10);
+        expect(punto(render)).toBe("rojo");
       },
       60_000
     );
