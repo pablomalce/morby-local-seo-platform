@@ -47,16 +47,19 @@
  *
  * El análisis es de `tsc` entero, con el verificador de tipos
  * (`credencialDeLaAgencia.analisis.ts`). Una lectura del entorno se reconoce
- * porque la clave tiene TIPO literal, no porque se parezca a un literal: así se
- * ven el `as const`, la constante local y la importada. El mundo es cerrado: una
- * lectura del entorno cuya clave el compilador no puede enumerar, un
- * `process.env` que se escapa a algo que no lo tipa como entorno, una llamada de
- * Supabase con un nombre armado en ejecución, o un `import()` de destino no
- * literal, son fallas por sí mismas — por ahí pasaría la próxima. Lo mismo un
- * `process` o un `globalThis` que pierden el tipo (`as any`, `Reflect.get`) y una
- * carga que resuelve webpack sin `import()` (`require.context`,
- * `import.meta.webpackContext`, `__non_webpack_require__`): medidos en la
- * tercera revisión del #118.
+ * porque su clave está ESCRITA —un literal, o una constante que vale uno, local,
+ * importada o `as const`—, no porque su TIPO sea literal: un tipo se afirma, y
+ * la cuarta revisión del #118 leyó la variable de la agencia con
+ * `process.env[nombre as PlatformEnvVar]` y pidió el secreto con
+ * `rpc(... as "current_user_org_ids")`, con tsc y la pared en verde. El mundo es
+ * cerrado: una lectura del entorno cuya clave no está escrita, un `process.env`
+ * que se escapa a algo que no lo tipa como entorno, un método de la base con un
+ * nombre que no está escrito —o sacado del cliente, o escondido con una
+ * aserción—, o un `import()` de destino no literal, son fallas por sí mismas —
+ * por ahí pasaría la próxima. Lo mismo un `process` o un `globalThis` que
+ * pierden el tipo (`as any`, `Reflect.get`) y una carga que resuelve webpack sin
+ * `import()` (`require.context`, `import.meta.webpackContext`,
+ * `__non_webpack_require__`): medidos en la tercera revisión del #118.
  *
  * Y NO SÓLO POR ARCHIVO: POR SÍMBOLO (R14)
  *
@@ -86,7 +89,10 @@
  *
  * No dice que la regla de `servicioCompartido.ts` sea correcta: eso lo miden
  * `servicioCompartido.test.ts` y los dos tests de varias organizaciones (el
- * reporte y la publicación). Dice que no hay otra puerta.
+ * reporte y la publicación). Dice que no hay otra puerta. Y tampoco dice qué
+ * hace quien pasa por la puerta con lo que recibe: por eso la puerta no entrega
+ * el token, sólo consultas atadas a sus mapeos (ver su encabezado). Lo que el
+ * analizador no ve está escrito al final de su encabezado.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -223,7 +229,9 @@ const VIRTUALES: Record<string, string> = {
       const org = resolveAgencyOrgId();
       const { data } = await admin().rpc("integration_token_secret", { p_organization_id: org });
       return data;
-    }`,
+    }
+    // Otra pieza, inocua: le da a una aserción un nombre que existe y no es el token.
+    export const proveedor = () => "google";`,
   "agencyToken.ts": `
     import { admin } from "./admin";
     export async function estado(org: string) {
@@ -310,6 +318,13 @@ const VIRTUALES: Record<string, string> = {
     import * as almacen from "./tokenStore";
     export const operador = () => resolveAgencyOrgId();
     export const clics = () => { const { ["agencyAccessToken"]: token } = almacen; return token(); };`,
+  // La clave dice ser otra pieza que existe (cuarta revisión del #118): con la
+  // clave leída de su TIPO, esto usaba `proveedor` y no el token.
+  "conexionPorClaveAsertada.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => (almacen[("agency" + "AccessToken") as "proveedor"] as unknown as () => Promise<unknown>)();`,
 
   // --- La variable, por las tres formas de la revisión del #118 y una más.
   "asConst.ts": `
@@ -340,6 +355,55 @@ const VIRTUALES: Record<string, string> = {
   "restoDelEntorno.ts": `
     const { ...todo } = process.env;
     export const agencia = () => todo.VULKAN_AGENCY_ORG_ID;`,
+
+  // --- El entorno, con una clave que sólo el TIPO enumera (cuarta revisión del
+  // #118). La pared se creía el tipo de la clave, y un tipo se afirma: con tsc y
+  // la pared en verde, P1, P5 y sus variantes leían la variable de la agencia.
+  // Y no hace falta una aserción: un parámetro, un arreglo covariante o un `any`
+  // ponen en una clave «de tipo literal» un texto armado en ejecución.
+  "asercionALiteral.ts": `
+    export function clave() {
+      const clave = ("VULKAN_AGENCY" + "_ORG_ID") as "OPENAI_API_KEY";
+      return process.env[clave];
+    }`,
+  "asercionAUnion.ts": `
+    type VariableDePlataforma = "OPENAI_API_KEY" | "SENTRY_DSN";
+    export const leer = (nombre: string) => process.env[nombre as VariableDePlataforma];`,
+  "asercionAngular.ts": `
+    export const agencia = () => process.env[<"OPENAI_API_KEY">("VULKAN_AGENCY" + "_ORG_ID")];`,
+  "asercionJsdoc.js": `
+    export const leer = (nombre) => process.env[/** @type {"OPENAI_API_KEY"} */ (nombre)];`,
+  // La aserción no está en la lectura: está en quien llama.
+  "claveDeParametro.ts": `
+    function leer(k: "OPENAI_API_KEY") { return process.env[k]; }
+    export const agencia = () => leer(("VULKAN_AGENCY" + "_ORG_ID") as "OPENAI_API_KEY");`,
+  // Sin ninguna aserción: el control de antes, que se creía el tipo de `k`.
+  "claveDeTipo.ts": `
+    type Clave = "OTRA_VARIABLE" | "Y_OTRA";
+    export const leer = (k: Clave) => process.env[k];`,
+  "claveCovariante.ts": `
+    const literales: "OPENAI_API_KEY"[] = ["OPENAI_API_KEY"];
+    const textos: string[] = literales;
+    textos.push("VULKAN_AGENCY" + "_ORG_ID");
+    export const agencia = () => process.env[literales[1]];`,
+  "claveDeJson.ts": `
+    const k: "OPENAI_API_KEY" = JSON.parse('"VULKAN_AGENCY' + '_ORG_ID"');
+    export const agencia = () => process.env[k];`,
+  // Un `let` vale lo último que alguien le asignó, y una condición vale
+  // cualquiera de sus dos ramas: con una armada, no se sabe.
+  "claveLet.ts": `
+    let clave = "OPENAI_API_KEY";
+    export const cambiar = (v: string) => { clave = v; };
+    export const agencia = () => process.env[clave];`,
+  "claveCondicionalArmada.ts": `
+    export const agencia = (c: boolean) => process.env[c ? "OTRA_VARIABLE" : "VULKAN_AGENCY" + "_ORG_ID"];`,
+  // Una constante ambiental dice qué vale algo que pone otro en ejecución.
+  "claveAmbiental.ts": `
+    declare const CLAVE = "OPENAI_API_KEY";
+    export const agencia = () => process.env[CLAVE];`,
+  // Y `process` con una clave asertada: el resultado ya no es un entorno.
+  "procesoClaveAsertada.ts": `
+    export const agencia = () => (process[("e" + "nv") as "title"] as unknown as Record<string, string>)["VULKAN_AGENCY_ORG_ID"];`,
 
   // --- El entorno, sacándole el tipo a `process` (tercera revisión del #118). El
   // rastreo empezaba en lo tipado como entorno, y `process` es un `Process`: un
@@ -379,6 +443,44 @@ const VIRTUALES: Record<string, string> = {
     import { admin } from "./admin";
     const nombre: string = ["integration", "token", "secret"].join("_");
     export const secreto = () => admin().rpc(nombre, {});`,
+  // La base con una aserción (cuarta revisión del #118): P2 pedía el secreto con
+  // `service_role` y la pared lo leía como `current_user_org_ids`.
+  "asercionEnLaCustodia.ts": `
+    import { admin } from "./admin";
+    export const secreto = () => admin().rpc(("integration_token" + "_secret") as "current_user_org_ids", {} as never);`,
+  // La aserción en el método, o en el cliente: la firma deja de ser de @supabase.
+  "calleeAsertado.ts": `
+    import { admin } from "./admin";
+    export const secreto = () => (admin().rpc as unknown as (nombre: string) => unknown)("integration_token" + "_secret");`,
+  "receptorAsertado.ts": `
+    import { admin } from "./admin";
+    type Llamador = { rpc(nombre: string): unknown };
+    export const secreto = () => (admin() as unknown as Llamador).rpc("integration_token" + "_secret");`,
+  "clienteComoIndice.ts": `
+    import { admin } from "./admin";
+    const c = admin() as unknown as Record<string, (nombre: string) => unknown>;
+    export const secreto = () => c["rpc"]("integration_token" + "_secret");`,
+  // Sin aserción: el método sacado del cliente, y llamado después.
+  "rpcEnlazada.ts": `
+    import { admin } from "./admin";
+    const llamar = admin().rpc.bind(admin());
+    export const secreto = () => llamar("integration_token" + "_secret");`,
+  "rpcDesestructurada.ts": `
+    import { admin } from "./admin";
+    export const secreto = () => { const { rpc } = admin(); return rpc.call(admin(), "integration_token" + "_secret"); };`,
+  "rpcPorAsignacion.ts": `
+    import { admin } from "./admin";
+    let r: unknown;
+    ({ rpc: r } = admin());
+    export const secreto = () => (r as (nombre: string) => unknown)("integration_token" + "_secret");`,
+  // En un .js, la aserción es un JSDoc sobre un paréntesis.
+  "clienteJsdoc.js": `
+    import { admin } from "./admin";
+    const c = /** @type {Record<string, Function>} */ (/** @type {unknown} */ (admin()));
+    export const secreto = () => c["rpc"]("integration_token" + "_secret");`,
+  "rpcPorElemento.ts": `
+    import { admin } from "./admin";
+    export const secreto = () => admin()[["r", "p", "c"].join("") as "rpc"]("integration_token" + "_secret");`,
   "urlCruda.ts": `
     export const secreto = (url: string) => fetch(url + "/rest/v1/rpc/integration_token_secret", { method: "POST" });`,
   "esquemaDelVault.ts": `
@@ -435,9 +537,32 @@ const VIRTUALES: Record<string, string> = {
   "controlSoloTipos.ts": `
     import type { agencyAccessToken } from "./tokenStore";
     export type T = typeof agencyAccessToken;`,
+  // Otras variables, con la clave escrita de las formas que se leen: un
+  // literal, una constante (también de otra constante), una condición entre
+  // ellas y un template sin sustituciones.
+  "constantes.ts": `export const DE_UN_MODULO = "Y_DE_UN_MODULO";`,
   "controlOtrasVariables.ts": `
-    type Clave = "OTRA_VARIABLE" | "Y_OTRA";
-    export const leer = (k: Clave) => process.env[k] ?? process.env.MAS_OTRA;`,
+    import * as constantes from "./constantes";
+    const A = "OTRA_VARIABLE";
+    const B = A;
+    const C = Math.random() > 0.5 ? "Y_OTRA" : B;
+    export const leer = () => process.env[C] ?? process.env["MAS_OTRA"] ?? process.env[\`Y_UNA_MAS\`];
+    export const delModulo = () => process.env[constantes.DE_UN_MODULO];`,
+  // La base usada como se usa, y lo que se llama igual sin ser la base.
+  "controlLaBase.ts": `
+    import { admin } from "./admin";
+    const TABLA = "businesses" as const;
+    export const negocios = () => admin().from(TABLA).select("id");
+    export const funcion = (c: boolean) => admin().rpc(c ? "current_user_org_ids" : "otra_funcion");
+    export const opcional = () => admin()?.from("reports");
+    export const noNula = () => admin().from!("reports");
+    export const tipo = () => typeof admin().schema;`,
+  "controlNoEsLaBase.ts": `
+    export const semanas = (xs: number[]) => Array.from(new Set(xs));
+    export const bytes = (s: string) => Buffer.from(s, "utf8");
+    export const tipos = (lectura: { schema: string[] }) => lectura.schema.length;
+    const pasos: Array<() => number> = [() => 1];
+    export const paso = (i: number) => pasos[i]();`,
   "controlPasaElEntorno.ts": `
     function leer(env: NodeJS.ProcessEnv) { return env.OTRA_VARIABLE; }
     export const valor = () => leer(process.env);`,
@@ -468,12 +593,19 @@ const VIRTUALES: Record<string, string> = {
 const CONEXION_SIN_IDENTIFICADOR = [
   "conexionPorCargador.ts",
   "conexionPorClaveArmada.js",
+  "conexionPorClaveAsertada.ts",
   "conexionPorClaveConst.ts",
   "conexionPorElemento.ts",
   "conexionPorImportDinamico.ts",
   "conexionPorPatronComputado.ts",
   "conexionPorReflect.ts",
 ];
+
+/**
+ * De ésas, las que no dicen QUÉ pieza piden —la clave no está escrita, o el
+ * namespace se va a otra función—: usan todo lo que el almacén exporta.
+ */
+const USAN_TODO_EL_ALMACEN = ["conexionPorClaveArmada.js", "conexionPorClaveAsertada.ts", "conexionPorReflect.ts"];
 
 const POLITICA_VIRTUAL: Politica = {
   variable: VARIABLE,
@@ -541,12 +673,24 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     );
   });
 
-  it("el entorno con clave desconocida: armada, escapada, guardada como otra cosa, o el resto", () => {
+  it("el entorno con clave desconocida: armada, escapada, guardada como otra cosa, el resto, o sólo enumerada por su tipo", () => {
     expect(archivosDe(virtual.envOpaco)).toEqual(
       en([
+        "asercionALiteral.ts",
+        "asercionAUnion.ts",
+        "asercionAngular.ts",
+        "asercionJsdoc.js",
+        "claveAmbiental.ts",
         "claveArmada.ts",
+        "claveCondicionalArmada.ts",
+        "claveCovariante.ts",
+        "claveDeJson.ts",
+        "claveDeParametro.ts",
+        "claveDeTipo.ts",
+        "claveLet.ts",
         "entornoEscapado.ts",
         "entornoGuardado.ts",
+        "procesoClaveAsertada.ts",
         "procesoComoAny.ts",
         "procesoDescriptor.ts",
         "procesoGlobalThisAny.ts",
@@ -556,6 +700,18 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "restoDelEntorno.ts",
       ])
     );
+  });
+
+  it("una clave que sólo el TIPO enumera no se sabe: la aserción, el parámetro y `process`, cada uno en su sitio", () => {
+    // Cuarta revisión del #118: P1, P5 y la aserción en quien llama leían la
+    // variable de la agencia con tsc y la pared en verde. Por SITIO: la
+    // lectura que se marca es la del entorno, no la aserción de más arriba.
+    const sitios = virtual.envOpaco.join("\n");
+    expect(sitios).toContain(`${V}/asercionALiteral.ts:4 clave que no está escrita: clave`);
+    expect(sitios).toContain(`${V}/asercionAUnion.ts:3 clave que no está escrita: nombre as VariableDePlataforma`);
+    expect(sitios).toContain(`${V}/claveDeParametro.ts:2 clave que no está escrita: k`);
+    expect(sitios).toContain(`${V}/claveCovariante.ts:5 clave que no está escrita: literales[1]`);
+    expect(sitios).toContain(`${V}/procesoClaveAsertada.ts:2 process se lee con una clave que no está escrita`);
   });
 
   it("`process` y el objeto global sin su tipo son entorno de clave desconocida, y cada sitio se nombra", () => {
@@ -575,8 +731,36 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       en(["secretoDirecto.ts", "tokenStore.ts", "urlCruda.ts"])
     );
     expect(virtual.custodios.integration_tokens).toEqual(en(["agencyToken.ts", "secretoDirecto.ts"]));
-    expect(archivosDe(virtual.supabaseOpaco)).toEqual(en(["rpcArmada.ts"]));
     expect(virtual.esquemas).toEqual(["vault"]);
+  });
+
+  it("un método de la base con un nombre que no se lee: armado, asertado, o sacado del cliente", () => {
+    expect(archivosDe(virtual.supabaseOpaco)).toEqual(
+      en([
+        "asercionEnLaCustodia.ts",
+        "calleeAsertado.ts",
+        "clienteComoIndice.ts",
+        "clienteJsdoc.js",
+        "receptorAsertado.ts",
+        "rpcArmada.ts",
+        "rpcDesestructurada.ts",
+        "rpcEnlazada.ts",
+        "rpcPorAsignacion.ts",
+        "rpcPorElemento.ts",
+      ])
+    );
+    // Por SITIO: P2 de la cuarta revisión del #118, y cada forma con su motivo.
+    const sitios = virtual.supabaseOpaco.join("\n");
+    expect(sitios).toContain(`${V}/asercionEnLaCustodia.ts:3 .rpc(("integration_token" + "_secret") as "current_user_org_ids")`);
+    expect(sitios).toContain(`${V}/calleeAsertado.ts:3 .rpc("integration_token" + "_secret")`);
+    expect(sitios).toContain(`${V}/receptorAsertado.ts:4 .rpc("integration_token" + "_secret")`);
+    expect(sitios).toContain(`${V}/receptorAsertado.ts:4 una aserción le saca el tipo a .rpc, .from, .schema`);
+    expect(sitios).toContain(`${V}/clienteComoIndice.ts:3 una aserción le saca el tipo a .rpc, .from, .schema`);
+    expect(sitios).toContain(`${V}/rpcEnlazada.ts:3 .rpc sin llamarlo`);
+    expect(sitios).toContain(`${V}/rpcDesestructurada.ts:3 destructuring de un método de la base`);
+    expect(sitios).toContain(`${V}/rpcPorAsignacion.ts:4 destructuring de un método de la base`);
+    expect(sitios).toContain(`${V}/clienteJsdoc.js:3 una aserción le saca el tipo a .rpc, .from, .schema`);
+    expect(sitios).toContain(`${V}/rpcPorElemento.ts:3 un método que puede ser de la base, con un nombre que no se lee`);
   });
 
   it("el grafo: un import() que no se puede seguir, uno con query, uno que no resuelve, y las cargas de webpack", () => {
@@ -641,10 +825,13 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(virtual.exportaLaPuerta).toEqual(["agencyAccessToken", "servir"]);
     expect(analisisVirtual.lecturas.get(`${V}/reexportaTodo.ts`)!.exporta).toContain("agencyAccessToken");
     const conToken = [`${V}/agency.ts#resolveAgencyOrgId`, `${V}/tokenStore.ts#agencyAccessToken`];
+    const conTodo = [...conToken, `${V}/tokenStore.ts#proveedor`];
     expect(virtual.conexionUsa).toEqual({
       [`${V}/conexion.ts`]: [`${V}/agency.ts#resolveAgencyOrgId`],
       [`${V}/conexionConToken.ts`]: conToken,
-      ...Object.fromEntries(CONEXION_SIN_IDENTIFICADOR.map((m) => [`${V}/${m}`, conToken])),
+      ...Object.fromEntries(
+        CONEXION_SIN_IDENTIFICADOR.map((m) => [`${V}/${m}`, USAN_TODO_EL_ALMACEN.includes(m) ? conTodo : conToken])
+      ),
       [`${V}/yaNoLlega.ts`]: [],
     });
   });
@@ -671,11 +858,19 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       "controlPasaElEntorno.ts",
       "controlProceso.ts",
       "controlRequireLiteral.js",
+      "controlLaBase.ts",
+      "controlNoEsLaBase.ts",
       "datosLegitimos.ts",
       "datosPorImportDinamico.ts",
       "conexion.ts",
     ])) {
       expect(marcados.has(control), `${control} no es una fuga y el detector lo marcó`).toBe(false);
+    }
+    // La base usada como se usa —un literal, una constante `as const`, una
+    // condición entre literales, `?.`, `typeof`— y lo que se llama `from` o
+    // `schema` sin ser la base: nada de eso es opaco, y los nombres se leen.
+    for (const control of ["controlLaBase.ts", "controlNoEsLaBase.ts"]) {
+      expect(analisisVirtual.lecturas.get(`${V}/${control}`)!.supabaseOpaco, control).toEqual([]);
     }
     for (const control of ["controlProceso.ts", "controlRequireLiteral.js"]) {
       expect(analisisVirtual.lecturas.get(`${V}/${control}`)!.sinResolver, control).toEqual([]);
@@ -685,7 +880,9 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect([...analisisVirtual.lecturas.get(`${V}/controlOtrasVariables.ts`)!.leeEnv].sort()).toEqual([
       "MAS_OTRA",
       "OTRA_VARIABLE",
+      "Y_DE_UN_MODULO",
       "Y_OTRA",
+      "Y_UNA_MAS",
     ]);
   });
 
@@ -777,9 +974,10 @@ describe("el árbol de src, leído del disco", () => {
     it("toda lectura del entorno tiene claves que el compilador puede enumerar", () => {
       expect(
         real.envOpaco,
-        "Una lectura del entorno con una clave de tipo `string`, o un process.env " +
-          "que se va a algo que no lo tipa como entorno, puede ser la variable de la " +
-          "agencia y la pared no tiene cómo saberlo. Tipá la clave con una unión de literales."
+        "Una lectura del entorno cuya clave no está ESCRITA, o un process.env que se va " +
+          "a algo que no lo tipa como entorno, puede ser la variable de la agencia y la " +
+          "pared no tiene cómo saberlo. Un tipo no alcanza: se afirma. Escribí la clave " +
+          "(un literal, o una constante que vale uno), como LECTURAS en platformStatus.ts."
       ).toEqual([]);
     });
   });

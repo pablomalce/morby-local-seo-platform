@@ -31,28 +31,36 @@
  */
 
 /**
- * Las variables de entorno que esta pantalla mira, todas, escritas una vez.
+ * Las variables de entorno que esta pantalla mira, todas, y cómo se lee cada una:
+ * con su nombre ESCRITO.
  *
- * Una unión de literales y no `string`, y no es prolijidad: `platformStatus()`
- * indexa el entorno con ellas, y la pared del token de la agencia
- * (`src/lib/__tests__/credencialDeLaAgencia.test.ts`) exige que TODA lectura del
- * entorno tenga claves que el compilador pueda enumerar. Con `string`, esta
- * lectura podía ser cualquier variable —también `VULKAN_AGENCY_ORG_ID`— y la
- * pared no tenía cómo saber que no lo era.
+ * No es prolijidad. La pared del token de la agencia
+ * (`src/lib/__tests__/credencialDeLaAgencia.test.ts`) exige que toda lectura del
+ * entorno tenga su clave en el TEXTO del código. Hasta la cuarta revisión del
+ * #118 esto era una unión de literales, `env[k]` con `k: PlatformEnvVar`, y la
+ * pared se creía el tipo de `k`. Medido el 2026-10-13: un `env[nombre as
+ * PlatformEnvVar]` con `nombre = "VULKAN_AGENCY" + "_ORG_ID"` leía la variable de
+ * la agencia con tsc y la pared en verde. Un tipo se afirma; un nombre escrito
+ * no. Ahora cada variable se lee con su nombre al lado, y el tipo de la tabla
+ * obliga a que estén todas.
  */
-export type PlatformEnvVar =
-  | "OPENAI_API_KEY"
-  | "OPENAI_IMAGE_MODEL"
-  | "GOOGLE_PLACES_API_KEY"
-  | "GOOGLE_PAGESPEED_API_KEY"
-  | "GOOGLE_CLIENT_ID"
-  | "GOOGLE_CLIENT_SECRET"
-  | "ANTHROPIC_API_KEY"
-  | "GOOGLE_GEMINI_API_KEY"
-  | "RESEND_API_KEY"
-  | "SENTRY_DSN"
-  | "POSTHOG_KEY"
-  | "GROWTH_OS_WEBHOOK_SECRET";
+const LECTURAS = {
+  OPENAI_API_KEY: (env: NodeJS.ProcessEnv) => env.OPENAI_API_KEY,
+  OPENAI_IMAGE_MODEL: (env: NodeJS.ProcessEnv) => env.OPENAI_IMAGE_MODEL,
+  GOOGLE_PLACES_API_KEY: (env: NodeJS.ProcessEnv) => env.GOOGLE_PLACES_API_KEY,
+  GOOGLE_PAGESPEED_API_KEY: (env: NodeJS.ProcessEnv) => env.GOOGLE_PAGESPEED_API_KEY,
+  GOOGLE_CLIENT_ID: (env: NodeJS.ProcessEnv) => env.GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET: (env: NodeJS.ProcessEnv) => env.GOOGLE_CLIENT_SECRET,
+  ANTHROPIC_API_KEY: (env: NodeJS.ProcessEnv) => env.ANTHROPIC_API_KEY,
+  GOOGLE_GEMINI_API_KEY: (env: NodeJS.ProcessEnv) => env.GOOGLE_GEMINI_API_KEY,
+  RESEND_API_KEY: (env: NodeJS.ProcessEnv) => env.RESEND_API_KEY,
+  SENTRY_DSN: (env: NodeJS.ProcessEnv) => env.SENTRY_DSN,
+  POSTHOG_KEY: (env: NodeJS.ProcessEnv) => env.POSTHOG_KEY,
+  GROWTH_OS_WEBHOOK_SECRET: (env: NodeJS.ProcessEnv) => env.GROWTH_OS_WEBHOOK_SECRET,
+} as const;
+
+/** El nombre de una de las variables de arriba. */
+export type PlatformEnvVar = keyof typeof LECTURAS;
 
 /** Qué hace falta para que una integración esté lista, y dónde se termina. */
 export interface PlatformIntegration {
@@ -143,7 +151,7 @@ export function platformStatus(env: NodeJS.ProcessEnv = process.env): PlatformIn
     // más común de «me olvidé de completarla», y contarla haría que la pantalla
     // dijera «listo» sobre una integración que va a fallar en la primera llamada.
     const present = i.needs.filter((k) => {
-      const v = env[k];
+      const v = LECTURAS[k](env);
       return typeof v === "string" && v.trim() !== "";
     }).length;
 

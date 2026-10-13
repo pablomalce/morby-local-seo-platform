@@ -146,3 +146,27 @@ describe("la lista", () => {
     ]);
   });
 });
+
+describe("cada variable se lee con SU nombre", () => {
+  // Desde la cuarta revisión del #118 cada variable se lee con su nombre escrito
+  // al lado (`LECTURAS`), y no con `env[k]`: la pared del token de la agencia ya
+  // no se cree el tipo de `k`. Una tabla así se puede cablear mal —la entrada de
+  // OPENAI_API_KEY leyendo ANTHROPIC_API_KEY— y el compilador no lo ve, porque
+  // las dos son un `string | undefined`. Esto sí: cada variable, sola, cuenta
+  // para cada integración que la necesita, y sólo para ésas.
+  const todas = [...new Set(PLATFORM_INTEGRATIONS.flatMap((i) => i.needs))];
+
+  it("son las doce de .env.example que esta pantalla mira", () => {
+    expect(todas).toHaveLength(12);
+  });
+
+  for (const variable of todas) {
+    it(`${variable}, sola, la cuentan las que la necesitan y ninguna otra`, () => {
+      const env = { [variable]: "puesta" } as unknown as NodeJS.ProcessEnv;
+      for (const s of platformStatus(env)) {
+        const i = PLATFORM_INTEGRATIONS.find((x) => x.name === s.name)!;
+        expect(s.present, `${s.name} con sólo ${variable}`).toBe(i.needs.includes(variable) ? 1 : 0);
+      }
+    });
+  }
+});

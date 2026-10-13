@@ -19,15 +19,34 @@
  *   - la misma constante declarada DENTRO de una función (no es de módulo);
  *   - el mismo código en un `.js` (`allowJs: true`), que el recorrido ni leía.
  *
- * Las tres tienen algo en común que el parser no ve y el verificador de tipos
- * sí: la clave con la que se indexa el entorno tiene TIPO literal
- * `"VULKAN_AGENCY_ORG_ID"`. Así que la pregunta deja de ser «¿se parece a una
- * lectura?» y pasa a ser «¿qué claves puede tener esta lectura del entorno?».
- * Y el mundo es CERRADO: una lectura del entorno cuya clave no se puede saber
- * —un `string` armado en ejecución, un `Object.entries(process.env)`, un
- * `process.env` pasado a algo que no lo tipa como entorno— no se tolera como
+ * El compilador entero resuelve las tres: sabe qué símbolo es cada nombre, a
+ * través de funciones, de imports y de `.js`. Así que la pregunta deja de ser
+ * «¿se parece a una lectura?» y pasa a ser «¿qué claves puede tener esta lectura
+ * del entorno?». Y el mundo es CERRADO: una lectura del entorno cuya clave no se
+ * puede saber —un `string` armado en ejecución, un `Object.entries(process.env)`,
+ * un `process.env` pasado a algo que no lo tipa como entorno— no se tolera como
  * «probablemente no es la de la agencia». Es una falla de la pared, porque es
  * exactamente por donde pasaría la próxima.
+ *
+ * Y LA CLAVE SE LEE DEL TEXTO, NO DEL TIPO (cuarta revisión del #118)
+ *
+ * Hasta la cuarta revisión, «se puede saber» era «tiene TIPO literal», y un
+ * tipo se afirma. Medido el 2026-10-13 con tsc y la pared en verde: `const clave
+ * = ("VULKAN_AGENCY" + "_ORG_ID") as "OPENAI_API_KEY"; process.env[clave]`,
+ * `process.env[nombre as PlatformEnvVar]` y `admin.rpc(("integration_token" +
+ * "_secret") as "current_user_org_ids")` leían la variable y el secreto de la
+ * agencia. Ahora una clave se sabe sólo si está ESCRITA: un literal, una
+ * condición entre literales, o una constante que vale una de esas cosas (ver
+ * `clavesDe`). Un parámetro, un arreglo, un `any` o una aserción no prueban qué
+ * texto llevan, aunque su tipo diga uno. Lo mismo vale para los nombres de la
+ * base, para las claves de un namespace y para lo que se le lee a `process`.
+ *
+ * Y del lado de la base, lo mismo con el método: es de la base todo lo que se
+ * llame `rpc`, `from` o `schema` y se pueda llamar, salvo lo que declaran el
+ * lenguaje o Node (`Array.from`, `Buffer.from`). Una aserción ya no lo esconde
+ * —ni sobre el método, ni sobre el cliente—, y sacarlo del cliente sin llamarlo
+ * (un `.bind`, un `.call`, un destructuring) es no saber con qué nombre se lo va
+ * a llamar.
  *
  * LO QUE COSECHA, POR ARCHIVO
  *
@@ -55,7 +74,7 @@
  *                    `Reflect.get(almacen, ...)`, un `as any`) usa todo el módulo;
  *   exporta          los nombres que el módulo exporta como valor, también los
  *                    reexportados;
- *   leeEnv           las claves del entorno que lee, con su tipo literal;
+ *   leeEnv           las claves del entorno que lee, escritas en el código;
  *   envOpaco         las lecturas del entorno de clave desconocida, y los
  *                    `process.env` que se escapan a algo que no es un entorno.
  *                    Y lo mismo para `process` y el objeto global (`globalThis`,
@@ -65,8 +84,10 @@
  *   custodia         los nombres de la custodia del token que menciona en
  *                    código (no en comentarios): las RPC de la `0021`, la tabla
  *                    `integration_tokens` y la vista del Vault;
- *   supabaseOpaco    una llamada de Supabase (`rpc`, `from`, `schema`) con un
- *                    nombre que no es literal;
+ *   supabaseOpaco    una llamada a un método de la base (`rpc`, `from`,
+ *                    `schema`) con un nombre que no está escrito, un método de
+ *                    la base sacado del cliente sin llamarlo, y una aserción que
+ *                    le borra el tipo al cliente;
  *   esquemas         los esquemas que pide con `.schema()`.
  *
  * POR QUÉ TAMBIÉN SÍMBOLOS, Y NO SÓLO EL GRAFO DE ARCHIVOS
@@ -104,12 +125,22 @@
  *
  * QUÉ NO VE, Y ESTÁ DICHO
  *
- * Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
- * `require()` (un `eval`, un `new Function`, que también pueden devolver
- * `process` sin tipo), y un secreto que llegue por la red desde otro servicio
- * sin nombrar ninguna de estas cosas. La pared es sobre el
- * código de este repositorio y la custodia de la `0021`; la frontera de la base
- * la sostienen sus GRANT, que `defects_test.sql` mide.
+ *   - Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
+ *     `require()` (un `eval`, un `new Function`, que también pueden devolver
+ *     `process` sin tipo).
+ *   - Un cliente de la base que se va, sin aserción, a una función que no lo
+ *     tipa (`Reflect.get(cliente, "rpc")`, `Object.values(cliente)`) y cuyo
+ *     método se llama después: el cliente no se rastrea como `process`. Ver
+ *     arriba: SÍ ve el método sacado por `.bind`, `.call`, destructuring o un
+ *     nombre que no está escrito, y el cliente que una aserción convierte en otra
+ *     cosa.
+ *   - Un módulo que reemplaza el `fetch` global y lee lo que la puerta o
+ *     `tokenStore.ts` le mandan a Google (el access token, el refresh token).
+ *   - Un secreto que llegue por la red desde otro servicio sin nombrar ninguna de
+ *     estas cosas.
+ *
+ * La pared es sobre el código de este repositorio y la custodia de la `0021`; la
+ * frontera de la base la sostienen sus GRANT, que `defects_test.sql` mide.
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { builtinModules } from "node:module";
@@ -266,18 +297,114 @@ function fuenteDelTipo(checker: ts.TypeChecker, tipo: ts.Type): Fuente | null {
 const META_INOCUA = new Set(["url", "dirname", "filename"]);
 const DE_WEBPACK = /^__(?:non_)?webpack_/;
 
-/** Las claves que puede tomar una expresión, si su tipo las fija. `null` = no se sabe. */
-function clavesDe(checker: ts.TypeChecker, nodo: ts.Node): string[] | null {
-  const t = checker.getTypeAtLocation(nodo);
-  const miembros = t.isUnion() ? t.types : [t];
-  const claves: string[] = [];
-  for (const m of miembros) {
-    if (m.isStringLiteral()) claves.push(m.value);
-    else if (m.isNumberLiteral()) claves.push(String(m.value));
-    else return null;
+/**
+ * Lo que no cambia el VALOR de una expresión: paréntesis, aserciones de tipo
+ * (`as T`, `<T>x`, y en un `.js` el `/** @type {T} *\/ (x)`, que es un
+ * paréntesis), `satisfies` y `!`. Cambian lo que el compilador CREE del valor,
+ * y por eso se miran a través.
+ */
+function sinEnvoltorios(nodo: ts.Node): ts.Node {
+  let n = nodo;
+  while (
+    ts.isParenthesizedExpression(n) ||
+    ts.isAsExpression(n) ||
+    ts.isTypeAssertionExpression(n) ||
+    ts.isSatisfiesExpression(n) ||
+    ts.isNonNullExpression(n) ||
+    ts.isPartiallyEmittedExpression(n)
+  ) {
+    n = n.expression;
   }
-  return claves;
+  return n;
 }
+
+/** El nodo que contiene a `nodo` cuando entre los dos sólo hay envoltorios (ver `sinEnvoltorios`). */
+function envueltoHasta(nodo: ts.Node): ts.Node {
+  let n = nodo;
+  while (
+    n.parent &&
+    (ts.isParenthesizedExpression(n.parent) ||
+      ts.isAsExpression(n.parent) ||
+      ts.isTypeAssertionExpression(n.parent) ||
+      ts.isSatisfiesExpression(n.parent) ||
+      ts.isNonNullExpression(n.parent) ||
+      ts.isPartiallyEmittedExpression(n.parent))
+  ) {
+    n = n.parent;
+  }
+  return n;
+}
+
+/**
+ * Las claves que puede tomar una expresión, LEÍDAS DEL TEXTO. `null` = no se
+ * sabe.
+ *
+ * Se sabe cuando el valor está escrito: un literal, una condición entre
+ * literales, o una constante (`const`, también importada) cuyo inicializador es
+ * una de esas cosas. Las aserciones, los paréntesis y `satisfies` se miran a
+ * través: lo que cuenta es el valor que envuelven, no el tipo que dicen.
+ *
+ * POR QUÉ EL TEXTO Y NO EL TIPO
+ *
+ * Hasta la cuarta revisión del #118 esto preguntaba el TIPO de la expresión. Un
+ * tipo se puede afirmar, y el compilador lo acepta sin mirar el valor. Medido el
+ * 2026-10-13 con tsc y la pared en verde: `const clave = ("VULKAN_AGENCY" +
+ * "_ORG_ID") as "OPENAI_API_KEY"; process.env[clave]` leía la variable de la
+ * agencia; `process.env[nombre as PlatformEnvVar]` también, con la unión que
+ * existía para que la pared pudiera enumerar; y `admin.rpc(("integration_token"
+ * + "_secret") as "current_user_org_ids")` pedía el secreto con `service_role`.
+ * Y no hace falta una aserción: un parámetro tipado con un literal recibe lo que
+ * le pase quien llama (con una aserción allá, o con un `any` de un
+ * `JSON.parse`), un arreglo de literales asignado a un `string[]` acepta
+ * cualquier texto (TypeScript es covariante en arreglos), y en un `.js` el tipo
+ * de un JSDoc no lo comprueba nadie (`checkJs: false`). El texto no se puede
+ * afirmar: o está escrito, o no se sabe.
+ */
+function clavesDe(checker: ts.TypeChecker, nodo: ts.Node, vistos: Set<ts.Node> = new Set()): string[] | null {
+  const n = sinEnvoltorios(nodo);
+  if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return [n.text];
+  if (ts.isNumericLiteral(n)) return [String(Number(n.text))];
+  if (ts.isConditionalExpression(n)) {
+    const si = clavesDe(checker, n.whenTrue, vistos);
+    const no = clavesDe(checker, n.whenFalse, vistos);
+    return si && no ? [...new Set([...si, ...no])] : null;
+  }
+  if (ts.isIdentifier(n) || ts.isPropertyAccessExpression(n)) {
+    const s = checker.getSymbolAtLocation(ts.isIdentifier(n) ? n : n.name);
+    const real = s && s.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(s) : s;
+    const decl = real?.valueDeclaration;
+    // Una constante del código: `const`, con nombre simple, con inicializador,
+    // y no ambiental (un `declare const K = "X"` dice qué vale algo que pone
+    // otro, en ejecución). Un `let`, un parámetro o una propiedad pueden valer
+    // cualquier cosa que les asigne alguien.
+    if (
+      decl &&
+      ts.isVariableDeclaration(decl) &&
+      ts.isIdentifier(decl.name) &&
+      decl.initializer &&
+      (ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const) !== 0 &&
+      !enContextoAmbiental(decl) &&
+      !vistos.has(decl)
+    ) {
+      vistos.add(decl);
+      return clavesDe(checker, decl.initializer, vistos);
+    }
+    return null;
+  }
+  return null;
+}
+
+/** Si `nodo` está en una declaración ambiental: un `.d.ts`, un `declare`, un `declare global`. */
+function enContextoAmbiental(nodo: ts.Node): boolean {
+  if (nodo.getSourceFile().isDeclarationFile) return true;
+  for (let n: ts.Node | undefined = nodo; n; n = n.parent) {
+    if (ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) return true;
+  }
+  return false;
+}
+
+/** Los métodos de un cliente de Supabase que nombran algo de la base. */
+const METODOS_DE_LA_BASE = new Set(["rpc", "from", "schema"]);
 
 /** Los textos literales de código: los que viajan, no los comentarios. */
 function textoLiteral(nodo: ts.Node): string | null {
@@ -329,6 +456,63 @@ export function analizar(
   const programa = ts.createProgram({ rootNames: archivosAbs, options: opciones, host });
   const checker = programa.getTypeChecker();
   const hostDeResolucion: ts.ModuleResolutionHost = host ?? ts.sys;
+
+  // ¿Puede `nombre`, leído de un valor de tipo `receptor`, ser un método de la
+  // base? El mundo es cerrado también acá: lo es salvo que se sepa que no.
+  //
+  // Hasta la cuarta revisión del #118 era al revés: una llamada contaba si su
+  // firma estaba declarada en `@supabase` o si el receptor era `any`. Una
+  // aserción a un tipo propio (`(cliente as unknown as { rpc(n: string): unknown
+  // }).rpc(nombre)`) dejaba la firma en este repositorio y la llamada fuera de la
+  // pared. Ahora NO es de la base sólo lo que el lenguaje o Node declaran
+  // (`Array.from`, `Buffer.from`) y lo que no se puede llamar (`lectura.schema`,
+  // que es una lista). Todo lo demás —Supabase, un tipo escrito a mano, un `any`—
+  // se trata como la base.
+  const delLenguaje = (d: ts.Declaration) => {
+    const f = d.getSourceFile();
+    return programa.isSourceFileDefaultLibrary(f) || /[\\/]node_modules[\\/]@types[\\/]node[\\/]/.test(f.fileName);
+  };
+  const SIN_TIPO = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
+  const llamable = (t: ts.Type): boolean => {
+    const u = checker.getNonNullableType(t);
+    const miembros = u.isUnion() ? u.types : [u];
+    return miembros.some(
+      (m) => (m.flags & SIN_TIPO) !== 0 || m.getCallSignatures().length > 0 || m.getSymbol()?.getName() === "Function"
+    );
+  };
+  /** El método `nombre` de `tipo`, si lo declara alguien que no es el lenguaje y se puede llamar. */
+  const metodoDeclarado = (tipo: ts.Type, nombre: string): boolean => {
+    const prop = checker.getPropertyOfType(checker.getApparentType(checker.getNonNullableType(tipo)), nombre);
+    if (!prop) return false;
+    const declaraciones = prop.declarations ?? [];
+    if (declaraciones.length > 0 && declaraciones.every(delLenguaje)) return false;
+    return llamable(checker.getTypeOfSymbol(prop));
+  };
+  const puedeSerDeLaBase = (receptor: ts.Type, nombre: string): boolean =>
+    (checker.getNonNullableType(receptor).flags & SIN_TIPO) !== 0 || metodoDeclarado(receptor, nombre);
+  // Las claves de un elemento de un patrón: `{ rpc }`, `{ rpc: r }`, `{ ["rpc"]: r }`.
+  // `null` = no se sabe (un resto, una clave calculada que no se lee).
+  const claveDeElemento = (e: ts.BindingElement): string[] | null => {
+    if (e.dotDotDotToken) return null;
+    const clave = e.propertyName ?? e.name;
+    if (ts.isIdentifier(clave) || ts.isStringLiteral(clave) || ts.isNumericLiteral(clave)) return [clave.text];
+    if (ts.isComputedPropertyName(clave)) return clavesDe(checker, clave.expression);
+    return null;
+  };
+  const claveDePropiedad = (p: ts.ObjectLiteralElementLike): string[] | null => {
+    if (ts.isSpreadAssignment(p)) return null;
+    if (ts.isShorthandPropertyAssignment(p)) return [p.name.text];
+    const nombre = p.name;
+    if (!nombre) return null;
+    if (ts.isIdentifier(nombre) || ts.isStringLiteral(nombre) || ts.isNumericLiteral(nombre)) return [nombre.text];
+    if (ts.isComputedPropertyName(nombre)) return clavesDe(checker, nombre.expression);
+    return null;
+  };
+  /** Una aserción de tipo, también la de un `.js` (`/** @type {T} *\/ (x)`). */
+  const esAsercion = (n: ts.Node): n is ts.AsExpression | ts.TypeAssertion | ts.ParenthesizedExpression =>
+    (ts.isAsExpression(n) && !ts.isConstTypeReference(n.type)) ||
+    ts.isTypeAssertionExpression(n) ||
+    (ts.isParenthesizedExpression(n) && /\.[cm]?jsx?$/.test(n.getSourceFile().fileName) && ts.getJSDocTypeTag(n) !== undefined);
   const rel = (abs: string) => path.relative(raiz, abs).replace(/\\/g, "/");
   const enArbol = new Set(archivosAbs.map((a) => path.resolve(a)));
 
@@ -461,7 +645,7 @@ export function analizar(
 
     const leerClaves = (nodoClave: ts.Node, sitio: ts.Node) => {
       const claves = clavesDe(checker, nodoClave);
-      if (claves === null) lectura.envOpaco.push(`${donde(sitio)} clave de tipo no literal: ${nodoClave.getText(sf)}`);
+      if (claves === null) lectura.envOpaco.push(`${donde(sitio)} clave que no está escrita: ${nodoClave.getText(sf)}`);
       else for (const c of claves) lectura.leeEnv.add(c);
     };
 
@@ -483,7 +667,7 @@ export function analizar(
       if (ts.isElementAccessExpression(p) && p.expression === n) {
         if (fuente === "entorno") leerClaves(p.argumentExpression, p);
         else if (clavesDe(checker, p.argumentExpression) === null) {
-          lectura.envOpaco.push(`${donde(p)} ${nombre} se lee con una clave de tipo no literal: ${p.argumentExpression.getText(sf)}`);
+          lectura.envOpaco.push(`${donde(p)} ${nombre} se lee con una clave que no está escrita: ${p.argumentExpression.getText(sf)}`);
         }
         return;
       }
@@ -504,7 +688,7 @@ export function analizar(
               // su símbolo. Un patrón anidado o una clave que no se sabe, no.
               if (!ts.isIdentifier(e.name)) lectura.envOpaco.push(`${donde(e)} destructuring anidado de ${nombre}`);
               else if (ts.isComputedPropertyName(clave) && clavesDe(checker, clave.expression) === null) {
-                lectura.envOpaco.push(`${donde(e)} clave de destructuring de ${nombre} de tipo no literal`);
+                lectura.envOpaco.push(`${donde(e)} clave de destructuring de ${nombre} que no está escrita`);
               }
               continue;
             }
@@ -704,30 +888,78 @@ export function analizar(
             lectura.sinResolver.push(`${donde(nodo)} ${nodo.getText(sf).slice(0, 80)}`);
           }
         }
-        // Las llamadas de Supabase que nombran algo de la base.
-        const callee = nodo.expression;
-        const metodo = ts.isPropertyAccessExpression(callee)
-          ? callee.name.text
-          : ts.isElementAccessExpression(callee)
-            ? textoLiteral(callee.argumentExpression)
-            : null;
-        if (metodo === "rpc" || metodo === "from" || metodo === "schema") {
-          const declaracion = checker.getResolvedSignature(nodo)?.getDeclaration();
-          const receptor = checker.getTypeAtLocation((callee as ts.PropertyAccessExpression).expression);
-          const deSupabase =
-            (declaracion && /[\\/]@supabase[\\/]/.test(declaracion.getSourceFile().fileName)) ||
-            (receptor.flags & ts.TypeFlags.Any) !== 0;
-          if (deSupabase && nodo.arguments[0]) {
-            const nombres = clavesDe(checker, nodo.arguments[0]);
-            if (nombres === null) {
-              lectura.supabaseOpaco.push(`${donde(nodo)} .${metodo}(${nodo.arguments[0].getText(sf)})`);
+      }
+      // Los métodos de la base: `rpc`, `from` y `schema`. Ver `puedeSerDeLaBase`.
+      if (ts.isPropertyAccessExpression(nodo) || ts.isElementAccessExpression(nodo)) {
+        const receptor = checker.getTypeAtLocation(nodo.expression);
+        const nombres = ts.isPropertyAccessExpression(nodo) ? [nodo.name.text] : clavesDe(checker, nodo.argumentExpression);
+        if (nombres === null) {
+          if ([...METODOS_DE_LA_BASE].some((m) => puedeSerDeLaBase(receptor, m))) {
+            lectura.supabaseOpaco.push(
+              `${donde(nodo)} un método que puede ser de la base, con un nombre que no se lee: ${nodo.getText(sf).slice(0, 80)}`
+            );
+          }
+        } else {
+          for (const metodo of nombres) {
+            if (!METODOS_DE_LA_BASE.has(metodo) || !puedeSerDeLaBase(receptor, metodo)) continue;
+            const envuelto = envueltoHasta(nodo);
+            const llamada = ts.isCallExpression(envuelto.parent) && envuelto.parent.expression === envuelto ? envuelto.parent : null;
+            if (!llamada) {
+              // `typeof cliente.rpc` no lo saca de ningún lado. Todo lo demás —un
+              // `.bind`, un `.call`, guardarlo, pasarlo, un template etiquetado—
+              // es llamarlo después con un nombre que acá no se ve.
+              if (!ts.isTypeOfExpression(envuelto.parent)) {
+                lectura.supabaseOpaco.push(`${donde(nodo)} .${metodo} sin llamarlo: ${envuelto.parent.getText(sf).slice(0, 80)}`);
+              }
+              continue;
+            }
+            const argumento = llamada.arguments[0];
+            const valores = argumento ? clavesDe(checker, argumento) : null;
+            if (valores === null) {
+              lectura.supabaseOpaco.push(`${donde(llamada)} .${metodo}(${argumento ? argumento.getText(sf).slice(0, 80) : ""})`);
             } else if (metodo === "schema") {
-              for (const n of nombres) lectura.esquemas.add(n);
+              for (const v of valores) lectura.esquemas.add(v);
             } else {
-              for (const n of nombres) {
-                for (const c of NOMBRES_DE_CUSTODIA) if (n.includes(c)) lectura.custodia.add(c);
+              for (const v of valores) {
+                for (const c of NOMBRES_DE_CUSTODIA) if (v.includes(c)) lectura.custodia.add(c);
               }
             }
+          }
+        }
+      }
+      // Un cliente de la base que una aserción convierte en algo sin sus métodos
+      // —`cliente as any`, `cliente as unknown as Record<string, Function>`— es
+      // el `process as any` de esta mitad: lo que se le llame después ya no se
+      // reconoce como la base.
+      if (esAsercion(nodo)) {
+        const antes = checker.getTypeAtLocation(nodo.expression);
+        const despues = checker.getTypeAtLocation(nodo);
+        const pierde = [...METODOS_DE_LA_BASE].filter((m) => metodoDeclarado(antes, m) && !metodoDeclarado(despues, m));
+        if (pierde.length > 0) {
+          lectura.supabaseOpaco.push(
+            `${donde(nodo)} una aserción le saca el tipo a .${pierde.join(", .")}: ${nodo.getText(sf).slice(0, 80)}`
+          );
+        }
+      }
+      // Lo mismo sacado por destructuring: `const { rpc } = cliente` deja un
+      // método de la base suelto, igual que un `.bind`. En una declaración, en un
+      // parámetro, y en una asignación (`({ rpc: r } = cliente)`).
+      const patron = ts.isObjectBindingPattern(nodo)
+        ? { tipo: checker.getTypeAtLocation(nodo), claves: nodo.elements.map(claveDeElemento) }
+        : ts.isObjectLiteralExpression(nodo) &&
+            ts.isBinaryExpression(nodo.parent) &&
+            nodo.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            nodo.parent.left === nodo
+          ? { tipo: checker.getTypeAtLocation(nodo.parent.right), claves: nodo.properties.map(claveDePropiedad) }
+          : null;
+      if (patron) {
+        for (const claves of patron.claves) {
+          const tomaDeLaBase =
+            claves === null
+              ? [...METODOS_DE_LA_BASE].some((m) => puedeSerDeLaBase(patron.tipo, m))
+              : claves.some((c) => METODOS_DE_LA_BASE.has(c) && puedeSerDeLaBase(patron.tipo, c));
+          if (tomaDeLaBase) {
+            lectura.supabaseOpaco.push(`${donde(nodo)} destructuring de un método de la base: ${nodo.getText(sf).slice(0, 80)}`);
           }
         }
       }
