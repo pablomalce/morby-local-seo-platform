@@ -144,16 +144,23 @@ const VENTANA = { width: 1366, height: 768 };
  * constructores no hay `RTCPeerConnection`, y sin él no hay UDP a ninguna parte.
  * Ver el encabezado: es lo único que, medido, cierra esa salida.
  */
-function sinWebRtc() {
+//
+// Viaja como TEXTO y no como función de TypeScript: corre en la pestaña, no en
+// Node, y escrito como función nombraba el objeto global, que es justo lo que
+// la pared de la credencial de la agencia (credencialDeLaAgencia.test.ts, #118)
+// no deja escapar en src. Como texto, el compilador no lo ve como código del
+// servidor y la pestaña lo corre igual. Una propiedad que no se deja borrar se
+// tapa: lo que importa es que no construya.
+// Sin "use strict" un delete que no puede borrar devuelve false en vez de
+// tirar, así que la tapa no depende del catch: se pregunta si sigue ahí.
+const sinWebRtc = `(() => {
   for (const nombre of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "RTCIceCandidate"]) {
-    try {
-      delete (window as unknown as Record<string, unknown>)[nombre];
-    } catch {
-      // Una propiedad que no se deja borrar se tapa: lo que importa es que no construya.
-      Object.defineProperty(window, nombre, { value: undefined, configurable: false, writable: false });
+    try { delete globalThis[nombre]; } catch (e) {}
+    if (globalThis[nombre] !== undefined) {
+      Object.defineProperty(globalThis, nombre, { value: undefined, configurable: false, writable: false });
     }
   }
-}
+})();`;
 
 async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador> {
   let cuerpo = req.postData();
