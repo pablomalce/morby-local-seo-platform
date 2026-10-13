@@ -3,7 +3,6 @@ import { z } from "zod";
 import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
-import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
 import { publicar, type Destino, type Publicador } from "@/lib/publishing/transport";
 import { permisoEn } from "@/lib/org/rol";
 import { quienLlama } from "@/lib/api/sesion";
@@ -64,6 +63,10 @@ export const runtime = "nodejs";
  * (`servicioCompartido.ts`). Sin `locations/N` propio, el asset de un cliente no
  * se publica con el token de la agencia ni en la ficha de la agencia, y el
  * token ni se pide.
+ *
+ * Y el publicador lo arma la regla, no esta ruta: el token de la agencia no
+ * llega acá (cuarta revisión del #118). Lo que vuelve es un publicador atado a
+ * la ficha del mapeo y a los assets de ESA organización.
  *
  * Al 2026-09-10 falta la cuota de Business Profile y falta el mapeo de la ficha,
  * así que en producción esta ruta contesta `sin-transporte` hoy. **Eso es lo
@@ -226,22 +229,28 @@ async function armarPublicador(
   // `0017` guarda los dos). Sin mapeo propio no hay ficha, y entonces el token
   // de la agencia no se resuelve. Con el mapeo ilegible, tampoco: antes una
   // lectura caída se convertía en «no hay ficha».
-  const { mapeos, token } = await servirConLaAgencia(organizationId, { superficie: DESTINO });
-  if (!token.ok && token.reason === "mapping-unreadable") return { ilegible: true };
+  const servicio = await servirConLaAgencia(organizationId, { superficie: DESTINO });
+  if (!servicio.token.ok && servicio.token.reason === "mapping-unreadable") return { ilegible: true };
 
-  const locationRef = mapeos.find((m) => m.provider === DESTINO)?.propertyRef;
+  const locationRef = servicio.mapeos.find((m) => m.provider === DESTINO)?.propertyRef;
   if (!locationRef) return { falta: "mapeo" };
-  if (!token.ok) return { falta: "token" };
+  if (!servicio.token.ok) return { falta: "token" };
 
-  return {
-    publicador: publicadorDeBusinessProfile({
-      accessToken: token.accessToken,
-      accountId,
-      // El texto y la ficha ya se resolvieron acá arriba, con el cliente de sesión
-      // y en la misma operación que decidió publicar. `leerDatos` existe para que
-      // el publicador no sepa de dónde salen, no para volver a buscarlos.
-      leerDatos: async () => ({ cuerpo, locationRef }),
-      fetcher: fetch,
-    }),
-  };
+  // El publicador lo arma la regla, con el token adentro: esta ruta no lo ve
+  // (cuarta revisión del #118). Publica en la ficha del mapeo y sólo un asset de
+  // ESTA organización. El texto ya se resolvió acá arriba, con el cliente de
+  // sesión y en la misma operación que decidió publicar.
+  const publicador = servicio.publicadorDeFicha(locationRef, { accountId, cuerpo });
+  // La regla acaba de decir que la ficha es de esta organización y que hay
+  // token: un `null` acá es un contrato roto, y se contesta como lo que más se le
+  // parece —sin ficha con qué publicar— en vez de inventar otra.
+  //
+  // Mutante equivalente, medido con `mutar.sh` (D12, cuarta revisión del #118):
+  // devolver `publicador!` acá sobrevive, y es porque este estado no se alcanza
+  // —`locationRef` sale de una copia de los mismos mapeos contra los que la regla
+  // compara— y, si se alcanzara, tampoco se publica nada: `publicar()` sin
+  // publicador contesta `sin-transporte`. Lo único que cambia es la etiqueta
+  // `falta` del 503.
+  if (!publicador) return { falta: "mapeo" };
+  return { publicador };
 }

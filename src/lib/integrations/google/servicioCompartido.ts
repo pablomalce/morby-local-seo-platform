@@ -69,6 +69,33 @@
  *     mapeos, igual que los de cualquier cliente — no por ser la agencia. No hay
  *     ningún `if (org === agencia)` en este archivo y no tiene que haberlo.
  *
+ * Y EL TOKEN NO SALE DE ACÁ
+ *
+ * Hasta la cuarta revisión del #118 la regla devolvía el access token como un
+ * texto, junto con los mapeos, y la regla de arriba se cumplía porque los dos
+ * llamadores de entonces pasaban la organización del recurso y gastaban el
+ * token sólo en `mapeos`. Nada los obligaba. Medido el 2026-10-13 con tsc y la
+ * pared en verde: un módulo de datos nuevo pedía el servicio para una
+ * organización mapeada de quien llama y gastaba el token en la property de una
+ * organización SIN mapeo — `fetchSearchConsoleTotals({ accessToken:
+ * token.accessToken, propertyRef: cualquiera })`. Un token al portador no sabe
+ * para qué se lo pidieron.
+ *
+ * Ahora lo que sale de acá no es el token: es el ESTADO del token (`{ ok: true
+ * }`, o por qué no) y tres consultas que lo usan adentro —Search Console, GA4 y
+ * el publicador de la ficha—, cada una atada a los mapeos que leyó esta
+ * función:
+ *
+ *   - una property que no es un mapeo vivo de ESTA organización, de ESA
+ *     superficie, no se consulta: Search Console y GA4 contestan
+ *     `no-credentials` sin salir a la red, y el publicador no se arma (`null`);
+ *   - los mapeos que se devuelven son una copia: cambiarlos no cambia contra qué
+ *     compara la consulta;
+ *   - el publicador publica sólo una entrada de ESTA organización, en la ficha
+ *     mapeada;
+ *   - el `fetch` es el del proceso y no se inyecta: un `fetch` de quien llama
+ *     vería la cabecera `Authorization`.
+ *
  * Y NO HAY OTRO CAMINO AL TOKEN
  *
  * Este archivo es el único llamador de producción de `agencyAccessToken()`, y
@@ -90,6 +117,15 @@
  *
  * QUÉ NO DICE
  *
+ * No dice que `organizationId` sea la del recurso: eso lo sabe quien llama, que
+ * la lee de la base bajo la RLS (el negocio del reporte, el asset que se
+ * publica). Lo que sí garantiza es que el token se gasta sólo en mapeos vivos de
+ * la organización que se le pasó, y que esa lectura se hace con la RLS de quien
+ * llama: una organización de la que no es miembro no tiene mapeos que leer, y
+ * entonces tampoco hay token. Un módulo que pida el servicio de una
+ * organización suya y ponga lo que vuelve en el reporte de otra mezcla datos que
+ * ya podía leer; ése es un defecto de quien llama, no un préstamo del token.
+ *
  * No dice nada de tokens PROPIOS de una organización cliente. La `0014` los
  * admite por organización, pero el código no lee ninguno (el callback sólo
  * guarda el de la agencia) y en hosted, medido el 2026-10-11, hay 1 token vivo,
@@ -98,8 +134,12 @@
  * credencial con su propia regla, no una excepción a ésta.
  */
 
+import { publicadorDeBusinessProfile } from "@/lib/publishing/googleBusinessProfile";
+import type { Publicador } from "@/lib/publishing/transport";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { type AccessTokenResult, agencyAccessToken } from "./tokenStore";
+import { type Ga4Result, fetchGa4Totals } from "./ga4";
+import { type SearchConsoleResult, fetchSearchConsoleTotals } from "./searchConsole";
+import { type TokenUnavailable, agencyAccessToken } from "./tokenStore";
 import type { GoogleSurface, PropertyMapping } from "./sources";
 
 /** Una fila de `integration_properties` tal como se lee: CON su organización y su `unmapped_at`. */
@@ -126,15 +166,42 @@ interface MapeoIlegible {
  */
 export type Negativa = "not-mapped" | "mapping-unreadable";
 
-/** El token de la agencia, por qué no se pudo resolver, o por qué no se le pidió. */
-export type TokenDelServicio = AccessTokenResult | { ok: false; reason: Negativa; detail: string };
+/**
+ * Si hay token de la agencia para este servicio, o por qué no. SIN el token:
+ * el token no sale de este archivo (ver el encabezado).
+ */
+export type TokenDelServicio =
+  | { ok: true }
+  | { ok: false; reason: TokenUnavailable | Negativa; detail: string };
 
-/** Lo que la regla deja servir con el token de la agencia, y con cuál token. */
+/** Lo que se publica en la ficha. La ficha no: la pone el mapeo. */
+export interface Publicacion {
+  /** `GOOGLE_BUSINESS_ACCOUNT_ID`: la cuenta de la agencia, una para todos. */
+  accountId: string;
+  /** El texto aprobado, tal como se selló. */
+  cuerpo: string;
+}
+
+/** Lo que la regla deja hacer con el token de la agencia, sin entregarlo. */
 export interface Servicio {
-  /** Los mapeos de ESTA organización. Nunca uno de otra. */
+  /** Los mapeos de ESTA organización, en copia. Nunca uno de otra. */
   mapeos: PropertyMapping[];
-  /** El token de la agencia, o por qué no se presta. */
+  /** Si hay token, o por qué no se presta. Sin el token. */
   token: TokenDelServicio;
+  /**
+   * Los totales de Search Console de `propertyRef`, SÓLO si es un mapeo vivo de
+   * Search Console de esta organización y hay token. Si no, `no-credentials`
+   * sin salir a la red.
+   */
+  searchConsole(propertyRef: string, ahora: Date): Promise<SearchConsoleResult>;
+  /** Lo mismo con GA4. */
+  ga4(propertyRef: string, ahora: Date): Promise<Ga4Result>;
+  /**
+   * El publicador de la ficha `locationRef`, SÓLO si es el mapeo vivo de
+   * Business Profile de esta organización y hay token; si no, `null`. Publica
+   * sólo entradas de esta organización.
+   */
+  publicadorDeFicha(locationRef: string, publicacion: Publicacion): Publicador | null;
 }
 
 export interface OpcionesDelServicio {
@@ -203,15 +270,19 @@ export async function servirConLaAgencia(
   const superficie = opciones.superficie;
   const leidos = organizationId === null ? [] : await leerMapeos(organizationId, superficie);
 
+  const registrar =
+    opciones.log ??
+    ((mensaje: string) => {
+      console.warn(mensaje);
+    });
+
   if ("ilegible" in leidos) {
-    return {
-      mapeos: [],
-      token: {
-        ok: false,
-        reason: "mapping-unreadable",
-        detail: `el mapeo no se pudo leer (${leidos.detalle}): no se sabe si la organización está mapeada, y el token de la agencia no se presta a ciegas`,
-      },
+    const ilegible: TokenDelServicio = {
+      ok: false,
+      reason: "mapping-unreadable",
+      detail: `el mapeo no se pudo leer (${leidos.detalle}): no se sabe si la organización está mapeada, y el token de la agencia no se presta a ciegas`,
     };
+    return servicio(organizationId, [], null, ilegible, registrar);
   }
 
   // Cada fila, entera, contra la regla: de ESTA organización, viva, y de la
@@ -231,11 +302,6 @@ export async function servirConLaAgencia(
       (superficie === undefined || m.provider === superficie)
   );
 
-  const registrar =
-    opciones.log ??
-    ((mensaje: string) => {
-      console.warn(mensaje);
-    });
   if (ajenas > 0) {
     registrar(`[google] ${ajenas} mapeo(s) de otra organización descartado(s): el token de la agencia no los sirve`);
   }
@@ -246,18 +312,79 @@ export async function servirConLaAgencia(
     registrar(`[google] ${deOtraSuperficie} mapeo(s) de otra superficie descartado(s): se pidió ${superficie}`);
   }
 
-  const mapeos = propios.map((m) => ({ provider: m.provider, propertyRef: m.propertyRef }));
+  // La lista contra la que se compara cada consulta. Congelada y SIN compartir
+  // objetos con la que se devuelve: si quien llama agrega o cambia un mapeo en
+  // su copia, la consulta no se entera.
+  const vivos: readonly PropertyMapping[] = Object.freeze(
+    propios.map((m) => Object.freeze({ provider: m.provider, propertyRef: m.propertyRef }))
+  );
 
-  if (mapeos.length === 0) {
-    return {
-      mapeos,
-      token: {
-        ok: false,
-        reason: "not-mapped",
-        detail: "la organización no tiene ningún mapeo vivo: el token de la agencia no se le presta",
-      },
+  if (vivos.length === 0) {
+    const sinMapeo: TokenDelServicio = {
+      ok: false,
+      reason: "not-mapped",
+      detail: "la organización no tiene ningún mapeo vivo: el token de la agencia no se le presta",
     };
+    return servicio(organizationId, vivos, null, sinMapeo, registrar);
   }
 
-  return { mapeos, token: await agencyAccessToken() };
+  const resuelto = await agencyAccessToken();
+  if (!resuelto.ok) {
+    const sinToken: TokenDelServicio = { ok: false, reason: resuelto.reason, detail: resuelto.detail };
+    return servicio(organizationId, vivos, null, sinToken, registrar);
+  }
+  return servicio(organizationId, vivos, resuelto.accessToken, { ok: true }, registrar);
+}
+
+/**
+ * El servicio de una organización: sus mapeos, el estado del token y las
+ * consultas que lo usan. `accessToken` queda en este cierre y no sale.
+ */
+function servicio(
+  organizationId: string | null,
+  vivos: readonly PropertyMapping[],
+  accessToken: string | null,
+  token: TokenDelServicio,
+  registrar: (mensaje: string) => void
+): Servicio {
+  // El token, para ESTA property de ESTA superficie, o `null`: sin token,
+  // `accessToken` ya es `null` y nada sale. Una property que no es de esta
+  // organización se anota: es un contrato roto que alguien tiene que ir a
+  // buscar.
+  const tokenPara = (superficie: GoogleSurface, ref: string): string | null => {
+    if (vivos.some((m) => m.provider === superficie && m.propertyRef === ref)) return accessToken;
+    registrar(
+      `[google] ${superficie}: ${ref} no es un mapeo vivo de esta organización: el token de la agencia no se usa sobre ella`
+    );
+    return null;
+  };
+  const sinConsultar = () => ({ outcome: { kind: "no-credentials" as const }, totals: null });
+
+  return {
+    mapeos: vivos.map((m) => ({ provider: m.provider, propertyRef: m.propertyRef })),
+    token,
+    async searchConsole(propertyRef, ahora) {
+      const conToken = tokenPara("search_console", propertyRef);
+      if (conToken === null) return sinConsultar();
+      return fetchSearchConsoleTotals({ accessToken: conToken, propertyRef, ahora, fetcher: fetch });
+    },
+    async ga4(propertyRef, ahora) {
+      const conToken = tokenPara("ga4", propertyRef);
+      if (conToken === null) return sinConsultar();
+      return fetchGa4Totals({ accessToken: conToken, propertyRef, ahora, fetcher: fetch });
+    },
+    publicadorDeFicha(locationRef, publicacion) {
+      const conToken = tokenPara("google_business_profile", locationRef);
+      if (conToken === null) return null;
+      return publicadorDeBusinessProfile({
+        accessToken: conToken,
+        accountId: publicacion.accountId,
+        // La ficha es la del mapeo, y la entrada tiene que ser de ESTA
+        // organización: un publicador armado para A no publica el asset de B.
+        leerDatos: async (entrada) =>
+          entrada.organizationId === organizationId ? { cuerpo: publicacion.cuerpo, locationRef } : null,
+        fetcher: fetch,
+      });
+    },
+  };
 }

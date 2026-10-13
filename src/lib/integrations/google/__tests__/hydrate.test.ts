@@ -30,7 +30,7 @@ const CUANDO = "2026-09-01T12:00:00.000Z";
 function deps(over: Partial<HydrateDeps> = {}): HydrateDeps {
   return {
     mappings: MAPEO_COMPLETO,
-    token: { ok: true, accessToken: "ACCESO-sintetico" },
+    token: { ok: true },
     env: ENV,
     fetchSearchConsole: async () => ({
       outcome: { kind: "ok" },
@@ -64,13 +64,16 @@ describe("con todo en orden", () => {
     expect(fetchSearchConsole).toHaveBeenCalledTimes(1);
   });
 
-  it("cada cliente recibe la property de SU superficie", async () => {
+  it("cada cliente recibe la property de SU superficie, y ningún token", async () => {
+    // El token no pasa por acá: lo usa el servicio compartido adentro de las
+    // consultas que arma (cuarta revisión del #118). Lo único que viaja es la
+    // property.
     const fetchSearchConsole = vi.fn(deps().fetchSearchConsole);
     const fetchGa4 = vi.fn(deps().fetchGa4);
     await hydrateGoogle(deps({ fetchSearchConsole, fetchGa4 }));
 
-    expect(fetchSearchConsole).toHaveBeenCalledWith("ACCESO-sintetico", "https://ejemplo.test/");
-    expect(fetchGa4).toHaveBeenCalledWith("ACCESO-sintetico", "properties/123456789");
+    expect(fetchSearchConsole.mock.calls).toEqual([["https://ejemplo.test/"]]);
+    expect(fetchGa4.mock.calls).toEqual([["properties/123456789"]]);
   });
 });
 

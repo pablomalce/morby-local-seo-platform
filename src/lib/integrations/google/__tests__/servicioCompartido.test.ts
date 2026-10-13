@@ -15,6 +15,16 @@
  * mapeo ya es usarlo —lee el secreto con `service_role` y puede refrescarlo
  * contra Google—, aunque después no se consulte nada.
  *
+ * Y EL TOKEN NO SALE
+ *
+ * Desde la cuarta revisión del #118 la regla no devuelve el token: devuelve su
+ * estado y consultas que lo usan adentro, atadas a los mapeos que leyó. Antes, un
+ * módulo de datos nuevo pedía el servicio de una organización mapeada y gastaba
+ * el token en la property de una organización sin mapeo, con la pared en verde.
+ * `fetch` es un espía que anota la URL —donde va la property— y la cabecera
+ * `Authorization` —donde va el token—, y el token del doble es un texto que se
+ * busca en todo lo que la regla devuelve.
+ *
  * Y LAS FILAS LAS DA LA BASE, NO EL TEST
  *
  * Desde la segunda revisión del #118 la regla lee el mapeo ella misma: un
@@ -94,7 +104,38 @@ vi.mock("../tokenStore", () => ({
   },
 }));
 
-import { servirConLaAgencia } from "../servicioCompartido";
+import { type Servicio, servirConLaAgencia } from "../servicioCompartido";
+
+/** El token del doble: se busca, textual, en todo lo que la regla devuelve. */
+const TOKEN = "ACCESO-de-la-agencia";
+
+/** Google, del otro lado: anota qué se le pidió y con qué token, y contesta bien. */
+let salidas: { url: string; autorizacion: string | null }[] = [];
+function googleContesta() {
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    salidas.push({ url: String(url), autorizacion: new Headers(init?.headers).get("authorization") });
+    const u = String(url);
+    const cuerpo = u.includes("searchconsole.googleapis.com")
+      ? { rows: [{ clicks: 9, impressions: 90, ctr: 0.1, position: 3 }] }
+      : u.includes("analyticsdata.googleapis.com")
+        ? { metricHeaders: [{ name: "sessions" }, { name: "keyEvents" }], rows: [{ metricValues: [{ value: "7" }, { value: "1" }] }] }
+        : { name: "accounts/123/locations/100/localPosts/1" };
+    return { ok: true, status: 200, json: async () => cuerpo } as unknown as Response;
+  });
+}
+
+/** Todo texto alcanzable desde `valor`, por cualquier propiedad propia, también las no enumerables. */
+function textosDe(valor: unknown, vistos = new Set<unknown>()): string[] {
+  if (typeof valor === "string") return [valor];
+  if (valor === null || (typeof valor !== "object" && typeof valor !== "function") || vistos.has(valor)) return [];
+  vistos.add(valor);
+  return Reflect.ownKeys(valor as object).flatMap((k) => [
+    ...(typeof k === "string" ? [k] : []),
+    ...textosDe((valor as Record<PropertyKey, unknown>)[k], vistos),
+  ]);
+}
+
+const AHORA = new Date("2026-10-13T12:00:00.000Z");
 
 beforeEach(() => {
   filas = [];
@@ -102,12 +143,15 @@ beforeEach(() => {
   clienteLanza = false;
   consultas = [];
   pedidosDeToken = 0;
-  respuestaDelToken = { ok: true, accessToken: "ACCESO-de-la-agencia" };
+  respuestaDelToken = { ok: true, accessToken: TOKEN };
   createSupabaseServerClient.mockClear();
+  salidas = [];
+  googleContesta();
 });
 
 afterEach(() => {
   delete process.env.VULKAN_AGENCY_ORG_ID;
+  vi.unstubAllGlobals();
 });
 
 describe("lo legítimo: la agencia sirve a una organización sobre SUS mapeos", () => {
@@ -116,7 +160,8 @@ describe("lo legítimo: la agencia sirve a una organización sobre SUS mapeos", 
 
     const s = await servirConLaAgencia(CLIENTE_A);
 
-    expect(s.token).toEqual({ ok: true, accessToken: "ACCESO-de-la-agencia" });
+    // El estado, no el token: el token se usa adentro de las consultas.
+    expect(s.token).toEqual({ ok: true });
     expect(s.mapeos).toEqual([
       { provider: "search_console", propertyRef: "https://cliente-a.test/" },
       { provider: "ga4", propertyRef: "properties/111111111" },
@@ -352,5 +397,150 @@ describe("un token que no se pudo resolver viaja con su motivo", () => {
     expect(s.token).toMatchObject({ ok: false, reason: "revoked" });
     expect(s.mapeos).toHaveLength(2);
     expect(pedidosDeToken).toBe(1);
+  });
+});
+
+describe("el token no sale de la regla: se usa adentro, y sólo sobre sus mapeos", () => {
+  // La cuarta revisión del #118 (F2): la regla devolvía el token como texto, y un
+  // módulo de datos lo gastaba en la property que quisiera. Ahora lo que vuelve
+  // son consultas atadas a los mapeos que la regla leyó.
+
+  it("lo que devuelve no lleva el token: ni en `token` ni en ninguna otra parte", async () => {
+    filas = MAPEOS_A;
+
+    const s = await servirConLaAgencia(CLIENTE_A);
+
+    // Lo que devuelve, exacto: un miembro nuevo es una decisión, no un descuido.
+    expect(Object.keys(s).sort()).toEqual(["ga4", "mapeos", "publicadorDeFicha", "searchConsole", "token"]);
+    expect(s.token).toEqual({ ok: true });
+    // Y el TIPO tampoco lo lleva: si `TokenDelServicio` vuelve a tener el token,
+    // esta línea deja de ser un error y `tsc` falla por la directiva sin uso.
+    if (s.token.ok) {
+      // @ts-expect-error el estado del token no lleva el token (cuarta revisión del #118)
+      expect(s.token.accessToken).toBeUndefined();
+    }
+    expect(pedidosDeToken).toBe(1);
+    const textos = textosDe(s);
+    expect(textos.length).toBeGreaterThan(5); // anti-vacuidad: el recorrido ve los mapeos
+    expect(textos).toContain("https://cliente-a.test/");
+    expect(textos.some((t) => t.includes(TOKEN)), "el token está en lo que la regla devuelve").toBe(false);
+  });
+
+  it("Search Console: sobre SU property sale con el token; sobre cualquier otra, nada sale", async () => {
+    filas = MAPEOS_A;
+    const avisos: string[] = [];
+    const s = await servirConLaAgencia(CLIENTE_A, { log: (m) => avisos.push(m) });
+
+    const propia = await s.searchConsole("https://cliente-a.test/", AHORA);
+    expect(propia.outcome).toEqual({ kind: "ok" });
+    expect(salidas).toHaveLength(1);
+    expect(decodeURIComponent(salidas[0].url)).toContain("https://cliente-a.test/");
+    expect(salidas[0].autorizacion).toBe(`Bearer ${TOKEN}`);
+
+    // La de una organización sin mapeo, y la de GA4 de A pedida como Search
+    // Console: ninguna sale, y las dos se anotan.
+    for (const ajena of ["https://cliente-b.test/", "sc-domain:cliente-b.test", "properties/111111111"]) {
+      const r = await s.searchConsole(ajena, AHORA);
+      expect(r, ajena).toEqual({ outcome: { kind: "no-credentials" }, totals: null });
+    }
+    expect(salidas).toHaveLength(1);
+    expect(avisos).toHaveLength(3);
+    expect(avisos[0]).toMatch(/no es un mapeo vivo de esta organización/);
+  });
+
+  it("GA4: lo mismo, con su superficie", async () => {
+    filas = MAPEOS_A;
+    const s = await servirConLaAgencia(CLIENTE_A, { log: () => {} });
+
+    const propia = await s.ga4("properties/111111111", AHORA);
+    expect(propia.outcome).toEqual({ kind: "ok" });
+    expect(salidas.map((x) => decodeURIComponent(x.url))).toEqual([expect.stringContaining("properties/111111111")]);
+    expect(salidas[0].autorizacion).toBe(`Bearer ${TOKEN}`);
+
+    for (const ajena of ["properties/999999999", "https://cliente-a.test/"]) {
+      expect(await s.ga4(ajena, AHORA), ajena).toEqual({ outcome: { kind: "no-credentials" }, totals: null });
+    }
+    expect(salidas).toHaveLength(1);
+  });
+
+  it("el caso de la revisión: el servicio de la agencia, mapeada, no consulta la property de B, que no tiene mapeo", async () => {
+    // El módulo de datos de la cuarta revisión: pide el servicio de una
+    // organización mapeada de quien llama —la agencia— y apunta el token a una
+    // property cualquiera. El token se resolvió (la agencia está mapeada), y no
+    // sale hacia ella.
+    process.env.VULKAN_AGENCY_ORG_ID = AGENCIA;
+    filas = MAPEOS_AGENCIA;
+    const s = await servirConLaAgencia(AGENCIA, { log: () => {} });
+    expect(pedidosDeToken).toBe(1);
+
+    expect(await s.searchConsole("https://cliente-b.test/", AHORA)).toEqual({
+      outcome: { kind: "no-credentials" },
+      totals: null,
+    });
+    expect(await s.ga4("properties/222222222", AHORA)).toEqual({ outcome: { kind: "no-credentials" }, totals: null });
+    expect(s.publicadorDeFicha("locations/200", { accountId: "123", cuerpo: "x" })).toBeNull();
+    expect(salidas).toEqual([]);
+  });
+
+  it("los mapeos que devuelve son una copia: agregarle o cambiarle uno no abre ninguna consulta", async () => {
+    filas = MAPEOS_A;
+    const s: Servicio = await servirConLaAgencia(CLIENTE_A, { log: () => {} });
+
+    s.mapeos.push({ provider: "search_console", propertyRef: "https://cliente-b.test/" });
+    s.mapeos[0].propertyRef = "sc-domain:cliente-b.test";
+
+    expect((await s.searchConsole("https://cliente-b.test/", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+    expect((await s.searchConsole("sc-domain:cliente-b.test", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+    expect(salidas).toEqual([]);
+    // Y lo que la base dijo sigue valiendo.
+    expect((await s.searchConsole("https://cliente-a.test/", AHORA)).outcome).toEqual({ kind: "ok" });
+    expect(salidas).toHaveLength(1);
+  });
+
+  it("sin token —revocado, sin mapeo, o con el mapeo ilegible— no sale nada, ni sobre su propia property", async () => {
+    filas = MAPEOS_A;
+    respuestaDelToken = { ok: false, reason: "revoked", detail: "la autorización fue revocada" };
+    const revocado = await servirConLaAgencia(CLIENTE_A);
+    expect(revocado.token).toEqual({ ok: false, reason: "revoked", detail: "la autorización fue revocada" });
+    expect((await revocado.searchConsole("https://cliente-a.test/", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+    expect((await revocado.ga4("properties/111111111", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+
+    filas = [];
+    const sinMapeo = await servirConLaAgencia(CLIENTE_B);
+    expect((await sinMapeo.searchConsole("https://cliente-a.test/", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+
+    filas = MAPEOS_A;
+    errorDeLectura = { code: "57014", message: "timeout" };
+    const ilegible = await servirConLaAgencia(CLIENTE_A);
+    expect((await ilegible.searchConsole("https://cliente-a.test/", AHORA)).outcome).toEqual({ kind: "no-credentials" });
+
+    expect(salidas).toEqual([]);
+  });
+
+  it("el publicador: sólo su ficha, y sólo un asset de su organización", async () => {
+    filas = [
+      { organization_id: CLIENTE_A, provider: "google_business_profile", property_ref: "locations/100", unmapped_at: null },
+    ];
+    const s = await servirConLaAgencia(CLIENTE_A, { superficie: "google_business_profile", log: () => {} });
+
+    expect(s.publicadorDeFicha("locations/999", { accountId: "123", cuerpo: "Texto de A." })).toBeNull();
+    const p = s.publicadorDeFicha("locations/100", { accountId: "123", cuerpo: "Texto de A." });
+    expect(p).not.toBeNull();
+
+    const entrada = { assetId: "7d703707-4f9d-43bf-9305-6bc22eddf4a1", approvedHash: "h", destino: "google_business_profile" as const };
+    // Un asset de B con el publicador de A: no sale.
+    expect(await p!.publicar({ ...entrada, organizationId: CLIENTE_B })).toEqual({
+      ok: false,
+      motivo: "sin-datos-para-publicar",
+    });
+    expect(salidas).toEqual([]);
+
+    expect(await p!.publicar({ ...entrada, organizationId: CLIENTE_A })).toEqual({
+      ok: true,
+      externalId: "accounts/123/locations/100/localPosts/1",
+    });
+    expect(salidas).toHaveLength(1);
+    expect(salidas[0].url).toBe("https://mybusiness.googleapis.com/v4/accounts/123/locations/100/localPosts");
+    expect(salidas[0].autorizacion).toBe(`Bearer ${TOKEN}`);
   });
 });

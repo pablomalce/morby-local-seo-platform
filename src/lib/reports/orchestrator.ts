@@ -22,8 +22,6 @@ import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
 import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
 import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
-import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
-import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
 import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
@@ -469,18 +467,19 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
   // el reporte de demostración— no resuelve el token de la agencia: ni se lee su
   // secreto ni se refresca contra Google. Una lectura caída tampoco: es
   // `mapping-unreadable`, no «sin mapear». Ver `servicioCompartido.ts`.
-  const { mapeos, token } = await servirConLaAgencia(organizacion);
+  //
+  // Y el token no sale de la regla: lo que vuelve son consultas que lo usan
+  // adentro, y sólo sobre esos mapeos (cuarta revisión del #118).
+  const servicio = await servirConLaAgencia(organizacion);
 
   // El token se pide UNA vez para las tres superficies, y las dos consultas que
   // hoy existen salen en paralelo. Ver `hydrate.ts`.
   const ahora = new Date();
   const google = await hydrateGoogle({
-    mappings: mapeos,
-    token,
-    fetchSearchConsole: (accessToken, propertyRef) =>
-      fetchSearchConsoleTotals({ accessToken, propertyRef, ahora, fetcher: fetch }),
-    fetchGa4: (accessToken, propertyRef) =>
-      fetchGa4Totals({ accessToken, propertyRef, ahora, fetcher: fetch }),
+    mappings: servicio.mapeos,
+    token: servicio.token,
+    fetchSearchConsole: (propertyRef) => servicio.searchConsole(propertyRef, ahora),
+    fetchGa4: (propertyRef) => servicio.ga4(propertyRef, ahora),
     // Sólo con sesión: `integration_probe` tiene `organization_id NOT NULL`, y un
     // reporte de demostración no tiene tenant que anotar. Sin esto, la sonda del
     // demo escribiría contra la organización sembrada, que no existe en la base.

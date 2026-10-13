@@ -156,14 +156,18 @@ const esNegativa = (reason: TokenUnavailable | Negativa): reason is Negativa =>
 export interface HydrateDeps {
   mappings: readonly PropertyMapping[];
   /**
-   * El access token de la agencia, ya resuelto —o por qué el servicio
-   * compartido no lo prestó—. Se pide UNA vez, y lo da `servirConLaAgencia()`
-   * junto con `mappings`: los dos salen de la misma llamada para que no se pueda
-   * prestar el token a mapeos de otra organización.
+   * Si hay token de la agencia —o por qué el servicio compartido no lo
+   * prestó—. SIN el token: lo da `servirConLaAgencia()` junto con `mappings`, y
+   * el token mismo no sale de allá (cuarta revisión del #118).
    */
   token: TokenDelServicio;
-  fetchSearchConsole: (accessToken: string, propertyRef: string) => Promise<SearchConsoleResult>;
-  fetchGa4: (accessToken: string, propertyRef: string) => Promise<Ga4Result>;
+  /**
+   * Las consultas, sin token: las arma el servicio compartido, que usa el suyo
+   * adentro y sólo sobre sus mapeos. Una property que no es un mapeo vivo de la
+   * organización contesta `no-credentials` sin salir a la red.
+   */
+  fetchSearchConsole: (propertyRef: string) => Promise<SearchConsoleResult>;
+  fetchGa4: (propertyRef: string) => Promise<Ga4Result>;
   env?: NodeJS.ProcessEnv;
   /**
    * Dónde se anota el motivo de un fallo. Inyectable para poder MEDIR que se
@@ -256,13 +260,11 @@ export async function hydrateGoogle(deps: HydrateDeps): Promise<GoogleHydration>
     return salida;
   }
 
-  const accessToken = deps.token.accessToken;
-
   // Las dos en paralelo: son APIs distintas y ninguna necesita el resultado de la
   // otra. En serie, el reporte espera la suma de las dos latencias.
   const [scResultado, gaResultado] = await Promise.all([
-    sc.ready ? deps.fetchSearchConsole(accessToken, sc.propertyRef) : null,
-    ga.ready ? deps.fetchGa4(accessToken, ga.propertyRef) : null,
+    sc.ready ? deps.fetchSearchConsole(sc.propertyRef) : null,
+    ga.ready ? deps.fetchGa4(ga.propertyRef) : null,
   ]);
 
   // Por defecto va a los logs del servidor, que en Vercel es donde alguien puede

@@ -126,7 +126,7 @@ vi.mock("@/lib/integrations/google/tokenStore", () => ({
 let armados: Array<{
   accessToken: string;
   accountId: string;
-  leerDatos: () => Promise<{ cuerpo: string; locationRef: string }>;
+  leerDatos: (entrada: { organizationId: string }) => Promise<{ cuerpo: string; locationRef: string } | null>;
 }> = [];
 vi.mock("@/lib/publishing/googleBusinessProfile", () => ({
   publicadorDeBusinessProfile: (deps: (typeof armados)[number]) => {
@@ -191,7 +191,13 @@ describe("lo legítimo: A publica en SU ficha, con el token de la agencia", () =
     expect(res.status).toBe(200);
     expect(armados).toHaveLength(1);
     expect(armados[0].accessToken).toBe("ACCESO-de-la-agencia");
-    expect(await armados[0].leerDatos()).toEqual({ cuerpo: "Texto aprobado de A.", locationRef: FICHA_A });
+    expect(await armados[0].leerDatos({ organizationId: CLIENTE_A })).toEqual({
+      cuerpo: "Texto aprobado de A.",
+      locationRef: FICHA_A,
+    });
+    // El publicador lo arma la regla, no la ruta (cuarta revisión del #118), y
+    // queda atado a A: una entrada de otra organización no tiene qué publicar.
+    expect(await armados[0].leerDatos({ organizationId: CLIENTE_B })).toBeNull();
     expect(pedidosDeToken).toBe(1);
     expect(lecturasDeMapeo).toEqual([
       { organization_id: CLIENTE_A, provider: "google_business_profile", unmapped_at: null },
