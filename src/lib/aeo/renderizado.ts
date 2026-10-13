@@ -138,9 +138,11 @@
  * Lo que NO cuenta como «no llegó»: lo que se rechazó por política —una red
  * que no es pública, un puerto, un esquema, un método que escribe—, que un
  * navegador del público tampoco recibiría de esta auditoría, y un nombre que
- * no resuelve (`no-resuelve`), que con el DNS de hoy no se distingue de un
- * dominio muerto. Las imágenes, las fuentes, el CSS y los videos no escriben
- * texto en el DOM.
+ * NO EXISTE (`no-resuelve`: NXDOMAIN, o sin registros). Un DNS que no contestó
+ * —timeout, SERVFAIL— SÍ cuenta (`dns-sin-respuesta`): antes los dos eran
+ * `no-resuelve`, y un bundle cuyo CDN tuvo un timeout de DNS quedaba fuera
+ * (PU-3). Tampoco cuenta lo que no escribe texto: imágenes, fuentes, CSS y
+ * videos.
  *
  * EL TIEMPO
  *
@@ -174,13 +176,19 @@ import { textoSinJavaScript } from "./lectura";
 // El resultado
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Por qué el examen de un destino lo rechazó, antes de cualquier conexión. */
+/**
+ * Por qué el examen de un destino lo rechazó, antes de cualquier conexión.
+ * `dns-sin-respuesta` NO es una política: el DNS no contestó (timeout,
+ * SERVFAIL, cancelado), y un subrecurso así NO LLEGÓ —RT-1 lo cuenta—, a
+ * diferencia de `no-resuelve`, que es un nombre que no existe (PU-3).
+ */
 export type MotivoDeBloqueo =
   | "esquema"
   | "credenciales"
   | "puerto"
   | "red-no-publica"
-  | "no-resuelve";
+  | "no-resuelve"
+  | "dns-sin-respuesta";
 
 /** Por qué el transporte no trajo una respuesta. */
 export type MotivoDeTransporte = "timeout" | "sin-respuesta" | "tls" | "demasiado-grande";
@@ -190,7 +198,7 @@ export type MotivoDeTransporte = "timeout" | "sin-respuesta" | "tls" | "demasiad
  * hace con esto es decidir un color.
  */
 /** Un pedido que escribe texto y no llegó, o que seguía en vuelo al leer (RT-1). */
-export type MotivoDeSubrecurso = MotivoDeTransporte | "presupuesto" | "pendiente";
+export type MotivoDeSubrecurso = MotivoDeTransporte | "presupuesto" | "pendiente" | "dns-sin-respuesta";
 
 export type CodigoDeFallo =
   | "timeout"
@@ -229,6 +237,13 @@ export interface PedidoHttp {
   url: string;
   /** La dirección que pasó el examen. El transporte conecta ACÁ, no re-resuelve. */
   ip: string;
+  /**
+   * Las OTRAS direcciones del mismo nombre, todas examinadas, en orden (IPv4
+   * primero): si la conexión a `ip` no se establece, el transporte prueba la
+   * siguiente dentro del mismo plazo (PU-3). Ninguna es de una segunda
+   * resolución.
+   */
+  alternativas?: string[];
   metodo: string;
   encabezados: Record<string, string>;
   cuerpo?: string;
@@ -360,7 +375,9 @@ export const OPCIONES_RENDER: OpcionesRender = {
 // El examen de un destino
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type Examen = { ok: true; ip: string } | { ok: false; motivo: MotivoDeBloqueo };
+export type Examen =
+  | { ok: true; ip: string; /** Las demás direcciones del nombre, ya examinadas. */ alternativas?: string[] }
+  | { ok: false; motivo: MotivoDeBloqueo };
 
 const ESQUEMAS_DE_RED = new Set(["http:", "https:"]);
 /** No salen a la red: el contenido ya está en el navegador. */
@@ -374,9 +391,11 @@ const ESQUEMAS_LOCALES = new Set(["data:", "blob:", "about:"]);
  * llega siempre entre corchetes. Por eso alcanza con mirar la forma, y no hace
  * falta `node:net` en este archivo.
  */
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
 function ipLiteral(hostname: string): string | null {
   if (hostname.startsWith("[") && hostname.endsWith("]")) return hostname.slice(1, -1);
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return hostname;
+  if (IPV4.test(hostname)) return hostname;
   return null;
 }
 
@@ -407,15 +426,21 @@ export function crearExaminador(resolver: Resolvedor): Examinador {
     const host = url.hostname.toLowerCase();
     let resolucion = cache.get(host);
     if (!resolucion) {
-      resolucion = resolver(host, senal).catch((): Resolucion => ({ ok: false }));
+      // Un resolvedor que TIRA no dijo que el nombre no exista: no contestó.
+      resolucion = resolver(host, senal).catch((): Resolucion => ({ ok: false, transitorio: true }));
       cache.set(host, resolucion);
     }
     const r = await resolucion;
-    if (!r.ok || r.direcciones.length === 0) return { ok: false, motivo: "no-resuelve" };
+    if (!r.ok) return { ok: false, motivo: r.transitorio ? "dns-sin-respuesta" : "no-resuelve" };
+    if (r.direcciones.length === 0) return { ok: false, motivo: "no-resuelve" };
     // TODAS públicas, no alguna: un nombre con una A pública y otra privada
     // deja que la conexión elija, y quien elige es el atacante.
     if (!r.direcciones.every(esIpPublica)) return { ok: false, motivo: "red-no-publica" };
-    return { ok: true, ip: r.direcciones[0] };
+    // IPv4 primero, sea cual sea el orden del DNS: una función sin ruta IPv6
+    // no puede conectar a una AAAA (PU-3), y las demás quedan de alternativa.
+    const ordenadas = [...r.direcciones.filter((d) => IPV4.test(d)), ...r.direcciones.filter((d) => !IPV4.test(d))];
+    const [ip, ...alternativas] = ordenadas;
+    return alternativas.length > 0 ? { ok: true, ip, alternativas } : { ok: true, ip };
   };
 }
 
@@ -472,7 +497,7 @@ export interface Bitacora {
    * Los pedidos que ESCRIBEN texto (scripts, datos, marcos) y no llegaron por
    * el transporte o por el presupuesto. Uno solo deja el render sin número.
    */
-  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeTransporte | "presupuesto" }>;
+  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeTransporte | "presupuesto" | "dns-sin-respuesta" }>;
   /** Cuántos de esos pedidos están en el transporte ahora mismo. */
   enVuelo: number;
 }
@@ -531,7 +556,12 @@ export function crearInterceptor(
   let bytesTotales = 0;
 
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
+    // Si este pedido ya tiene un desenlace decidido —se bloqueó con su
+    // motivo, o se le entregó la respuesta—. Lo que tire ANTES de eso, en el
+    // `catch` de abajo, es un pedido que no llegó y nadie anotó (PU-3).
+    let decidido = false;
     const bloquear = async (motivo: Bitacora["bloqueados"][number]["motivo"]) => {
+      decidido = true;
       bitacora.bloqueados.push({ url: pedido.url, motivo });
       if (
         escribeTexto(pedido) &&
@@ -539,7 +569,8 @@ export function crearInterceptor(
           motivo === "sin-respuesta" ||
           motivo === "tls" ||
           motivo === "demasiado-grande" ||
-          motivo === "presupuesto")
+          motivo === "presupuesto" ||
+          motivo === "dns-sin-respuesta")
       ) {
         bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo });
       }
@@ -558,7 +589,10 @@ export function crearInterceptor(
         return await bloquear("esquema");
       }
 
-      if (ESQUEMAS_LOCALES.has(url.protocol)) return await pedido.continuar();
+      if (ESQUEMAS_LOCALES.has(url.protocol)) {
+        decidido = true;
+        return await pedido.continuar();
+      }
       if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
       if (!METODOS.has(pedido.metodo.toUpperCase())) return await bloquear("metodo");
       if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || pestana.soloDocumento)) {
@@ -571,7 +605,9 @@ export function crearInterceptor(
       const guardada = pedido.metodo.toUpperCase() === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
       if (guardada) {
         if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
-        return await pedido.responder(guardada);
+        await pedido.responder(guardada);
+        decidido = true;
+        return;
       }
 
       const examen = await examinar(url, senal);
@@ -593,15 +629,26 @@ export function crearInterceptor(
       const cuenta = escribeTexto(pedido);
       if (cuenta) bitacora.enVuelo += 1;
       try {
-        const respuesta = await deps.transporte({
-          url: url.toString(),
-          ip: examen.ip,
-          metodo: pedido.metodo.toUpperCase(),
-          encabezados,
-          cuerpo: pedido.cuerpo,
-          timeoutMs: plazo,
-          maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
-        });
+        let respuesta: RespuestaHttp;
+        try {
+          respuesta = await deps.transporte({
+            url: url.toString(),
+            ip: examen.ip,
+            ...(examen.alternativas ? { alternativas: examen.alternativas } : {}),
+            metodo: pedido.metodo.toUpperCase(),
+            encabezados,
+            cuerpo: pedido.cuerpo,
+            timeoutMs: plazo,
+            maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
+          });
+        } catch {
+          // Un transporte que RECHAZA no trajo nada: es «sin respuesta», con
+          // su lugar en `noLlegaron`, y no una excepción que el `catch` de
+          // abajo sólo aborta. MEDIDO (PU-3): el `TypeError` de un connect
+          // IPv6 sin ruta dejaba fuera de RT-1 al bundle, y el render salía
+          // `medido` y VERDE.
+          respuesta = { tipo: "error", motivo: "sin-respuesta" };
+        }
         await entregar(respuesta, url.toString());
       } finally {
         if (cuenta) bitacora.enVuelo -= 1;
@@ -609,6 +656,13 @@ export function crearInterceptor(
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
       // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
+      //
+      // Y si escribe texto y no tenía desenlace —tiró el examen, o el
+      // navegador no aceptó la respuesta (`responder` tira con un encabezado
+      // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
+      if (!decidido && escribeTexto(pedido)) {
+        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta" });
+      }
       await pedido.abortar().catch(() => {});
     }
 
@@ -626,6 +680,7 @@ export function crearInterceptor(
       const entregada = { status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo };
       if (pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(clave, entregada);
       await pedido.responder(entregada);
+      decidido = true;
     }
   };
 }

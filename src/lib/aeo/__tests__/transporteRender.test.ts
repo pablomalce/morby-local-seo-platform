@@ -44,6 +44,9 @@ beforeAll(async () => {
           return res.end();
         case "/colgado":
           return; // nunca contesta
+        case "/corta":
+          // Conectó, leyó el pedido y cortó: el origen está, y contestó mal.
+          return req.socket.destroy();
         default:
           res.writeHead(200, { "content-type": "text/plain" });
           return res.end("ok");
@@ -134,5 +137,69 @@ describe("el transporte del renderizado", () => {
   it("una conexión rechazada es sin-respuesta, no un status inventado", async () => {
     const sinNadie = crearTransporteRender({ conectarA: () => ({ ip: "127.0.0.1", puerto: 1 }) });
     expect(await sinNadie(pedido("/"))).toEqual({ tipo: "error", motivo: "sin-respuesta" });
+  });
+
+  /**
+   * PU-3: el `lookup` fijado llamaba al callback de forma SÍNCRONA, y un
+   * `connect` que falla en el acto —una IPv6 en un host sin ruta IPv6, una
+   * dirección a la que el kernel ni intenta— destruía el socket antes de que
+   * existieran los listeners. MEDIDO en Node 24 y 26: `https.request` tiraba
+   * `TypeError: Cannot read properties of null (reading 'setServername')` (la
+   * promesa del transporte RECHAZABA) y además el proceso recibía un
+   * `uncaughtException` `EHOSTUNREACH`. 224.0.0.1 falla en el acto en Linux y
+   * en macOS (TCP a multicast); 100::1 (RFC 6666) en un host sin ruta IPv6.
+   */
+  describe("PU-3: un connect que falla en el acto es un error con motivo, no una excepción", () => {
+    const noCapturadas: unknown[] = [];
+    const anotar = (e: unknown) => noCapturadas.push(e);
+
+    it.each([
+      ["https a una dirección que falla en el acto", "https", "224.0.0.1"],
+      ["http a una dirección que falla en el acto", "http", "224.0.0.1"],
+      ["https a una IPv6 sin ruta", "https", "100::1"],
+    ])("%s: resuelve `{ tipo: \"error\" }`, y el proceso no ve ninguna excepción", async (_caso, esquema, ip) => {
+      process.on("uncaughtException", anotar);
+      try {
+        const sinRuta = crearTransporteRender({ conectarA: ({ puerto: p }) => ({ ip, puerto: p }) });
+        const r = await sinRuta(pedido("/", { url: `${esquema}://sitio.test/`, timeoutMs: 1_500 }));
+        expect(r.tipo).toBe("error");
+        // Un tick más: el `uncaughtException` llegaba después del rechazo.
+        await new Promise((listo) => setTimeout(listo, 50));
+        expect(noCapturadas).toEqual([]);
+      } finally {
+        process.off("uncaughtException", anotar);
+      }
+    });
+
+    it("un pedido que `request()` rechaza en el acto (un encabezado inválido) es sin-respuesta, no una promesa rechazada", async () => {
+      expect(await transporte(pedido("/", { encabezados: { "x-mala": "a\nb" } }))).toEqual({ tipo: "error", motivo: "sin-respuesta" });
+    });
+
+    it("con varias direcciones examinadas prueba la siguiente si la primera no conecta, IPv4 primero", async () => {
+      const intentos: string[] = [];
+      const conFallo = crearTransporteRender({
+        conectarA: ({ ip }) => {
+          intentos.push(ip);
+          // La primera no conecta; la segunda va al servidor local.
+          return ip === "93.184.216.34" ? { ip: "224.0.0.1", puerto: 80 } : { ip: "127.0.0.1", puerto };
+        },
+      });
+      const r = await conFallo(pedido("/", { ip: "93.184.216.34", alternativas: ["93.184.216.35"] }));
+      expect(r).toMatchObject({ tipo: "respuesta", status: 200 });
+      expect(intentos).toEqual(["93.184.216.34", "93.184.216.35"]);
+    });
+
+    it("una conexión que SE ESTABLECIÓ y falló después NO se reintenta en otra dirección", async () => {
+      const intentos: string[] = [];
+      const t = crearTransporteRender({
+        conectarA: ({ ip }) => {
+          intentos.push(ip);
+          return { ip: "127.0.0.1", puerto };
+        },
+      });
+      const r = await t(pedido("/corta", { ip: "93.184.216.34", alternativas: ["93.184.216.35"] }));
+      expect(r).toEqual({ tipo: "error", motivo: "sin-respuesta" });
+      expect(intentos).toEqual(["93.184.216.34"]);
+    });
   });
 });

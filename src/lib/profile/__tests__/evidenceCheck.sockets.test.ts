@@ -336,7 +336,8 @@ describe("el DNS no se queda con lo que no es suyo", () => {
     const antes = Date.now();
     const r = await resolvedorLocal({ timeoutMs: 300, intentos: 3 })(nombre, corte.signal);
     const tardo = Date.now() - antes;
-    expect(r).toEqual({ ok: false });
+    // Cortada, la consulta no dijo que el nombre no exista: `transitorio`.
+    expect(r).toEqual({ ok: false, transitorio: true });
     // Sin `cancel` son 2,1 s: la cota es holgada a propósito, para una
     // máquina cargada, y sigue separando los dos casos.
     expect(tardo).toBeLessThan(1_000);
@@ -346,6 +347,24 @@ describe("el DNS no se queda con lo que no es suyo", () => {
       consultasDns.filter((q) => q.nombre === nombre).map((q) => q.tipo).sort(),
       "una A y una AAAA, y ningún reintento después del corte"
     ).toEqual([1, 28]);
+  });
+
+  /**
+   * PU-3: «no resuelve» eran dos cosas. Un nombre que NO EXISTE (NXDOMAIN, o
+   * sin registros) y un DNS que NO CONTESTÓ (timeout, SERVFAIL) salían igual,
+   * `{ ok: false }`, y la auditoría AEO dejaba fuera de RT-1 a un bundle
+   * cuyo CDN tuvo un timeout de DNS. El chequeo de H1.4 sólo mira `ok`, y lo
+   * lee como antes.
+   */
+  it("PU-3: un nombre que no existe es `{ ok: false }`; un DNS que no contesta, `transitorio`", async () => {
+    const senal = new AbortController().signal;
+    expect(await resolvedorLocal()(`no-existe-${Date.now()}.test`, senal)).toEqual({ ok: false });
+    expect(await resolvedorLocal({ timeoutMs: 100, intentos: 1 })(`negro-pu3-${Date.now()}.test`, senal)).toEqual({
+      ok: false,
+      transitorio: true,
+    });
+    // Con A y la AAAA en NOERROR vacío, resuelve: la familia vacía no es un fallo.
+    expect(await resolvedorLocal()("fuente-sana.test", senal)).toEqual({ ok: true, direcciones: [IP_DE_PRUEBA] });
   });
 
   it("la corrida con 24 fuentes de DNS mudo: entra en su cuenta, las sanas no salen timeout y el DNS del proceso queda libre", async () => {

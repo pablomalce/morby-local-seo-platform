@@ -158,6 +158,12 @@ export interface OpcionesDoble {
    * su cuerpo se escribe en el DOM cuando llegan (RT-1).
    */
   enSegundoPlano?: Array<{ url: string; tipo: string }>;
+  /**
+   * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
+   * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
+   * (PU-3).
+   */
+  responderFalla?: (url: string) => boolean;
 }
 
 export function navegadorDoble(opciones: OpcionesDoble = {}) {
@@ -190,7 +196,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       esDocumentoPrincipal,
       continuar: async () => resolver({ tipo: "continuado" }),
       abortar: async () => resolver({ tipo: "abortado" }),
-      responder: async (r) => resolver({ tipo: "respondido", ...r }),
+      responder: async (r) => {
+        if (opciones.responderFalla?.(url)) throw new Error("Protocol error (Fetch.fulfillRequest): Invalid header");
+        resolver({ tipo: "respondido", ...r });
+      },
     };
     await atender(pedido);
     const d = await desenlace;

@@ -349,6 +349,63 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect(await medirRenderizado("http://sitio.test/", marco.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-tls" });
   });
 
+  /**
+   * PU-3: tres caminos por los que un bundle NO LLEGABA y el render salía
+   * `medido` igual. Reproducido con Chrome 154 por la revisión: una página
+   * con un menú de 529 y `<script src=https://cdn-v6.test/app.js>` (una IPv6
+   * sin ruta) daba `render 529/529`, punto VERDE y `noLlegaron=[]`.
+   */
+  it("PU-3 — un transporte que RECHAZA (el TypeError del connect IPv6) es `subrecurso-sin-respuesta`, no un verde", async () => {
+    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } });
+    const transporte = deps.transporte;
+    deps.transporte = async (pedido) => {
+      if (pedido.url.endsWith("/app.js")) throw new TypeError("Cannot read properties of null (reading 'setServername')");
+      return transporte(pedido);
+    };
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo: "sin-respuesta" }]);
+    // Con su motivo en la bitácora, como cualquier otro error del transporte.
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://sitio.test/app.js", motivo: "sin-respuesta" });
+
+    // Y si el que rechaza es el del DOCUMENTO, el render dice por qué no
+    // navegó —`sin-respuesta`—, no un genérico `navegacion`.
+    const doc = armar({ "http://sitio.test/": { cuerpo: HIBRIDA } });
+    doc.deps.transporte = async () => {
+      throw new TypeError("Cannot read properties of null (reading 'setServername')");
+    };
+    expect(await medirRenderizado("http://sitio.test/", doc.deps)).toEqual({ estado: "fallo", codigo: "sin-respuesta" });
+  });
+
+  it("PU-3 — una respuesta que el navegador NO ACEPTA (`responder` tira) no llegó: `subrecurso-sin-respuesta`", async () => {
+    const { deps, bitacora } = armar(
+      { "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } },
+      { responderFalla: (url) => url.endsWith("/app.js") }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(bitacora.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/app.js"]);
+  });
+
+  it("PU-3 — un CDN cuyo DNS NO CONTESTÓ no es un nombre que no existe: `subrecurso-dns-sin-respuesta`", async () => {
+    const html = `<html><body>${MENU}<main id="app"></main><script src="http://cdn.test/app.js"></script></body></html>`;
+    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html }, "http://cdn.test/app.js": { cuerpo: CONTENIDO } });
+    const resolver = deps.resolver;
+    deps.resolver = async (host, senal) => (host === "cdn.test" ? { ok: false, transitorio: true } : resolver(host, senal));
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-dns-sin-respuesta" });
+    // Y un nombre que NO EXISTE sigue sin contar: con el DNS de hoy es un dominio muerto.
+    deps.resolver = async (host, senal) => (host === "cdn.test" ? { ok: false } : resolver(host, senal));
+    expect((await medirRenderizado("http://sitio.test/", deps)).estado).toBe("medido");
+  });
+
+  it("PU-3 — el examen pasa la IPv4 primero y las demás de alternativa, aunque el DNS traiga la AAAA antes", async () => {
+    const { deps, red } = armar({ "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } });
+    deps.resolver = async () => ({ ok: true, direcciones: ["2606:4700:4700::1111", PUBLICA, OTRA_PUBLICA] });
+    await medirRenderizado("http://sitio.test/", deps);
+    expect(red.pedidos[0]).toMatchObject({ ip: PUBLICA, alternativas: [OTRA_PUBLICA, "2606:4700:4700::1111"] });
+  });
+
   it("lo que la POLÍTICA rechaza no es «no llegó»: un script a una red privada deja medir", async () => {
     const html = `<html><body>${MENU}<script src="http://interno.test/interno.js"></script><img src="/foto.jpg"></body></html>`;
     const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html }, "http://interno.test/interno.js": { cuerpo: "x" } });
@@ -650,12 +707,14 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     expect(hostil.consultas).toEqual(["sitio.test"]);
   });
 
-  it("un nombre que no resuelve no sale, y un DNS que tira es «no resuelve», no un permiso", async () => {
+  it("un nombre que no resuelve no sale, y un DNS que tira no es un permiso: es «el DNS no contestó» (PU-3)", async () => {
     const senal = new AbortController().signal;
     const examinar = crearExaminador(async () => {
       throw new Error("ECONNREFUSED");
     });
-    expect(await examinar(new URL("http://cualquiera.test/"), senal)).toEqual({ ok: false, motivo: "no-resuelve" });
+    // Antes «no-resuelve», como un nombre que no existe: y un subrecurso así
+    // quedaba fuera de RT-1. Ahora es un pedido que no llegó.
+    expect(await examinar(new URL("http://cualquiera.test/"), senal)).toEqual({ ok: false, motivo: "dns-sin-respuesta" });
     const vacio = crearExaminador(resolvedorDoble({}).resolver);
     expect(await vacio(new URL("http://nadie.test/"), senal)).toEqual({ ok: false, motivo: "no-resuelve" });
   });

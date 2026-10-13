@@ -133,6 +133,7 @@ export async function traerExaminado(red: RedExaminada, url: string, opciones: O
       const respuesta = await red.transporte({
         url: actual.toString(),
         ip: examen.ip,
+        ...(examen.alternativas ? { alternativas: examen.alternativas } : {}),
         metodo: "GET",
         encabezados: { "user-agent": opciones.userAgent, accept: "*/*" },
         timeoutMs: restante,
