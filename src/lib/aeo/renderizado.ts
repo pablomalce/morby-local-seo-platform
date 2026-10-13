@@ -11,7 +11,8 @@
  * Esto abre la URL en Chromium sin interfaz, espera a que el documento cargue y
  * la red se aquiete, y cuenta el texto del DOM con la MISMA función que cuenta
  * el HTML servido (`textoSinJavaScript` de `lectura.ts`) sobre la
- * serialización del DOM (`html()`, que en Chromium es `page.content()`).
+ * serialización del DOM CON SUS SOMBRAS (`html()`, que en Chromium es
+ * `DOM.getOuterHTML` con `includeShadowDOM`: ver `chromium.ts`, PU-2).
  *
  * Y EL LADO SERVIDO TAMBIÉN SE MIDE ACÁ, CON LA MISMA EXTRACCIÓN. Con el mismo
  * navegador se abre una segunda pestaña con el JavaScript APAGADO, se le
@@ -290,9 +291,11 @@ export interface PaginaAbierta {
    */
   desplazar(timeoutMs: number): Promise<void>;
   /**
-   * El DOM serializado, tal como está ahora (`page.content()`). La extracción
-   * del texto es de este archivo —`textoSinJavaScript`, la misma del HTML
-   * servido—, no del navegador: ver «NINGÚN LADO APLICA CSS» arriba.
+   * El DOM serializado, tal como está ahora, CON cada shadow root de autor
+   * como `<template shadowrootmode>` (PU-2): `outerHTML` las deja afuera, y
+   * el contenido que un componente dibuja en su sombra no contaba. La
+   * extracción del texto es de este archivo —`textoSinJavaScript`, la misma
+   * del HTML servido—, no del navegador: ver «NINGÚN LADO APLICA CSS» arriba.
    */
   html(): Promise<string>;
 }

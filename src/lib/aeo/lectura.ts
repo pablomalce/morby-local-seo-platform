@@ -529,9 +529,13 @@ export function textoSinJavaScript(html: string): number {
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
     // Ni el `<title>` ni un `<template>` se dibujan: `innerText` no los
-    // cuenta, y contarlos acá era ruido a favor del verde (P4).
+    // cuenta, y contarlos acá era ruido a favor del verde (P4). SALVO el
+    // `<template shadowrootmode>`, que es un shadow root DECLARATIVO: el
+    // parser lo dibuja sin JavaScript, y es también como `chromium.ts`
+    // serializa cada sombra del DOM renderizado (PU-2). Sus etiquetas caen
+    // con las demás y su texto cuenta.
     .replace(/<title[\s\S]*?<\/title>/gi, " ")
-    .replace(/<template[\s\S]*?<\/template>/gi, " ")
+    .replace(/<template\b(?![^>]*\sshadowrootmode\s*=\s*["']?(?:open|closed)["'\s>])[^>]*>[\s\S]*?<\/template>/gi, " ")
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<[^>]+>/g, " ")
     // Una entidad es UN carácter dibujado: `&amp;` es «&», `&#8217;` es «’».

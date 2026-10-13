@@ -185,6 +185,39 @@ function hibrida(script: string): string {
 }
 
 /**
+ * PU-2: el contenido real dibujado por JavaScript DENTRO de un shadow root
+ * (Lit, Stencil, LWC), con un menú servido. `page.content()` es `outerHTML`
+ * y no serializa los shadow roots: MEDIDO por la revisión con Chrome 154, el
+ * menú de 529 y la sombra de 2 999 daban `render 529 / servidos 529` y el punto
+ * VERDE, cuando un rastreador sin JavaScript sólo lee el menú. Abierto y
+ * cerrado: el cerrado tampoco lo ve el JavaScript de la página.
+ */
+const CONTENIDO_EN_SOMBRA = "Contenido del negocio que un componente dibuja en su sombra. ".repeat(50);
+function enSombra(modo: "open" | "closed"): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<x-contenido></x-contenido>
+<script>customElements.define("x-contenido", class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: "${modo}" });
+    r.innerHTML = "<main><p>" + ${JSON.stringify(CONTENIDO_EN_SOMBRA)} + "</p><x-anidado></x-anidado></main>";
+  }
+});
+customElements.define("x-anidado", class extends HTMLElement {
+  connectedCallback() { this.attachShadow({ mode: "open" }).innerHTML = "<p>Y una sombra anidada adentro de la otra.</p>"; }
+});</script></body></html>`;
+}
+
+/**
+ * PU-2, al revés: un declarative shadow DOM SERVIDO —el contenido viene en el
+ * HTML, dentro de `<template shadowrootmode>`, y el parser lo dibuja sin
+ * JavaScript—. Contado con `page.content()` daba `servido 0 / renderizado 0` y
+ * rojo «poco texto», cuando el HTML trae el texto.
+ */
+const DSD_SERVIDO = `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<x-tarjeta><template shadowrootmode="open"><main><p>${CONTENIDO_EN_SOMBRA}</p></main></template></x-tarjeta>
+<x-pie><template shadowrootmode="closed"><footer>Pie servido en una sombra cerrada.</footer></template></x-pie>
+</body></html>`;
+
+/**
  * RV-1: un popup es otro target. Ni la intercepción ni `evaluateOnNewDocument`
  * llegan a él, así que el constructor de WebRTC está entero adentro, y su
  * navegación no pasa por el interceptor.
@@ -333,6 +366,12 @@ beforeAll(async () => {
       case "/app-grande.js":
         res.writeHead(200, { "content-type": "text/javascript" });
         return res.end(`${BUNDLE}\n/* ${"relleno ".repeat(15_000)} */`);
+      case "/sombra-abierta":
+        return html(enSombra("open"));
+      case "/sombra-cerrada":
+        return html(enSombra("closed"));
+      case "/dsd-servido":
+        return html(DSD_SERVIDO);
       case "/elementor-invisible":
         return html(ELEMENTOR_INVISIBLE);
       case "/anti-fouc":
@@ -557,6 +596,48 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       if (render.estado !== "medido") return;
       expect(Math.abs(render.caracteres - esperado) / esperado).toBeLessThan(0.05);
       expect(Math.abs((render.servidos ?? 0) - esperado) / esperado).toBeLessThan(0.05);
+    },
+    60_000
+  );
+
+  it.each(["/sombra-abierta", "/sombra-cerrada"])(
+    "PU-2 — el contenido dibujado por JavaScript en un shadow root (%s) cuenta del lado renderizado: punto ROJO",
+    async (ruta) => {
+      const d = deps();
+      const render = await medirRenderizado(`http://sitio.test${ruta}`, d);
+      const menu = contarCaracteres(MENU.replace(/<[^>]+>/g, " "));
+      console.log(`[PU-2 ${ruta}] menu=${menu} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      // Servido, el menú solo; renderizado, el menú y lo de las dos sombras.
+      expect(Math.abs((render.servidos ?? 0) - menu) / menu).toBeLessThan(0.05);
+      expect(render.caracteres).toBeGreaterThan(menu + contarCaracteres(CONTENIDO_EN_SOMBRA) - 10);
+      const html = enSombra(ruta === "/sombra-abierta" ? "open" : "closed");
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+      expect(d.cierres()).toBe(d.aperturas());
+    },
+    60_000
+  );
+
+  it(
+    "PU-2 — un declarative shadow DOM SERVIDO cuenta de los dos lados, abierto y cerrado: punto VERDE",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/dsd-servido", deps());
+      const esperado = contarCaracteres(`${CONTENIDO_EN_SOMBRA} Pie servido en una sombra cerrada.`);
+      console.log(`[PU-2 /dsd-servido] esperado=${esperado} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(Math.abs((render.servidos ?? 0) - esperado) / esperado).toBeLessThan(0.05);
+      expect(Math.abs(render.caracteres - esperado) / esperado).toBeLessThan(0.05);
+      // Y el HTML que trae la ruta, contado sin navegador, dice lo mismo.
+      expect(Math.abs(textoSinJavaScript(DSD_SERVIDO) - esperado) / esperado).toBeLessThan(0.05);
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: textoSinJavaScript(DSD_SERVIDO), caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("verde");
     },
     60_000
   );

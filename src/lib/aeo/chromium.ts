@@ -91,7 +91,7 @@ import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { Browser, HTTPRequest, LaunchOptions, Page } from "puppeteer-core";
+import type { Browser, CDPSession, HTTPRequest, LaunchOptions, Page } from "puppeteer-core";
 import { resolverDns } from "@/lib/profile/nodeTransport";
 import type {
   AbrirNavegador,
@@ -172,6 +172,8 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
 }
 
 function envolverPagina(page: Page): PaginaAbierta {
+  // Una sesión de CDP por pestaña, para serializar con las sombras (`html`).
+  let sesion: Promise<CDPSession> | undefined;
   return {
     async interceptar(atender) {
       await page.setBypassServiceWorker(true);
@@ -212,7 +214,30 @@ function envolverPagina(page: Page): PaginaAbierta {
       // esto era `innerText` y, en la pestaña sin JavaScript, borraba los
       // `<noscript>` —y con ellos el `<style>` que muestra el contenido sin
       // JavaScript— (GATE-1).
-      return page.content();
+      //
+      // CON LAS SOMBRAS (PU-2). Después fue `page.content()`, que es
+      // `outerHTML` y NO serializa los shadow roots: una página que sirve un
+      // menú y dibuja el contenido en un componente (Lit, Stencil, LWC) salía
+      // con renderizado = servido y VERDE —medido con Chrome 154: 529 contra
+      // 529—, y un shadow DOM declarativo servido contaba 0 de los dos lados.
+      // `DOM.getOuterHTML` con `includeShadowDOM` serializa CADA sombra de
+      // autor —abierta, cerrada, declarativa o creada por JavaScript, también
+      // anidadas— como `<template shadowrootmode>`, que `textoSinJavaScript`
+      // cuenta; las del agente de usuario (`<input>`, `<video>`) no salen.
+      // MEDIDO con Chrome 155 en las dos pestañas, con y sin JavaScript. Lo
+      // vuelve a medir `renderizado.integracion.test.ts` con los dos binarios.
+      //
+      // Lo que sigue sin contar, dicho: el contenido de los MARCOS
+      // (`<iframe>`, también `srcdoc`), que ninguna serialización del
+      // documento trae. La pestaña sin JavaScript no los carga, y contarlos
+      // sólo del lado renderizado pondría rojo a cualquier página SSR con un
+      // mapa o un video incrustado; distinguir el marco que crea el
+      // JavaScript del servido es una decisión aparte.
+      sesion ??= page.createCDPSession();
+      const cdp = await sesion;
+      const { root } = await cdp.send("DOM.getDocument", { depth: 0 });
+      const { outerHTML } = await cdp.send("DOM.getOuterHTML", { nodeId: root.nodeId, includeShadowDOM: true });
+      return outerHTML;
     },
   };
 }

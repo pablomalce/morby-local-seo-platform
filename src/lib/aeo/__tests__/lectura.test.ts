@@ -447,6 +447,17 @@ describe("cuánto texto hay sin JavaScript", () => {
     expect(textoSinJavaScript("<p>hola</p><noscript>Activá JavaScript para ver esta página</noscript>")).toBe(4);
   });
 
+  it("PU-2: un shadow root declarativo SÍ se dibuja —sin JavaScript— y cuenta; un `<template>` común no", () => {
+    // Es lo que devuelve la serialización con las sombras del navegador
+    // (`chromium.ts`), y lo que trae el HTML de un sitio con DSD servido.
+    expect(textoSinJavaScript('<x-a><template shadowrootmode="open"><p>hola</p></template></x-a>')).toBe(4);
+    expect(textoSinJavaScript("<x-a><template shadowrootmode='closed'><p>chau</p></template></x-a>")).toBe(4);
+    expect(textoSinJavaScript('<x-a><template shadowrootmode="open"><p>a</p><template><p>inerte</p></template></template></x-a>')).toBe(1);
+    // Un `shadowrootmode` que no es `open` ni `closed` no declara una sombra.
+    expect(textoSinJavaScript('<template shadowrootmode="otro"><p>hola</p></template>')).toBe(0);
+    expect(textoSinJavaScript("<template><p>hola</p></template>")).toBe(0);
+  });
+
   it("no cuenta el `<title>`, ni un `<template>`, ni un comentario: `innerText` tampoco", () => {
     const html = `<html><head><title>Un título largo de la pestaña</title></head><body>
       <!-- un comentario > con signo de mayor -->
