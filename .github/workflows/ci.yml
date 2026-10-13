@@ -215,3 +215,13 @@ jobs:
       - name: canonical shape agreement
         if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
         run: $PSQL -f supabase/qa/forma_canonica.sql
+
+      # La 0034 tiene garantías que `defects_test.sql` no puede medir porque
+      # corre en UNA transacción: dos onboardings concurrentes que se solapan
+      # (el candado), el rechazo fuera de READ COMMITTED, y la propia migración
+      # aplicada con un onboarding solapado abierto (su guarda tiene que verlo).
+      # Necesitan varias sesiones y su propio aislamiento, y por eso van en un
+      # script aparte. Revierte y vuelve a aplicar la 0034: va último.
+      - name: search console overlap under concurrency
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: PSQL="psql -h localhost -U postgres -d growthos" bash supabase/qa/solape_concurrente.sh

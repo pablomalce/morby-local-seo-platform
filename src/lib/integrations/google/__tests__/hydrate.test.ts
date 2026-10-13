@@ -30,7 +30,7 @@ const CUANDO = "2026-09-01T12:00:00.000Z";
 function deps(over: Partial<HydrateDeps> = {}): HydrateDeps {
   return {
     mappings: MAPEO_COMPLETO,
-    token: { ok: true, accessToken: "ACCESO-sintetico" },
+    token: { ok: true },
     env: ENV,
     fetchSearchConsole: async () => ({
       outcome: { kind: "ok" },
@@ -64,13 +64,16 @@ describe("con todo en orden", () => {
     expect(fetchSearchConsole).toHaveBeenCalledTimes(1);
   });
 
-  it("cada cliente recibe la property de SU superficie", async () => {
+  it("cada cliente recibe la property de SU superficie, y ningún token", async () => {
+    // El token no pasa por acá: lo usa el servicio compartido adentro de las
+    // consultas que arma (cuarta revisión del #118). Lo único que viaja es la
+    // property.
     const fetchSearchConsole = vi.fn(deps().fetchSearchConsole);
     const fetchGa4 = vi.fn(deps().fetchGa4);
     await hydrateGoogle(deps({ fetchSearchConsole, fetchGa4 }));
 
-    expect(fetchSearchConsole).toHaveBeenCalledWith("ACCESO-sintetico", "https://ejemplo.test/");
-    expect(fetchGa4).toHaveBeenCalledWith("ACCESO-sintetico", "properties/123456789");
+    expect(fetchSearchConsole.mock.calls).toEqual([["https://ejemplo.test/"]]);
+    expect(fetchGa4.mock.calls).toEqual([["properties/123456789"]]);
   });
 });
 
@@ -140,6 +143,107 @@ describe("cada motivo del token dice lo que es", () => {
     expect(statusForTokenFailure("absent")).toBe("missing");
     expect(statusForTokenFailure("revoked")).toBe("missing");
     expect(statusForTokenFailure("refresh-rejected")).toBe("missing");
+  });
+});
+
+/**
+ * La negativa del servicio compartido y el motivo de cada fuente.
+ *
+ * Hasta la revisión del #118 (2026-10-11) `not-mapped` era un motivo del TOKEN y
+ * `statusForTokenFailure` tenía un `case` para él que ningún reporte alcanzaba:
+ * la regla sólo lo devuelve con la lista de mapeos vacía, y con la lista vacía
+ * las tres fuentes ya salían `client-not-mapped` antes de mirar el token. El
+ * reporte de una organización sin ningún mapeo era idéntico, en lo visible, al de
+ * una plataforma sin credenciales. Ahora la negativa es de la organización y se
+ * decide antes que el mapeo de cada superficie, y cada fuente que no se consultó
+ * dice por qué.
+ */
+describe("la negativa del servicio compartido, y el motivo de cada fuente", () => {
+  it("sin ningún mapeo: las tres `missing` con `not-mapped`, no con `client-not-mapped`", async () => {
+    const fetchSearchConsole = vi.fn(deps().fetchSearchConsole);
+    const r = await hydrateGoogle(
+      deps({
+        mappings: [],
+        token: { ok: false, reason: "not-mapped", detail: "sin mapeo" },
+        fetchSearchConsole,
+      })
+    );
+
+    expect([r.searchConsole, r.ga4, r.gbp]).toEqual(["missing", "missing", "missing"]);
+    expect(r.motivos).toEqual({ searchConsole: "not-mapped", ga4: "not-mapped", gbp: "not-mapped" });
+    expect(fetchSearchConsole).not.toHaveBeenCalled();
+  });
+
+  it("con el mapeo ilegible: `error`, no «sin conectar», y no se llama a nadie", async () => {
+    const fetchSearchConsole = vi.fn(deps().fetchSearchConsole);
+    const fetchGa4 = vi.fn(deps().fetchGa4);
+    const r = await hydrateGoogle(
+      deps({
+        mappings: [],
+        token: { ok: false, reason: "mapping-unreadable", detail: "57014" },
+        fetchSearchConsole,
+        fetchGa4,
+      })
+    );
+
+    expect([r.searchConsole, r.ga4, r.gbp]).toEqual(["error", "error", "error"]);
+    expect(r.motivos).toEqual({
+      searchConsole: "mapping-unreadable",
+      ga4: "mapping-unreadable",
+      gbp: "mapping-unreadable",
+    });
+    expect(fetchSearchConsole).not.toHaveBeenCalled();
+    expect(fetchGa4).not.toHaveBeenCalled();
+  });
+
+  it("la negativa le gana al mapeo aunque lleguen mapeos: nunca se consulta con ella", async () => {
+    // Un llamador que mezcle los mapeos de una lectura con la negativa de otra
+    // es un contrato roto; lo seguro es no consultar.
+    const fetchSearchConsole = vi.fn(deps().fetchSearchConsole);
+    const r = await hydrateGoogle(
+      deps({ token: { ok: false, reason: "not-mapped", detail: "sin mapeo" }, fetchSearchConsole })
+    );
+
+    expect(fetchSearchConsole).not.toHaveBeenCalled();
+    expect(r.motivos.searchConsole).toBe("not-mapped");
+  });
+
+  it("sin credenciales de plataforma, ése es el motivo, aunque además no haya mapeo", async () => {
+    const r = await hydrateGoogle(
+      deps({
+        env: {} as NodeJS.ProcessEnv,
+        mappings: [],
+        token: { ok: false, reason: "not-mapped", detail: "sin mapeo" },
+      })
+    );
+
+    expect(r.motivos).toEqual({
+      searchConsole: "platform-not-connected",
+      ga4: "platform-not-connected",
+      gbp: "platform-not-connected",
+    });
+  });
+
+  it("con mapeos, la superficie que falta dice `client-not-mapped`, y las consultadas no tienen motivo", async () => {
+    const r = await hydrateGoogle(
+      deps({ mappings: [{ provider: "ga4", propertyRef: "properties/123456789" }] })
+    );
+
+    expect(r.ga4).toBe("live");
+    expect(r.motivos).toEqual({ searchConsole: "client-not-mapped", gbp: "client-not-mapped" });
+  });
+
+  it("mapeada y sin token de la agencia: `agency-token`, sin el motivo fino", async () => {
+    const r = await hydrateGoogle(
+      deps({ token: { ok: false, reason: "revoked", detail: "la autorización fue revocada" } })
+    );
+
+    expect(r.searchConsole).toBe("missing");
+    expect(r.motivos).toEqual({
+      searchConsole: "agency-token",
+      ga4: "agency-token",
+      gbp: "agency-token",
+    });
   });
 });
 

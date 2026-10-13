@@ -20,11 +20,8 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lookupPlace } from "@/lib/integrations/google/places";
 import { lookupPageSpeed } from "@/lib/integrations/google/pagespeed";
 import { guardarSonda, sondaDeOutcome } from "@/lib/integrations/google/probe";
-import type { GoogleSurface, PropertyMapping } from "@/lib/integrations/google/sources";
 import { describirFallo, hydrateGoogle } from "@/lib/integrations/google/hydrate";
-import { type AccessTokenResult, agencyAccessToken } from "@/lib/integrations/google/tokenStore";
-import { fetchSearchConsoleTotals } from "@/lib/integrations/google/searchConsole";
-import { fetchGa4Totals } from "@/lib/integrations/google/ga4";
+import { servirConLaAgencia } from "@/lib/integrations/google/servicioCompartido";
 import { type LecturaDeFicha, leerFichaPublicada } from "@/lib/profile/fichaPublicada";
 import { buildReport } from "./engine";
 import type { BusinessSnapshot } from "@/lib/mock/universal";
@@ -439,56 +436,6 @@ async function hydrateWithPageSpeed(
   return "error";
 }
 
-/**
- * Los mapeos VIVOS de una organización, de `integration_properties`.
- *
- * Una consulta para las tres superficies: la 0017 garantiza un mapeo vivo por
- * organización y proveedor, así que son tres filas como mucho y pedirlas de a
- * una sería triplicar el costo de cada reporte por nada.
- *
- * `organization_id` va escrito aunque la RLS ya lo imponga, por lo mismo que el
- * INSERT en `reports` lo escribe: la policy es la garantía y el filtro es lo que
- * hace legible qué se está pidiendo. Y `unmapped_at IS NULL` también, aunque el
- * índice único sólo alcance a los vivos — el índice impide que haya DOS vivos,
- * no que se lea uno muerto.
- *
- * Un fallo de lectura devuelve la lista vacía y NO rompe el reporte. La
- * consecuencia es que las tres fuentes salen `client-not-mapped`, que es lo
- * mismo que dirían si no hubiera mapeo — y eso es una pérdida de precisión
- * aceptada a cambio de que una integración no tumbe un reporte que las otras
- * cuatro fuentes pueden llenar igual.
- */
-async function readPropertyMappings(organizationId: string): Promise<PropertyMapping[]> {
-  const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase
-    .from("integration_properties")
-    .select("provider, property_ref")
-    .eq("organization_id", organizationId)
-    .is("unmapped_at", null);
-
-  if (error || !data) return [];
-  return data.map((row) => ({
-    provider: row.provider as GoogleSurface,
-    propertyRef: row.property_ref as string,
-  }));
-}
-
-/**
- * El token de la agencia para ESTE reporte, o por qué no lo hay.
- *
- * Un reporte de demostración no tiene sesión ni organización, así que tampoco
- * tiene mapeos: las tres fuentes salen `missing` por el mapeo y el token nunca se
- * llega a usar. Se escribe igual, y con un motivo honesto, para que haya UN solo
- * camino — una rama que saltee la hidratación entera sería una segunda manera de
- * decidir estados, y dos maneras se separan con el tiempo.
- */
-async function tokenParaElReporte(authenticated: boolean): Promise<AccessTokenResult> {
-  if (!authenticated) {
-    return { ok: false, reason: "absent", detail: "reporte de demostración, sin sesión" };
-  }
-  return agencyAccessToken();
-}
-
 export async function generateReport(input: GenerateReportInput): Promise<Report | null> {
   const result = await loadSnapshot(input);
   if (!result) {
@@ -510,21 +457,29 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
 
   // Sin sesión no hay mapeo que leer: la tabla es por organización y un reporte
   // de demostración no tiene ninguna. Las tres salen `missing`, que es lo que
-  // corresponde — y por eso la lista vacía, no por una palabra escrita.
-  const mappings = result.authenticated
-    ? await readPropertyMappings(result.snapshot.business.organizationId)
-    : [];
+  // corresponde — y por eso `null`, no por una palabra escrita.
+  const organizacion = result.authenticated ? result.snapshot.business.organizationId : null;
+
+  // El token de la agencia y los mapeos salen JUNTOS de la regla del servicio
+  // compartido (H4.4), que además LEE los mapeos ella misma, con la sesión de
+  // quien pide el reporte: sólo los vivos de ESTA organización, y el token sólo
+  // si hay alguno. Una organización sin mapeo —un cliente recién dado de alta, o
+  // el reporte de demostración— no resuelve el token de la agencia: ni se lee su
+  // secreto ni se refresca contra Google. Una lectura caída tampoco: es
+  // `mapping-unreadable`, no «sin mapear». Ver `servicioCompartido.ts`.
+  //
+  // Y el token no sale de la regla: lo que vuelve son consultas que lo usan
+  // adentro, y sólo sobre esos mapeos (cuarta revisión del #118).
+  const servicio = await servirConLaAgencia(organizacion);
 
   // El token se pide UNA vez para las tres superficies, y las dos consultas que
   // hoy existen salen en paralelo. Ver `hydrate.ts`.
   const ahora = new Date();
   const google = await hydrateGoogle({
-    mappings,
-    token: await tokenParaElReporte(result.authenticated),
-    fetchSearchConsole: (accessToken, propertyRef) =>
-      fetchSearchConsoleTotals({ accessToken, propertyRef, ahora, fetcher: fetch }),
-    fetchGa4: (accessToken, propertyRef) =>
-      fetchGa4Totals({ accessToken, propertyRef, ahora, fetcher: fetch }),
+    mappings: servicio.mapeos,
+    token: servicio.token,
+    fetchSearchConsole: (propertyRef) => servicio.searchConsole(propertyRef, ahora),
+    fetchGa4: (propertyRef) => servicio.ga4(propertyRef, ahora),
     // Sólo con sesión: `integration_probe` tiene `organization_id NOT NULL`, y un
     // reporte de demostración no tiene tenant que anotar. Sin esto, la sonda del
     // demo escribiría contra la organización sembrada, que no existe en la base.
@@ -545,6 +500,10 @@ export async function generateReport(input: GenerateReportInput): Promise<Report
       searchConsole: google.searchConsole,
       gbp: google.gbp,
       ga4: google.ga4,
+      // El porqué de cada `missing` y `error` de Google, con nombre: «sin
+      // ningún mapeo» no es «sin credenciales de plataforma», y la Espina pide
+      // que una organización sin token propio falle CON MOTIVO.
+      motivos: google.motivos,
     },
     localeOverride: input.locale,
     profileCitation: result.profileCitation,

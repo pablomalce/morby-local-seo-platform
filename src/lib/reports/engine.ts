@@ -1015,8 +1015,12 @@ export function buildReport(
     .filter(([, status]) => status === "error")
     .map(([source]) => labelForSource(source));
 
+  const motivos = options.dataSources?.motivos;
   const dataSourceHealth: DataSourceHealth = {
     ...sources,
+    // Sólo si hay alguno: un objeto vacío diría «se miró y no hubo motivo» de
+    // un reporte que no lo miró.
+    ...(motivos && Object.keys(motivos).length > 0 ? { motivos } : {}),
     note:
       failed.length > 0
         ? `${lang.sourceNoteFailed(failed.join(", "))} ${lang.sourceNote}`

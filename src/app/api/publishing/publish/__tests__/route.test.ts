@@ -45,7 +45,7 @@ let asset: {
 let errorLectura: { message: string } | null = null;
 
 /** El mapeo vivo de Business Profile, o su ausencia. */
-let propiedad: { property_ref: string } | null = null;
+let propiedad: { organization_id: string; property_ref: string } | null = null;
 
 /**
  * La membresía de quien llama, leída como el usuario. Por defecto manager: el
@@ -83,10 +83,15 @@ vi.mock("@/lib/supabase/server", () => ({
           eq: () => ({
             // La lectura del asset termina acá.
             maybeSingle: async () => ({ data: asset, error: errorLectura }),
-            // La del mapeo encadena provider y `unmapped_at is null`.
+            // La del mapeo (la hace la regla del servicio compartido) encadena
+            // provider y `unmapped_at is null`, y es una lista.
             eq: () => ({
               is: () => ({
-                maybeSingle: async () => ({ data: propiedad, error: null }),
+                then: (resolver: (v: unknown) => unknown) =>
+                  Promise.resolve({
+                    data: propiedad ? [{ ...propiedad, provider: "google_business_profile", unmapped_at: null }] : [],
+                    error: null,
+                  }).then(resolver),
               }),
             }),
           }),
@@ -156,7 +161,7 @@ beforeEach(() => {
     body: CUERPO,
   };
   errorLectura = null;
-  propiedad = { property_ref: FICHA };
+  propiedad = { organization_id: ORG_DEL_ASSET, property_ref: FICHA };
   token = { ok: true, accessToken: "no-es-un-token" };
   llamadas = [];
   publicadoresArmados = [];
@@ -270,6 +275,7 @@ describe("POST /api/publishing/publish — falta una pieza: falla con nombre", (
     const res = await pedir({ assetId: ASSET });
 
     expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ falta: "cuenta" });
     expect(publicadoresArmados).toHaveLength(0);
     // El tercer argumento es `undefined`: eso es lo que el transporte lee.
     expect(llamadas[0][2]).toBeUndefined();
@@ -281,6 +287,9 @@ describe("POST /api/publishing/publish — falta una pieza: falla con nombre", (
     const res = await pedir({ assetId: ASSET });
 
     expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ falta: "mapeo" });
+    // Sin ficha propia, el token de la agencia no se presta: ni se pide.
+    expect(pedidosDeToken).toBe(0);
     expect(publicadoresArmados).toHaveLength(0);
     expect(llamadas[0][2]).toBeUndefined();
   });
@@ -291,6 +300,7 @@ describe("POST /api/publishing/publish — falta una pieza: falla con nombre", (
     const res = await pedir({ assetId: ASSET });
 
     expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ falta: "token" });
     expect(publicadoresArmados).toHaveLength(0);
     expect(llamadas[0][2]).toBeUndefined();
   });

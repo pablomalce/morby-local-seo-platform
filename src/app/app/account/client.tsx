@@ -1,9 +1,16 @@
 "use client";
 
 import { useState, useTransition } from "react";
+import { unstable_rethrow } from "next/navigation";
 import { AlertTriangle, Download, LogOut, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { deleteMyAccount, exportMyData, signOutAction } from "@/lib/auth/account-actions";
+import {
+  deleteMyAccount,
+  exportMyData,
+  signOutAction,
+  type BajaFallida,
+} from "@/lib/auth/account-actions";
+import { FRASE_SIN_RESPUESTA, type MotivoEnPantalla } from "@/lib/auth/porQueNoSeBorro";
 
 export function ExportButton() {
   const [pending, start] = useTransition();
@@ -52,19 +59,56 @@ export function ExportButton() {
   );
 }
 
+/** Lo que la pantalla muestra cuando la baja no terminó. */
+export interface FalloEnPantalla {
+  motivo: MotivoEnPantalla;
+  message: string;
+}
+
+/**
+ * Llama a la acción de baja y traduce lo que vuelve a lo que la pantalla
+ * muestra, o `null` si no hay nada que mostrar.
+ *
+ * QUÉ IMPIDE: que una acción que RECHAZA —la red se cortó, el servidor se cayó—
+ * llegue a la pantalla como una excepción sin motivo. Sin este `catch` el
+ * rechazo salía de la transición sin que nadie lo atajara (no hay `error.tsx`
+ * bajo `src/app`).
+ *
+ * Y que el `catch` se trague la baja que TERMINÓ. En Next 15.3.8 una acción que
+ * llama a `redirect` no resuelve: el `server-action-reducer` RECHAZA la promesa
+ * con el error de redirect, para que el `RedirectBoundary` navegue. Atajarlo
+ * mostraría un error sobre una cuenta ya borrada y la dejaría en esta pantalla;
+ * `unstable_rethrow` lo devuelve a Next.
+ */
+export async function pedirLaBaja(
+  accion: () => Promise<BajaFallida | undefined>,
+): Promise<FalloEnPantalla | null> {
+  let res: BajaFallida | undefined;
+  try {
+    res = await accion();
+  } catch (e) {
+    unstable_rethrow(e);
+    return { motivo: "sin-respuesta", message: FRASE_SIN_RESPUESTA };
+  }
+  if (res && !res.ok) return { motivo: res.motivo, message: res.message };
+  return null;
+}
+
 export function DeleteAccountButton() {
   const [confirming, setConfirming] = useState(false);
   const [confirmInput, setConfirmInput] = useState("");
   const [pending, start] = useTransition();
-  const [error, setError] = useState<string | null>(null);
+  // El motivo con nombre y su frase, tal como vuelven de la acción: la frase ya
+  // dice qué quedó borrado si la cadena se cortó a la mitad, y la pantalla no
+  // la reemplaza por un «Delete failed» genérico. Si la baja termina, la acción
+  // redirige y esto no se usa.
+  const [fallo, setFallo] = useState<FalloEnPantalla | null>(null);
 
   function handleConfirm() {
-    setError(null);
+    setFallo(null);
     start(async () => {
-      const res = await deleteMyAccount();
-      if (res && !res.ok) {
-        setError(res.message ?? "Delete failed");
-      }
+      const f = await pedirLaBaja(deleteMyAccount);
+      if (f) setFallo(f);
     });
   }
 
@@ -79,8 +123,9 @@ export function DeleteAccountButton() {
             Delete account
           </p>
           <p className="mt-1 text-[12px] text-red-300/80">
-            Right to erasure — permanently removes your account and all tenant data. Cannot be
-            undone.
+            Right to erasure — permanently removes your account. Organizations that are only
+            yours are deleted with all their data; organizations you share with another owner,
+            or do not own, stay without you. Cannot be undone.
           </p>
         </div>
       </div>
@@ -121,8 +166,15 @@ export function DeleteAccountButton() {
               {pending ? "Deleting..." : "CONFIRM DELETE"}
             </Button>
           </div>
-          {error && (
-            <p className="font-mono text-[10px] uppercase tracking-hud text-red-400">{error}</p>
+          {fallo && (
+            <p
+              role="alert"
+              data-testid="error-baja"
+              data-motivo={fallo.motivo}
+              className="text-[11px] leading-relaxed text-red-300"
+            >
+              {fallo.message}
+            </p>
           )}
         </div>
       )}
