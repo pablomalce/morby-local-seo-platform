@@ -359,6 +359,60 @@ describe("GATE-9: el JSON-LD se valida, no sólo se busca", () => {
   });
 });
 
+/**
+ * PU-4: el verde falso del schema. `BLOQUE_JSON_LD` era una expresión regular
+ * sobre el HTML crudo: un JSON-LD válido dentro de un comentario, de un
+ * `<template>` o de un `<textarea>` contaba como schema presente y sin errores,
+ * y el punto salía VERDE con los tipos listados —reproducido por la ruta con
+ * la página sana y su JSON-LD entre `<!-- -->`—, aunque un parser de HTML no
+ * ve ningún `<script>` ahí. Y `"@type": ""` daba el tipo `""` y verde.
+ */
+describe("PU-4: el JSON-LD se lee donde un parser de HTML lo lee, y un @type vacío es un error", () => {
+  const LD = '<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization"}</script>';
+
+  it.each([
+    ["un comentario", `<!-- ${LD} -->`],
+    ["un <template>", `<template>${LD}</template>`],
+    ["un <textarea>", `<textarea>${LD}</textarea>`],
+    ["un <noscript>", `<noscript>${LD}</noscript>`],
+    ["un <title>", `<title>${LD}</title>`],
+    ["un <style>", `<style>/* ${LD} */</style>`],
+    ["un <iframe>", `<iframe>${LD}</iframe>`],
+    ["un <xmp>", `<xmp>${LD}</xmp>`],
+    ["un comentario sin cerrar", `<p>hola</p><!-- ${LD}`],
+    ["un <plaintext>, que se come el resto", `<plaintext>${LD}`],
+  ])("dentro de %s no hay JSON-LD: ni tipos ni errores", (_donde, html) => {
+    expect(tiposDeSchema(`<html><body>${html}</body></html>`)).toEqual([]);
+    expect(erroresDeSchema(`<html><body>${html}</body></html>`)).toEqual([]);
+  });
+
+  it("lo que viene DESPUÉS de esos contenedores sí se lee, y lo de adentro de un <script> no los abre", () => {
+    expect(tiposDeSchema(`<!-- un comentario --><template><p>x</p></template><textarea>y</textarea>${LD}`)).toEqual(["Organization"]);
+    // `<!-->` y `<!--->` son comentarios que cierran en el acto.
+    expect(tiposDeSchema(`<!-->${LD}`)).toEqual(["Organization"]);
+    expect(tiposDeSchema(`<!--->${LD}`)).toEqual(["Organization"]);
+    // Un `<!--` o un `<template>` escritos DENTRO de un script son texto del script.
+    expect(tiposDeSchema(`<script>var a = "<!--"; var b = "<template>";</script>${LD}`)).toEqual(["Organization"]);
+    // Un template anidado no cierra al de afuera.
+    expect(tiposDeSchema(`<template><template></template>${LD}</template>`)).toEqual([]);
+    // Un `</scriptx>` no cierra un script; `</script >` sí.
+    expect(
+      tiposDeSchema('<script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage"}</script >')
+    ).toEqual(["FAQPage"]);
+  });
+
+  it("un `@type` vacío, o que no es texto, es un error y no es un tipo", () => {
+    const bloque = (tipo: string) => `<script type="application/ld+json">{"@context":"https://schema.org","@type":${tipo}}</script>`;
+    for (const tipo of ['""', '"   "', "5", "null", "[]", '[""]', "{}"]) {
+      expect(erroresDeSchema(bloque(tipo)), tipo).toEqual([expect.stringMatching(/bloque 1: un nodo con @type vacío o que no es texto/)]);
+      expect(tiposDeSchema(bloque(tipo)), tipo).toEqual([]);
+    }
+    // En un arreglo, los válidos cuentan y el vacío igual es un error.
+    expect(tiposDeSchema(bloque('["Organization", ""]'))).toEqual(["Organization"]);
+    expect(erroresDeSchema(bloque('["Organization", ""]'))).toHaveLength(1);
+  });
+});
+
 describe("cuánto texto hay sin JavaScript", () => {
   it("no cuenta lo que hay dentro de `script` ni de `style`", () => {
     // Es la trampa: una página vacía con un bundle grande parecería llena.

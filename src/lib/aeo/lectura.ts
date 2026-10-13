@@ -314,17 +314,95 @@ export function accesoDeLasIA(robots: string, ruta = "/"): Record<AgenteIA, bool
  * sitios reales.
  */
 /**
- * Los bloques JSON-LD del HTML: `<script type="application/ld+json">` con el
- * atributo entre comillas dobles, simples o SIN comillas, con parámetros
- * (`; charset=utf-8`) y en cualquier caja. Antes sólo se veía con comillas
- * (GATE-9): un bloque con `type=application/ld+json` no aportaba tipos y,
- * roto, tampoco era un error.
+ * Un `<script>` cuyo `type` es JSON-LD: con el atributo entre comillas
+ * dobles, simples o SIN comillas, con parámetros (`; charset=utf-8`) y en
+ * cualquier caja. Antes sólo se veía con comillas (GATE-9): un bloque con
+ * `type=application/ld+json` no aportaba tipos y, roto, tampoco era un error.
  */
-const BLOQUE_JSON_LD =
-  /<script\b[^>]*?\stype\s*=\s*(?:"\s*application\/ld\+json\s*(?:;[^"]*)?"|'\s*application\/ld\+json\s*(?:;[^']*)?'|application\/ld\+json(?:;[^\s>]*)?(?=[\s>]))[^>]*>([\s\S]*?)<\/script\s*>/gi;
+const TYPE_JSON_LD =
+  /\stype\s*=\s*(?:"\s*application\/ld\+json\s*(?:;[^"]*)?"|'\s*application\/ld\+json\s*(?:;[^']*)?'|application\/ld\+json(?:;[^\s>]*)?(?=[\s>/]))/i;
 
+/**
+ * Lo que abre algo que un parser de HTML NO lee como elementos: un
+ * comentario; un `<template>`, cuyo contenido es inerte; `<textarea>` y
+ * `<title>`, que son texto; `<style>`, `<xmp>`, `<iframe>`, `<noembed>` y
+ * `<noframes>`, texto crudo; `<noscript>`, texto crudo para un navegador con
+ * JavaScript —que es como lee un motor que renderiza—; y `<plaintext>`, que
+ * vuelve texto el resto del documento. Y `<script>`, cuyo contenido es suyo:
+ * un `<!--` o un `<template>` escritos adentro no abren nada.
+ */
+const APERTURA =
+  /<!--|<(script|template|textarea|title|style|xmp|iframe|noembed|noframes|noscript|plaintext)(?=[\s/>])[^>]*>/gi;
+
+/** El cierre de un elemento: `</nombre` seguido de espacio, `/` o `>`, como en HTML. */
+function cierre(nombre: string): RegExp {
+  return new RegExp(`</${nombre}(?=[\\s/>])[^>]*>`, "gi");
+}
+
+/** Dónde termina el `<template>` que se abrió antes de `desde`, contando los anidados. */
+function finDeTemplate(html: string, desde: number): number {
+  const marca = /<template(?=[\s/>])[^>]*>|<\/template(?=[\s/>])[^>]*>/gi;
+  marca.lastIndex = desde;
+  let abiertos = 1;
+  for (let m = marca.exec(html); m; m = marca.exec(html)) {
+    abiertos += m[0][1] === "/" ? -1 : 1;
+    if (abiertos === 0) return m.index + m[0].length;
+  }
+  return html.length;
+}
+
+/**
+ * Los bloques JSON-LD del HTML: el contenido de cada `<script>` JSON-LD que
+ * un parser de HTML ve como elemento.
+ *
+ * Se RECORRE el documento en orden, como lo tokeniza un parser, y no se busca
+ * con una expresión regular sobre el texto crudo (PU-4): así, un JSON-LD
+ * dentro de un comentario, de un `<template>`, de un `<textarea>` o de un
+ * `<noscript>` no cuenta —antes contaba, y la página sana con su JSON-LD
+ * comentado salía con schema VERDE y los tres tipos—, y lo que hay dentro de
+ * un `<script>` no abre un comentario. Un `<script>` sin cerrar no aporta un
+ * bloque, como antes.
+ */
 function bloquesJsonLd(html: string): string[] {
-  return [...html.matchAll(BLOQUE_JSON_LD)].map((m) => m[1]);
+  const bloques: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    APERTURA.lastIndex = i;
+    const m = APERTURA.exec(html);
+    if (!m) break;
+    const despues = m.index + m[0].length;
+
+    if (m[0] === "<!--") {
+      // `<!-->` y `<!--->` cierran en el acto; uno sin cerrar llega al final.
+      if (html.startsWith(">", despues)) i = despues + 1;
+      else if (html.startsWith("->", despues)) i = despues + 2;
+      else {
+        const fin = html.indexOf("-->", despues);
+        i = fin < 0 ? html.length : fin + 3;
+      }
+      continue;
+    }
+
+    const nombre = m[1].toLowerCase();
+    if (nombre === "plaintext") break;
+    if (nombre === "template") {
+      i = finDeTemplate(html, despues);
+      continue;
+    }
+    const fin = cierre(nombre);
+    fin.lastIndex = despues;
+    const c = fin.exec(html);
+    if (!c) break;
+    if (nombre === "script" && TYPE_JSON_LD.test(m[0])) bloques.push(html.slice(despues, c.index));
+    i = c.index + c[0].length;
+  }
+  return bloques;
+}
+
+/** Un `@type` que dice qué es el nodo: un texto no vacío, o una lista no vacía de ellos. */
+function tipoValido(tipo: unknown): boolean {
+  const valido = (t: unknown) => typeof t === "string" && t.trim() !== "";
+  return Array.isArray(tipo) ? tipo.length > 0 && tipo.every(valido) : valido(tipo);
 }
 
 export function tiposDeSchema(html: string): string[] {
@@ -353,9 +431,12 @@ function recolectar(nodo: unknown, tipos: Set<string>): void {
   if (!nodo || typeof nodo !== "object") return;
 
   const objeto = nodo as Record<string, unknown>;
+  // Un `@type` vacío no es un tipo: es el error que `erroresDeSchema` informa
+  // (PU-4). Antes `""` entraba como tipo y el punto salía verde.
   const tipo = objeto["@type"];
-  if (typeof tipo === "string") tipos.add(tipo);
-  if (Array.isArray(tipo)) for (const t of tipo) if (typeof t === "string") tipos.add(t);
+  for (const t of Array.isArray(tipo) ? tipo : [tipo]) {
+    if (typeof t === "string" && t.trim() !== "") tipos.add(t.trim());
+  }
 
   if (Array.isArray(objeto["@graph"])) recolectar(objeto["@graph"], tipos);
 }
@@ -384,7 +465,8 @@ function recolectar(nodo: unknown, tipos: Set<string>): void {
  *   - parsea pero no declara `@context`, sin lo cual no es JSON-LD sino JSON;
  *   - declara un `@context` que no es schema.org, y entonces sus `@type` no son
  *     los de schema.org: un motor no los lee como tales (GATE-9);
- *   - parsea pero algún nodo no declara `@type`, o sea que no dice qué es.
+ *   - parsea pero algún nodo no declara `@type`, o lo declara vacío o no
+ *     como texto (`""`, `5`, `[]`): no dice qué es (PU-4).
  *
  * Lo que NO valida, dicho: que cada `@type` exista en el vocabulario de
  * schema.org, ni las propiedades de cada tipo. Para eso hace falta el
@@ -414,8 +496,12 @@ export function erroresDeSchema(html: string): string[] {
       }
       const nodos = Array.isArray(objeto["@graph"]) ? objeto["@graph"] : [objeto];
       for (const nodo of nodos) {
-        if (nodo && typeof nodo === "object" && !("@type" in (nodo as object))) {
-          errores.push(`bloque ${n}: un nodo sin @type`);
+        if (!nodo || typeof nodo !== "object") continue;
+        if (!("@type" in (nodo as object))) errores.push(`bloque ${n}: un nodo sin @type`);
+        else if (!tipoValido((nodo as Record<string, unknown>)["@type"])) {
+          errores.push(
+            `bloque ${n}: un nodo con @type vacío o que no es texto (${JSON.stringify((nodo as Record<string, unknown>)["@type"]).slice(0, 40)})`
+          );
         }
       }
     }

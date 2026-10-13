@@ -61,6 +61,8 @@ let robotsDelDespliegue = ROBOTS;
  * user-agent, o `null` para dejarlo pasar. Wordfence bloquea con 503.
  */
 let wafDelDespliegue: (ua: string) => number | null = () => null;
+/** La página sana que sirve el despliegue: la de `public/`, salvo en el caso de PU-4. */
+let sanaDelDespliegue = SANA;
 
 // El middleware pregunta por la sesión: acá no hay ninguna, y no sale a la red.
 vi.mock("@supabase/ssr", () => ({
@@ -89,7 +91,7 @@ async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
     case `${ORIGEN}/aeo-control`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
     case `${ORIGEN}/aeo-sana`:
-      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(SANA) };
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(sanaDelDespliegue) };
     case `${ORIGEN}/robots.txt`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/plain" }, cuerpo: Buffer.from(robotsDelDespliegue) };
     default:
@@ -384,6 +386,31 @@ describe("PU-1: la sana con un WAF que le contesta 503 sólo a GPTBot sale ROJA 
       expect(bloqueantes.map((h) => h.quePasa).join(" | ")).toMatch(new RegExp(`permite a gptbot, pero el servidor les contesta ${codigo}`));
     } finally {
       wafDelDespliegue = () => null;
+    }
+  });
+});
+
+/**
+ * PU-4, por la ruta: la página sana con su JSON-LD dentro de un comentario.
+ * Antes: `RUTA-S3 schema=["FAQPage","LocalBusiness","Organization"] errores=[]
+ * puntos={…"schema":"verde"} legible=true`, aunque un parser de HTML no ve
+ * ningún `<script>`.
+ */
+describe("PU-4: la sana con el JSON-LD comentado sale ROJA en el schema, por la ruta", () => {
+  it.each([
+    ["un comentario", (b: string) => `<!--${b}-->`],
+    ["un <template>", (b: string) => `<template>${b}</template>`],
+    ["un <textarea>", (b: string) => `<textarea hidden>${b}</textarea>`],
+  ])("dentro de %s", async (_donde, envolver) => {
+    const bloques = [...SANA.matchAll(/<script type="application\/ld\+json">[\s\S]*?<\/script>/g)].map((m) => m[0]);
+    expect(bloques.length, "la sana trae sus bloques así escritos").toBeGreaterThan(0);
+    sanaDelDespliegue = bloques.reduce((html, b) => html.replace(b, envolver(b)), SANA);
+    try {
+      const { cuerpo } = await auditarPorLaRuta(`${ORIGEN}/aeo-sana/`);
+      expect(cuerpo.lectura.schema).toEqual([]);
+      expect(cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "rojo" });
+    } finally {
+      sanaDelDespliegue = SANA;
     }
   });
 });
