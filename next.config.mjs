@@ -42,6 +42,8 @@ const nextConfig = {
   // same config, and with maxDuration 60 it bundled geo/grid, profile/evidence-check and
   // reports/generate into this 72.8 MB function (measured with `vercel inspect`). That is why
   // the route's maxDuration is unique (route.ts, and funcionPropia.test.ts).
+  // Removing or widening this entry still builds green: the CI `verify` job reads the nft after
+  // `npm run build` with scripts/verificar-nft-chromium.mjs, and fails on either (RV-B).
   outputFileTracingIncludes: {
     "/api/aeo/audit": ["./node_modules/@sparticuz/chromium/bin/**"],
   },

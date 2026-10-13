@@ -71,8 +71,19 @@ jobs:
       # variables de entorno. Si algún día las necesita, va a fallar acá y no
       # en el deploy a producción.
       - name: build
+        id: build
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: npm run build
+
+      # RV-B: el binario de Chromium viaja en la función de la auditoría AEO
+      # porque `outputFileTracingIncludes` lo mete en su nft; el trazador de
+      # Next no lo ve solo. Sin esa línea el build termina en 0 y en
+      # producción cada render es «sin-navegador». El job `render` no lo ve:
+      # corre con node_modules entero. Esto lee el nft que deja el build de
+      # arriba, que es lo que Vercel empaqueta.
+      - name: el nft de la auditoría lleva Chromium, y ningún otro
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/verificar-nft-chromium.mjs
 
   # La defensa SSRF del render de la auditoría AEO —el proxy que no existe, el
   # resolvedor apagado, las banderas de WebRTC, el popup, las descargas— y la
