@@ -40,6 +40,7 @@ import { navegadorDoble, relojVirtual, resolvedorDoble } from "./navegadorDoble"
 const RAIZ = process.cwd();
 const CONTROL = readFileSync(path.join(RAIZ, "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(RAIZ, "public", "aeo-sana", "index.html"), "utf8");
+const HIBRIDA = readFileSync(path.join(RAIZ, "public", "aeo-hibrida", "index.html"), "utf8");
 const ROBOTS = readFileSync(path.join(RAIZ, "public", "robots.txt"), "utf8");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ vi.mock("@supabase/ssr", () => ({
 
 async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
   const vacio = Buffer.alloc(0);
-  for (const ruta of ["/aeo-control", "/aeo-sana"]) {
+  for (const ruta of ["/aeo-control", "/aeo-sana", "/aeo-hibrida"]) {
     if (pedido.url === `${ORIGEN}${ruta}/`) {
       return { tipo: "respuesta", status: 308, encabezados: { location: ruta }, cuerpo: vacio };
     }
@@ -92,6 +93,8 @@ async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(CONTROL) };
     case `${ORIGEN}/aeo-sana`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(sanaDelDespliegue) };
+    case `${ORIGEN}/aeo-hibrida`:
+      return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/html" }, cuerpo: Buffer.from(HIBRIDA) };
     case `${ORIGEN}/robots.txt`:
       return { tipo: "respuesta", status: 200, encabezados: { "content-type": "text/plain" }, cuerpo: Buffer.from(robotsDelDespliegue) };
     default:
@@ -107,10 +110,17 @@ async function despliegue(pedido: PedidoHttp): Promise<RespuestaHttp> {
  * 154, `renderizado.integracion.test.ts` lo mide de verdad.
  */
 function domQueDibujaElControl(): string {
-  const script = [...CONTROL.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
+  return domQueDibuja(CONTROL, "app");
+}
+
+/** Lo mismo para cualquier página de control: su script escribe el `innerHTML` del elemento `id`. */
+function domQueDibuja(html: string, id: string): string {
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
   const app = { innerHTML: "" };
   new Function("document", script)({ getElementById: () => app });
-  return CONTROL.replace('<div id="app"></div>', `<div id="app">${app.innerHTML}</div>`);
+  const vacio = new RegExp(`<(\\w+) id="${id}"></\\1>`);
+  expect(html, `la página trae el elemento #${id} vacío`).toMatch(vacio);
+  return html.replace(vacio, (_t, etiqueta: string) => `<${etiqueta} id="${id}">${app.innerHTML}</${etiqueta}>`);
 }
 
 let negocioControl = { id: "", organization_id: "org-control", website: "" };
@@ -134,7 +144,12 @@ vi.mock("@/lib/aeo/chromium", () => ({
       // ninguno, y su DOM es el documento que llegó.
       abrirNavegador: navegadorDoble({
         reloj,
-        htmlCrudo: (url) => (url.endsWith("/aeo-control") ? domQueDibujaElControl() : undefined),
+        htmlCrudo: (url) =>
+          url.endsWith("/aeo-control")
+            ? domQueDibujaElControl()
+            : url.endsWith("/aeo-hibrida")
+              ? domQueDibuja(HIBRIDA, "contenido")
+              : undefined,
       }).abrirNavegador,
       transporte: (pedido) => despliegue(pedido),
       resolver: resolvedorDoble({ "morby-local-seo-platform.vercel.app": ["76.76.21.21"] }).resolver,
@@ -411,6 +426,53 @@ describe("PU-4: la sana con el JSON-LD comentado sale ROJA en el schema, por la 
       expect(cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "rojo" });
     } finally {
       sanaDelDespliegue = SANA;
+    }
+  });
+});
+
+/**
+ * F5: los dos controles no veían la regla que compara. La rota sirve 0
+ * caracteres y sale roja por el MÍNIMO; la sana no tiene un script y sale verde
+ * aunque el render no midiera. MEDIDO por la revisión: con la proporción
+ * anulada (`servido < renderizado * FRACCION_MINIMA_SERVIDA` por `false`), la
+ * corrida de la puerta en producción daba lo mismo. El híbrido
+ * (`public/aeo-hibrida/`) sirve un menú y un pie por encima del mínimo y
+ * dibuja con JavaScript más del doble: su rojo de contenido es SÓLO de la
+ * proporción, y con la regla rota sale verde.
+ */
+describe("F5: el control HÍBRIDO sale verde, ROJO, verde por la ruta, y su rojo es el de la proporción", () => {
+  it("el híbrido, por la ruta: acceso y schema verdes, contenido ROJO con lo servido por encima del mínimo", async () => {
+    const { status, cuerpo } = await auditarPorLaRuta(`${ORIGEN}/aeo-hibrida/`);
+    expect(status).toBe(200);
+    expect(cuerpo.urlFinal).toBe(`${ORIGEN}/aeo-hibrida`);
+    const render = cuerpo.lectura.caracteresRenderizados;
+    expect(render?.estado).toBe("medido");
+    if (render?.estado !== "medido") return;
+    // El rojo NO puede venir del mínimo: lo servido lo pasa.
+    expect(render.servidos ?? 0).toBeGreaterThan(MINIMO_DE_TEXTO);
+    expect(render.caracteres).toBeGreaterThan(3 * (render.servidos ?? 0));
+    expect(cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "rojo", schema: "verde" });
+    expect(cuerpo.legible).toBe(false);
+  });
+
+  it("las TRES en la misma corrida: rota 3/3 rojo, sana 3/3 verde, híbrida verde-rojo-verde", async () => {
+    const rota = await auditarPorLaRuta(`${ORIGEN}/aeo-control/`);
+    const sana = await auditarPorLaRuta(`${ORIGEN}/aeo-sana/`);
+    const hibrida = await auditarPorLaRuta(`${ORIGEN}/aeo-hibrida/`);
+    expect(rota.cuerpo.puntos).toEqual({ acceso: "rojo", contenidoSinJs: "rojo", schema: "rojo" });
+    expect(sana.cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "verde", schema: "verde" });
+    expect(hibrida.cuerpo.puntos).toEqual({ acceso: "verde", contenidoSinJs: "rojo", schema: "verde" });
+  });
+
+  it("el HTML del híbrido: lo servido pasa el mínimo con margen, lo de JavaScript es más del doble, el schema es válido y el robots lo deja abierto", () => {
+    const servido = textoSinJavaScript(HIBRIDA);
+    const soloJs = textoSinJavaScript(domQueDibuja(HIBRIDA, "contenido")) - servido;
+    expect(servido).toBeGreaterThan(MINIMO_DE_TEXTO + 150);
+    expect(soloJs).toBeGreaterThan(2 * servido);
+    expect(tiposDeSchema(HIBRIDA)).toEqual(["FAQPage", "LocalBusiness", "Organization"]);
+    expect(erroresDeSchema(HIBRIDA)).toEqual([]);
+    for (const ruta of ["/aeo-hibrida", "/aeo-hibrida/"]) {
+      expect(Object.values(accesoDeLasIA(ROBOTS, ruta)).every(Boolean), ruta).toBe(true);
     }
   });
 });
