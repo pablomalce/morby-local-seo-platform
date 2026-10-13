@@ -34,11 +34,54 @@ export const AGENTES_IA = [
 
 export type AgenteIA = (typeof AGENTES_IA)[number];
 
-/** Una regla de `robots.txt`, ya normalizada. */
+/**
+ * Los topes del `robots.txt`. Lo escribe el sitio auditado —un tercero— y la
+ * ruta lo lee en el servidor: sin topes, un archivo armado para eso decide
+ * cuánto trabajo hace la función.
+ *
+ * Coincidir una regla es LINEAL en el largo de la ruta y del patrón
+ * (`coincide`), así que lo que queda por acotar es cuántas veces se hace y
+ * con qué: un patrón kilométrico, o miles de reglas para el mismo agente —y
+ * la suma de todo, con `PRESUPUESTO_DE_COINCIDENCIA`, porque la ruta también
+ * la elige el sitio—. Pasado cualquiera, lo que ese grupo declara NO SE MIDE —`null`,
+ * «no medido» en la auditoría—. Ignorar la regla podía volver un `Disallow` un
+ * permiso, y truncarla, otro patrón: los dos son verdes inventados.
+ *
+ * Escritos a mano y en un solo lugar: son un juicio, no una medición. Un
+ * patrón real mide decenas de caracteres; un `robots.txt` real grande, cientos
+ * de reglas por grupo.
+ */
+export const MAX_LARGO_DE_PATRON = 2_048;
+export const MAX_REGLAS_POR_GRUPO = 5_000;
+
+/**
+ * Una regla de `robots.txt`, ya preparada para coincidir: el patrón se parte
+ * en tramos y se mide UNA vez, al parsear, y no una vez por agente y por regla.
+ */
+interface Regla {
+  permite: boolean;
+  /** El largo del patrón en octetos: el que RFC 9309 compara para «gana la más larga». */
+  largo: number;
+  /** Los tramos literales entre comodines `*`. Siempre al menos uno. */
+  tramos: string[];
+  /** Termina en `$`: el último tramo tiene que llegar al final de la ruta. */
+  anclado: boolean;
+}
+
 interface Grupo {
   agentes: string[];
-  permite: string[];
-  bloquea: string[];
+  reglas: Regla[];
+  /** Por qué este grupo no se puede evaluar, si pasó un tope. */
+  fueraDeTope: string | null;
+}
+
+/** Uno por módulo: antes se creaba uno por regla y por agente. */
+const CODIFICADOR = new TextEncoder();
+
+function preparar(patron: string, permite: boolean): Regla {
+  const anclado = patron.endsWith("$");
+  const cuerpo = anclado ? patron.slice(0, -1) : patron;
+  return { permite, largo: CODIFICADOR.encode(patron).length, tramos: cuerpo.split("*"), anclado };
 }
 
 /**
@@ -48,6 +91,10 @@ interface Grupo {
  * forma que el estándar define, y la que hace que `User-agent: *` seguido de
  * `User-agent: GPTBot` compartan las mismas reglas — un detalle que, leído mal,
  * hace decir «bloqueado» sobre un sitio abierto.
+ *
+ * Un `Disallow:` o `Allow:` VACÍO no se guarda: no coincide con nada. Es la
+ * manera estándar de decir «pasá», y tratarlo como prefijo vacío bloquearía el
+ * sitio entero — el error que hace informar «bloqueado» sobre un sitio abierto.
  */
 function parsear(robots: string): Grupo[] {
   const grupos: Grupo[] = [];
@@ -66,7 +113,7 @@ function parsear(robots: string): Grupo[] {
 
     if (campo === "user-agent") {
       if (!actual || !ultimaFueAgente) {
-        actual = { agentes: [], permite: [], bloquea: [] };
+        actual = { agentes: [], reglas: [], fueraDeTope: null };
         grupos.push(actual);
       }
       actual.agentes.push(valor.toLowerCase());
@@ -77,83 +124,185 @@ function parsear(robots: string): Grupo[] {
     if (!actual) continue;
     ultimaFueAgente = false;
 
-    if (campo === "disallow") actual.bloquea.push(valor);
-    if (campo === "allow") actual.permite.push(valor);
+    if (campo !== "disallow" && campo !== "allow") continue;
+    if (valor === "" || actual.fueraDeTope) continue;
+    if (valor.length > MAX_LARGO_DE_PATRON) {
+      actual.fueraDeTope = `una regla de ${valor.length} caracteres, y el tope es ${MAX_LARGO_DE_PATRON}`;
+      actual.reglas = [];
+      continue;
+    }
+    if (actual.reglas.length >= MAX_REGLAS_POR_GRUPO) {
+      actual.fueraDeTope = `más de ${MAX_REGLAS_POR_GRUPO} reglas en un grupo`;
+      actual.reglas = [];
+      continue;
+    }
+    actual.reglas.push(preparar(valor, campo === "allow"));
   }
 
   return grupos;
 }
 
 /**
- * Si una ruta cae bajo un patrón de `robots.txt`, con la coincidencia de RFC
+ * Si una ruta cae bajo una regla de `robots.txt`, con la coincidencia de RFC
  * 9309 (§2.2.3): `*` es cualquier secuencia de caracteres, un `$` al final
  * ancla el fin de la ruta, y todo lo demás se compara literal desde el
  * principio.
  *
- * Un `Disallow:` VACÍO no bloquea nada — es la manera estándar de decir «pasá»,
- * y tratarlo como prefijo vacío bloquearía el sitio entero. Es el error que hace
- * que una herramienta informe «bloqueado» sobre un sitio abierto.
+ * SIN `RegExp`, A PROPÓSITO (REDOS). Antes cada `*` se traducía a `.*` y la
+ * expresión hacía backtracking: MEDIDO en Node 26, `/*a*a*a*a*a*b` contra «/»
+ * y 100 «a» tardaba 15 s, y con 30 comodines no terminaba — con un patrón que
+ * escribe el sitio auditado, en el servidor. Ahora cada tramo literal se
+ * busca con `indexOf` DESDE donde terminó el anterior, sin volver atrás: tomar
+ * la PRIMERA aparición de cada tramo deja el mayor resto posible para los que
+ * siguen, así que si esa no alcanza, ninguna alcanza. El último, si está
+ * anclado, tiene que ser el final de la ruta y empezar después de lo ya
+ * consumido.
  *
- * Antes esto era `startsWith` (GATE-4): `Disallow: /*` no bloqueaba ni la raíz,
- * y `Disallow: /aeo-control$` no bloqueaba `/aeo-control`.
+ * Antes de la `RegExp` esto era `startsWith` (GATE-4): `Disallow: /*` no
+ * bloqueaba ni la raíz, y `Disallow: /aeo-control$` no bloqueaba `/aeo-control`.
  */
-function aplica(patron: string, ruta: string): boolean {
-  if (patron === "") return false;
-  const anclado = patron.endsWith("$");
-  const cuerpo = anclado ? patron.slice(0, -1) : patron;
-  const expresion = cuerpo
-    .split("*")
-    .map((tramo) => tramo.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
-    .join(".*");
-  return new RegExp(`^${expresion}${anclado ? "$" : ""}`).test(ruta);
+function coincide(regla: Regla, ruta: string, presupuesto: { restante: number }): boolean | "presupuesto" {
+  const { tramos, anclado } = regla;
+  const primero = tramos[0];
+  // Lo que cada paso puede recorrer, cobrado ANTES de recorrerlo: el primer
+  // tramo se compara en su lugar; los demás barren, como mucho, lo que queda
+  // de la ruta y lo que queda del patrón.
+  presupuesto.restante -= primero.length + 1;
+  if (presupuesto.restante < 0) return "presupuesto";
+  if (!ruta.startsWith(primero)) return false;
+  if (tramos.length === 1) return !anclado || ruta.length === primero.length;
+  presupuesto.restante -= ruta.length - primero.length + regla.largo;
+  if (presupuesto.restante < 0) return "presupuesto";
+
+  let desde = primero.length;
+  const ultimo = tramos.length - 1;
+  for (let i = 1; i < ultimo; i++) {
+    const tramo = tramos[i];
+    if (tramo === "") continue;
+    const en = ruta.indexOf(tramo, desde);
+    if (en < 0) return false;
+    desde = en + tramo.length;
+  }
+  const fin = tramos[ultimo];
+  if (anclado) return ruta.length - fin.length >= desde && ruta.endsWith(fin);
+  return fin === "" || ruta.indexOf(fin, desde) >= 0;
+}
+
+/** Lo que un `robots.txt` le declara a un agente para una ruta: entra, no entra, o no se sabe y por qué. */
+type Decision = { puede: boolean } | { puede: null; fueraDeTope: string };
+
+/**
+ * Cuánto trabajo puede costar decidir el acceso de los cinco agentes, en
+ * caracteres: cada regla cobra lo que como mucho recorre `coincide` —su
+ * primer tramo y, si la ruta empieza con él, el resto de la ruta y del
+ * patrón—.
+ *
+ * Los dos topes de arriba no alcanzan solos, porque la RUTA también la elige
+ * el sitio (es la del último salto de la portada, y un `Location` puede medir
+ * 16 KB). MEDIDO con vitest en esta Mac: 5 grupos propios de 5 000 reglas
+ * `/*ab<n>` contra una ruta de 2 000 «a» tardaron 0,4 s, y contra 16 000, más
+ * de 3 s — dentro de los topes. Con el presupuesto, un `robots.txt` real
+ * (cientos de reglas, rutas de decenas de caracteres) gasta decenas de miles;
+ * el que lo agota deja a los agentes que faltan en «no medido».
+ */
+export const PRESUPUESTO_DE_COINCIDENCIA = 10_000_000;
+
+/**
+ * Los grupos que gobiernan a un agente. Gana el grupo MÁS ESPECÍFICO: si el
+ * agente está nombrado, sus reglas mandan y las de `*` no se miran. Es lo que
+ * dice el estándar, y lo contrario haría que un `Disallow: /` general se
+ * leyera como bloqueo aunque el sitio permita al agente explícitamente. Varios
+ * grupos para el mismo agente se FUSIONAN (RFC 9309 §2.2.1).
+ */
+function aplicablesA(grupos: Grupo[], agente: string): Grupo[] {
+  const nombre = agente.toLowerCase();
+  const propio = grupos.filter((g) => g.agentes.includes(nombre));
+  return propio.length > 0 ? propio : grupos.filter((g) => g.agentes.includes("*"));
 }
 
 /**
- * Si un agente puede entrar a una ruta.
+ * Si los grupos `aplicables` dejan entrar a `ruta`.
  *
- * Gana el grupo MÁS ESPECÍFICO: si el agente está nombrado, sus reglas mandan y
- * las de `*` no se miran. Es lo que dice el estándar, y lo contrario haría que un
- * `Disallow: /` general se leyera como bloqueo aunque el sitio permita al agente
- * explícitamente.
- *
- * Dentro de los grupos que aplican, gana la regla MÁS LARGA que coincide —la
- * más específica, en octetos del patrón— y, a igual largo, `Allow` (RFC 9309
- * §2.2.2). Antes ganaba cualquier `Allow` que coincidiera, y con `Allow: /` y
- * `Disallow: /aeo-control` la página de control salía abierta (GATE-4).
+ * Gana la regla MÁS LARGA que coincide —la más específica, en octetos del
+ * patrón— y, a igual largo, `Allow` (RFC 9309 §2.2.2). Antes ganaba cualquier
+ * `Allow` que coincidiera, y con `Allow: /` y `Disallow: /aeo-control` la
+ * página de control salía abierta (GATE-4).
  */
-export function agentePuede(robots: string, agente: string, ruta = "/"): boolean {
+function decidir(aplicables: Grupo[], ruta: string, presupuesto: { restante: number }): Decision {
   // RFC 9309 §2.2.2: `/robots.txt` se puede leer siempre.
-  if (ruta === "/robots.txt") return true;
-
-  const grupos = parsear(robots);
-  const nombre = agente.toLowerCase();
-
-  const propio = grupos.filter((g) => g.agentes.includes(nombre));
-  const aplicables = propio.length > 0 ? propio : grupos.filter((g) => g.agentes.includes("*"));
+  if (ruta === "/robots.txt") return { puede: true };
 
   // Sin reglas para nadie, `robots.txt` permite. La ausencia de una prohibición
   // NO es una prohibición.
-  if (aplicables.length === 0) return true;
+  if (aplicables.length === 0) return { puede: true };
 
-  const reglas = aplicables.flatMap((g) => [
-    ...g.permite.map((patron) => ({ patron, permite: true })),
-    ...g.bloquea.map((patron) => ({ patron, permite: false })),
-  ]);
+  const excedido = aplicables.find((g) => g.fueraDeTope !== null);
+  if (excedido?.fueraDeTope) return { puede: null, fueraDeTope: excedido.fueraDeTope };
+  // El tope de reglas cuenta el grupo FUSIONADO: dos grupos de `*` que no lo
+  // pasan solos lo pasan juntos.
+  const total = aplicables.reduce((n, g) => n + g.reglas.length, 0);
+  if (total > MAX_REGLAS_POR_GRUPO) {
+    return { puede: null, fueraDeTope: `${total} reglas para el mismo agente, y el tope es ${MAX_REGLAS_POR_GRUPO}` };
+  }
+
   let gana: { largo: number; permite: boolean } | null = null;
-  for (const { patron, permite } of reglas) {
-    if (!aplica(patron, ruta)) continue;
-    const largo = new TextEncoder().encode(patron).length;
-    if (!gana || largo > gana.largo || (largo === gana.largo && permite)) gana = { largo, permite };
+  for (const g of aplicables) {
+    for (const regla of g.reglas) {
+      const { largo, permite } = regla;
+      // Una regla que ya no puede ganar no se compara, ni cobra.
+      if (gana && (largo < gana.largo || (largo === gana.largo && (!permite || gana.permite)))) continue;
+      const r = coincide(regla, ruta, presupuesto);
+      if (r === "presupuesto") {
+        return {
+          puede: null,
+          fueraDeTope: `comparar ${total} reglas contra una ruta de ${ruta.length} caracteres pasa el presupuesto de ${PRESUPUESTO_DE_COINCIDENCIA}`,
+        };
+      }
+      if (r) gana = { largo, permite };
+    }
   }
   // Ninguna regla coincide: se permite.
-  return gana?.permite ?? true;
+  return { puede: gana?.permite ?? true };
+}
+
+/**
+ * Si un agente puede entrar a una ruta. `null` es «no se sabe»: el grupo que
+ * lo gobierna pasó un tope (ver `MAX_LARGO_DE_PATRON`).
+ */
+export function agentePuede(robots: string, agente: string, ruta = "/"): boolean | null {
+  const grupos = parsear(robots);
+  return decidir(aplicablesA(grupos, agente), ruta, { restante: PRESUPUESTO_DE_COINCIDENCIA }).puede;
+}
+
+/**
+ * Qué agentes de IA pueden entrar, uno por uno, con el `robots.txt` parseado
+ * UNA vez para los cinco, y decidido una vez por cada conjunto de grupos
+ * distinto: los agentes sin grupo propio comparten el de `*`. `fueraDeTope`
+ * dice por qué alguno quedó en `null`.
+ */
+export function leerAcceso(
+  robots: string,
+  ruta = "/"
+): { acceso: Record<AgenteIA, boolean | null>; fueraDeTope: string | null } {
+  const grupos = parsear(robots);
+  const presupuesto = { restante: PRESUPUESTO_DE_COINCIDENCIA };
+  const yaDecididos = new Map<string, Decision>();
+  const acceso = {} as Record<AgenteIA, boolean | null>;
+  let fueraDeTope: string | null = null;
+  for (const agente of AGENTES_IA) {
+    const aplicables = aplicablesA(grupos, agente);
+    const clave = aplicables.map((g) => grupos.indexOf(g)).join(",");
+    const d = yaDecididos.get(clave) ?? decidir(aplicables, ruta, presupuesto);
+    yaDecididos.set(clave, d);
+    acceso[agente] = d.puede;
+    if (d.puede === null) fueraDeTope ??= d.fueraDeTope;
+  }
+  return { acceso, fueraDeTope };
 }
 
 /** Qué agentes de IA pueden entrar, uno por uno. */
-export function accesoDeLasIA(robots: string, ruta = "/"): Record<AgenteIA, boolean> {
-  const salida = {} as Record<AgenteIA, boolean>;
-  for (const agente of AGENTES_IA) salida[agente] = agentePuede(robots, agente, ruta);
-  return salida;
+export function accesoDeLasIA(robots: string, ruta = "/"): Record<AgenteIA, boolean | null> {
+  return leerAcceso(robots, ruta).acceso;
 }
 
 /**

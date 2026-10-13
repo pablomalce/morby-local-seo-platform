@@ -4,9 +4,9 @@ import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
 import {
-  accesoDeLasIA,
   AGENTES_IA,
   erroresDeSchema,
+  leerAcceso,
   textoSinJavaScript,
   tiposDeSchema,
 } from "@/lib/aeo/lectura";
@@ -206,15 +206,29 @@ export async function POST(req: Request) {
     // estándar dice: sin robots, se permite. Uno que no se pudo traer deja el
     // acceso en `null` por agente —«no se sabe»—, y el hallazgo lo dice como
     // no medido. Antes los dos se leían «permite a todos» (P3).
+    //
+    // Y uno que se leyó pero pasa los topes (`MAX_LARGO_DE_PATRON`,
+    // `MAX_REGLAS_POR_GRUPO` en `lectura.ts`) deja en `null` a los agentes
+    // que ese grupo gobierna, con el motivo: lo escribe un tercero, y sin
+    // topes decide cuánto trabaja esta función (REDOS).
     const estadoRobots = estadoDelRobots(robots);
-    const acceso =
+    const leido =
       estadoRobots === "no-medido"
-        ? (Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as LecturaDelSitio["acceso"])
-        : accesoDeLasIA(robots.ok ? robots.texto : "", rutaFinal);
+        ? {
+            acceso: Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as LecturaDelSitio["acceso"],
+            fueraDeTope: null,
+          }
+        : leerAcceso(robots.ok ? robots.texto : "", rutaFinal);
+    const acceso = leido.acceso;
+    const robotsNoMedido = !robots.ok
+      ? estadoRobots === "no-medido"
+        ? robots.motivo
+        : null
+      : leido.fueraDeTope && `robots.txt fuera de tope: ${leido.fueraDeTope}`;
 
     const lectura: LecturaDelSitio = {
       acceso,
-      ...(estadoRobots === "no-medido" && !robots.ok ? { robotsNoMedido: robots.motivo } : {}),
+      ...(robotsNoMedido ? { robotsNoMedido } : {}),
       statusPorAgente: statusAgentes,
       caracteresSinJs: textoSinJavaScript(portada.texto),
       caracteresRenderizados,

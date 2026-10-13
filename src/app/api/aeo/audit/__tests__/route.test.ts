@@ -532,6 +532,29 @@ describe("P3: lo que no se midió en el acceso sale «no medido», por la ruta",
     expect(cuerpo.legible).toBeNull();
   });
 
+  it("REDOS: un robots que pasa los topes se lee, y lo que su grupo declara sale «no medido» con el motivo", async () => {
+    // GPTBot tiene su grupo, dentro del tope: se mide. El de `*` trae un
+    // patrón más largo que el tope: los otros cuatro no se miden.
+    respuestas["https://ejemplo.com/robots.txt"] = `User-agent: GPTBot\nDisallow:\n\nUser-agent: *\nDisallow: /${"*a".repeat(1_100)}*b\n`;
+    const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as Cuerpo & {
+      puntos: { acceso: string };
+      lectura: { robotsNoMedido?: string };
+    };
+    expect(cuerpo.estadoRobots).toBe("leido");
+    expect(cuerpo.lectura.acceso).toEqual({
+      gptbot: true,
+      claudebot: null,
+      perplexitybot: null,
+      "google-extended": null,
+      ccbot: null,
+    });
+    expect(cuerpo.lectura.robotsNoMedido).toMatch(/fuera de tope: una regla de 2203 caracteres/);
+    expect(cuerpo.puntos.acceso).toBe("no-medido");
+    expect(cuerpo.hallazgos.map((h) => h.gravedad)).toEqual(["no-medido"]);
+    expect(cuerpo.hallazgos[0].quePasa).toMatch(/fuera de tope.*claudebot, perplexitybot, google-extended, ccbot/);
+    expect(cuerpo.legible).toBeNull();
+  });
+
   it("un robots con 404 SÍ es una respuesta: «no hay robots», deja entrar a todos, y el sitio sano queda verde", async () => {
     respuestas["https://ejemplo.com/robots.txt"] = null;
     const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as Cuerpo;

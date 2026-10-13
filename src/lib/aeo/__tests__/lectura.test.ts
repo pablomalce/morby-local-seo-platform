@@ -9,13 +9,17 @@
  * mano con las formas que aparecen en sitios reales, y no generados desde el
  * mismo código que los interpreta.
  */
+import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 import {
   AGENTES_IA,
+  MAX_LARGO_DE_PATRON,
+  MAX_REGLAS_POR_GRUPO,
   MINIMO_DE_TEXTO,
   accesoDeLasIA,
   agentePuede,
   erroresDeSchema,
+  leerAcceso,
   textoSinJavaScript,
   tiposDeSchema,
 } from "../lectura";
@@ -132,6 +136,154 @@ describe("GATE-4: la coincidencia de RFC 9309 —comodines, fin de ruta y la reg
 
   it("`/robots.txt` siempre se puede leer, aunque el robots lo prohíba", () => {
     expect(agentePuede("User-agent: *\nDisallow: /", "gptbot", "/robots.txt")).toBe(true);
+  });
+
+  it("el `$` del final ancla, y en el medio es un carácter más; los tramos no se pisan", () => {
+    expect(agentePuede("User-agent: *\nDisallow: /$", "gptbot", "/")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: /$", "gptbot", "/x")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /a$b", "gptbot", "/a$b/c")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: /a$b", "gptbot", "/ab")).toBe(true);
+    // El último tramo anclado no puede reusar lo que ya consumió el primero.
+    expect(agentePuede("User-agent: *\nDisallow: /a*a$", "gptbot", "/a")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /a*a$", "gptbot", "/aa")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: /ab*ba", "gptbot", "/aba")).toBe(true);
+    expect(agentePuede("User-agent: *\nDisallow: /ab*ba", "gptbot", "/abba")).toBe(false);
+    expect(agentePuede("User-agent: *\nDisallow: *", "gptbot", "/cualquiera")).toBe(false);
+  });
+});
+
+/**
+ * REDOS: los patrones del `robots.txt` los escribe el sitio auditado, que es
+ * un tercero. `aplica` los traducía a una `RegExp` con cada `*` como `.*`, sin
+ * tope, y un patrón con muchos comodines contra una ruta larga hace
+ * backtracking catastrófico EN EL SERVIDOR. MEDIDO con la versión de la
+ * `RegExp` en Node 26: `/*a*a*a*a*b` contra «/» y 100 «a» tardó 0,9 s; con un
+ * comodín más, 15 s; con 30, no termina.
+ *
+ * La medición corre dentro de `vm` con plazo: si vuelve el backtracking, el
+ * plazo CORTA la `RegExp` (lo interrumpe V8) y el caso da un rojo legible, en
+ * vez de colgar al runner con un bucle que ningún `testTimeout` interrumpe.
+ */
+describe("REDOS: un robots.txt ajeno no puede colgar el servidor", () => {
+  const PATOLOGICO = `User-agent: *\nDisallow: /${"*a".repeat(30)}*b\n`;
+  const RUTA_LARGA = `/${"a".repeat(2_000)}`;
+
+  /** Corre `f` con un plazo que interrumpe incluso una `RegExp` en backtracking. */
+  function conPlazo<T>(f: () => T, ms: number): { valor: T; ms: number } {
+    const inicio = performance.now();
+    const valor = vm.runInNewContext("medir()", { medir: f }, { timeout: ms }) as T;
+    return { valor, ms: performance.now() - inicio };
+  }
+
+  it("treinta comodines contra una ruta de 2 000 caracteres terminan en milisegundos, con la respuesta correcta", () => {
+    const { valor, ms } = conPlazo(() => accesoDeLasIA(PATOLOGICO, RUTA_LARGA), 2_000);
+    // No hay ninguna «b»: el patrón no coincide y el agente entra.
+    expect(valor.gptbot).toBe(true);
+    expect(ms).toBeLessThan(100);
+    // Y cuando sí coincide, también en milisegundos.
+    const conB = conPlazo(() => accesoDeLasIA(PATOLOGICO, `${RUTA_LARGA}b`), 2_000);
+    expect(conB.valor.gptbot).toBe(false);
+    expect(conB.ms).toBeLessThan(100);
+  });
+
+  /**
+   * El oráculo es la traducción a `RegExp` de antes, que era CORRECTA y lenta:
+   * sobre entradas chicas, donde no se cuelga, las dos tienen que contestar
+   * lo mismo. Generado con una semilla fija, para que un rojo se reproduzca.
+   */
+  it("el matcher lineal contesta lo mismo que la RegExp en 4 000 casos chicos", () => {
+    const comoRegExp = (patron: string, ruta: string) => {
+      const anclado = patron.endsWith("$");
+      const cuerpo = anclado ? patron.slice(0, -1) : patron;
+      const expresion = cuerpo
+        .split("*")
+        .map((t) => t.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*");
+      return new RegExp(`^${expresion}${anclado ? "$" : ""}`).test(ruta);
+    };
+    let semilla = 9309;
+    const azar = (n: number) => {
+      semilla = (semilla * 1103515245 + 12345) % 2 ** 31;
+      return semilla % n;
+    };
+    const palabra = (alfabeto: string, largo: number) =>
+      Array.from({ length: largo }, () => alfabeto[azar(alfabeto.length)]).join("");
+    const distintos: string[] = [];
+    for (let i = 0; i < 4_000; i++) {
+      const patron = `/${palabra("ab*$", azar(7))}${azar(3) === 0 ? "$" : ""}`;
+      const ruta = `/${palabra("ab$", azar(9))}`;
+      const esperado = !comoRegExp(patron, ruta);
+      const obtenido = agentePuede(`User-agent: *\nDisallow: ${patron}`, "gptbot", ruta);
+      if (obtenido !== esperado) distintos.push(`${patron} contra ${ruta}: ${obtenido}, la RegExp dice ${esperado}`);
+    }
+    expect(distintos).toEqual([]);
+  });
+});
+
+/**
+ * Los topes: el trabajo de coincidir es lineal por regla, pero un robots puede
+ * traer miles de reglas o un patrón kilométrico. Pasado el tope, lo que ese
+ * grupo dice NO SE MIDE —`null`, «no medido»—: ignorar la regla podía
+ * convertir un `Disallow` en un verde, y truncarla, en otro patrón.
+ */
+describe("los topes del robots.txt: fuera de tope es «no medido», nunca un permiso", () => {
+  it("un patrón más largo que el tope deja sin medir a los agentes de ese grupo, y sólo a ellos", () => {
+    const largo = `/${"x".repeat(MAX_LARGO_DE_PATRON)}`;
+    const robots = `User-agent: GPTBot\nDisallow: /privado\n\nUser-agent: *\nDisallow: ${largo}\n`;
+    const { acceso, fueraDeTope } = leerAcceso(robots, "/");
+    expect(acceso.gptbot, "GPTBot tiene su grupo, que está dentro del tope").toBe(true);
+    expect(acceso.claudebot).toBeNull();
+    expect(fueraDeTope).toMatch(new RegExp(`${largo.length} caracteres`));
+    // En el tope justo, se mide.
+    const justo = `User-agent: *\nDisallow: /${"x".repeat(MAX_LARGO_DE_PATRON - 1)}\n`;
+    expect(accesoDeLasIA(justo, "/").claudebot).toBe(true);
+  });
+
+  it("más reglas que el tope en el grupo que aplica —contando los grupos que se fusionan— deja sin medir", () => {
+    const reglas = (n: number, prefijo: string) =>
+      Array.from({ length: n }, (_, i) => `Disallow: /${prefijo}${i}`).join("\n");
+    const mitad = Math.ceil((MAX_REGLAS_POR_GRUPO + 1) / 2);
+    // Dos grupos de `*` se fusionan (RFC 9309 §2.2.1): ninguno pasa el tope solo.
+    const fusionado = `User-agent: *\n${reglas(mitad, "a")}\n\nUser-agent: *\n${reglas(mitad, "b")}\n`;
+    const { acceso, fueraDeTope } = leerAcceso(fusionado, "/");
+    expect(acceso.gptbot).toBeNull();
+    expect(fueraDeTope).toMatch(/reglas/);
+    const enElTope = `User-agent: *\n${reglas(MAX_REGLAS_POR_GRUPO - 1, "a")}\nDisallow: /\n`;
+    expect(accesoDeLasIA(enElTope, "/").gptbot).toBe(false);
+  });
+
+  it("al parsear, un grupo que pasa el tope deja de guardar reglas ahí mismo: no se arma lo que no se va a usar", () => {
+    const reglas = Array.from({ length: MAX_REGLAS_POR_GRUPO * 3 }, (_, i) => `Disallow: /r${i}`).join("\n");
+    const { acceso, fueraDeTope } = leerAcceso(`User-agent: *\n${reglas}\n`, "/");
+    expect(acceso.ccbot).toBeNull();
+    // El motivo del PARSEO, no el del grupo fusionado: el grupo no llegó a
+    // guardar las 15 000.
+    expect(fueraDeTope).toBe(`más de ${MAX_REGLAS_POR_GRUPO} reglas en un grupo`);
+  });
+
+  /**
+   * La ruta también la elige el sitio, y los dos topes solos no acotaban el
+   * trabajo: MEDIDO, cinco grupos de 5 000 reglas `/*ab<n>` contra una ruta de
+   * 16 000 «a» tardaban más de 3 s. El presupuesto lo corta y lo dice.
+   */
+  it("el peor caso dentro de los topes —5 grupos llenos contra una ruta larga— termina rápido, y es «no medido»", () => {
+    const agentes = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "CCBot"];
+    const robots = agentes
+      .map((a) => `User-agent: ${a}\n${Array.from({ length: MAX_REGLAS_POR_GRUPO }, (_, i) => `Disallow: /*ab${i}`).join("\n")}`)
+      .join("\n\n");
+    const inicio = performance.now();
+    const { acceso, fueraDeTope } = leerAcceso(robots, `/${"a".repeat(16_000)}`);
+    const ms = performance.now() - inicio;
+    expect(Object.values(acceso)).toEqual([null, null, null, null, null]);
+    expect(fueraDeTope).toMatch(/presupuesto/);
+    expect(ms).toBeLessThan(1_000);
+  });
+
+  it("un robots.txt real y grande sí se mide contra una ruta larga: cobra lo que recorre, no el largo de la ruta por regla", () => {
+    const reglas = Array.from({ length: MAX_REGLAS_POR_GRUPO - 1 }, (_, i) => `Disallow: /categoria-${i}/*?orden=`);
+    const ruta = `/${"a".repeat(16_000)}`;
+    expect(accesoDeLasIA(`User-agent: *\n${reglas.join("\n")}\n`, ruta).gptbot).toBe(true);
+    expect(accesoDeLasIA(`User-agent: *\n${reglas.join("\n")}\nDisallow: /*a$\n`, ruta).gptbot).toBe(false);
   });
 });
 
