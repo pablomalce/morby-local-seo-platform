@@ -140,12 +140,14 @@ function pedido(cuerpo: unknown): Request {
 }
 
 const HTML_SANO = `<html><body><p>${"contenido real ".repeat(80)}</p>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization"}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"LocalBusiness"}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage"}</script></body></html>`;
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Ejemplo"}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"LocalBusiness","name":"Ejemplo","address":"Calle 1, Ciudad"}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"¿Qué?","acceptedAnswer":{"@type":"Answer","text":"Esto."}}]}</script></body></html>`;
 // Los tres bloques llevan @context desde que existe el validador: sin él no
 // son JSON-LD sino JSON, y el «sitio sano» de este fixture no lo era. El
-// validador nuevo lo dijo antes que nadie — que es para lo que está.
+// validador nuevo lo dijo antes que nadie — que es para lo que está. Y desde
+// F6, lo mínimo de cada tipo: un LocalBusiness sin nombre ni dirección no es
+// un schema sano, y tampoco lo era el de este fixture.
 
 beforeEach(() => {
   usuario = { id: "u1" };

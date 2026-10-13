@@ -11,6 +11,7 @@
  */
 import vm from "node:vm";
 import { describe, expect, it } from "vitest";
+import { puntosDeLaPuerta } from "../hallazgos";
 import {
   AGENTES_IA,
   MAX_LARGO_DE_PATRON,
@@ -326,7 +327,9 @@ describe("GATE-9: el JSON-LD se valida, no sólo se busca", () => {
   const bloque = (cuerpo: string, tipo = '"application/ld+json"') => `<script type=${tipo}>${cuerpo}</script>`;
 
   it("un `@context` que no es schema.org es un error, con el valor que trae", () => {
-    const errores = erroresDeSchema(bloque('{"@context":"https://example.com/nada","@type":"LocalBusiness"}'));
+    const errores = erroresDeSchema(
+      bloque('{"@context":"https://example.com/nada","@type":"LocalBusiness","name":"X","address":"Calle 1"}')
+    );
     expect(errores).toEqual([expect.stringMatching(/bloque 1: @context no es schema\.org.*example\.com\/nada/)]);
   });
 
@@ -337,7 +340,7 @@ describe("GATE-9: el JSON-LD se valida, no sólo se busca", () => {
       '["https://schema.org", {"ex": "https://example.com/"}]',
       '{"@vocab": "https://schema.org/"}',
     ]) {
-      expect(erroresDeSchema(bloque(`{"@context":${ctx},"@type":"Organization"}`)), ctx).toEqual([]);
+      expect(erroresDeSchema(bloque(`{"@context":${ctx},"@type":"Organization","name":"X"}`)), ctx).toEqual([]);
     }
   });
 
@@ -402,7 +405,8 @@ describe("PU-4: el JSON-LD se lee donde un parser de HTML lo lee, y un @type vac
   });
 
   it("un `@type` vacío, o que no es texto, es un error y no es un tipo", () => {
-    const bloque = (tipo: string) => `<script type="application/ld+json">{"@context":"https://schema.org","@type":${tipo}}</script>`;
+    const bloque = (tipo: string) =>
+      `<script type="application/ld+json">{"@context":"https://schema.org","@type":${tipo},"name":"X"}</script>`;
     for (const tipo of ['""', '"   "', "5", "null", "[]", '[""]', "{}"]) {
       expect(erroresDeSchema(bloque(tipo)), tipo).toEqual([expect.stringMatching(/bloque 1: un nodo con @type vacío o que no es texto/)]);
       expect(tiposDeSchema(bloque(tipo)), tipo).toEqual([]);
@@ -463,5 +467,98 @@ describe("cuánto texto hay sin JavaScript", () => {
       <!-- un comentario > con signo de mayor -->
       <template><p>Una fila que el JavaScript clona</p></template><p>hola</p></body></html>`;
     expect(textoSinJavaScript(html)).toBe(4);
+  });
+});
+
+/**
+ * F6: el validador era de presencia un nivel más abajo. MEDIDO por la revisión
+ * con `erroresDeSchema`, `tiposDeSchema` y `puntosDeLaPuerta`: un `@type`
+ * inventado, un `LocalBusiness` vacío y uno con valores absurdos salían
+ * «Schema verificable: VERDE». Los tres casos, tal cual, y la puerta que
+ * deciden.
+ */
+describe("F6: un @type que schema.org no define, o un tipo que importa sin lo mínimo, es un error", () => {
+  const ld = (...nodos: string[]) => nodos.map((n) => `<script type="application/ld+json">${n}</script>`).join("\n");
+  const puntoSchema = (html: string) =>
+    puntosDeLaPuerta({
+      acceso: Object.fromEntries(AGENTES_IA.map((a) => [a, true])) as Record<(typeof AGENTES_IA)[number], boolean>,
+      caracteresSinJs: 0,
+      schema: tiposDeSchema(html),
+      erroresDeSchema: erroresDeSchema(html),
+      tieneLlmsTxt: false,
+    }).schema;
+
+  it("los tres casos de la revisión salen ROJOS, y cada error dice qué falta", () => {
+    const bananaa = ld('{"@context":"https://schema.org","@type":"Bananaa"}');
+    expect(erroresDeSchema(bananaa)).toEqual(['bloque 1: @type "Bananaa" no es un tipo de schema.org']);
+    expect(puntoSchema(bananaa)).toBe("rojo");
+
+    const vacio = ld('{"@context":"https://schema.org","@type":"LocalBusiness"}');
+    expect(erroresDeSchema(vacio)).toEqual(['bloque 1: LocalBusiness sin "name"', 'bloque 1: LocalBusiness sin "address"']);
+    expect(puntoSchema(vacio)).toBe("rojo");
+
+    const absurdo = ld(
+      '{"@context":"https://schema.org","@type":"LocalBusiness","name":"X","telephone":{"x":1},"address":42,"openingHours":true}'
+    );
+    expect(erroresDeSchema(absurdo)).toEqual([
+      'bloque 1: LocalBusiness con "telephone" que no es texto ({"x":1})',
+      'bloque 1: LocalBusiness con "openingHours" que no es texto (true)',
+      'bloque 1: LocalBusiness con "address" que no es un PostalAddress o texto (42)',
+    ]);
+    expect(puntoSchema(absurdo)).toBe("rojo");
+  });
+
+  it("los SUBTIPOS cuentan como su tipo, y el tipo se reconoce con prefijo o como IRI", () => {
+    expect(erroresDeSchema(ld('{"@context":"https://schema.org","@type":"Restaurant","name":"La Esquina"}'))).toEqual([
+      'bloque 1: Restaurant sin "address"',
+    ]);
+    expect(erroresDeSchema(ld('{"@context":"https://schema.org","@type":"Corporation"}'))).toEqual(['bloque 1: Corporation sin "name"']);
+    for (const tipo of ["schema:Dentist", "https://schema.org/Dentist", "http://schema.org/Dentist"]) {
+      expect(erroresDeSchema(ld(`{"@context":"https://schema.org","@type":"${tipo}","name":"D","address":"Calle 1"}`)), tipo).toEqual([]);
+    }
+  });
+
+  it("FAQPage: sin preguntas, con una pregunta sin nombre o sin respuesta con texto, o con una referencia que no está, es un error", () => {
+    expect(erroresDeSchema(ld('{"@context":"https://schema.org","@type":"FAQPage"}'))).toEqual([
+      'bloque 1: FAQPage sin "mainEntity" (las preguntas)',
+    ]);
+    const faq = (preguntas: string) => ld(`{"@context":"https://schema.org","@type":"FAQPage","mainEntity":${preguntas}}`);
+    expect(erroresDeSchema(faq('[{"@type":"Question","acceptedAnswer":{"@type":"Answer","text":"Sí."}}]'))).toEqual([
+      'bloque 1: FAQPage, la pregunta 1 sin "name"',
+    ]);
+    expect(erroresDeSchema(faq('{"@type":"Question","name":"¿Abren?","acceptedAnswer":{"@type":"Answer"}}'))).toEqual([
+      'bloque 1: FAQPage, la pregunta 1 sin "acceptedAnswer" con "text"',
+    ]);
+    expect(erroresDeSchema(faq('[{"@id":"#no-esta"}]'))).toEqual([
+      "bloque 1: FAQPage, la pregunta 1 apunta a un @id que la página no declara",
+    ]);
+    expect(erroresDeSchema(faq('["¿Abren?"]'))).toEqual(['bloque 1: FAQPage, la entrada 1 de "mainEntity" no es una Question']);
+  });
+
+  it("lo que escriben los plugins reales sigue VERDE: Yoast con referencias por @id, RankMath con dos tipos, y un negocio repartido en dos nodos", () => {
+    // Yoast: el FAQ es un WebPage+FAQPage cuyas preguntas son nodos aparte del @graph.
+    const yoast = ld(`{"@context":"https://schema.org","@graph":[
+      {"@type":"Organization","@id":"https://x.test/#organization","name":"X","url":"https://x.test/","logo":{"@type":"ImageObject","url":"https://x.test/logo.png"},"sameAs":["https://instagram.com/x"]},
+      {"@type":"WebSite","@id":"https://x.test/#website","url":"https://x.test/","name":"X","publisher":{"@id":"https://x.test/#organization"}},
+      {"@type":["WebPage","FAQPage"],"@id":"https://x.test/faq","mainEntity":[{"@id":"https://x.test/faq#q1"}]},
+      {"@type":"Question","@id":"https://x.test/faq#q1","name":"¿Abren los domingos?","acceptedAnswer":{"@type":"Answer","text":"No."}}
+    ]}`);
+    expect(erroresDeSchema(yoast)).toEqual([]);
+    expect(puntoSchema(yoast)).toBe("verde");
+    // RankMath, sitio personal: Person y Organization a la vez.
+    expect(erroresDeSchema(ld('{"@context":"https://schema.org","@type":["Person","Organization"],"name":"Ana"}'))).toEqual([]);
+    // El mismo @id en dos bloques se FUSIONA, como en JSON-LD.
+    const repartido = ld(
+      '{"@context":"https://schema.org","@type":"LocalBusiness","@id":"#local","name":"Panadería"}',
+      '{"@context":"https://schema.org","@id":"#local","@type":"Bakery","address":{"@type":"PostalAddress","streetAddress":"Calle 1"},"geo":{"@type":"GeoCoordinates","latitude":1,"longitude":2}}'
+    );
+    expect(erroresDeSchema(repartido)).toEqual([]);
+  });
+
+  it("lo que NO valida, dicho: un nodo ANIDADO no pide lo mínimo (el publisher de un Article)", () => {
+    const anidado = ld(
+      '{"@context":"https://schema.org","@type":"Article","headline":"Hola","publisher":{"@type":"Organization"}}'
+    );
+    expect(erroresDeSchema(anidado)).toEqual([]);
   });
 });
