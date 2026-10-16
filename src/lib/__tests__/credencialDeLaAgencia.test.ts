@@ -92,6 +92,15 @@
  * el cliente de sesión, y nada más. Un módulo nuevo al que le pase el token
  * tiene que importarlo, y entonces es un receptor declarado o un rojo.
  *
+ * Eso medía sólo lo de ADENTRO del árbol. Medido el 2026-10-16 en la revisión
+ * del #123, con tsc, eslint y esta pared en verde: un receptor —o la puerta—
+ * le dejaba el token a `node:diagnostics_channel`, a `next/cache`, a `node:fs`,
+ * a la cookie de `next/headers`, o al `BroadcastChannel` global sin importar
+ * nada, y una ruta nueva sin ningún import del árbol lo recibía. Ahora lo que la
+ * puerta y cada receptor usan de AFUERA —lo que importan, y los globales del
+ * lenguaje y de Node que nombran— es exacto y está en `DE_AFUERA`, con su razón;
+ * y la puerta tampoco toca lo global.
+ *
  * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
  *
  * Un detector ciego da el mismo verde que un árbol limpio. Antes de mirar `src`,
@@ -232,6 +241,39 @@ const RECEPTORES: Array<Receptor & { porque: string }> = [
   },
 ];
 
+/**
+ * Lo que la puerta y cada receptor usan de AFUERA del árbol, exacto: lo que
+ * importan como valor (un paquete, un módulo de Node) y los globales del
+ * lenguaje y de Node que nombran. Los cuatro tienen el token en la mano.
+ *
+ * Uno nuevo es una decisión: `next/cache`, `node:fs`, `node:diagnostics_channel`
+ * o un `BroadcastChannel` guardan el token donde lo lea otra ruta, y una cookie
+ * lo manda al navegador. Si es inocuo —un `Math`—, va acá con su razón.
+ */
+const DE_AFUERA: Record<string, { importa: string[]; globales: string[]; porque: string }> = {
+  [PUERTA]: {
+    importa: [],
+    globales: ["Object", "console", "fetch"],
+    porque:
+      "`fetch` es el transporte que les pasa a los receptores; `Object.freeze` congela los mapeos; `console.warn` avisa el mapeo rechazado, sin el token",
+  },
+  [SEARCH_CONSOLE]: {
+    importa: [],
+    globales: ["Array", "Date", "JSON", "Number", "encodeURIComponent"],
+    porque: "arma la ventana (`Date`), la URL (`encodeURIComponent`) y el cuerpo (`JSON`), y valida la respuesta (`Array`, `Number`)",
+  },
+  [GA4]: {
+    importa: [],
+    globales: ["Array", "JSON", "Number", "encodeURIComponent"],
+    porque: "arma la URL y el cuerpo, y valida la respuesta; la ventana la toma de Search Console",
+  },
+  [BUSINESS_PROFILE]: {
+    importa: [],
+    globales: ["JSON", "encodeURIComponent"],
+    porque: "arma la URL de la ficha y el cuerpo del post",
+  },
+};
+
 const POLITICA: Politica = {
   variable: VARIABLE,
   lector: LECTOR,
@@ -287,9 +329,12 @@ const VIRTUALES: Record<string, string> = {
       return admin().from("integration_tokens").select("expires_at").eq("organization_id", org);
     }`,
   // La puerta, con la reexportación de la segunda revisión del #118 puesta: el
-  // detector tiene que verla en lo que la puerta exporta y en quién la usa. Y le
+  // detector tiene que verla en lo que la puerta exporta y en quién la usa. Le
   // pasa el token a cada receptor de abajo, como la de verdad a los tres suyos.
+  // Y G01 de la revisión del #123: ella misma lo deja en `next/cache`, que lee
+  // cualquier ruta con la misma clave, y en un global del repositorio.
   "servicioCompartido.ts": `
+    import { unstable_cache } from "next/cache";
     import { agencyAccessToken } from "./tokenStore";
     import { consultar } from "./receptor";
     import { consultarHermano } from "./receptorHermano";
@@ -299,11 +344,18 @@ const VIRTUALES: Record<string, string> = {
     import { consultarAlEntorno } from "./receptorAlEntorno";
     import { consultarAlGlobal } from "./receptorAlGlobal";
     import { consultarAlDesnudo } from "./receptorGlobalDeclarado";
+    import { consultarAlCanal } from "./receptorAlCanal";
+    import { consultarCacheando } from "./receptorALaCache";
+    import { consultarAlDisco } from "./receptorAlDisco";
+    import { consultarPorElCanalGlobal } from "./receptorAlCanalGlobal";
     const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo];
+    const deAfuera = [consultarAlCanal, consultarCacheando, consultarAlDisco, consultarPorElCanalGlobal];
     export async function servir(mapeos: string[]) {
       if (mapeos.length === 0) return null;
       const accessToken = String(await agencyAccessToken());
-      for (const r of conTrampa) await r({ accessToken });
+      await unstable_cache(async () => accessToken, ["virtual"])();
+      ultimoDeLaPuerta = accessToken;
+      for (const r of [...conTrampa, ...deAfuera]) await r({ accessToken });
       await consultarHermano({ accessToken, ahora: new Date() });
       return consultar({ accessToken, ref: mapeos[0], fetcher: fetch });
     }
@@ -364,15 +416,53 @@ const VIRTUALES: Record<string, string> = {
     export function consultarAlGlobal(deps: { accessToken: string }) {
       globalThis.cacheDeGoogle = deps.accessToken;
     }`,
+  // Una variable, una función, una clase, un enum y un namespace: cada clase
+  // de valor global que el repositorio puede declarar (F2 de la revisión del
+  // #123: sin la función, la clase o el namespace, la suite seguía en verde).
   "globales.ts": `
-    declare global { var tokenAjeno: string | undefined }
+    declare global {
+      var tokenAjeno: string | undefined;
+      var ultimoDeLaPuerta: string | undefined;
+      function guardarTokenGlobal(t: string): void;
+      class CajaGlobal { static token: string }
+      enum NivelGlobal { Bajo }
+      namespace cacheGlobal { let token: string }
+    }
     export {};`,
   "receptorGlobalDeclarado.ts": `
     declare global { var tokenPropio: string | undefined }
     export function consultarAlDesnudo(deps: { accessToken: string }) {
       tokenPropio = deps.accessToken;
       tokenAjeno = deps.accessToken;
+      guardarTokenGlobal(deps.accessToken);
+      CajaGlobal.token = deps.accessToken;
+      (NivelGlobal as unknown as { t?: string }).t = deps.accessToken;
+      cacheGlobal.token = deps.accessToken;
     }`,
+  // Lo de AFUERA del árbol (revisión del #123): un módulo de Node, un paquete y
+  // un global del runtime, que guardan estado de todo el proceso. EV-1: la ruta
+  // que recibe el token no importa nada del árbol, así que no es una fuga.
+  "receptorAlCanal.ts": `
+    import { channel } from "node:diagnostics_channel";
+    export function consultarAlCanal(deps: { accessToken: string }) { channel("gsc").publish(deps.accessToken); }`,
+  "app/api/canal/route.ts": `
+    import { subscribe } from "node:diagnostics_channel";
+    let visto: unknown = null;
+    subscribe("gsc", (m) => { visto = m; });
+    export async function GET() { return visto; }`,
+  "receptorALaCache.ts": `
+    import { unstable_cache } from "next/cache";
+    export async function consultarCacheando(deps: { accessToken: string }) { return unstable_cache(async () => deps.accessToken, ["gsc"])(); }`,
+  // Por `require()` y por `import()` literales, en un .js.
+  "receptorAlDisco.js": `
+    const { writeFileSync } = require("node:fs");
+    export async function consultarAlDisco(deps) {
+      writeFileSync("/tmp/gsc", deps.accessToken);
+      await (await import("node:fs/promises")).writeFile("/tmp/gsc-2", deps.accessToken);
+    }`,
+  // Sin importar nada: el BroadcastChannel que declaran el lenguaje y Node.
+  "receptorAlCanalGlobal.ts": `
+    export function consultarPorElCanalGlobal(deps: { accessToken: string }) { new BroadcastChannel("gsc").postMessage(deps.accessToken); }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
@@ -381,6 +471,12 @@ const VIRTUALES: Record<string, string> = {
   // puerta virtual reexporta, y sería un falso positivo.
   "datosPorImportDinamico.ts": `
     export const reporte = async () => (await import("./servicioCompartido")).servir(["properties/2"]);`,
+  // La anotación que SIGUE siendo el namespace: se rastrea igual de preciso.
+  "datosPorImportAnotado.ts": `
+    export const reporte = async () => {
+      const puerta: typeof import("./servicioCompartido") = await import("./servicioCompartido");
+      return puerta.servir(["properties/3"]);
+    };`,
   "conexion.ts": `
     import { resolveAgencyOrgId } from "./agency";
     export const conectar = () => resolveAgencyOrgId();`,
@@ -448,6 +544,30 @@ const VIRTUALES: Record<string, string> = {
     import * as almacen from "./tokenStore";
     export const operador = () => resolveAgencyOrgId();
     export const clics = () => { const { ["agencyAccessToken"]: token } = almacen; return token(); };`,
+  // La variable anotada con un tipo que ya no es el namespace (EV-2 de la
+  // revisión del #123): sin aserción, la variable deja de ser el namespace y su
+  // `.agencyAccessToken` no tiene símbolo. Con un `import()` y con un
+  // `import * as`.
+  "conexionPorAnotacion.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = async () => {
+      const almacen: Record<string, (...a: never[]) => unknown> = await import("./tokenStore");
+      return almacen.agencyAccessToken();
+    };`,
+  "conexionPorAny.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    import * as almacen from "./tokenStore";
+    export const operador = () => resolveAgencyOrgId();
+    export const clics = () => { const a: any = almacen; return a.agencyAccessToken(); };`,
+  // Lo mismo sobre un receptor, desde un módulo de conexión, que no es fuga.
+  "conexionAlReceptor.ts": `
+    import { resolveAgencyOrgId } from "./agency";
+    export const operador = () => resolveAgencyOrgId();
+    export const ultimo = async () => {
+      const r: Record<string, unknown> = await import("./receptorGuarda");
+      return r.ultimoToken;
+    };`,
   // La clave dice ser otra pieza que existe (cuarta revisión del #118): con la
   // clave leída de su TIPO, esto usaba `proveedor` y no el token.
   "conexionPorClaveAsertada.ts": `
@@ -611,6 +731,28 @@ const VIRTUALES: Record<string, string> = {
   "rpcPorElemento.ts": `
     import { admin } from "./admin";
     export const secreto = () => admin()[["r", "p", "c"].join("") as "rpc"]("integration_token" + "_secret");`,
+  // El cliente entra a `unknown` sin aserción y sale por una firma de índice
+  // (EV-3 de la revisión del #123): la aserción no pierde ningún método
+  // declarado, y el `.rpc` de un índice no era de la base.
+  "clientePorIndice.ts": `
+    import { admin } from "./admin";
+    type Indice = { [m: string]: (...a: unknown[]) => unknown };
+    export const secreto = (org: string) => { const c: unknown = admin(); return (c as Indice).rpc("integration_token" + "_secret", { p_organization_id: org }); };`,
+  "clientePorRegistro.ts": `
+    import { admin } from "./admin";
+    export const secreto = () => {
+      const c: unknown = admin();
+      const r = (c as Record<string, unknown>).rpc as (nombre: string) => unknown;
+      return r("integration_token" + "_secret");
+    };`,
+  // Por el mismo índice, con el nombre del método armado.
+  "clientePorIndiceArmado.ts": `
+    import { admin } from "./admin";
+    type Indice = { [m: string]: (...a: unknown[]) => unknown };
+    export const secreto = () => {
+      const c: unknown = admin();
+      return (c as Indice)[["r", "p", "c"].join("")]("integration_token" + "_secret");
+    };`,
   "urlCruda.ts": `
     export const secreto = (url: string) => fetch(url + "/rest/v1/rpc/integration_token_secret", { method: "POST" });`,
   "esquemaDelVault.ts": `
@@ -692,7 +834,10 @@ const VIRTUALES: Record<string, string> = {
     export const bytes = (s: string) => Buffer.from(s, "utf8");
     export const tipos = (lectura: { schema: string[] }) => lectura.schema.length;
     const pasos: Array<() => number> = [() => 1];
-    export const paso = (i: number) => pasos[i]();`,
+    export const paso = (i: number) => pasos[i]();
+    const acciones: Record<string, () => number> = { uno: () => 1 };
+    export const accion = () => acciones.uno();
+    export const campo = (fila: Record<string, unknown>, k: string) => fila[k];`,
   "controlPasaElEntorno.ts": `
     function leer(env: NodeJS.ProcessEnv) { return env.OTRA_VARIABLE; }
     export const valor = () => leer(process.env);`,
@@ -721,6 +866,8 @@ const VIRTUALES: Record<string, string> = {
 
 /** Las exenciones de conexión que piden el token sin nombrarlo con un identificador. */
 const CONEXION_SIN_IDENTIFICADOR = [
+  "conexionPorAnotacion.ts",
+  "conexionPorAny.ts",
   "conexionPorCargador.ts",
   "conexionPorClaveArmada.js",
   "conexionPorClaveAsertada.ts",
@@ -735,7 +882,13 @@ const CONEXION_SIN_IDENTIFICADOR = [
  * De ésas, las que no dicen QUÉ pieza piden —la clave no está escrita, o el
  * namespace se va a otra función—: usan todo lo que el almacén exporta.
  */
-const USAN_TODO_EL_ALMACEN = ["conexionPorClaveArmada.js", "conexionPorClaveAsertada.ts", "conexionPorReflect.ts"];
+const USAN_TODO_EL_ALMACEN = [
+  "conexionPorAnotacion.ts",
+  "conexionPorAny.ts",
+  "conexionPorClaveArmada.js",
+  "conexionPorClaveAsertada.ts",
+  "conexionPorReflect.ts",
+];
 
 /** Los receptores virtuales que guardan el token donde lo lea otro, con la función que les pasa la puerta. */
 const RECEPTORES_CON_TRAMPA: ReadonlyArray<readonly [string, string]> = [
@@ -745,6 +898,10 @@ const RECEPTORES_CON_TRAMPA: ReadonlyArray<readonly [string, string]> = [
   ["receptorAlEntorno.ts", "consultarAlEntorno"],
   ["receptorAlGlobal.ts", "consultarAlGlobal"],
   ["receptorGlobalDeclarado.ts", "consultarAlDesnudo"],
+  ["receptorAlCanal.ts", "consultarAlCanal"],
+  ["receptorALaCache.ts", "consultarCacheando"],
+  ["receptorAlDisco.js", "consultarAlDisco"],
+  ["receptorAlCanalGlobal.ts", "consultarPorElCanalGlobal"],
 ];
 
 const POLITICA_VIRTUAL: Politica = {
@@ -765,6 +922,7 @@ const POLITICA_VIRTUAL: Politica = {
     { modulo: `${V}/conexion.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
     { modulo: `${V}/conexionConToken.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
     ...CONEXION_SIN_IDENTIFICADOR.map((m) => ({ modulo: `${V}/${m}`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] })),
+    { modulo: `${V}/conexionAlReceptor.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
     { modulo: `${V}/yaNoLlega.ts`, usa: [] },
   ],
   // `usadoPor` es lo que la política DECLARA; lo que se mide está en el test.
@@ -887,6 +1045,9 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "calleeAsertado.ts",
         "clienteComoIndice.ts",
         "clienteJsdoc.js",
+        "clientePorIndice.ts",
+        "clientePorIndiceArmado.ts",
+        "clientePorRegistro.ts",
         "receptorAsertado.ts",
         "rpcArmada.ts",
         "rpcDesestructurada.ts",
@@ -907,6 +1068,13 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(sitios).toContain(`${V}/rpcPorAsignacion.ts:4 destructuring de un método de la base`);
     expect(sitios).toContain(`${V}/clienteJsdoc.js:3 una aserción le saca el tipo a .rpc, .from, .schema`);
     expect(sitios).toContain(`${V}/rpcPorElemento.ts:3 un método que puede ser de la base, con un nombre que no se lee`);
+    // EV-3 de la revisión del #123: el cliente que pasó por `unknown` y sale por
+    // un índice. La llamada, la aserción a un índice que se puede llamar, y el
+    // `.rpc` leído de un registro de valores `unknown`.
+    expect(sitios).toContain(`${V}/clientePorIndice.ts:4 .rpc("integration_token" + "_secret")`);
+    expect(sitios).toContain(`${V}/clientePorIndice.ts:4 una aserción de algo sin tipo a un índice que se puede llamar: c as Indice`);
+    expect(sitios).toContain(`${V}/clientePorRegistro.ts:5 .rpc sin llamarlo`);
+    expect(sitios).toContain(`${V}/clientePorIndiceArmado.ts:6 un método que puede ser de la base, con un nombre que no se lee`);
   });
 
   it("el grafo: un import() que no se puede seguir, uno con query, uno que no resuelve, y las cargas de webpack", () => {
@@ -965,6 +1133,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorGuarda.ts`]: {
           [puerta]: ["consultarGuardando"],
           [`${V}/app/api/seo/search-console/route.ts`]: ["ultimoToken"],
+          // EV-2: el namespace en una variable anotada, desde una exención.
+          [`${V}/conexionAlReceptor.ts`]: ["consultarGuardando", "ultimoToken"],
         },
         // Ningún export mutable: el token colgado de la función. Se ve igual.
         [`${V}/receptorEnLaFuncion.ts`]: { [puerta]: ["consultarColgando"], [`${V}/usaLaFuncion.ts`]: ["consultarColgando"] },
@@ -972,6 +1142,10 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlEntorno.ts`]: { [puerta]: ["consultarAlEntorno"] },
         [`${V}/receptorAlGlobal.ts`]: { [puerta]: ["consultarAlGlobal"] },
         [`${V}/receptorGlobalDeclarado.ts`]: { [puerta]: ["consultarAlDesnudo"] },
+        [`${V}/receptorAlCanal.ts`]: { [puerta]: ["consultarAlCanal"] },
+        [`${V}/receptorALaCache.ts`]: { [puerta]: ["consultarCacheando"] },
+        [`${V}/receptorAlDisco.js`]: { [puerta]: ["consultarAlDisco"] },
+        [`${V}/receptorAlCanalGlobal.ts`]: { [puerta]: ["consultarPorElCanalGlobal"] },
       });
     });
 
@@ -989,17 +1163,55 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlEntorno.ts`]: [],
         [`${V}/receptorAlGlobal.ts`]: [],
         [`${V}/receptorGlobalDeclarado.ts`]: [],
+        // Lo de afuera del árbol no está acá: va abajo.
+        [`${V}/receptorAlCanal.ts`]: [],
+        [`${V}/receptorALaCache.ts`]: [],
+        [`${V}/receptorAlDisco.js`]: [],
+        [`${V}/receptorAlCanalGlobal.ts`]: [],
       });
     });
 
-    it("un receptor que toca el entorno, el objeto global o un global del repositorio, cada sitio con su línea", () => {
-      expect(virtual.receptoresTocanLoGlobal.sort()).toEqual(
+    it("lo que la puerta y cada receptor usan de AFUERA del árbol: un paquete, un módulo de Node, un global del runtime", () => {
+      // EV-1 y F1 de la revisión del #123: la ruta de `app/api/canal` recibe el
+      // token sin importar nada del árbol, así que no es una fuga ni usa un
+      // receptor. Lo único que lo delata es lo que el receptor usa de afuera.
+      expect(virtual.fugas.some((f) => f.startsWith(`${V}/app/api/canal/route.ts`))).toBe(false);
+      const nada = { importa: [], globales: [] };
+      expect(virtual.deAfuera).toEqual({
+        // G01: la puerta misma, con `next/cache`.
+        [puerta]: { importa: ["next/cache"], globales: ["Date", "String", "fetch"] },
+        // Los controles: lo que usan del lenguaje, nada importado.
+        [`${V}/receptor.ts`]: { importa: [], globales: ["Date", "JSON", "encodeURIComponent"] },
+        [`${V}/receptorHermano.ts`]: { importa: [], globales: ["JSON"] },
+        [`${V}/receptorGuarda.ts`]: nada,
+        [`${V}/receptorEnLaFuncion.ts`]: nada,
+        [`${V}/receptorDeposita.ts`]: nada,
+        [`${V}/receptorAlEntorno.ts`]: { importa: [], globales: ["process"] },
+        [`${V}/receptorAlGlobal.ts`]: nada,
+        [`${V}/receptorGlobalDeclarado.ts`]: nada,
+        [`${V}/receptorAlCanal.ts`]: { importa: ["node:diagnostics_channel"], globales: [] },
+        [`${V}/receptorALaCache.ts`]: { importa: ["next/cache"], globales: [] },
+        // Por `require()` y por `import()` literales.
+        [`${V}/receptorAlDisco.js`]: { importa: ["node:fs", "node:fs/promises"], globales: ["require"] },
+        [`${V}/receptorAlCanalGlobal.ts`]: { importa: [], globales: ["BroadcastChannel"] },
+      });
+    });
+
+    it("la puerta o un receptor que tocan el entorno, el objeto global o un global del repositorio, cada sitio con su línea", () => {
+      expect(virtual.conElTokenTocanLoGlobal.sort()).toEqual(
         [
           `${V}/receptorAlEntorno.ts:3 el entorno: process.env.CACHE_DE_GOOGLE`,
           `${V}/receptorAlEntorno.ts:3 process: process.env`,
           `${V}/receptorAlGlobal.ts:4 el objeto global: globalThis.cacheDeGoogle`,
           `${V}/receptorGlobalDeclarado.ts:4 tokenPropio, un valor global que declara ${V}/receptorGlobalDeclarado.ts`,
           `${V}/receptorGlobalDeclarado.ts:5 tokenAjeno, un valor global que declara ${V}/globales.ts`,
+          // F2 de la revisión del #123: cada clase de valor global, con su línea.
+          `${V}/receptorGlobalDeclarado.ts:6 guardarTokenGlobal, un valor global que declara ${V}/globales.ts`,
+          `${V}/receptorGlobalDeclarado.ts:7 CajaGlobal, un valor global que declara ${V}/globales.ts`,
+          `${V}/receptorGlobalDeclarado.ts:8 NivelGlobal, un valor global que declara ${V}/globales.ts`,
+          `${V}/receptorGlobalDeclarado.ts:9 cacheGlobal, un valor global que declara ${V}/globales.ts`,
+          // La puerta tiene el token igual que ellos.
+          `${V}/servicioCompartido.ts:22 ultimoDeLaPuerta, un valor global que declara ${V}/globales.ts`,
         ].sort()
       );
       // El control: lo que declaran el lenguaje y Node no es un global ajeno.
@@ -1037,17 +1249,25 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       ...Object.fromEntries(
         CONEXION_SIN_IDENTIFICADOR.map((m) => [`${V}/${m}`, USAN_TODO_EL_ALMACEN.includes(m) ? conTodo : conToken])
       ),
+      // EV-2: lo que usa del receptor está en la superficie, igual que el token.
+      [`${V}/conexionAlReceptor.ts`]: [
+        `${V}/agency.ts#resolveAgencyOrgId`,
+        `${V}/receptorGuarda.ts#consultarGuardando`,
+        `${V}/receptorGuarda.ts#ultimoToken`,
+      ],
       [`${V}/yaNoLlega.ts`]: [],
     });
   });
 
   it("lo legítimo pasa: la ruta de datos por la puerta, la de conexión, y los controles", () => {
     expect(virtual.porLaPuerta).toEqual(
-      en(["atajoPorLaPuerta.ts", "datosLegitimos.ts", "datosPorImportDinamico.ts", "usaAbreviado.ts"])
+      en(["atajoPorLaPuerta.ts", "datosLegitimos.ts", "datosPorImportAnotado.ts", "datosPorImportDinamico.ts", "usaAbreviado.ts"])
     );
-    expect([...analisisVirtual.lecturas.get(`${V}/datosPorImportDinamico.ts`)!.usa]).toEqual([
-      `${V}/servicioCompartido.ts#servir`,
-    ]);
+    // Con un import() esperado, y con la variable anotada con el tipo del
+    // namespace (el control de EV-2): la regla de la puerta, y nada más.
+    for (const control of ["datosPorImportDinamico.ts", "datosPorImportAnotado.ts"]) {
+      expect([...analisisVirtual.lecturas.get(`${V}/${control}`)!.usa], control).toEqual([`${V}/servicioCompartido.ts#servir`]);
+    }
     expect(analisisVirtual.lecturas.get(`${V}/controlEstilos.ts`)!.sinResolver).toEqual([]);
     expect(analisisVirtual.lecturas.get(`${V}/controlSoloTipos.ts`)!.usa.size).toBe(0);
     const marcados = new Set([
@@ -1066,8 +1286,10 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       "controlLaBase.ts",
       "controlNoEsLaBase.ts",
       "datosLegitimos.ts",
+      "datosPorImportAnotado.ts",
       "datosPorImportDinamico.ts",
       "conexion.ts",
+      "app/api/canal/route.ts",
     ])) {
       expect(marcados.has(control), `${control} no es una fuga y el detector lo marcó`).toBe(false);
     }
@@ -1305,13 +1527,27 @@ describe("el árbol de src, leído del disco", () => {
       ).toEqual(Object.fromEntries(RECEPTORES.map((r) => [r.modulo, []])));
     });
 
-    it("un receptor no toca process, el entorno, el objeto global ni un global del repositorio", () => {
+    it("lo que la puerta y cada receptor usan de afuera del árbol es exactamente lo declarado", () => {
+      // EV-1 y F1 de la revisión del #123: `channel(...).publish(token)` de
+      // `node:diagnostics_channel` en searchConsole.ts, y una ruta nueva que lo
+      // recibía sin importar nada del árbol, pasaban tsc, eslint y esta pared.
+      // Que los globales del lenguaje estén es también la anti-vacuidad: si el
+      // detector no cosechara nada, el mapa de abajo no coincidiría.
+      expect(
+        real.deAfuera,
+        "La puerta o un receptor usan algo nuevo de afuera del árbol: un paquete, un módulo de Node o un " +
+          "global del runtime. Tienen el token en la mano, y un next/cache, un node:fs, un canal o una cookie " +
+          "lo guardan donde lo lea otra ruta. Si es inocuo, va a DE_AFUERA con su razón."
+      ).toEqual(Object.fromEntries(Object.entries(DE_AFUERA).map(([m, { importa, globales }]) => [m, { importa, globales }])));
+    });
+
+    it("ni la puerta ni un receptor tocan process, el entorno, el objeto global ni un global del repositorio", () => {
       // Anti-vacuidad: en el árbol de verdad el detector ve lo que tiene que
       // ver. agency.ts lee el entorno (`env: NodeJS.ProcessEnv = process.env`).
       expect(analisisReal.lecturas.get(LECTOR)!.tocaLoGlobal.join("\n")).toContain(`${LECTOR}:`);
       expect(
-        real.receptoresTocanLoGlobal,
-        "Lo que un receptor escribe ahí lo lee cualquier módulo del proceso, y el receptor tiene el token."
+        real.conElTokenTocanLoGlobal,
+        "Lo que la puerta o un receptor escriben ahí lo lee cualquier módulo del proceso, y tienen el token."
       ).toEqual([]);
     });
   });

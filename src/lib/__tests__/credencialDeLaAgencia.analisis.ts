@@ -46,7 +46,15 @@
  * lenguaje o Node (`Array.from`, `Buffer.from`). Una aserción ya no lo esconde
  * —ni sobre el método, ni sobre el cliente—, y sacarlo del cliente sin llamarlo
  * (un `.bind`, un `.call`, un destructuring) es no saber con qué nombre se lo va
- * a llamar.
+ * a llamar. Tampoco lo esconde una firma de índice: medido el 2026-10-16 en la
+ * revisión del #123, `const c: unknown = admin(); (c as { [m: string]: (...a:
+ * unknown[]) => unknown }).rpc("integration_token" + "_secret")` pedía el
+ * secreto con tsc, eslint y la pared en verde. La aserción sale de `unknown`, que
+ * no tiene métodos que perder, y el `.rpc` de un índice no era un método
+ * declarado. Ahora un tipo con un índice de texto puede ser la base: con el
+ * nombre escrito (`.rpc`), cualquier índice; con uno que no se lee, uno cuyos
+ * valores se pueden llamar (ver `indiceDeTexto`). Y una aserción de `unknown` o
+ * `any` a un índice así es una falla por sí misma.
  *
  * LO QUE COSECHA, POR ARCHIVO
  *
@@ -54,6 +62,16 @@
  *                    misma resolución que usa `tsc` (los `paths` de tsconfig,
  *                    las extensiones, los `index`). Un `import type` se borra al
  *                    compilar y no es un camino;
+ *   importaAfuera    los imports de VALOR que resuelven AFUERA del árbol —un
+ *                    paquete, un módulo de Node, un JSON o una hoja de estilos
+ *                    que no son de `src`—, también por `import()` o
+ *                    `require()` literal, con el especificador como está
+ *                    escrito. Sólo se juzgan en la puerta y los receptores
+ *                    (ver abajo);
+ *   globales         los valores globales que declaran el lenguaje o Node y
+ *                    que el módulo nombra (`JSON`, `fetch`, `BroadcastChannel`):
+ *                    lo de afuera que se usa sin importarlo. También se juzgan
+ *                    sólo en la puerta y los receptores;
  *   sinResolver      un `import()` o `require()` cuyo destino no es un literal,
  *                    todo especificador literal que `tsc` no resuelve a un
  *                    módulo del árbol ni a un paquete, y toda carga que resuelve
@@ -92,8 +110,9 @@
  *   tocaLoGlobal     cada sitio donde toca algo que comparte con todo el proceso:
  *                    `process`, el entorno, el objeto global, o un valor global
  *                    que no declaran el lenguaje ni Node (un `declare global {
- *                    var x }`, propio o de otro archivo). Sólo se juzga en los
- *                    RECEPTORES del token (ver abajo).
+ *                    var x }`, una función, una clase, un enum o un namespace,
+ *                    propio o de otro archivo). Sólo se juzga en la puerta y
+ *                    los RECEPTORES del token (ver abajo).
  *
  * POR QUÉ TAMBIÉN SÍMBOLOS, Y NO SÓLO EL GRAFO DE ARCHIVOS
  *
@@ -145,10 +164,25 @@
  *   - por ARCHIVO, que un receptor es una credencial más: llegar a él sin la
  *     puerta es una fuga, como llegar a `tokenStore.ts`;
  *   - que no importa nada de valor fuera de los receptores: el token no sale de
- *     ellos hacia otro módulo que lo guarde;
+ *     ellos hacia otro módulo del árbol que lo guarde;
  *   - que no toca `process`, el entorno, el objeto global ni un valor global
  *     declarado por el repositorio (`tocaLoGlobal`): el token no queda donde lo
  *     lea cualquiera.
+ *
+ * Y LO DE AFUERA DEL ÁRBOL (revisión del #123)
+ *
+ * Medido el 2026-10-16 con tsc, eslint y la pared en verde: `importa` sólo
+ * cosechaba lo que resuelve DENTRO del árbol, así que un receptor —o la misma
+ * puerta— le dejaba el token a un módulo de afuera que guarda estado de todo el
+ * proceso: `channel("e1").publish(token)` de `node:diagnostics_channel`, un
+ * `unstable_cache` de `next/cache`, un `writeFileSync` de `node:fs`, o la cookie
+ * de `next/headers`, que lo manda al navegador. Y sin importar nada, el
+ * `BroadcastChannel` global hace lo mismo. Ahora, para la puerta y cada
+ * receptor, lo que usan de afuera es exacto y está declarado: lo que importan de
+ * afuera (`importaAfuera`, hoy nada) y los globales del lenguaje y de Node que
+ * nombran (`globales`, hoy `JSON`, `fetch` y sus vecinos). Uno nuevo es un rojo
+ * hasta que alguien escriba por qué. Y la puerta, que tiene el token igual que
+ * ellos, tampoco toca lo global.
  *
  * QUÉ NO VE, Y ESTÁ DICHO
  *
@@ -160,13 +194,22 @@
  *     (`orchestrator.servicioCompartido.test.ts` y el de la publicación).
  *   - Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
  *     `require()` (un `eval`, un `new Function`, que también pueden devolver
- *     `process` sin tipo).
+ *     `process` sin tipo). En la puerta y los receptores, `eval` y `Function`
+ *     son globales que habría que declarar; el `constructor` de una función
+ *     (`f.constructor("...")`) no es un global, y no se ve.
+ *   - Un global del lenguaje que la puerta o un receptor ya usan, usado para
+ *     otra cosa: el `console.warn` de la puerta con el token adentro. La lista
+ *     dice QUÉ globales, no qué se les pasa.
  *   - Un cliente de la base que se va, sin aserción, a una función que no lo
- *     tipa (`Reflect.get(cliente, "rpc")`, `Object.values(cliente)`) y cuyo
- *     método se llama después: el cliente no se rastrea como `process`. Ver
- *     arriba: SÍ ve el método sacado por `.bind`, `.call`, destructuring o un
- *     nombre que no está escrito, y el cliente que una aserción convierte en otra
- *     cosa.
+ *     tipa (`Reflect.get(cliente, "rpc")`, `Object.values(cliente)`) o a una
+ *     variable `unknown`, y cuyo método se llama después sin nombrarlo: el
+ *     cliente no se rastrea como `process`. Ver arriba: SÍ ve el método sacado
+ *     por `.bind`, `.call`, destructuring o un nombre que no está escrito, el
+ *     cliente que una aserción convierte en otra cosa, y el `.rpc` de cualquier
+ *     cosa que tenga una firma de índice. Lo que no ve es un índice de valores
+ *     `unknown` leído por una clave que no está escrita (ver `indiceDeTexto`):
+ *     un cliente que entró a `unknown`, leído por `Record<string, unknown>` con
+ *     una clave armada y llamado con el nombre de la RPC también armado.
  *   - Un módulo que reemplaza el `fetch` global y lee lo que la puerta o
  *     `tokenStore.ts` le mandan a Google (el access token, el refresh token).
  *   - Un secreto que llegue por la red desde otro servicio sin nombrar ninguna de
@@ -195,6 +238,8 @@ export const NOMBRES_DE_CUSTODIA = [
 
 export interface Lectura {
   importa: string[];
+  importaAfuera: string[];
+  globales: Set<string>;
   sinResolver: string[];
   usa: Set<string>;
   exporta: string[];
@@ -507,10 +552,12 @@ export function analizar(
     return programa.isSourceFileDefaultLibrary(f) || /[\\/]node_modules[\\/]@types[\\/]node[\\/]/.test(f.fileName);
   };
   // ¿Este nombre es un valor GLOBAL que no declaran el lenguaje ni Node? Un
-  // `declare global { var x }` —en el mismo archivo o en otro— o un `declare
+  // `declare global { var x }` —o una función, una clase, un enum o un
+  // namespace con valores, en el mismo archivo o en otro— o un `declare
   // const`: un lugar que comparte todo el proceso y que no es `process` ni el
   // objeto global, así que `fuenteDe` no lo ve. Un import no: su símbolo es un
-  // alias, no un valor, y lo miden `importa` y `usa`. Y un nombre sin
+  // alias, no un valor; lo de adentro del árbol lo miden `importa` y `usa`, y lo
+  // de afuera (un paquete, un módulo de Node) `importaAfuera`. Y un nombre sin
   // declaración (`undefined`, `globalThis`) tampoco: el objeto global lo ve
   // `fuenteDe`.
   const VALOR_CON_NOMBRE =
@@ -520,6 +567,16 @@ export function analizar(
     return (
       (s.declarations ?? []).find((d) => !delLenguaje(d) && (d.getSourceFile() !== sf || enContextoAmbiental(d))) ?? null
     );
+  };
+  // ¿Este nombre es un valor global que declaran SÓLO el lenguaje o Node? `JSON`,
+  // `fetch`, `console`, `BroadcastChannel`: lo de afuera que se usa sin
+  // importarlo. Un import no: su alias se declara en el archivo que importa (lo
+  // mide `importaAfuera`). Lo que declara también el repositorio es un global
+  // ajeno, y un nombre sin declaración (`undefined`, `globalThis`) lo ve
+  // `fuenteDe`.
+  const globalDelRuntime = (s: ts.Symbol): boolean => {
+    const declaraciones = s.declarations ?? [];
+    return declaraciones.length > 0 && declaraciones.every(delLenguaje);
   };
   const SIN_TIPO = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
   const llamable = (t: ts.Type): boolean => {
@@ -537,8 +594,36 @@ export function analizar(
     if (declaraciones.length > 0 && declaraciones.every(delLenguaje)) return false;
     return llamable(checker.getTypeOfSymbol(prop));
   };
+  /**
+   * Un índice de texto: `{ [m: string]: T }`, `Record<string, T>`. Cualquier
+   * nombre puede ser el de un método, también `rpc`. Ver el encabezado: medido
+   * en la revisión del #123.
+   *
+   * Con un nombre ESCRITO (`.rpc`, `["from"]`) cuenta todo índice: nada lee un
+   * `.rpc` de un registro si no es para llamarlo. Con un nombre que no se lee
+   * (`x[k]`), sólo si lo que se lee se puede llamar —`(...a) => unknown`,
+   * `Function`, `any`—: un índice de valores `unknown` (`Record<string,
+   * unknown>`) existe para leerle un campo por una clave calculada (`fila[campo]`
+   * en `searchConsole.ts`, `fuente[clave]` en `payload.ts`), y lo que devuelve no
+   * se llama sin otra aserción. Ver «QUÉ NO VE».
+   */
+  const TEXTO = ts.TypeFlags.String | ts.TypeFlags.TemplateLiteral | ts.TypeFlags.StringMapping;
+  const indiceDeTexto = (tipo: ts.Type, soloLlamable: boolean): boolean => {
+    const t = checker.getApparentType(checker.getNonNullableType(tipo));
+    const miembros = t.isUnion() ? t.types : [t];
+    return miembros.some((m) =>
+      checker.getIndexInfosOfType(m).some((i) => (i.keyType.flags & TEXTO) !== 0 && (!soloLlamable || llamable(i.type)))
+    );
+  };
+  const sinTipo = (t: ts.Type) => (checker.getNonNullableType(t).flags & SIN_TIPO) !== 0;
+  /** ¿`nombre`, escrito, leído de un valor de tipo `receptor`, puede ser un método de la base? */
   const puedeSerDeLaBase = (receptor: ts.Type, nombre: string): boolean =>
-    (checker.getNonNullableType(receptor).flags & SIN_TIPO) !== 0 || metodoDeclarado(receptor, nombre);
+    sinTipo(receptor) || metodoDeclarado(receptor, nombre) || indiceDeTexto(receptor, false);
+  /** ¿Y un nombre que no se lee? */
+  const algunoPuedeSerDeLaBase = (receptor: ts.Type): boolean =>
+    sinTipo(receptor) ||
+    [...METODOS_DE_LA_BASE].some((m) => metodoDeclarado(receptor, m)) ||
+    indiceDeTexto(receptor, true);
   // Las claves de un elemento de un patrón: `{ rpc }`, `{ rpc: r }`, `{ ["rpc"]: r }`.
   // `null` = no se sabe (un resto, una clave calculada que no se lee).
   const claveDeElemento = (e: ts.BindingElement): string[] | null => {
@@ -675,6 +760,8 @@ export function analizar(
     if (!sf) throw new Error(`el programa no cargó ${abs}`);
     const lectura: Lectura = {
       importa: [],
+      importaAfuera: [],
+      globales: new Set(),
       sinResolver: [],
       usa: new Set(),
       exporta: [],
@@ -689,7 +776,8 @@ export function analizar(
     const seguir = (n: ts.Node, especificador: string) => {
       const d = resolver(abs, especificador);
       if ("arbol" in d) lectura.importa.push(d.arbol);
-      else if ("falla" in d) lectura.sinResolver.push(`${donde(n)} ${JSON.stringify(especificador)}: ${d.falla}`);
+      else if ("afuera" in d) lectura.importaAfuera.push(especificador);
+      else lectura.sinResolver.push(`${donde(n)} ${JSON.stringify(especificador)}: ${d.falla}`);
     };
     const vistos = new Set<ts.Node>();
 
@@ -854,7 +942,18 @@ export function analizar(
       }
       if (ts.isTypeOfExpression(p) || ts.isExpressionStatement(p)) return;
       if (ts.isVariableDeclaration(p) && p.initializer === n) {
-        if (ts.isIdentifier(p.name)) return; // la variable es el namespace: se rastrea por su símbolo
+        // La variable es el namespace, y se rastrea por su símbolo, sólo si su
+        // TIPO lo sigue siendo. Medido el 2026-10-16 en la revisión del #123: con
+        // `const almacen: Record<string, (...a: never[]) => unknown> = await
+        // import("./tokenStore")` —o `: any`, sin aserción— la variable deja de
+        // ser un namespace, `almacen.agencyAccessToken` no tiene símbolo, y una
+        // server action de `property-actions.ts` pedía el token con tsc, eslint y
+        // la pared en verde. Una anotación que lo ensancha es un `as any`.
+        if (ts.isIdentifier(p.name)) {
+          const variable = checker.getSymbolAtLocation(p.name);
+          if (!variable || !namespaceDelArbol(checker.getTypeOfSymbol(variable))) usarTodo(namespace);
+          return;
+        }
         if (ts.isObjectBindingPattern(p.name)) {
           for (const e of p.name.elements) {
             if (e.dotDotDotToken) usarTodo(namespace);
@@ -944,7 +1043,7 @@ export function analizar(
         const receptor = checker.getTypeAtLocation(nodo.expression);
         const nombres = ts.isPropertyAccessExpression(nodo) ? [nodo.name.text] : clavesDe(checker, nodo.argumentExpression);
         if (nombres === null) {
-          if ([...METODOS_DE_LA_BASE].some((m) => puedeSerDeLaBase(receptor, m))) {
+          if (algunoPuedeSerDeLaBase(receptor)) {
             lectura.supabaseOpaco.push(
               `${donde(nodo)} un método que puede ser de la base, con un nombre que no se lee: ${nodo.getText(sf).slice(0, 80)}`
             );
@@ -990,6 +1089,15 @@ export function analizar(
             `${donde(nodo)} una aserción le saca el tipo a .${pierde.join(", .")}: ${nodo.getText(sf).slice(0, 80)}`
           );
         }
+        // Y desde algo que ya no tiene tipo —`unknown`, `any`— hacia un índice
+        // que se puede llamar: no pierde ningún método declarado porque ya los
+        // perdió antes, sin aserción (`const c: unknown = admin()`). Ver
+        // `indiceDeTexto`.
+        if ((antes.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 && indiceDeTexto(despues, true)) {
+          lectura.supabaseOpaco.push(
+            `${donde(nodo)} una aserción de algo sin tipo a un índice que se puede llamar: ${nodo.getText(sf).slice(0, 80)}`
+          );
+        }
       }
       // Lo mismo sacado por destructuring: `const { rpc } = cliente` deja un
       // método de la base suelto, igual que un `.bind`. En una declaración, en un
@@ -1006,7 +1114,7 @@ export function analizar(
         for (const claves of patron.claves) {
           const tomaDeLaBase =
             claves === null
-              ? [...METODOS_DE_LA_BASE].some((m) => puedeSerDeLaBase(patron.tipo, m))
+              ? algunoPuedeSerDeLaBase(patron.tipo)
               : claves.some((c) => METODOS_DE_LA_BASE.has(c) && puedeSerDeLaBase(patron.tipo, c));
           if (tomaDeLaBase) {
             lectura.supabaseOpaco.push(`${donde(nodo)} destructuring de un método de la base: ${nodo.getText(sf).slice(0, 80)}`);
@@ -1067,6 +1175,8 @@ export function analizar(
               `${donde(nodo)} ${nodo.text}, un valor global que declara ${rel(ajeno.getSourceFile().fileName)}`
             );
           }
+          // O uno que sí declaran. Ver `globalDelRuntime`.
+          if (globalDelRuntime(s)) lectura.globales.add(nodo.text);
         }
       }
       // Un acceso por elemento sobre un namespace que no se nombró arriba (el de
@@ -1192,10 +1302,16 @@ export interface Veredicto {
   conexionUsa: Record<string, string[]>;
   /** Receptor → módulo de producción que usa sus exports de valor → cuáles, medido. */
   usosDeLosReceptores: Record<string, Record<string, string[]>>;
-  /** Receptor → lo que importa como valor fuera de los receptores, medido. */
+  /** Receptor → lo que importa como valor, dentro del árbol, fuera de los receptores, medido. */
   receptoresImportan: Record<string, string[]>;
-  /** Los sitios donde un receptor toca `process`, el entorno, el objeto global o un global del repositorio. */
-  receptoresTocanLoGlobal: string[];
+  /**
+   * La puerta y cada receptor → lo que usan de afuera del árbol, medido: lo que
+   * importan como valor (el especificador) y los globales del lenguaje y de Node
+   * que nombran.
+   */
+  deAfuera: Record<string, { importa: string[]; globales: string[] }>;
+  /** Los sitios donde la puerta o un receptor tocan `process`, el entorno, el objeto global o un global del repositorio. */
+  conElTokenTocanLoGlobal: string[];
 }
 
 export function juzgar(a: Analisis, politica: Politica): Veredicto {
@@ -1260,8 +1376,16 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
   }
 
   // Los receptores, por símbolo: quién usa qué de cada uno, qué importan fuera
-  // de los receptores, y dónde tocan lo que comparte todo el proceso.
+  // de los receptores, y dónde tocan lo que comparte todo el proceso. Lo de
+  // afuera del árbol y lo global, también en la puerta: tiene el token igual.
   const esReceptor = new Set(receptores);
+  const conElToken = [politica.puerta, ...receptores];
+  const deAfuera: Record<string, { importa: string[]; globales: string[] }> = {};
+  for (const m of conElToken) {
+    deAfuera[m] = a.lecturas.has(m)
+      ? { importa: [...new Set(de(m).importaAfuera)].sort(), globales: [...de(m).globales].sort() }
+      : { importa: [], globales: [] };
+  }
   const usosDeLosReceptores: Record<string, Record<string, string[]>> = {};
   const receptoresImportan: Record<string, string[]> = {};
   for (const r of receptores) {
@@ -1292,7 +1416,8 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     conexionUsa,
     usosDeLosReceptores,
     receptoresImportan,
-    receptoresTocanLoGlobal: receptores.filter((r) => a.lecturas.has(r)).flatMap((r) => de(r).tocaLoGlobal),
+    deAfuera,
+    conElTokenTocanLoGlobal: conElToken.filter((r) => a.lecturas.has(r)).flatMap((r) => de(r).tocaLoGlobal),
   };
 }
 
