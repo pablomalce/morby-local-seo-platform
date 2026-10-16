@@ -110,6 +110,31 @@ const CRECIENTE = `<!doctype html><html><head><meta charset="utf-8"></head><body
 </body></html>`;
 
 /**
+ * F3 (tardío): el contenido llega con un temporizador LARGO, mucho después de
+ * que el texto se quedó quieto. MEDIDO por la revisión con Chrome real sobre
+ * `9fb77e8`: 4 s y 7 s daban 610 contra 610, VERDE. Y con un ciclo de
+ * `MessageChannel` al lado, que es como agenda React: sin un tope de hambre
+ * el reloj virtual no avanza nunca (ver `chromium.ts`).
+ */
+const tardia = (ms: number, extra = "") => `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>
+<script>${extra}setTimeout(() => { document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_TARDE)}; }, ${ms});</script>
+</body></html>`;
+const CICLO_DE_MENSAJES = "const c = new MessageChannel(); c.port1.onmessage = () => c.port2.postMessage(0); c.port2.postMessage(0);";
+/** El temporizador largo pide los datos: el pedido sale durante el adelanto, y pasa por el interceptor. */
+const tardiaConDatos = (url: string) => `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>
+<script>setTimeout(() => { fetch(${JSON.stringify(url)}).then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {}); }, 7000);</script>
+</body></html>`;
+/**
+ * El reloj se DETIENE mientras el pedido está en vuelo: los datos tardan 2 s
+ * reales y, cuando llegan, otro temporizador de 5 s los escribe. Si el reloj
+ * siguiera corriendo durante el pedido, el adelanto se gastaría antes de que
+ * lleguen y el segundo temporizador quedaría congelado afuera.
+ */
+const TARDIA_ENCADENADA = `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>
+<script>setTimeout(() => { fetch("/datos-lentos").then((r) => r.text()).then((t) => { setTimeout(() => { document.getElementById("app").textContent = t; }, 5000); }).catch(() => {}); }, 7000);</script>
+</body></html>`;
+
+/**
  * P5 y GATE-1: lo que cuenta y lo que no, de los DOS lados. Un párrafo
  * visible y un bloque oculto por CSS cuentan —un rastreador sin JavaScript no
  * aplica CSS—; el código de un `<script>` largo en línea y el aviso de un
@@ -469,6 +494,29 @@ beforeAll(async () => {
         return html(AL_VERSE);
       case "/creciente":
         return html(CRECIENTE);
+      case "/tardia-4s":
+        return html(tardia(4_000));
+      case "/tardia-7s":
+        return html(tardia(7_000));
+      case "/tardia-7s-mensajes":
+        return html(tardia(7_000, CICLO_DE_MENSAJES));
+      case "/tardia-29s":
+        return html(tardia(29_000));
+      case "/tardia-datos":
+        return html(tardiaConDatos("/datos-tardios"));
+      case "/tardia-datos-caidos":
+        return html(tardiaConDatos("http://cdn-v6.test/datos-tardios"));
+      case "/datos-tardios":
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        return res.end(CONTENIDO_TARDE);
+      case "/tardia-encadenada":
+        return html(TARDIA_ENCADENADA);
+      case "/datos-lentos":
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(CONTENIDO_TARDE);
+        }, 2_000);
+        return;
       case "/subrecursos":
         return html(paginaConSubrecursos());
       case "/popup-webrtc":
@@ -898,6 +946,58 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     },
     60_000
   );
+
+  describe("F3 (tardío) — lo que el JavaScript escribe mucho después de la quietud se cuenta, en tiempo virtual", () => {
+    for (const [ruta, que] of [
+      ["/tardia-4s", "un temporizador de 4 s"],
+      ["/tardia-7s", "un temporizador de 7 s"],
+      ["/tardia-7s-mensajes", "un temporizador de 7 s con un ciclo de MessageChannel que no deja de agendar"],
+      ["/tardia-datos", "un temporizador de 7 s que PIDE los datos al sitio"],
+      ["/tardia-encadenada", "un temporizador de 7 s cuyos datos tardan 2 s reales y se escriben con otro de 5 s"],
+    ] as const) {
+      it(
+        `${que}: se cuenta, y el punto sale ROJO —antes, servido igual a renderizado y VERDE—`,
+        async () => {
+          const d = deps();
+          const inicio = Date.now();
+          const render = await medirRenderizado(`http://sitio.test${ruta}`, d);
+          const servido = textoSinJavaScript(tardia(0));
+          console.log(`[F3 ${ruta}] servido=${servido} renderizado=${JSON.stringify(render)} en ${Date.now() - inicio} ms`);
+          expect(render.estado).toBe("medido");
+          if (render.estado !== "medido") return;
+          expect(render.caracteres).toBeGreaterThan(servido + 8_000);
+          expect(
+            contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: servido, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+              .estado
+          ).toBe("rojo");
+          expect(d.cierres()).toBe(d.aperturas());
+        },
+        60_000
+      );
+    }
+
+    it(
+      "un temporizador de 7 s cuyos datos NO llegan: `subrecurso-<motivo>`, no un verde",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/tardia-datos-caidos", deps());
+        console.log(`[F3 /tardia-datos-caidos] renderizado=${JSON.stringify(render)}`);
+        // Como en PU-3: sin ruta IPv6 el connect falla en el acto; con ruta, vence el plazo.
+        expect(render.estado).toBe("fallo");
+        if (render.estado === "fallo") expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+      },
+      60_000
+    );
+
+    it(
+      "un temporizador que escribe cerca del final del adelanto: `inestable`, no un número parcial",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/tardia-29s", deps());
+        console.log(`[F3 /tardia-29s] renderizado=${JSON.stringify(render)}`);
+        expect(render).toEqual({ estado: "fallo", codigo: "inestable" });
+      },
+      60_000
+    );
+  });
 
   it(
     "F5 — el control HÍBRIDO de `public/aeo-hibrida/`: lo servido pasa el mínimo, y el punto sale ROJO por la proporción",

@@ -195,6 +195,117 @@ describe("P2: el texto que llega DESPUÉS de la quietud de red también se cuent
 });
 
 /**
+ * F3 (tardío): la quietud del texto no alcanzaba. MEDIDO por la revisión con
+ * Chrome real sobre `9fb77e8`, y vuelto a medir con Chrome 155 sobre
+ * `70a4b65` (`renderizado.integracion.test.ts`): el contenido de un
+ * `setTimeout` de 4 s o de 7 s, puesto después de que el texto se quedó
+ * quieto 2 s, no se veía, y el punto salía VERDE con el menú solo. Ahora el
+ * reloj de la página se adelanta `adelantoMs` virtuales después de la quietud.
+ *
+ * El doble lee la quietud en 2 000 ms exactos de su reloj (8 sondeos de 250
+ * sin crecer): el reloj de la página al empezar el adelanto es ése, y los
+ * bordes de abajo se escriben contra él. El primer caso lo afirma.
+ */
+describe("F3 (tardío): lo que un temporizador escribe mucho después de la quietud se cuenta", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO_TARDE = "Contenido real que el JavaScript pone con un temporizador. ".repeat(147);
+  const HTML = `<html><body>${MENU}<main id="app"></main></body></html>`;
+  const AL_EMPEZAR = 2_000;
+  const { adelantoMs, quietudAdelantoMs } = OPCIONES_RENDER;
+
+  function punto(render: Awaited<ReturnType<typeof medirRenderizado>>) {
+    return contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: textoSinJavaScript(HTML), caracteresRenderizados: render, schema: [], tieneLlmsTxt: true });
+  }
+
+  for (const enMs of [4_000, 7_000]) {
+    it(`contenido puesto a los ${enMs / 1_000} s, con el texto quieto desde el principio: se cuenta, y el punto sale ROJO`, async () => {
+      const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: HTML } }, { textoTardio: [{ enMs, texto: CONTENIDO_TARDE }] });
+      const render = await medirRenderizado("http://sitio.test/", deps);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(render.caracteres).toBeGreaterThan(textoSinJavaScript(HTML) + 8_000);
+      expect(punto(render).estado).toBe("rojo");
+      expect(navegador.registro.relojAlAdelantar, "los bordes de abajo cuentan con esto").toBe(AL_EMPEZAR);
+      // El adelanto ENTERO, de a un paso: no corta en la primera quietud.
+      expect(navegador.registro.adelantos.reduce((a, b) => a + b, 0)).toBe(adelantoMs);
+      expect(navegador.registro.adelantos.every((ms) => ms === OPCIONES_RENDER.pasoAdelantoMs)).toBe(true);
+    });
+  }
+
+  it("un temporizador que PIDE los datos a los 7 s: el adelanto espera el pedido, y lo que trae se cuenta", async () => {
+    const { deps } = armar(
+      { "http://sitio.test/": { cuerpo: HTML }, "http://sitio.test/datos": { cuerpo: CONTENIDO_TARDE } },
+      { pedidosTardios: [{ enMs: 7_000, url: "/datos", tipo: "fetch" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(textoSinJavaScript(HTML) + 8_000);
+    expect(punto(render).estado).toBe("rojo");
+  });
+
+  it("un temporizador cuyos datos NO llegan: `subrecurso-<motivo>`, y el punto queda «no medido»", async () => {
+    const { deps } = armar(
+      { "http://sitio.test/": { cuerpo: HTML }, "http://sitio.test/datos": { error: "timeout" } },
+      { pedidosTardios: [{ enMs: 7_000, url: "/datos", tipo: "fetch" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
+    expect(punto(render).estado).toBe("no-medido");
+  });
+
+  it("el borde: lo que aparece justo a `adelantoMs - quietudAdelantoMs` se cuenta; un paso después, `inestable`", async () => {
+    const borde = AL_EMPEZAR + adelantoMs - quietudAdelantoMs;
+    const enElBorde = armar({ "http://sitio.test/": { cuerpo: HTML } }, { textoTardio: [{ enMs: borde, texto: CONTENIDO_TARDE }] });
+    const medido = await medirRenderizado("http://sitio.test/", enElBorde.deps);
+    expect(medido.estado === "medido" && medido.caracteres).toBeGreaterThan(textoSinJavaScript(HTML) + 8_000);
+
+    const pasado = armar({ "http://sitio.test/": { cuerpo: HTML } }, { textoTardio: [{ enMs: borde + 1, texto: CONTENIDO_TARDE }] });
+    const render = await medirRenderizado("http://sitio.test/", pasado.deps);
+    expect(render).toEqual({ estado: "fallo", codigo: "inestable" });
+    expect(punto(render).estado).toBe("no-medido");
+  });
+
+  it("cuenta el MÁXIMO de todo lo leído, también lo de la quietud: un texto largo que la página saca antes del adelanto no se pierde", async () => {
+    const { deps } = armar(
+      { "http://sitio.test/": { cuerpo: HTML } },
+      { textoTardio: [{ enMs: 500, hastaMs: AL_EMPEZAR + 1, texto: CONTENIDO_TARDE }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(textoSinJavaScript(HTML) + 8_000);
+    expect(punto(render).estado).toBe("rojo");
+  });
+
+  it("lo que aparece después del adelanto no se ve: es el umbral escrito, y está dicho", async () => {
+    const { deps } = armar(
+      { "http://sitio.test/": { cuerpo: HTML } },
+      { textoTardio: [{ enMs: AL_EMPEZAR + adelantoMs + 1, texto: CONTENIDO_TARDE }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render).toEqual({ estado: "medido", caracteres: textoSinJavaScript(HTML), servidos: textoSinJavaScript(HTML) });
+  });
+
+  it("una página que no deja avanzar el reloj: `timeout`; con un pedido en vuelo, `subrecurso-pendiente`", async () => {
+    const quieta = armar({ "http://sitio.test/": { cuerpo: HTML } }, { relojQueNoAvanza: true });
+    expect(await medirRenderizado("http://sitio.test/", quieta.deps)).toEqual({ estado: "fallo", codigo: "timeout" });
+    expect(quieta.navegador.registro.cierres).toBe(1);
+
+    const colgada = armar(
+      { "http://sitio.test/": { cuerpo: HTML }, "http://sitio.test/eterno": { cuerpo: "x", llegaCuando: () => new Promise(() => {}) } },
+      { relojQueNoAvanza: true, enSegundoPlano: [{ url: "/eterno", tipo: "fetch" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", colgada.deps, { ...OPCIONES_RENDER, topeMs: 10_000 })).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-pendiente",
+    });
+  });
+
+  it("un navegador que no puede adelantar el reloj: `lectura`, no el número de antes del adelanto", async () => {
+    const { deps, navegador } = armar({ "http://sitio.test/": { cuerpo: HTML } }, { relojFalla: true });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "lectura" });
+    expect(navegador.registro.cierres).toBe(1);
+  });
+});
+
+/**
  * P4 y GATE-1: los dos lados salen del MISMO documento, con la MISMA
  * extracción, y ninguno aplica CSS.
  *

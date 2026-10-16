@@ -119,10 +119,37 @@
  *      renderizado empuja al rojo, nunca al verde—;
  *   3. si al vencer `topeDomMs` el texto SIGUE creciendo, el número no se
  *      devuelve: `inestable`, y el punto queda «no medido». Un número parcial
- *      sería el verde que la puerta prohíbe.
+ *      sería el verde que la puerta prohíbe;
+ *   4. y después se ADELANTA EL RELOJ DE LA PÁGINA (F3, tardío): `adelantoMs`
+ *      de tiempo VIRTUAL, de a `pasoAdelantoMs`, leyendo el texto en cada
+ *      paso (`leerConElRelojAdelantado`).
  *
- * Lo que NO alcanza, dicho: un texto que aparece más de `quietudDomMs`
- * después del último cambio no se ve. Es un umbral escrito, no una medición.
+ * El paso 4 existe porque la quietud sola no alcanzaba: un texto que aparecía
+ * más de `quietudDomMs` después del último cambio no se veía. MEDIDO por la
+ * revisión con Chrome real y la ruta: un menú servido y el contenido puesto
+ * por un `setTimeout` de 4 s o de 7 s daban 610 contra 610 y el punto VERDE
+ * (vuelto a medir acá, con Chrome 155: 1 249 contra 1 249, también con el
+ * `setTimeout` que pide los datos con `fetch` y con el que pide datos que no
+ * llegan). Esperar de verdad no escala —40 s es el presupuesto entero—, y
+ * Chromium tiene un reloj que no hace falta esperar: con el reloj virtual
+ * (`adelantarReloj`, CDP `Emulation.setVirtualTimePolicy`) los temporizadores
+ * de la página corren en orden y en lo que tarda su código, y el reloj se
+ * DETIENE mientras haya un pedido en vuelo, así que lo que un temporizador
+ * pide pasa por el interceptor y por RT-1 como cualquier otro pedido. MEDIDO
+ * con Chrome 155 y con el headless shell 153 en AL2023: 15 s virtuales en
+ * 1,3 s reales, con un `fetch` de 800 ms adentro.
+ *
+ * La regla del paso 4 es la del paso 3, en tiempo virtual: el número es el
+ * MÁXIMO de lo leído, y si ese máximo creció en los últimos
+ * `quietudAdelantoMs` virtuales, `inestable`. Con 30 s de adelanto y 10 de
+ * quietud: lo que aparece hasta 20 s virtuales después de la lectura se
+ * cuenta; entre 20 y 30 s, el render queda «no medido»; y lo que aparece
+ * después de 30 s no se ve. Es un umbral escrito, no una medición, igual que
+ * antes; lo que cambió es que ahora está a 20 s y no a 2.
+ *
+ * Lo que el reloj virtual NO adelanta, dicho: los temporizadores de un
+ * `Worker` (corren en su propio hilo, en tiempo real) y lo que espera un
+ * evento de una persona (un clic, el mouse). Eso sigue sin verse.
  *
  * Y UN NÚMERO SÓLO VALE SI LLEGÓ LO QUE ESCRIBE EL TEXTO (RT-1)
  *
@@ -364,6 +391,16 @@ export interface PaginaAbierta {
    */
   desplazar(timeoutMs: number): Promise<void>;
   /**
+   * Adelanta el reloj de la página `ms` milisegundos VIRTUALES (F3, tardío):
+   * sus temporizadores corren en orden sin esperar el tiempo de verdad, y el
+   * reloj se detiene mientras haya un pedido en vuelo. Al terminar, el reloj
+   * queda DETENIDO: el DOM no cambia hasta el próximo adelanto. Resuelve
+   * `true` cuando los `ms` virtuales pasaron, y `false` si antes vencen
+   * `timeoutMs` reales —una página que no deja avanzar el reloj—. Rechaza si
+   * el navegador no lo puede hacer.
+   */
+  adelantarReloj(ms: number, timeoutMs: number): Promise<boolean>;
+  /**
    * El DOM serializado, tal como está ahora, CON cada shadow root de autor
    * como `<template shadowrootmode>` (PU-2): `outerHTML` las deja afuera, y
    * el contenido que un componente dibuja en su sombra no contaba. La
@@ -416,6 +453,12 @@ export interface OpcionesRender {
   sondeoMs: number;
   /** Cuánto se espera esa quietud, como mucho: pasado esto, `inestable`. */
   topeDomMs: number;
+  /** Cuánto se adelanta el reloj de la página después de esa quietud, en tiempo VIRTUAL (F3, tardío). */
+  adelantoMs: number;
+  /** De a cuánto se adelanta: el texto se lee después de cada paso. */
+  pasoAdelantoMs: number;
+  /** Si el texto creció en estos últimos ms virtuales del adelanto, `inestable`. */
+  quietudAdelantoMs: number;
   /** Cuánto se espera al cierre antes de matar el proceso. */
   cierreMs: number;
   maxBytesPorRespuesta: number;
@@ -447,6 +490,9 @@ export const OPCIONES_RENDER: OpcionesRender = {
   quietudDomMs: 2_000,
   sondeoMs: 250,
   topeDomMs: 8_000,
+  adelantoMs: 30_000,
+  pasoAdelantoMs: 1_000,
+  quietudAdelantoMs: 10_000,
   cierreMs: 5_000,
   maxBytesPorRespuesta: 5 * 1024 * 1024,
   maxBytesTotales: 25 * 1024 * 1024,
@@ -904,6 +950,41 @@ async function leerCuandoSeQuede(
 }
 
 /**
+ * F3 (tardío): adelanta el reloj de la página `adelantoMs` virtuales, de a
+ * `pasoAdelantoMs`, y lee el texto después de cada paso. Devuelve el MÁXIMO
+ * entre `desde` —lo que ya leyó la quietud— y cada lectura. Si ese máximo
+ * creció en los últimos `quietudAdelantoMs` virtuales, `inestable`: la página
+ * sigue escribiendo y el número sería parcial. Si el reloj no alcanza a
+ * avanzar dentro de `topeMs` reales, `plazo`.
+ *
+ * El adelanto entero, siempre, sin cortar en la primera quietud: cortar ahí
+ * es exactamente lo que dejaba afuera al `setTimeout` de 7 s.
+ */
+async function leerConElRelojAdelantado(
+  pagina: PaginaAbierta,
+  opciones: OpcionesRender,
+  desde: number,
+  topeMs: number,
+  ahora: () => number
+): Promise<number | "inestable" | "plazo"> {
+  const inicio = ahora();
+  let maximo = desde;
+  let crecioEn = 0;
+  for (let virtual = 0; virtual < opciones.adelantoMs; ) {
+    const paso = Math.min(opciones.pasoAdelantoMs, opciones.adelantoMs - virtual);
+    const queda = topeMs - (ahora() - inicio);
+    if (queda <= 0 || !(await pagina.adelantarReloj(paso, queda))) return "plazo";
+    virtual += paso;
+    const n = textoSinJavaScript(await pagina.html());
+    if (n > maximo) {
+      maximo = n;
+      crecioEn = virtual;
+    }
+  }
+  return crecioEn > opciones.adelantoMs - opciones.quietudAdelantoMs ? "inestable" : maximo;
+}
+
+/**
  * Espera a `promesa` como mucho `ms`. Al vencer llama `alVencer`, que es lo que
  * CORTA el trabajo de abajo: sin eso, el plazo sólo deja de esperar.
  */
@@ -1033,6 +1114,22 @@ export async function medirRenderizado(
       };
       let caracteres = await leer();
       if (typeof caracteres !== "number") return caracteres;
+
+      // F3 (tardío): el reloj de la página se adelanta, y lo que sus
+      // temporizadores escriben se cuenta. Lo que esos temporizadores PIDEN
+      // pasa por el interceptor como cualquier pedido, así que RT-1, abajo,
+      // también lo juzga. Ver «CUÁNDO SE LEE» arriba.
+      let adelantado: number | "inestable" | "plazo";
+      try {
+        adelantado = await leerConElRelojAdelantado(pagina, opciones, caracteres, Math.max(restante() - 1_000, 0), ahora);
+      } catch {
+        return fallo("lectura");
+      }
+      if (adelantado === "inestable") return fallo("inestable");
+      // Un reloj que no avanzó con un pedido en vuelo es un pedido que no
+      // terminó: lo mismo que dice RT-1 abajo cuando se acaba el presupuesto.
+      if (adelantado === "plazo") return fallo(bitacora.enVuelo > 0 ? "subrecurso-pendiente" : "timeout");
+      caracteres = adelantado;
 
       // RT-1: lo que escribe el texto tiene que haber LLEGADO. Lo que sigue en
       // vuelo se espera y se vuelve a leer, mientras quede presupuesto: cada

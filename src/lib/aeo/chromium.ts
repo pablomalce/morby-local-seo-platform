@@ -218,6 +218,15 @@ async function vigilarSalidasPropias(
   return salidas;
 }
 
+/**
+ * Cuántas tareas inmediatas puede correr la página antes de que el reloj
+ * virtual avance igual (F3, tardío). MEDIDO con Chrome 155 y con el headless
+ * shell 153 en AL2023: una página con un ciclo de `MessageChannel` —como
+ * agenda React— nunca se queda sin tareas, y sin este tope el reloj virtual
+ * no avanzó NI UN paso en 3 s; con 100, diez pasos de 1 s tardaron 195 ms.
+ */
+const HAMBRE_MAXIMA_DEL_RELOJ = 100;
+
 function envolverPagina(
   page: Page,
   vigilada?: { sesion: CDPSession; salidas: Array<{ url: string; tipo: SalidaPropia }> }
@@ -261,6 +270,39 @@ function envolverPagina(
           window.scrollTo(0, document.documentElement.scrollHeight);
         }, timeoutMs)
         .catch(() => {});
+    },
+    async adelantarReloj(ms, timeoutMs) {
+      if (timeoutMs <= 0) return false;
+      // `pauseIfNetworkFetchesPending`: el reloj se detiene mientras un pedido
+      // de la página está en vuelo —interceptado y esperando al transporte—, y
+      // se detiene del todo al gastar el presupuesto, que es cuando Chromium
+      // avisa `virtualTimeBudgetExpired`. El aviso se escucha ANTES de pedir
+      // el adelanto, y se suelta después: el de un paso vencido no puede
+      // resolver el paso siguiente.
+      sesion ??= page.createCDPSession();
+      const cdp = await sesion;
+      let alGastarse!: () => void;
+      const gastado = new Promise<true>((listo) => {
+        alGastarse = () => listo(true);
+      });
+      let reloj: ReturnType<typeof setTimeout> | undefined;
+      cdp.on("Emulation.virtualTimeBudgetExpired", alGastarse);
+      try {
+        await cdp.send("Emulation.setVirtualTimePolicy", {
+          policy: "pauseIfNetworkFetchesPending",
+          budget: ms,
+          maxVirtualTimeTaskStarvationCount: HAMBRE_MAXIMA_DEL_RELOJ,
+        });
+        return await Promise.race([
+          gastado,
+          new Promise<false>((listo) => {
+            reloj = setTimeout(() => listo(false), timeoutMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(reloj);
+        cdp.off("Emulation.virtualTimeBudgetExpired", alGastarse);
+      }
     },
     async html() {
       // La serialización del DOM, sin tocarlo: la extracción del texto es la

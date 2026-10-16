@@ -24,6 +24,11 @@
  * trae lo que «contestó» la metadata y el transporte registra el pedido: las
  * dos cosas que los tests miran.
  *
+ * El reloj de la página es el de la medición (`relojVirtual`) más lo que se
+ * ADELANTÓ (`adelantarReloj`, F3 tardío): el texto y los pedidos de un
+ * temporizador aparecen cuando ese reloj llega a su hora, como con el reloj
+ * virtual de Chromium.
+ *
  * Lo que NO simula, dicho: la red propia de Chromium —WebSocket, preconnect,
  * WebRTC—. Eso no pasa por el interceptor y por eso no se puede probar con un
  * doble: lo mide `renderizado.integracion.test.ts` con un Chrome de verdad y un
@@ -124,7 +129,12 @@ export interface OpcionesDoble {
    * a la red: cada entrada aparece a los `enMs` del reloj. Es la página que
    * dibuja con un `setTimeout`, o con `requestIdleCallback`.
    */
-  textoTardio?: Array<{ enMs: number; texto: string }>;
+  textoTardio?: Array<{
+    enMs: number;
+    texto: string;
+    /** Si está, el texto SE VA a esta hora: un titular que rota, un aviso de «cargando». */
+    hastaMs?: number;
+  }>;
   /** Texto que aparece SÓLO si la página se recorrió: lo que un `IntersectionObserver` dibuja al verse. */
   textoAlVerse?: string;
   /** El reloj de `textoTardio`. Sin él, el tardío nunca aparece. */
@@ -171,6 +181,18 @@ export interface OpcionesDoble {
    */
   responderFalla?: (url: string) => boolean;
   /**
+   * Pedidos que un TEMPORIZADOR de la página hace a los `enMs` de su reloj
+   * (F3, tardío): salen cuando el reloj de la página llega ahí —por el
+   * tiempo de la medición o por un adelanto— y, si llegan, su cuerpo se
+   * escribe en el DOM. Como en Chromium con el reloj virtual, el adelanto
+   * espera a que terminen antes de seguir.
+   */
+  pedidosTardios?: Array<{ enMs: number; url: string; tipo: string }>;
+  /** `adelantarReloj` no avanza nunca: una página que no deja correr el reloj virtual. */
+  relojQueNoAvanza?: boolean;
+  /** `adelantarReloj` tira: un navegador que no lo admite. */
+  relojFalla?: boolean;
+  /**
    * La pestaña con JavaScript termina la navegación con ESTE documento sin
    * que el interceptor lo haya visto —lo sirvió Chromium por su cuenta, de su
    * caché—: la medición no tiene status del documento (M12).
@@ -190,6 +212,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     recorridos: 0,
     /** Cuántas pestañas sin JavaScript llegaron a dibujar un documento. */
     paginasSinJs: 0,
+    /** Cada adelanto del reloj de la página, en ms virtuales (F3, tardío). */
+    adelantos: [] as number[],
+    /** El reloj de la página cuando empezó el primer adelanto. */
+    relojAlAdelantar: null as number | null,
   };
 
   async function emitir(
@@ -228,6 +254,34 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     let urlDelDocumento = "";
     let navegadoEn: number | null = null;
     let recorrida = false;
+    /** Lo que se adelantó el reloj de ESTA página, en virtual, por encima del de la medición. */
+    let adelantado = 0;
+    const tardiosEmitidos = new Set<number>();
+
+    /** El reloj de la página: desde la navegación, el de la medición más lo adelantado. */
+    const relojDeLaPagina = (): number | null => {
+      const ahora = opciones.reloj?.ahora();
+      return navegadoEn === null || ahora === undefined ? null : ahora - navegadoEn + adelantado;
+    };
+
+    /** Los pedidos tardíos cuyo temporizador ya sonó y no salieron: salen ahora. */
+    function dispararTardios(): Promise<unknown>[] {
+      const reloj = relojDeLaPagina();
+      if (reloj === null || !atender || sinJs) return [];
+      const enVuelo: Promise<unknown>[] = [];
+      (opciones.pedidosTardios ?? []).forEach((p, i) => {
+        if (p.enMs > reloj || tardiosEmitidos.has(i)) return;
+        tardiosEmitidos.add(i);
+        enVuelo.push(
+          emitir(atender!, new URL(p.url, urlDelDocumento).toString(), p.tipo, false).then((d) => {
+            if (d.tipo !== "respondido") return;
+            html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
+            registro.textoDibujado = html;
+          })
+        );
+      });
+      return enVuelo;
+    }
 
     return {
       salidasPropias() {
@@ -312,13 +366,25 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         recorrida = true;
         registro.recorridos += 1;
       },
+      async adelantarReloj(ms) {
+        if (opciones.relojFalla) throw new Error("Protocol error (Emulation.setVirtualTimePolicy): not supported");
+        if (opciones.relojQueNoAvanza) return false;
+        registro.relojAlAdelantar ??= relojDeLaPagina();
+        registro.adelantos.push(ms);
+        adelantado += ms;
+        // Como `pauseIfNetworkFetchesPending`: el paso termina cuando
+        // terminaron los pedidos que sus temporizadores hicieron.
+        await Promise.all(dispararTardios());
+        return true;
+      },
       async html() {
         if (sinJs) return html;
+        void dispararTardios();
         const crudo = typeof opciones.htmlCrudo === "function" ? opciones.htmlCrudo(urlDelDocumento) : opciones.htmlCrudo;
         const base = crudo ?? html;
-        const ahora = opciones.reloj?.ahora();
+        const reloj = relojDeLaPagina();
         const tardio = (opciones.textoTardio ?? [])
-          .filter((t) => navegadoEn !== null && ahora !== undefined && ahora - navegadoEn >= t.enMs)
+          .filter((t) => reloj !== null && reloj >= t.enMs && (t.hastaMs === undefined || reloj < t.hastaMs))
           .map((t) => escrito(t.texto));
         const alVerse = recorrida && opciones.textoAlVerse ? [escrito(opciones.textoAlVerse)] : [];
         return [base, ...tardio, ...alVerse].join("\n");
