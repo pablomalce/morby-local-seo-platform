@@ -1452,7 +1452,11 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
 
   /** Un pedido al interceptor, uno por vez, con su desenlace anotado. */
   function pedidor(atender: (p: PedidoDelNavegador) => Promise<void>, desenlaces: Record<string, string>) {
-    return (url: string, urlDelMarco: string | null, opciones: { tipo?: string; metodo?: string; cuerpo?: string; principal?: boolean } = {}) =>
+    return (
+      url: string,
+      urlDelMarco: string | null,
+      opciones: { tipo?: string; metodo?: string; cuerpo?: string; principal?: boolean; urlDeLaPagina?: string | null } = {}
+    ) =>
       atender({
         url,
         metodo: opciones.metodo ?? "GET",
@@ -1461,12 +1465,25 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
         tipo: opciones.tipo ?? (opciones.principal ? "document" : "xhr"),
         esDocumentoPrincipal: opciones.principal === true,
         urlDelMarco,
-        urlDeLaPagina: opciones.principal ? null : "http://sitio.test/",
+        urlDeLaPagina: opciones.urlDeLaPagina !== undefined ? opciones.urlDeLaPagina : opciones.principal ? null : "http://sitio.test/",
         continuar: async () => void (desenlaces[url] = "continuado"),
         abortar: async () => void (desenlaces[url] = "abortado"),
         responder: async () => void (desenlaces[url] = "respondido"),
       });
   }
+
+  it("sin documento confirmado todavía, todo POST es ajeno: no hay sitio contra el cual eximirlo", async () => {
+    const { deps } = armar({ "http://sitio.test/api": { cuerpo: "ok" }, "http://sitio.test/api?2": { cuerpo: "ok" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/api", "about:blank", { metodo: "POST", cuerpo: "x", urlDeLaPagina: "about:blank" });
+    expect(desenlaces["http://sitio.test/api"]).toBe("abortado");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://sitio.test/api", motivo: "presupuesto" });
+    // Con la página confirmada, el mismo POST es del sitio, y sale.
+    await pedir("http://sitio.test/api?2", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://sitio.test/api?2"]).toBe("respondido");
+  });
 
   it("los pedidos de un marco de otro sitio salen de SU tope: los del reproductor no le quitan ninguno a la página", async () => {
     const { deps } = armar({
