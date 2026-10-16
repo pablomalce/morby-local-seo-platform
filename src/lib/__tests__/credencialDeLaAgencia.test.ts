@@ -88,6 +88,9 @@
  * declarado abajo (la ventana de Search Console, que GA4 comparte), llegar a uno
  * sin la puerta es una fuga, no importan nada de valor fuera de los tres, y no
  * tocan `process`, el entorno, el objeto global ni un global del repositorio.
+ * Y la lista no es de fe: la puerta importa como valor los tres, la custodia y
+ * el cliente de sesión, y nada más. Un módulo nuevo al que le pase el token
+ * tiene que importarlo, y entonces es un receptor declarado o un rojo.
  *
  * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
  *
@@ -1271,6 +1274,16 @@ describe("el árbol de src, leído del disco", () => {
   });
 
   describe("los que reciben el token de la puerta", () => {
+    it("la puerta importa como valor la custodia, el cliente de sesión y los receptores, y nada más", () => {
+      // La lista de RECEPTORES se declara, no se mide: si la puerta le pasara el
+      // token a un módulo nuevo, la pared no lo sabría. Para pasárselo tiene que
+      // importarlo, y eso sí se mide.
+      expect(
+        [...new Set(analisisReal.lecturas.get(PUERTA)!.importa)].sort(),
+        "La puerta importa un módulo nuevo. Si le pasa el token, es un receptor: va a RECEPTORES con su razón."
+      ).toEqual([...RECEPTORES.map((r) => r.modulo), "src/lib/supabase/server.ts", TOKEN_STORE].sort());
+    });
+
     it("cada export de un receptor lo usa la puerta, o quien está declarado, y nadie más", () => {
       // Por SÍMBOLO (R14). La quinta revisión del #118 guardó el token en un
       // export de searchConsole.ts y una ruta nueva lo gastó, con tsc y esta
