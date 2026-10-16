@@ -123,6 +123,48 @@ describe("el transporte del renderizado", () => {
     expect(motivo(await transporte(pedido("/grande", { maxBytes: 1024 * 1024 })))).toBe("demasiado-grande");
   });
 
+  /**
+   * RED-121-2: el presupuesto que un pedido comparte con los que van en
+   * paralelo se descuenta con cada parte que LLEGA. Antes el transporte no lo
+   * conocía, y 30 pedidos en paralelo de un marco bajaron 40,5 MB contra 10.
+   */
+  it("RED-121-2 — cada parte del cuerpo se descuenta del presupuesto al llegar, y si no alcanza el pedido se corta ahí", async () => {
+    let aceptados = 0;
+    const presupuesto = (bytes: number) => {
+      if (aceptados + bytes > 300 * 1024) return false;
+      aceptados += bytes;
+      return true;
+    };
+    const r = await transporte(pedido("/grande", { maxBytes: 4 * 1024 * 1024, presupuesto }));
+    // Cabía en su tope propio (4 MB): lo que lo cortó fue el presupuesto.
+    expect(motivo(r)).toBe("demasiado-grande");
+    expect(aceptados).toBeGreaterThan(0);
+    expect(aceptados).toBeLessThanOrEqual(300 * 1024);
+  });
+
+  it("RED-121-2 — cuatro pedidos EN PARALELO de 2 MB con un presupuesto compartido de 3 MB: lo entregado no lo pasa", async () => {
+    let aceptados = 0;
+    const presupuesto = (bytes: number) => {
+      if (aceptados + bytes > 3 * 1024 * 1024) return false;
+      aceptados += bytes;
+      return true;
+    };
+    const rs = await Promise.all(
+      [1, 2, 3, 4].map(() => transporte(pedido("/grande", { maxBytes: 4 * 1024 * 1024, presupuesto })))
+    );
+    const entregados = rs.reduce((suma, r) => suma + (r.tipo === "respuesta" ? r.cuerpo.length : 0), 0);
+    expect(entregados).toBeLessThanOrEqual(3 * 1024 * 1024);
+    expect(aceptados).toBeLessThanOrEqual(3 * 1024 * 1024);
+    expect(rs.filter((r) => r.tipo === "error").length).toBeGreaterThan(0);
+  });
+
+  it("y con presupuesto de sobra, la respuesta llega entera y se descontó entera", async () => {
+    let aceptados = 0;
+    const r = await transporte(pedido("/grande", { maxBytes: 4 * 1024 * 1024, presupuesto: (b) => ((aceptados += b), true) }));
+    expect(r.tipo === "respuesta" && r.cuerpo.length).toBe(2 * 1024 * 1024);
+    expect(aceptados).toBe(2 * 1024 * 1024);
+  });
+
   it("un origen que no contesta es timeout, con plazo TOTAL", async () => {
     const inicio = Date.now();
     expect(await transporte(pedido("/colgado", { timeoutMs: 200 }))).toEqual({ tipo: "error", motivo: "timeout" });

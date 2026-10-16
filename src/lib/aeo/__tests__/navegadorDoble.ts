@@ -72,22 +72,49 @@ export interface PaginaDelSitio {
 /** El «internet» del doble: qué contesta cada URL. Lo que no está, `sin-respuesta`. */
 export type Sitio = Record<string, PaginaDelSitio>;
 
-export function transporteDoble(sitio: Sitio) {
+export interface OpcionesTransporteDoble {
+  /**
+   * El cuerpo llega en partes de este tamaño, y cada una se descuenta de
+   * `PedidoHttp.presupuesto` como en `transporteRender.ts`, con un turno del
+   * event loop entre parte y parte: los pedidos en paralelo bajan a la vez
+   * (RED-121-2). Sin esto, el cuerpo llega entero y nada se descuenta: es un
+   * transporte que no usa el presupuesto, y el interceptor lo descuenta al
+   * entregar.
+   */
+  porPartes?: number;
+}
+
+export function transporteDoble(sitio: Sitio, opciones: OpcionesTransporteDoble = {}) {
   const pedidos: PedidoHttp[] = [];
+  /** Lo que el presupuesto ACEPTÓ, por URL: lo que de verdad se bajó parte por parte. */
+  const bajados: Record<string, number> = {};
   const transporte: Transporte = async (pedido) => {
     pedidos.push(pedido);
     const pagina = sitio[pedido.url];
     if (!pagina) return { tipo: "error", motivo: "sin-respuesta" } satisfies RespuestaHttp;
     if (pagina.llegaCuando) await pagina.llegaCuando();
     if (pagina.error) return { tipo: "error", motivo: pagina.error } satisfies RespuestaHttp;
+    const cuerpo = Buffer.from(pagina.cuerpo ?? "");
+    if (opciones.porPartes) {
+      let leidos = 0;
+      for (let i = 0; i < cuerpo.length; i += opciones.porPartes) {
+        await new Promise((listo) => setImmediate(listo));
+        const parte = Math.min(opciones.porPartes, cuerpo.length - i);
+        leidos += parte;
+        if (leidos > pedido.maxBytes || (pedido.presupuesto && !pedido.presupuesto(parte))) {
+          return { tipo: "error", motivo: "demasiado-grande" } satisfies RespuestaHttp;
+        }
+        bajados[pedido.url] = (bajados[pedido.url] ?? 0) + parte;
+      }
+    }
     return {
       tipo: "respuesta",
       status: pagina.status ?? 200,
       encabezados: { "content-type": "text/html", ...(pagina.encabezados ?? {}) },
-      cuerpo: Buffer.from(pagina.cuerpo ?? ""),
+      cuerpo,
     };
   };
-  return { transporte, pedidos };
+  return { transporte, pedidos, bajados };
 }
 
 /** Un DNS escrito: cada nombre, sus direcciones. Cuenta cuántas veces se preguntó por cada uno. */

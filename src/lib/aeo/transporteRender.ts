@@ -26,6 +26,9 @@
  *     gotea un byte por segundo no dispara `timeout:` de `http.request`;
  *   - un máximo de bytes, contado DESPUÉS de descomprimir: un gzip de 10 KB que
  *     se infla a 1 GB es la bomba de compresión, y `maxOutputLength` la corta;
+ *   - el presupuesto que el pedido comparte con los que van en paralelo
+ *     (`PedidoHttp.presupuesto`), descontado con cada parte del cuerpo que
+ *     llega: el que no alcanza corta el pedido (RED-121-2);
  *   - ninguna redirección se sigue acá: el 3xx vuelve al navegador, y el pedido
  *     al destino vuelve a pasar por el examen de `renderizado.ts`.
  *
@@ -212,9 +215,14 @@ function intentar(
       let leidos = 0;
       // Antes de descomprimir también hay tope: un cuerpo comprimido más
       // grande que el máximo descomprimido no puede ser legítimo.
+      //
+      // Y cada parte se descuenta del presupuesto que este pedido comparte
+      // con los que van en paralelo, al llegar y no al terminar (RED-121-2):
+      // si no alcanza, el pedido se corta ahí, y ningún otro byte suyo se lee.
       res.on("data", (parte: Buffer) => {
+        if (terminado) return;
         leidos += parte.length;
-        if (leidos > pedido.maxBytes) {
+        if (leidos > pedido.maxBytes || (pedido.presupuesto !== undefined && !pedido.presupuesto(parte.length))) {
           terminar({ tipo: "error", motivo: "demasiado-grande" });
           res.destroy();
           req.destroy();
