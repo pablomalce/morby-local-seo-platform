@@ -34,9 +34,12 @@
  * mismo camino que la ruta en Vercel, el headless shell de
  * `@sparticuz/chromium`. Es el binario que importa, y no se porta igual que
  * Chrome (RV-1: una bandera de WebRTC que en Chrome 154 cierra el UDP, en
- * headless shell 153 no). Se corre en un contenedor
- * `public.ecr.aws/lambda/nodejs:24` con `VERCEL=1` y
- * `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, con su propio `npm ci`.
+ * headless shell 153 no). Y en el sistema que importa: el CI lo corre en un
+ * contenedor `public.ecr.aws/lambda/nodejs:24` (AL2023, como la función de
+ * Vercel) con `VERCEL=1` y `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, que son
+ * las que hacen que `@sparticuz/chromium` use SUS bibliotecas (RTV-3). En el
+ * runner de Ubuntu, sin ellas, Chromium arranca con las del sistema, y un
+ * cambio que rompiera las de AL2023 salía verde.
  *
  * Sin ninguna de las dos se saltea con el motivo escrito en el nombre del
  * bloque, y eso NO es un verde. Por eso el CI tiene un job propio
@@ -636,6 +639,31 @@ describe.runIf(process.env.AEO_INTEGRACION_OBLIGATORIA === "1")("en el CI la int
   it("hay un Chromium con el que correrla: si falta, esto es rojo y no un salteo", () => {
     expect(HAY_CHROME, MOTIVO).toBe(true);
   });
+});
+
+/**
+ * RTV-3: el camino de bibliotecas de Vercel. `@sparticuz/chromium` sólo
+ * descomprime `al2023.tar.br` y fija `LD_LIBRARY_PATH` cuando cree estar en
+ * AL2023 (`VERCEL`, `AWS_EXECUTION_ENV`). En el runner de Ubuntu no lo cree, y
+ * Chromium arranca con las bibliotecas del sistema: un cambio que rompiera las
+ * de AL2023 salía verde. REPRODUCIDO en `public.ecr.aws/lambda/nodejs:24` sin
+ * esas variables: «libnspr4.so: cannot open shared object file», Code 127.
+ *
+ * El paso del CI que corre este archivo en ese contenedor exporta
+ * `AEO_EN_AL2023=1`, y esto afirma que el entorno es el que el paso dice: si
+ * alguien le cambia la imagen o le saca las variables, no queda un paso verde
+ * que mide otra cosa.
+ */
+describe.runIf(process.env.AEO_EN_AL2023 === "1")("RTV-3: la integración corre como en Vercel, en AL2023", () => {
+  it("es Amazon Linux 2023, con el headless shell de producción, y Chromium arranca con las bibliotecas de al2023", async () => {
+    expect(readFileSync("/etc/os-release", "utf8")).toMatch(/Amazon Linux[\s\S]*VERSION_ID="2023"/);
+    expect(DE_PRODUCCION, "AEO_CHROMIUM_DE_PRODUCCION=1, en Linux y sin AEO_CHROME_PATH").toBe(true);
+    const navegador = await abrirChromium()();
+    await navegador.cerrar();
+    const bibliotecas = path.join(os.tmpdir(), "al2023", "lib");
+    expect(process.env.LD_LIBRARY_PATH ?? "").toContain(bibliotecas);
+    expect(existsSync(path.join(bibliotecas, "libnspr4.so"))).toBe(true);
+  }, 60_000);
 });
 
 describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO})`, { retry: process.env.CI ? 1 : 0 }, () => {
