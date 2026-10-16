@@ -244,6 +244,49 @@ describe("la auditoría desde la pantalla", () => {
     expect(renderizado.textContent).not.toMatch(/\b0\b/);
     expect(screen.getByTestId("hallazgo").textContent).toMatch(/NO MEDIDO/);
     expect(screen.queryByTestId("sin-hallazgos")).toBeNull();
+    // Un `timeout` del render entero no lo decidió un pedido: no hay detalle que inventar.
+    expect(screen.queryByTestId("render-detalle")).toBeNull();
+  });
+
+  it("si lo decidió un pedido que no llegó, dice CUÁL al lado del «no medido»: tipo, host, ruta, de dónde, motivo y cuántos", async () => {
+    respuesta = {
+      ok: true,
+      status: 200,
+      cuerpo: {
+        ok: true,
+        url: "https://vulkan-studios.com/",
+        robotsLeido: true,
+        motivoRobots: null,
+        hallazgos: [
+          { gravedad: "no-medido", quePasa: "no se pudo medir (subrecurso-sin-respuesta)", queHacer: "Volver a correr.", donde: "la auditoría" },
+        ],
+        lectura: {
+          caracteresSinJs: 5444,
+          caracteresRenderizados: {
+            estado: "fallo",
+            codigo: "subrecurso-sin-respuesta",
+            detalle: {
+              tipo: "script",
+              host: "vulkan-studios.com",
+              ruta: "/wp-content/plugins/elementor/assets/js/frontend.min.js",
+              origen: "worker",
+              motivo: "sin-respuesta",
+              noLlegaron: 3,
+            },
+          },
+        },
+      },
+    };
+    render(<AuditoriaAeo businessId={NEGOCIO} />);
+    fireEvent.click(screen.getByTestId("auditar"));
+
+    await waitFor(() => expect(screen.getByTestId("render-detalle")).toBeTruthy());
+    expect(screen.getByTestId("texto-renderizado").textContent).toMatch(/no medido \(subrecurso-sin-respuesta\)/);
+    const detalle = screen.getByTestId("render-detalle");
+    expect(detalle.dataset.origen).toBe("worker");
+    expect(detalle.textContent).toBe(
+      "No llegó: script vulkan-studios.com/wp-content/plugins/elementor/assets/js/frontend.min.js · desde un worker · sin-respuesta · 3 pedidos sin llegar en total"
+    );
   });
 
   it("avisa cuando el robots.txt no se pudo leer: SIN MEDIR, no «permite»", async () => {

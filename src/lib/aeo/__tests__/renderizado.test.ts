@@ -24,14 +24,18 @@ import { AGENTES_IA, contarCaracteres, textoSinJavaScript } from "../lectura";
 import {
   crearExaminador,
   crearInterceptor,
+  MAX_RUTA_DEL_DETALLE,
   medirRenderizado,
   nuevaBitacora,
   OPCIONES_RENDER,
   type Bitacora,
   type CacheDeRespuestas,
   type DependenciasRender,
+  type DetalleDelSubrecurso,
+  type MotivoDeSubrecurso,
   type PedidoDelNavegador,
   type PedidoHttp,
+  type ResultadoRenderizado,
 } from "../renderizado";
 import { navegadorDoble, relojVirtual, resolvedorDoble, transporteDoble, type Sitio } from "./navegadorDoble";
 
@@ -59,6 +63,17 @@ const DNS = {
 
 function bitacoraVacia(): Bitacora {
   return nuevaBitacora();
+}
+
+/**
+ * Un `subrecurso-<motivo>` con su detalle: el PRIMER pedido que lo decidió.
+ * `noLlegaron` es 1 salvo que el caso diga otra cosa.
+ */
+function falloPor(
+  motivo: MotivoDeSubrecurso,
+  pedido: Omit<DetalleDelSubrecurso, "motivo" | "noLlegaron"> & { noLlegaron?: number }
+): ResultadoRenderizado {
+  return { estado: "fallo", codigo: `subrecurso-${motivo}`, detalle: { noLlegaron: 1, ...pedido, motivo } };
 }
 
 function armar(
@@ -333,8 +348,8 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
         "http://sitio.test/app.js": { cuerpo: CONTENIDO, error: motivo },
       });
       const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-      expect(render).toEqual({ estado: "fallo", codigo: `subrecurso-${motivo}` });
-      expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo }]);
+      expect(render).toEqual(falloPor(motivo, { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina" }));
+      expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo, origen: "pagina" }]);
       expect(navegador.registro.cierres).toBe(1);
       const punto = contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(HIBRIDA), caracteresRenderizados: render });
       expect(punto.estado).toBe("no-medido");
@@ -347,17 +362,22 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
       ...OPCIONES_RENDER,
       maxBytesTotales: Buffer.byteLength(HIBRIDA),
     });
-    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+    expect(render).toEqual(falloPor("presupuesto", { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina" }));
   });
 
   it("los datos que trae el JavaScript (`fetch`) y un marco cuentan igual que un script", async () => {
     const conDatos = `<html><body>${MENU}<main data-fetch="/api/contenido"></main></body></html>`;
     const datos = armar({ "http://sitio.test/": { cuerpo: conDatos }, "http://sitio.test/api/contenido": { error: "timeout" } });
-    expect(await medirRenderizado("http://sitio.test/", datos.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
+    expect(await medirRenderizado("http://sitio.test/", datos.deps)).toEqual(
+      falloPor("timeout", { tipo: "fetch", host: "sitio.test", ruta: "/api/contenido", origen: "pagina" })
+    );
 
     const conMarco = `<html><body>${MENU}<iframe src="/widget"></iframe></body></html>`;
     const marco = armar({ "http://sitio.test/": { cuerpo: conMarco }, "http://sitio.test/widget": { error: "tls" } });
-    expect(await medirRenderizado("http://sitio.test/", marco.deps)).toEqual({ estado: "fallo", codigo: "subrecurso-tls" });
+    // La navegación del marco se juzga por la URL a la que va: es del sitio de la página.
+    expect(await medirRenderizado("http://sitio.test/", marco.deps)).toEqual(
+      falloPor("tls", { tipo: "document", host: "sitio.test", ruta: "/widget", origen: "mismo-sitio" })
+    );
   });
 
   /**
@@ -374,8 +394,8 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
       return transporte(pedido);
     };
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
-    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo: "sin-respuesta" }]);
+    expect(render).toEqual(falloPor("sin-respuesta", { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina" }));
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/app.js", tipo: "script", motivo: "sin-respuesta", origen: "pagina" }]);
     // Con su motivo en la bitácora, como cualquier otro error del transporte.
     expect(bitacora.bloqueados).toContainEqual({ url: "http://sitio.test/app.js", motivo: "sin-respuesta" });
 
@@ -394,7 +414,7 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
       { responderFalla: (url) => url.endsWith("/app.js") }
     );
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(render).toEqual(falloPor("sin-respuesta", { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina" }));
     expect(bitacora.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/app.js"]);
   });
 
@@ -404,7 +424,7 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     const resolver = deps.resolver;
     deps.resolver = async (host, senal) => (host === "cdn.test" ? { ok: false, transitorio: true } : resolver(host, senal));
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-dns-sin-respuesta" });
+    expect(render).toEqual(falloPor("dns-sin-respuesta", { tipo: "script", host: "cdn.test", ruta: "/app.js", origen: "pagina" }));
     // Y un nombre que NO EXISTE sigue sin contar: con el DNS de hoy es un dominio muerto.
     deps.resolver = async (host, senal) => (host === "cdn.test" ? { ok: false } : resolver(host, senal));
     expect((await medirRenderizado("http://sitio.test/", deps)).estado).toBe("medido");
@@ -452,7 +472,9 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
       },
       { enSegundoPlano: [{ url: "/api/siempre", tipo: "fetch" }] }
     );
-    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "subrecurso-pendiente" });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("pendiente", { tipo: "fetch", host: "sitio.test", ruta: "/api/siempre", origen: "pagina" })
+    );
     expect(navegador.registro.cierres).toBe(1);
   });
 });
@@ -513,27 +535,30 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
 
   it("el MISMO pedido desde la página sigue sin número: lo que la página pide y no le llega es `subrecurso-<motivo>`", async () => {
     const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch" }] });
-    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
-      estado: "fallo",
-      codigo: "subrecurso-sin-respuesta",
-    });
-    expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta" }]);
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual(
+      falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen: "pagina" })
+    );
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta", origen: "pagina" }]);
   });
 
+  // El tercer valor es de dónde salió el pedido según el detalle: lo nombra,
+  // no decide nada (los seis cuentan igual).
   it.each([
-    ["un marco del MISMO origen, que puede escribir en la página", "http://sitio.test/widget"],
-    ["un marco de otro origen del MISMO sitio (`document.domain`)", "http://widgets.sitio.test/w"],
-    ["un marco `about:blank`, que hereda el origen de quien lo creó", "about:blank"],
+    ["un marco del MISMO origen, que puede escribir en la página", "http://sitio.test/widget", "mismo-sitio"],
+    ["un marco de otro origen del MISMO sitio (`document.domain`)", "http://widgets.sitio.test/w", "mismo-sitio"],
+    ["un marco `about:blank`, que hereda el origen de quien lo creó", "about:blank", "marco-desconocido"],
     // F2: lo que la tabla del PR afirma y ningún test ataba. MEDIDO con
     // Chrome 155: el `script` de un `<iframe srcdoc>` sale con el marco
     // `about:srcdoc`, y el de un `<iframe src=blob:…>` con el marco
     // `blob:http://sitio.test/<uuid>`. Los dos heredan el origen de la página.
-    ["un marco `about:srcdoc`", "about:srcdoc"],
-    ["un marco `blob:` que armó la página", "blob:http://sitio.test/6f1c2a9e-3b7d-4e2a-9c1f-0d8e7b6a5c4d"],
-    ["un pedido SIN marco: un worker de la página, que le pasa los datos", null],
-  ])("lo que no llega a %s sigue dejando la página sin número", async (_caso, marco) => {
+    ["un marco `about:srcdoc`", "about:srcdoc", "marco-desconocido"],
+    ["un marco `blob:` que armó la página", "blob:http://sitio.test/6f1c2a9e-3b7d-4e2a-9c1f-0d8e7b6a5c4d", "marco-desconocido"],
+    ["un pedido SIN marco: un worker de la página, que le pasa los datos", null, "worker"],
+  ] as const)("lo que no llega a %s sigue dejando la página sin número", async (_caso, marco, origen) => {
     const { deps } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco }] });
-    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen })
+    );
   });
 
   it("F2 — un marco de otro sitio que SE NAVEGA al sitio de la página se juzga por la URL a la que va: si no llega, la página no se mide", async () => {
@@ -543,11 +568,12 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     const { deps, bitacora } = armar(SITIO, {
       enSegundoPlano: [{ url: "http://sitio.test/corta", tipo: "document", marco: "http://video.test/embed" }],
     });
-    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
-      estado: "fallo",
-      codigo: "subrecurso-sin-respuesta",
-    });
-    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/corta", tipo: "document", motivo: "sin-respuesta" }]);
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual(
+      falloPor("sin-respuesta", { tipo: "document", host: "sitio.test", ruta: "/corta", origen: "mismo-sitio" })
+    );
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/corta", tipo: "document", motivo: "sin-respuesta", origen: "mismo-sitio" },
+    ]);
     // Y la misma navegación del marco a OTRO sitio no cuenta.
     const aOtro = armar(SITIO, {
       enSegundoPlano: [{ url: "http://cdn.test/corta", tipo: "document", marco: "http://video.test/embed" }],
@@ -562,14 +588,13 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
    * contaba, y la página que escribía con ellos salía VERDE si no llegaban.
    */
   it.each([
-    ["el `importScripts` de un worker (`other`, sin marco)", { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null }],
-    ["un `EventSource` de la página", { url: "http://solo-v6.test/sse", tipo: "eventsource" }],
-  ] as const)("FV-4 — %s que no llega deja la página sin número", async (_caso, pedido) => {
+    ["el `importScripts` de un worker (`other`, sin marco)", { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null }, "worker"],
+    ["un `EventSource` de la página", { url: "http://solo-v6.test/sse", tipo: "eventsource" }, "pagina"],
+  ] as const)("FV-4 — %s que no llega deja la página sin número", async (_caso, pedido, origen) => {
     const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [pedido] });
-    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
-      estado: "fallo",
-      codigo: "subrecurso-sin-respuesta",
-    });
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual(
+      falloPor("sin-respuesta", { tipo: pedido.tipo, host: "solo-v6.test", ruta: new URL(pedido.url).pathname, origen })
+    );
     expect(bitacora.noLlegaron.map((n) => n.url)).toEqual([pedido.url]);
   });
 
@@ -631,7 +656,9 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     // tope ajeno, 1 200, pasaba).
     await pedir("http://sitio.test/chunk2.js", "script", false, "http://sitio.test/");
     expect(desenlaces["http://sitio.test/chunk2.js"]).toBe("abortado");
-    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/chunk2.js", tipo: "script", motivo: "presupuesto" }]);
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/chunk2.js", tipo: "script", motivo: "presupuesto", origen: "pagina" },
+    ]);
   });
 
   it("F3 — los topes de producción: 25 MB la página, 10 MB los marcos de otro sitio, 5 MB cada respuesta", () => {
@@ -679,10 +706,9 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     const delNuevo = armar(sitio, {
       enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://cdn.mudado.test/w" }],
     });
-    expect(await medirRenderizado("http://sitio.test/", delNuevo.deps)).toEqual({
-      estado: "fallo",
-      codigo: "subrecurso-sin-respuesta",
-    });
+    expect(await medirRenderizado("http://sitio.test/", delNuevo.deps)).toEqual(
+      falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen: "mismo-sitio" })
+    );
     // Y uno del sitio del PRIMER salto ya es de otro sitio que la página.
     const delViejo = armar(sitio, {
       enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://sitio.test/w" }],
@@ -717,8 +743,10 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
       const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
       // La navegación SALIÓ por el transporte: si no, esto no prueba nada.
       expect(red.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
-      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
-      expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta" }]);
+      expect(render).toEqual(falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen: "pagina" }));
+      expect(bitacora.noLlegaron).toEqual([
+        { url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta", origen: "pagina" },
+      ]);
     }
   );
 
@@ -741,8 +769,10 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     );
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
     expect(bitacora.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
-    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
-    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/api/datos", tipo: "fetch", motivo: "sin-respuesta" }]);
+    expect(render).toEqual(falloPor("sin-respuesta", { tipo: "fetch", host: "sitio.test", ruta: "/api/datos", origen: "pagina" }));
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/api/datos", tipo: "fetch", motivo: "sin-respuesta", origen: "pagina" },
+    ]);
   });
 
   it("y si el `fetch` LLEGA después de esa navegación, lo que escribe se cuenta: la página sigue siendo la misma, punto ROJO", async () => {
@@ -763,6 +793,109 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     if (render.estado !== "medido") return;
     expect(render.caracteres).toBeGreaterThan(textoSinJavaScript(CON_VIDEO) + contarCaracteres(CONTENIDO));
     expect(rojo(render)).toBe("rojo");
+  });
+});
+
+/**
+ * El detalle de un `subrecurso-<motivo>`. Con el #121 en producción,
+ * https://vulkan-studios.com seguía saliendo `subrecurso-sin-respuesta` desde
+ * la red de Vercel, y ni la respuesta ni los logs decían qué pedido faltaba:
+ * en la Mac y en un contenedor `lambda/nodejs:24` medía. Ahora el fallo dice
+ * cuál —el PRIMERO, el mismo que da el código—, sin la query ni el fragmento
+ * de su URL, y cuántos no llegaron.
+ */
+describe("el fallo dice CUÁL pedido dejó el render sin número", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const PAGINA = `<html><body>${MENU}<main id="app"></main></body></html>`;
+
+  it("la ruta sale SIN query ni fragmento: un token de la URL no llega al resultado", async () => {
+    const { deps, bitacora } = armar(
+      { "http://sitio.test/": { cuerpo: PAGINA } },
+      { enSegundoPlano: [{ url: "/api/datos;v=1?token=SECRETO-del-cliente&x=1#SECRETO-del-fragmento", tipo: "fetch" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    // El pedido salió con su query —si no, esto no prueba nada— …
+    expect(bitacora.noLlegaron.map((n) => n.url)).toEqual([
+      "http://sitio.test/api/datos;v=1?token=SECRETO-del-cliente&x=1#SECRETO-del-fragmento",
+    ]);
+    // … y el detalle no la trae, ni el fragmento, en ningún campo.
+    expect(render).toEqual(falloPor("sin-respuesta", { tipo: "fetch", host: "sitio.test", ruta: "/api/datos;v=1", origen: "pagina" }));
+    expect(JSON.stringify(render)).not.toMatch(/SECRETO|token=|#/);
+  });
+
+  it("es el PRIMER pedido que no llegó —el mismo que da el código—, y cuenta todos los que no llegaron", async () => {
+    // El bundle declarado no llega (timeout) mientras la página se carga; un
+    // worker pide después y tampoco le llega (sin-respuesta). Manda el
+    // primero: el código es suyo, y el detalle también.
+    const { deps, bitacora } = armar(
+      {
+        "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script></body></html>` },
+        "http://sitio.test/app.js": { error: "timeout" },
+      },
+      { enSegundoPlano: [{ url: "http://cdn.test/datos", tipo: "fetch", marco: null }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(bitacora.noLlegaron.map((n) => [n.url, n.motivo, n.origen])).toEqual([
+      ["http://sitio.test/app.js", "timeout", "pagina"],
+      ["http://cdn.test/datos", "sin-respuesta", "worker"],
+    ]);
+    expect(render).toEqual(
+      falloPor("timeout", { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina", noLlegaron: 2 })
+    );
+  });
+
+  it(`una ruta larga se corta a ${MAX_RUTA_DEL_DETALLE} caracteres, y se nota que se cortó`, async () => {
+    const larga = `/assets/${"segmento-largo/".repeat(20)}chunk.js`;
+    expect(larga.length).toBeGreaterThan(MAX_RUTA_DEL_DETALLE);
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: PAGINA } }, { enSegundoPlano: [{ url: larga, tipo: "script" }] });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado === "fallo" && render.detalle?.ruta).toBe(`${larga.slice(0, MAX_RUTA_DEL_DETALLE - 1)}…`);
+    // Una de 120 justos no se toca.
+    const justa = `/${"r".repeat(MAX_RUTA_DEL_DETALLE - 1)}`;
+    const otro = armar({ "http://sitio.test/": { cuerpo: PAGINA } }, { enSegundoPlano: [{ url: justa, tipo: "script" }] });
+    const renderJusto = await medirRenderizado("http://sitio.test/", otro.deps);
+    expect(renderJusto.estado === "fallo" && renderJusto.detalle?.ruta).toBe(justa);
+  });
+
+  it("`subrecurso-pendiente` dice el PRIMERO que seguía en vuelo, y cuenta también los que no llegaron antes", async () => {
+    const nunca = () => new Promise<void>(() => {});
+    const { deps, bitacora } = armar(
+      {
+        "http://sitio.test/": { cuerpo: PAGINA },
+        "http://sitio.test/api/siempre": { cuerpo: "x", llegaCuando: nunca },
+        "http://sitio.test/api/tambien": { cuerpo: "x", llegaCuando: nunca },
+        "http://sitio.test/api/cayo": { error: "tls" },
+      },
+      {
+        enSegundoPlano: [
+          { url: "/api/cayo", tipo: "fetch" },
+          { url: "/api/siempre", tipo: "fetch", marco: "/marco-propio" },
+          { url: "/api/tambien", tipo: "xhr" },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    // Dos en vuelo, en este orden, y uno que no llegó: si no, esto no prueba nada.
+    expect([...bitacora.enCamino].map((p) => p.url)).toEqual(["http://sitio.test/api/siempre", "http://sitio.test/api/tambien"]);
+    expect(bitacora.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/api/cayo"]);
+    expect(render).toEqual(
+      falloPor("pendiente", { tipo: "fetch", host: "sitio.test", ruta: "/api/siempre", origen: "mismo-sitio", noLlegaron: 3 })
+    );
+  });
+
+  it("un fallo que NO decidió un pedido no trae detalle: el documento, el navegador, la pestaña sin JavaScript", async () => {
+    const caido = armar({ "http://sitio.test/": { status: 503, cuerpo: "caído" } });
+    expect(await medirRenderizado("http://sitio.test/", caido.deps)).toEqual({ estado: "fallo", codigo: "http_503" });
+    const sinNavegador = armar({ "http://sitio.test/": { cuerpo: PAGINA } }, { arranqueFalla: true });
+    expect(await medirRenderizado("http://sitio.test/", sinNavegador.deps)).toEqual({ estado: "fallo", codigo: "sin-navegador" });
+    // Y un pedido de otro sitio que no llegó no aparece en ningún lado: la página se midió.
+    const ajeno = armar(
+      { "http://sitio.test/": { cuerpo: PAGINA } },
+      { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://video.test/embed" }] }
+    );
+    const medido = await medirRenderizado("http://sitio.test/", ajeno.deps);
+    expect(medido.estado).toBe("medido");
+    expect(medido).not.toHaveProperty("detalle");
   });
 });
 

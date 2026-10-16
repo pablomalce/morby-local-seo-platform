@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { Badge, Card, HudLabel } from "@/components/ui";
 import type { EstadoDelPunto, Gravedad, Hallazgo, PuntosDeLaPuerta } from "@/lib/aeo/hallazgos";
-import type { ResultadoRenderizado } from "@/lib/aeo/renderizado";
+import type { DetalleDelSubrecurso, ResultadoRenderizado } from "@/lib/aeo/renderizado";
 
 /**
  * QUÉ IMPIDE ESTA PANTALLA
@@ -19,7 +19,8 @@ import type { ResultadoRenderizado } from "@/lib/aeo/renderizado";
  * H2-GO-1 pide los DOS números crudos, uno frente al otro: con uno solo no se
  * distingue una página corta de una que se dibuja en el cliente. Si el
  * renderizado no se pudo medir, el lugar del número dice «no medido» y por qué
- * —nunca un cero, que se leería como «la página no tiene texto»—.
+ * —nunca un cero, que se leería como «la página no tiene texto»—, y si lo
+ * decidió un pedido que no llegó, cuál (`detalle`).
  */
 
 const TONO: Record<Gravedad, "critical" | "orange" | "hud" | "outline"> = {
@@ -181,12 +182,38 @@ function TextoComparado({ lectura }: { lectura: NonNullable<Resultado["lectura"]
             {render.caracteres.toLocaleString("es")} caracteres
           </p>
         ) : (
-          <p className="mt-1 text-[13px] text-metal-400" data-testid="texto-renderizado" data-estado="no-medido">
-            no medido ({render?.estado === "fallo" ? render.codigo : "sin dato"})
-          </p>
+          <>
+            <p className="mt-1 text-[13px] text-metal-400" data-testid="texto-renderizado" data-estado="no-medido">
+              no medido ({render?.estado === "fallo" ? render.codigo : "sin dato"})
+            </p>
+            {render?.estado === "fallo" && render.detalle && <PedidoQueNoLlego detalle={render.detalle} />}
+          </>
         )}
       </div>
     </div>
+  );
+}
+
+const DE_DONDE: Record<DetalleDelSubrecurso["origen"], string> = {
+  pagina: "la página",
+  "mismo-sitio": "un marco del mismo sitio",
+  worker: "un worker",
+  "marco-desconocido": "un marco sin URL de red",
+};
+
+/**
+ * CUÁL pedido dejó el render sin número, al lado del «no medido»: sin esto,
+ * `subrecurso-sin-respuesta` no dice qué falta ni a quién preguntarle. La ruta
+ * llega sin query: es lo que manda el servidor (`renderizado.ts`).
+ */
+function PedidoQueNoLlego({ detalle }: { detalle: DetalleDelSubrecurso }) {
+  const n = detalle.noLlegaron;
+  return (
+    <p className="mt-1 break-all font-mono text-[11px] text-metal-500" data-testid="render-detalle" data-origen={detalle.origen}>
+      No llegó: {detalle.tipo} {detalle.host}
+      {detalle.ruta} · desde {DE_DONDE[detalle.origen]} · {detalle.motivo} · {n} {n === 1 ? "pedido" : "pedidos"} sin
+      llegar en total
+    </p>
   );
 }
 
