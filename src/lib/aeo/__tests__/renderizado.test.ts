@@ -765,6 +765,28 @@ describe("un fallo es un fallo: con código, sin número, y con el navegador cer
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "http_403" });
   });
 
+  // M11 (F10): el borde es 400, no 401. Un 400 con una página de error larga
+  // se medía como el sitio.
+  it("el borde: un documento que contesta 400 es `http_400`, y uno que contesta 399 se mide", async () => {
+    const error = `<h1>Bad Request</h1><p>${"Página de error del servidor. ".repeat(40)}</p>`;
+    const { deps } = armar({ "http://sitio.test/": { status: 400, cuerpo: error } });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "http_400" });
+    const otro = armar({ "http://sitio.test/": { status: 399, cuerpo: error } });
+    expect((await medirRenderizado("http://sitio.test/", otro.deps)).estado).toBe("medido");
+  });
+
+  // M12 (F10): sin status del documento no hay documento medido. Si Chromium
+  // lo sirvió por su cuenta, lo que se lee no pasó por el examen ni por el
+  // transporte, y su texto no es el del sitio.
+  it("un documento que la medición no vio llegar —sin status— es `navegacion`, no un número", async () => {
+    const { deps, navegador } = armar(
+      { "http://sitio.test/": { cuerpo: "<p>x</p>" } },
+      { documentoPorFuera: `<main><p>${"Texto que nadie examinó. ".repeat(40)}</p></main>` }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "navegacion" });
+    expect(navegador.registro.cierres).toBe(1);
+  });
+
   it("un documento que se declara descarga no se entrega: `descarga`", async () => {
     const { deps, navegador } = armar({
       "http://sitio.test/": { cuerpo: "PK...", encabezados: { "content-disposition": "attachment; filename=x.zip" } },

@@ -170,6 +170,12 @@ export interface OpcionesDoble {
    * (PU-3).
    */
   responderFalla?: (url: string) => boolean;
+  /**
+   * La pestaña con JavaScript termina la navegación con ESTE documento sin
+   * que el interceptor lo haya visto —lo sirvió Chromium por su cuenta, de su
+   * caché—: la medición no tiene status del documento (M12).
+   */
+  documentoPorFuera?: string;
 }
 
 export function navegadorDoble(opciones: OpcionesDoble = {}) {
@@ -235,6 +241,13 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         if (!atender) throw new Error("el doble necesita el interceptor antes de navegar");
         if (opciones.navegacionColgada) await new Promise(() => {});
         if (!sinJs && opciones.navegacionVirtualMs) await opciones.reloj?.esperar?.(opciones.navegacionVirtualMs);
+        if (!sinJs && opciones.documentoPorFuera !== undefined) {
+          urlDelDocumento = url;
+          html = opciones.documentoPorFuera;
+          registro.textoDibujado = html;
+          navegadoEn = opciones.reloj?.ahora() ?? null;
+          return;
+        }
 
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
