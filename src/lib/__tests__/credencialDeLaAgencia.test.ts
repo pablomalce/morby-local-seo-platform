@@ -77,6 +77,18 @@
  *     clave `as const`, un `import()`) o si el namespace se va a otra función:
  *     la tercera revisión del #118 pidió el token así desde `property-actions.ts`.
  *
+ * Y LOS TRES QUE RECIBEN EL TOKEN
+ *
+ * La puerta no entrega el token, pero se lo pasa a `searchConsole.ts`, `ga4.ts`
+ * y `googleBusinessProfile.ts`, que lo ponen en la cabecera. Medido el
+ * 2026-10-16 en la quinta revisión del #118, con tsc, esta pared y la suite
+ * entera en verde: `fetchSearchConsoleTotals` guardaba `deps.accessToken` en un
+ * `export const ultimoToken`, y una ruta nueva lo gastaba sobre cualquier sitio.
+ * Ahora son RECEPTORES: sus exports de valor los usa la puerta y lo que está
+ * declarado abajo (la ventana de Search Console, que GA4 comparte), llegar a uno
+ * sin la puerta es una fuga, no importan nada de valor fuera de los tres, y no
+ * tocan `process`, el entorno, el objeto global ni un global del repositorio.
+ *
  * LA PRIMERA MITAD DE ESTE ARCHIVO PRUEBA EL DETECTOR
  *
  * Un detector ciego da el mismo verde que un árbol limpio. Antes de mirar `src`,
@@ -108,6 +120,7 @@ import {
   juzgar,
   opcionesDelProyecto,
   type Politica,
+  type Receptor,
   type Veredicto,
 } from "./credencialDeLaAgencia.analisis";
 
@@ -184,6 +197,38 @@ const CONEXION: Array<{ modulo: string; usa: string[]; porque: string }> = [
   },
 ];
 
+const SEARCH_CONSOLE = "src/lib/integrations/google/searchConsole.ts";
+const GA4 = "src/lib/integrations/google/ga4.ts";
+const BUSINESS_PROFILE = "src/lib/publishing/googleBusinessProfile.ts";
+
+/**
+ * Los que RECIBEN el token de la puerta y lo ponen en la cabecera, y quién usa
+ * cada export de valor suyo en producción. Exacto, por símbolo.
+ *
+ * Un usuario nuevo de un receptor es una decisión, como una exención de
+ * conexión: el que lo use puede leer lo que el receptor deje en sus exports, y
+ * ése es el token. Un módulo de datos no entra acá; pide la consulta a
+ * `servicioCompartido.ts`.
+ */
+const RECEPTORES: Array<Receptor & { porque: string }> = [
+  {
+    modulo: SEARCH_CONSOLE,
+    usadoPor: { [PUERTA]: ["fetchSearchConsoleTotals"], [GA4]: ["VENTANA_DIAS", "ventana"] },
+    porque:
+      "la puerta consulta con el token; GA4 —otro receptor, que ya tiene el token— usa la MISMA ventana para que las dos mitades del reporte se puedan comparar",
+  },
+  {
+    modulo: GA4,
+    usadoPor: { [PUERTA]: ["fetchGa4Totals"] },
+    porque: "la puerta consulta con el token",
+  },
+  {
+    modulo: BUSINESS_PROFILE,
+    usadoPor: { [PUERTA]: ["publicadorDeBusinessProfile"] },
+    porque: "la puerta arma el publicador de la ficha mapeada con el token",
+  },
+];
+
 const POLITICA: Politica = {
   variable: VARIABLE,
   lector: LECTOR,
@@ -199,6 +244,7 @@ const POLITICA: Politica = {
     decrypted_secrets: [],
   },
   conexion: CONEXION.map(({ modulo, usa }) => ({ modulo, usa })),
+  receptores: RECEPTORES.map(({ modulo, usadoPor }) => ({ modulo, usadoPor })),
 };
 
 // ---------------------------------------------------------------------------
@@ -238,11 +284,92 @@ const VIRTUALES: Record<string, string> = {
       return admin().from("integration_tokens").select("expires_at").eq("organization_id", org);
     }`,
   // La puerta, con la reexportación de la segunda revisión del #118 puesta: el
-  // detector tiene que verla en lo que la puerta exporta y en quién la usa.
+  // detector tiene que verla en lo que la puerta exporta y en quién la usa. Y le
+  // pasa el token a cada receptor de abajo, como la de verdad a los tres suyos.
   "servicioCompartido.ts": `
     import { agencyAccessToken } from "./tokenStore";
-    export async function servir(mapeos: string[]) { return mapeos.length > 0 ? agencyAccessToken() : null; }
+    import { consultar } from "./receptor";
+    import { consultarHermano } from "./receptorHermano";
+    import { consultarGuardando } from "./receptorGuarda";
+    import { consultarColgando } from "./receptorEnLaFuncion";
+    import { consultarDepositando } from "./receptorDeposita";
+    import { consultarAlEntorno } from "./receptorAlEntorno";
+    import { consultarAlGlobal } from "./receptorAlGlobal";
+    import { consultarAlDesnudo } from "./receptorGlobalDeclarado";
+    const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo];
+    export async function servir(mapeos: string[]) {
+      if (mapeos.length === 0) return null;
+      const accessToken = String(await agencyAccessToken());
+      for (const r of conTrampa) await r({ accessToken });
+      await consultarHermano({ accessToken, ahora: new Date() });
+      return consultar({ accessToken, ref: mapeos[0], fetcher: fetch });
+    }
     export { agencyAccessToken } from "./tokenStore";`,
+  // --- Los RECEPTORES: la puerta les pasa el token (quinta revisión del #118).
+  // Los dos primeros son como searchConsole.ts y ga4.ts: usan el lenguaje
+  // (`JSON`, `encodeURIComponent`, `Date`) y el hermano comparte la ventana. Los
+  // demás guardan el token donde lo lea otro.
+  "receptor.ts": `
+    export const VENTANA = 28;
+    export const ventana = (ahora: Date) => new Date(ahora.getTime() - VENTANA * 86_400_000).toISOString();
+    export async function consultar(deps: { accessToken: string; ref: string; fetcher: typeof fetch }) {
+      const r = await deps.fetcher("https://ejemplo.test/" + encodeURIComponent(deps.ref), { headers: { authorization: "Bearer " + deps.accessToken } });
+      return JSON.stringify({ ok: r.ok });
+    }`,
+  "receptorHermano.ts": `
+    import { ventana } from "./receptor";
+    export async function consultarHermano(deps: { accessToken: string; ahora: Date }) {
+      return JSON.stringify({ desde: ventana(deps.ahora), con: deps.accessToken.length > 0 });
+    }`,
+  // A1 de la quinta revisión: el token en un export mutable, y una ruta nueva
+  // que lo gasta. Con tsc y la pared en verde.
+  "receptorGuarda.ts": `
+    export const ultimoToken: { valor: string | null } = { valor: null };
+    export async function consultarGuardando(deps: { accessToken: string }) { ultimoToken.valor = deps.accessToken; }`,
+  "app/api/seo/search-console/route.ts": `
+    import { ultimoToken } from "../../../../receptorGuarda";
+    export async function GET() { return ultimoToken.valor; }`,
+  // Sin ningún export mutable: el token colgado de la función que la puerta
+  // usa. Una regla sobre la FORMA del export no lo ve; una sobre quién lo usa, sí.
+  "receptorEnLaFuncion.ts": `
+    export async function consultarColgando(deps: { accessToken: string }) {
+      (consultarColgando as unknown as { t?: string }).t = deps.accessToken;
+    }`,
+  "usaLaFuncion.ts": `
+    import { consultarColgando } from "./receptorEnLaFuncion";
+    export const token = () => (consultarColgando as unknown as { t?: string }).t;`,
+  // El token sale del receptor por un import: el depósito no es una credencial,
+  // y quien lo lee no llega a ninguna.
+  "receptorDeposita.ts": `
+    import { guardar } from "./deposito";
+    export async function consultarDepositando(deps: { accessToken: string }) { guardar(deps.accessToken); }`,
+  "deposito.ts": `
+    let guardado: string | null = null;
+    export const guardar = (t: string) => { guardado = t; };
+    export const leer = () => guardado;`,
+  "usaElDeposito.ts": `
+    import { leer } from "./deposito";
+    export const token = () => leer();`,
+  // Lo que comparte todo el proceso: el entorno, el objeto global, y un global
+  // declarado por el repositorio, en el mismo archivo o en otro.
+  "receptorAlEntorno.ts": `
+    export function consultarAlEntorno(deps: { accessToken: string }) {
+      process.env.CACHE_DE_GOOGLE = deps.accessToken;
+    }`,
+  "receptorAlGlobal.ts": `
+    declare global { var cacheDeGoogle: string | undefined }
+    export function consultarAlGlobal(deps: { accessToken: string }) {
+      globalThis.cacheDeGoogle = deps.accessToken;
+    }`,
+  "globales.ts": `
+    declare global { var tokenAjeno: string | undefined }
+    export {};`,
+  "receptorGlobalDeclarado.ts": `
+    declare global { var tokenPropio: string | undefined }
+    export function consultarAlDesnudo(deps: { accessToken: string }) {
+      tokenPropio = deps.accessToken;
+      tokenAjeno = deps.accessToken;
+    }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
@@ -607,6 +734,16 @@ const CONEXION_SIN_IDENTIFICADOR = [
  */
 const USAN_TODO_EL_ALMACEN = ["conexionPorClaveArmada.js", "conexionPorClaveAsertada.ts", "conexionPorReflect.ts"];
 
+/** Los receptores virtuales que guardan el token donde lo lea otro, con la función que les pasa la puerta. */
+const RECEPTORES_CON_TRAMPA: ReadonlyArray<readonly [string, string]> = [
+  ["receptorGuarda.ts", "consultarGuardando"],
+  ["receptorEnLaFuncion.ts", "consultarColgando"],
+  ["receptorDeposita.ts", "consultarDepositando"],
+  ["receptorAlEntorno.ts", "consultarAlEntorno"],
+  ["receptorAlGlobal.ts", "consultarAlGlobal"],
+  ["receptorGlobalDeclarado.ts", "consultarAlDesnudo"],
+];
+
 const POLITICA_VIRTUAL: Politica = {
   variable: VARIABLE,
   lector: `${V}/agency.ts`,
@@ -626,6 +763,12 @@ const POLITICA_VIRTUAL: Politica = {
     { modulo: `${V}/conexionConToken.ts`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] },
     ...CONEXION_SIN_IDENTIFICADOR.map((m) => ({ modulo: `${V}/${m}`, usa: [`${V}/agency.ts#resolveAgencyOrgId`] })),
     { modulo: `${V}/yaNoLlega.ts`, usa: [] },
+  ],
+  // `usadoPor` es lo que la política DECLARA; lo que se mide está en el test.
+  receptores: [
+    { modulo: `${V}/receptor.ts`, usadoPor: { [`${V}/servicioCompartido.ts`]: ["consultar"], [`${V}/receptorHermano.ts`]: ["ventana"] } },
+    { modulo: `${V}/receptorHermano.ts`, usadoPor: { [`${V}/servicioCompartido.ts`]: ["consultarHermano"] } },
+    ...RECEPTORES_CON_TRAMPA.map(([m, f]) => ({ modulo: `${V}/${m}`, usadoPor: { [`${V}/servicioCompartido.ts`]: [f] } })),
   ],
 };
 
@@ -790,18 +933,77 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(origenes).toEqual(
       en([
         "app/api/clics__tests__/route.ts",
+        "app/api/seo/search-console/route.ts",
         "app/reports/template.tsx",
         "cargadorDelAlmacen.ts",
         "instrumentation.ts",
         "reexporta.ts",
         "reexportaTodo.ts",
         "usaElSecreto.ts",
+        "usaLaFuncion.ts",
         "usaPorEstrella.ts",
         "usaPorNamespace.ts",
       ])
     );
     // La exención no se hereda: instrumentation.ts llega POR la de conexión.
     expect(virtual.fugas).toContain([`${V}/instrumentation.ts`, `${V}/conexion.ts`, `${V}/agency.ts`].join(" -> "));
+    // Un receptor es una credencial más para el grafo: A1 de la quinta revisión.
+    expect(virtual.fugas).toContain([`${V}/app/api/seo/search-console/route.ts`, `${V}/receptorGuarda.ts`].join(" -> "));
+  });
+
+  describe("los receptores del token (quinta revisión del #118)", () => {
+    const puerta = `${V}/servicioCompartido.ts`;
+
+    it("por símbolo: quién usa cada export de un receptor, sea un objeto mutable o la función que la puerta llama", () => {
+      expect(virtual.usosDeLosReceptores).toEqual({
+        [`${V}/receptor.ts`]: { [puerta]: ["consultar"], [`${V}/receptorHermano.ts`]: ["ventana"] },
+        [`${V}/receptorHermano.ts`]: { [puerta]: ["consultarHermano"] },
+        // A1: la ruta nueva usa el export donde el receptor dejó el token.
+        [`${V}/receptorGuarda.ts`]: {
+          [puerta]: ["consultarGuardando"],
+          [`${V}/app/api/seo/search-console/route.ts`]: ["ultimoToken"],
+        },
+        // Ningún export mutable: el token colgado de la función. Se ve igual.
+        [`${V}/receptorEnLaFuncion.ts`]: { [puerta]: ["consultarColgando"], [`${V}/usaLaFuncion.ts`]: ["consultarColgando"] },
+        [`${V}/receptorDeposita.ts`]: { [puerta]: ["consultarDepositando"] },
+        [`${V}/receptorAlEntorno.ts`]: { [puerta]: ["consultarAlEntorno"] },
+        [`${V}/receptorAlGlobal.ts`]: { [puerta]: ["consultarAlGlobal"] },
+        [`${V}/receptorGlobalDeclarado.ts`]: { [puerta]: ["consultarAlDesnudo"] },
+      });
+    });
+
+    it("un receptor que importa algo de valor fuera de los receptores: el token sale por ahí", () => {
+      // usaElDeposito.ts no llega a ninguna credencial ni usa ningún receptor:
+      // lo único que lo delata es adónde importa el receptor.
+      expect(virtual.fugas.some((f) => f.startsWith(`${V}/usaElDeposito.ts`))).toBe(false);
+      expect(virtual.receptoresImportan).toEqual({
+        [`${V}/receptor.ts`]: [],
+        // El hermano importa la ventana de OTRO receptor: eso no sale de ellos.
+        [`${V}/receptorHermano.ts`]: [],
+        [`${V}/receptorGuarda.ts`]: [],
+        [`${V}/receptorEnLaFuncion.ts`]: [],
+        [`${V}/receptorDeposita.ts`]: [`${V}/deposito.ts`],
+        [`${V}/receptorAlEntorno.ts`]: [],
+        [`${V}/receptorAlGlobal.ts`]: [],
+        [`${V}/receptorGlobalDeclarado.ts`]: [],
+      });
+    });
+
+    it("un receptor que toca el entorno, el objeto global o un global del repositorio, cada sitio con su línea", () => {
+      expect(virtual.receptoresTocanLoGlobal.sort()).toEqual(
+        [
+          `${V}/receptorAlEntorno.ts:3 el entorno: process.env.CACHE_DE_GOOGLE`,
+          `${V}/receptorAlEntorno.ts:3 process: process.env`,
+          `${V}/receptorAlGlobal.ts:4 el objeto global: globalThis.cacheDeGoogle`,
+          `${V}/receptorGlobalDeclarado.ts:4 tokenPropio, un valor global que declara ${V}/receptorGlobalDeclarado.ts`,
+          `${V}/receptorGlobalDeclarado.ts:5 tokenAjeno, un valor global que declara ${V}/globales.ts`,
+        ].sort()
+      );
+      // El control: lo que declaran el lenguaje y Node no es un global ajeno.
+      for (const limpio of ["receptor.ts", "receptorHermano.ts"]) {
+        expect(analisisVirtual.lecturas.get(`${V}/${limpio}`)!.tocaLoGlobal, limpio).toEqual([]);
+      }
+    });
   });
 
   it("por símbolo: quién usa el token, aunque llegue por la puerta o por una exención", () => {
@@ -1065,6 +1267,39 @@ describe("el árbol de src, leído del disco", () => {
       // Una exención que ya no llega a la credencial no exime nada y le hace
       // lugar a la próxima sin que se note en el diff.
       expect(real.vencidas, "exenta como conexión pero ya no existe o no llega a la credencial").toEqual([]);
+    });
+  });
+
+  describe("los que reciben el token de la puerta", () => {
+    it("cada export de un receptor lo usa la puerta, o quien está declarado, y nadie más", () => {
+      // Por SÍMBOLO (R14). La quinta revisión del #118 guardó el token en un
+      // export de searchConsole.ts y una ruta nueva lo gastó, con tsc y esta
+      // pared en verde. Que la puerta esté es también la anti-vacuidad: si un
+      // receptor cambiara de nombre, el mapa de abajo dejaría de coincidir.
+      expect(
+        real.usosDeLosReceptores,
+        "Un módulo nuevo usa un export de un receptor del token. Lo que el receptor deje en " +
+          "sus exports es el token de la agencia: un módulo de datos pide la consulta a " +
+          "servirConLaAgencia(). Si es legítimo, va a RECEPTORES con su razón."
+      ).toEqual(Object.fromEntries(RECEPTORES.map((r) => [r.modulo, r.usadoPor])));
+    });
+
+    it("un receptor no importa nada de valor fuera de los receptores", () => {
+      expect(
+        real.receptoresImportan,
+        "Un receptor importa algo que no es otro receptor: el token puede salir por ahí a " +
+          "un módulo que no recibe nada de la puerta."
+      ).toEqual(Object.fromEntries(RECEPTORES.map((r) => [r.modulo, []])));
+    });
+
+    it("un receptor no toca process, el entorno, el objeto global ni un global del repositorio", () => {
+      // Anti-vacuidad: en el árbol de verdad el detector ve lo que tiene que
+      // ver. agency.ts lee el entorno (`env: NodeJS.ProcessEnv = process.env`).
+      expect(analisisReal.lecturas.get(LECTOR)!.tocaLoGlobal.join("\n")).toContain(`${LECTOR}:`);
+      expect(
+        real.receptoresTocanLoGlobal,
+        "Lo que un receptor escribe ahí lo lee cualquier módulo del proceso, y el receptor tiene el token."
+      ).toEqual([]);
     });
   });
 });

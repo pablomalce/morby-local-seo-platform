@@ -110,6 +110,13 @@
  *     otro, a través de cualquier reexportación;
  *   - este archivo exporta como valor `servirConLaAgencia` y nada más: una
  *     reexportación del token desde acá pone la pared en rojo;
+ *   - los tres a los que este archivo les pasa el token —`searchConsole.ts`,
+ *     `ga4.ts` y `googleBusinessProfile.ts`— son RECEPTORES: sus exports de valor
+ *     los usa este archivo (y GA4 la ventana de Search Console) y nadie más, no
+ *     importan nada fuera de ellos y no tocan `process`, el entorno ni el objeto
+ *     global. Medido el 2026-10-16 en la quinta revisión del #118: un export de
+ *     `searchConsole.ts` que guardaba el token y una ruta nueva que lo gastaba
+ *     pasaban la pared;
  *   - los de CONEXIÓN —el OAuth, la pantalla de integraciones, el mapeo y el
  *     guardián del operador— llegan a la credencial sin pasar por acá, y cada
  *     uno usa exactamente las piezas que declara allá, con su razón. Ninguno

@@ -88,7 +88,12 @@
  *                    `schema`) con un nombre que no está escrito, un método de
  *                    la base sacado del cliente sin llamarlo, y una aserción que
  *                    le borra el tipo al cliente;
- *   esquemas         los esquemas que pide con `.schema()`.
+ *   esquemas         los esquemas que pide con `.schema()`;
+ *   tocaLoGlobal     cada sitio donde toca algo que comparte con todo el proceso:
+ *                    `process`, el entorno, el objeto global, o un valor global
+ *                    que no declaran el lenguaje ni Node (un `declare global {
+ *                    var x }`, propio o de otro archivo). Sólo se juzga en los
+ *                    RECEPTORES del token (ver abajo).
  *
  * POR QUÉ TAMBIÉN SÍMBOLOS, Y NO SÓLO EL GRAFO DE ARCHIVOS
  *
@@ -123,8 +128,36 @@
  * `orchestrator.ts` (el rastreo empezaba en lo tipado como entorno). Los tres
  * están arriba, y en `credencialDeLaAgencia.test.ts` como fuentes virtuales.
  *
+ * Y LOS QUE RECIBEN EL TOKEN (quinta revisión del #118)
+ *
+ * La puerta no entrega el token, pero se lo pasa a tres módulos que lo ponen en
+ * la cabecera: `searchConsole.ts`, `ga4.ts` y `googleBusinessProfile.ts`. Medido
+ * el 2026-10-16 con tsc, la pared y la suite entera en verde: una línea en
+ * `fetchSearchConsoleTotals` que guardaba `deps.accessToken` en un `export const
+ * ultimoToken = { valor: null }`, y una ruta nueva que lo gastaba sobre el sitio
+ * de la query. La pared no sabía que esos tres existían. Ahora son RECEPTORES
+ * (`Politica.receptores`), y para cada uno se mide:
+ *
+ *   - quién usa sus exports de valor, por SÍMBOLO: la puerta y lo que declara la
+ *     política, nada más. No importa la forma del export —un objeto mutable, un
+ *     `let`, una propiedad colgada de la función exportada—: quien no está
+ *     declarado no usa ninguno;
+ *   - por ARCHIVO, que un receptor es una credencial más: llegar a él sin la
+ *     puerta es una fuga, como llegar a `tokenStore.ts`;
+ *   - que no importa nada de valor fuera de los receptores: el token no sale de
+ *     ellos hacia otro módulo que lo guarde;
+ *   - que no toca `process`, el entorno, el objeto global ni un valor global
+ *     declarado por el repositorio (`tocaLoGlobal`): el token no queda donde lo
+ *     lea cualquiera.
+ *
  * QUÉ NO VE, Y ESTÁ DICHO
  *
+ *   - Un receptor que escribe el token en un objeto que comparte con otros por
+ *     el heap y no por un módulo: el `ahora` o la entrada que le pasa quien
+ *     llama, el resultado que devuelve, el `fetch` del proceso, o un objeto del
+ *     lenguaje (`Object.prototype`). Lo que los receptores de hoy devuelven lo
+ *     miden los tests de comportamiento de la puerta y de sus dos llamadores
+ *     (`orchestrator.servicioCompartido.test.ts` y el de la publicación).
  *   - Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
  *     `require()` (un `eval`, un `new Function`, que también pueden devolver
  *     `process` sin tipo).
@@ -170,6 +203,7 @@ export interface Lectura {
   custodia: Set<string>;
   supabaseOpaco: string[];
   esquemas: Set<string>;
+  tocaLoGlobal: string[];
 }
 
 export interface Analisis {
@@ -472,6 +506,21 @@ export function analizar(
     const f = d.getSourceFile();
     return programa.isSourceFileDefaultLibrary(f) || /[\\/]node_modules[\\/]@types[\\/]node[\\/]/.test(f.fileName);
   };
+  // ¿Este nombre es un valor GLOBAL que no declaran el lenguaje ni Node? Un
+  // `declare global { var x }` —en el mismo archivo o en otro— o un `declare
+  // const`: un lugar que comparte todo el proceso y que no es `process` ni el
+  // objeto global, así que `fuenteDe` no lo ve. Un import no: su símbolo es un
+  // alias, no un valor, y lo miden `importa` y `usa`. Y un nombre sin
+  // declaración (`undefined`, `globalThis`) tampoco: el objeto global lo ve
+  // `fuenteDe`.
+  const VALOR_CON_NOMBRE =
+    ts.SymbolFlags.Variable | ts.SymbolFlags.Function | ts.SymbolFlags.Class | ts.SymbolFlags.Enum | ts.SymbolFlags.ValueModule;
+  const globalAjeno = (s: ts.Symbol, sf: ts.SourceFile): ts.Declaration | null => {
+    if (!(s.flags & VALOR_CON_NOMBRE)) return null;
+    return (
+      (s.declarations ?? []).find((d) => !delLenguaje(d) && (d.getSourceFile() !== sf || enContextoAmbiental(d))) ?? null
+    );
+  };
   const SIN_TIPO = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
   const llamable = (t: ts.Type): boolean => {
     const u = checker.getNonNullableType(t);
@@ -634,6 +683,7 @@ export function analizar(
       custodia: new Set(),
       supabaseOpaco: [],
       esquemas: new Set(),
+      tocaLoGlobal: [],
     };
     const donde = (n: ts.Node) => `${rel(abs)}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}`;
     const seguir = (n: ts.Node, especificador: string) => {
@@ -1010,6 +1060,13 @@ export function analizar(
         if (s && !esNombreDeclarado(nodo)) {
           const { namespace } = delSimbolo(s);
           if (namespace) usoDelNamespace(nodo, namespace);
+          // Y si es un global que no declara el lenguaje. Ver `globalAjeno`.
+          const ajeno = globalAjeno(s, sf);
+          if (ajeno) {
+            lectura.tocaLoGlobal.push(
+              `${donde(nodo)} ${nodo.text}, un valor global que declara ${rel(ajeno.getSourceFile().fileName)}`
+            );
+          }
         }
       }
       // Un acceso por elemento sobre un namespace que no se nombró arriba (el de
@@ -1021,7 +1078,10 @@ export function analizar(
       // El entorno, `process` y el objeto global. Ver `fuenteDe`: por símbolo,
       // no por expresión.
       const fuente = fuenteDe(nodo);
-      if (fuente) usoDe(nodo, fuente);
+      if (fuente) {
+        lectura.tocaLoGlobal.push(`${donde(nodo)} ${NOMBRE_DE_LA_FUENTE[fuente]}: ${nodo.parent.getText(sf).slice(0, 80)}`);
+        usoDe(nodo, fuente);
+      }
       ts.forEachChild(nodo, visitar);
     };
     visitar(sf);
@@ -1064,6 +1124,15 @@ export interface Exencion {
   usa: readonly string[];
 }
 
+/**
+ * Un módulo que RECIBE el token de la puerta y lo pone en la cabecera, y quién
+ * usa cada uno de sus exports de valor (`modulo usuario` → nombres), exacto.
+ */
+export interface Receptor {
+  modulo: string;
+  usadoPor: Readonly<Record<string, readonly string[]>>;
+}
+
 /** Lo que una política declara: quién puede leer qué, y quién está exento de la pared. */
 export interface Politica {
   /** La variable de la agencia y su único lector. */
@@ -1085,6 +1154,11 @@ export interface Politica {
    * —«este archivo puede»— deja entrar cualquier export nuevo del archivo.
    */
   conexion: readonly Exencion[];
+  /**
+   * Los que reciben el token de la puerta. Para el grafo son una credencial
+   * más: tienen el token en la mano mientras consultan. Ver el encabezado.
+   */
+  receptores: readonly Receptor[];
 }
 
 export interface Veredicto {
@@ -1116,6 +1190,12 @@ export interface Veredicto {
    * conexión, medidos.
    */
   conexionUsa: Record<string, string[]>;
+  /** Receptor → módulo de producción que usa sus exports de valor → cuáles, medido. */
+  usosDeLosReceptores: Record<string, Record<string, string[]>>;
+  /** Receptor → lo que importa como valor fuera de los receptores, medido. */
+  receptoresImportan: Record<string, string[]>;
+  /** Los sitios donde un receptor toca `process`, el entorno, el objeto global o un global del repositorio. */
+  receptoresTocanLoGlobal: string[];
 }
 
 export function juzgar(a: Analisis, politica: Politica): Veredicto {
@@ -1141,12 +1221,15 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
   // Las credenciales: lo declarado Y lo medido. Un módulo que lee la variable o
   // nombra la custodia sin estar autorizado ya pone en rojo su propia regla; lo
   // que esto agrega es que quien LO importe también es una fuga, aunque la
-  // lectura viva un archivo más abajo.
+  // lectura viva un archivo más abajo. Y los receptores: quien llega a uno sin
+  // la puerta llega a lo que el receptor haga con el token.
+  const receptores = politica.receptores.map((r) => r.modulo);
   const sumideros = new Set<string>([
     politica.lector,
     ...Object.values(politica.custodia).flat(),
     ...lectoresDe(politica.variable),
     ...Object.values(custodios).flat(),
+    ...receptores,
   ]);
   const modulosDeConexion = politica.conexion.map((c) => c.modulo);
   const conexion = new Set(modulosDeConexion);
@@ -1176,6 +1259,22 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     conexionUsa[c] = a.lecturas.has(c) ? [...de(c).usa].filter(enLaSuperficie).sort() : [];
   }
 
+  // Los receptores, por símbolo: quién usa qué de cada uno, qué importan fuera
+  // de los receptores, y dónde tocan lo que comparte todo el proceso.
+  const esReceptor = new Set(receptores);
+  const usosDeLosReceptores: Record<string, Record<string, string[]>> = {};
+  const receptoresImportan: Record<string, string[]> = {};
+  for (const r of receptores) {
+    const usos: Record<string, string[]> = {};
+    for (const m of prod) {
+      if (m === r) continue;
+      const nombres = [...de(m).usa].filter((s) => s.startsWith(`${r}#`)).map((s) => s.slice(r.length + 1));
+      if (nombres.length > 0) usos[m] = nombres.sort();
+    }
+    usosDeLosReceptores[r] = usos;
+    receptoresImportan[r] = a.lecturas.has(r) ? [...new Set(de(r).importa.filter((d) => !esReceptor.has(d)))].sort() : [];
+  }
+
   return {
     produccion: prod,
     lectoresDe,
@@ -1191,6 +1290,9 @@ export function juzgar(a: Analisis, politica: Politica): Veredicto {
     usosDelToken,
     exportaLaPuerta: a.lecturas.get(politica.puerta)?.exporta ?? [],
     conexionUsa,
+    usosDeLosReceptores,
+    receptoresImportan,
+    receptoresTocanLoGlobal: receptores.filter((r) => a.lecturas.has(r)).flatMap((r) => de(r).tocaLoGlobal),
   };
 }
 
