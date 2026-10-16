@@ -18,7 +18,20 @@
  *     el interceptor ENTREGÓ agrega su cuerpo al DOM, como si el JavaScript lo
  *     escribiera. Uno que el interceptor abortó no agrega nada;
  *   - `<img src>` se pide como `image`, `<iframe src>` como `document` de un
- *     marco que no es el principal.
+ *     marco que no es el principal;
+ *   - cada pedido dice desde qué marco sale (`urlDelMarco`): el documento de
+ *     la pestaña, salvo un pedido en segundo plano con `marco`, que sale del
+ *     `<iframe>` con esa URL —un widget de otro sitio y lo que pide adentro
+ *     (RT-4)—. Lo que pide un marco no se escribe en el DOM de la página. La
+ *     navegación de un `<iframe>` sale de `about:blank`, como en Chromium:
+ *     MEDIDO con Chrome 155 y el headless shell 153, el marco que navega
+ *     todavía no tiene la URL a la que va;
+ *   - cada pedido dice también cuál es el documento CONFIRMADO de la pestaña
+ *     (`urlDeLaPagina`): el del último salto de la navegación que llegó, como
+ *     `page.mainFrame().url()`. Una navegación de la pestaña en segundo plano
+ *     (`principal`) sale y se entrega, pero NO se confirma —un 204, una
+ *     descarga, un `window.stop()`—: el documento, su DOM y esa URL siguen
+ *     siendo los de antes (FV-1).
  *
  * Así, si la guarda deja pasar un subrecurso a la metadata, el texto dibujado
  * trae lo que «contestó» la metadata y el transporte registra el pedido: las
@@ -59,22 +72,49 @@ export interface PaginaDelSitio {
 /** El «internet» del doble: qué contesta cada URL. Lo que no está, `sin-respuesta`. */
 export type Sitio = Record<string, PaginaDelSitio>;
 
-export function transporteDoble(sitio: Sitio) {
+export interface OpcionesTransporteDoble {
+  /**
+   * El cuerpo llega en partes de este tamaño, y cada una se descuenta de
+   * `PedidoHttp.presupuesto` como en `transporteRender.ts`, con un turno del
+   * event loop entre parte y parte: los pedidos en paralelo bajan a la vez
+   * (RED-121-2). Sin esto, el cuerpo llega entero y nada se descuenta: es un
+   * transporte que no usa el presupuesto, y el interceptor lo descuenta al
+   * entregar.
+   */
+  porPartes?: number;
+}
+
+export function transporteDoble(sitio: Sitio, opciones: OpcionesTransporteDoble = {}) {
   const pedidos: PedidoHttp[] = [];
+  /** Lo que el presupuesto ACEPTÓ, por URL: lo que de verdad se bajó parte por parte. */
+  const bajados: Record<string, number> = {};
   const transporte: Transporte = async (pedido) => {
     pedidos.push(pedido);
     const pagina = sitio[pedido.url];
     if (!pagina) return { tipo: "error", motivo: "sin-respuesta" } satisfies RespuestaHttp;
     if (pagina.llegaCuando) await pagina.llegaCuando();
     if (pagina.error) return { tipo: "error", motivo: pagina.error } satisfies RespuestaHttp;
+    const cuerpo = Buffer.from(pagina.cuerpo ?? "");
+    if (opciones.porPartes) {
+      let leidos = 0;
+      for (let i = 0; i < cuerpo.length; i += opciones.porPartes) {
+        await new Promise((listo) => setImmediate(listo));
+        const parte = Math.min(opciones.porPartes, cuerpo.length - i);
+        leidos += parte;
+        if (leidos > pedido.maxBytes || (pedido.presupuesto && !pedido.presupuesto(parte))) {
+          return { tipo: "error", motivo: "demasiado-grande" } satisfies RespuestaHttp;
+        }
+        bajados[pedido.url] = (bajados[pedido.url] ?? 0) + parte;
+      }
+    }
     return {
       tipo: "respuesta",
       status: pagina.status ?? 200,
       encabezados: { "content-type": "text/html", ...(pagina.encabezados ?? {}) },
-      cuerpo: Buffer.from(pagina.cuerpo ?? ""),
+      cuerpo,
     };
   };
-  return { transporte, pedidos };
+  return { transporte, pedidos, bajados };
 }
 
 /** Un DNS escrito: cada nombre, sus direcciones. Cuenta cuántas veces se preguntó por cada uno. */
@@ -127,7 +167,7 @@ export interface OpcionesDoble {
   /** Texto que aparece SÓLO si la página se recorrió: lo que un `IntersectionObserver` dibuja al verse. */
   textoAlVerse?: string;
   /** El reloj de `textoTardio`. Sin él, el tardío nunca aparece. */
-  reloj?: { ahora: () => number; esperar?: (ms: number) => Promise<void> };
+  reloj?: { ahora: () => number; esperar?: (ms: number) => Promise<void>; alcanzar?: (ms: number) => Promise<void> };
   /** El arranque falla, como un Chromium que no está. */
   arranqueFalla?: boolean;
   /** El arranque tarda esto antes de devolver el navegador. */
@@ -157,7 +197,27 @@ export interface OpcionesDoble {
    * los espere: un chunk perezoso, los datos de una hidratación. Si llegan,
    * su cuerpo se escribe en el DOM cuando llegan (RT-1).
    */
-  enSegundoPlano?: Array<{ url: string; tipo: string }>;
+  enSegundoPlano?: Array<{
+    url: string;
+    tipo: string;
+    /**
+     * La URL del marco desde el que sale el pedido, si no es la página: lo
+     * que pide un `<iframe>` por dentro (RT-4). Lo que trae no se escribe en
+     * el DOM de la página, como en Chromium: el contenido de un marco no está
+     * en la serialización del documento. `null` es un pedido SIN marco —un
+     * worker de la página—, y lo que trae sí se escribe: el worker se lo pasa.
+     */
+    marco?: string | null;
+    /**
+     * Una navegación de la PESTAÑA (`location.href = …`) que no se confirma:
+     * sale como documento principal, el interceptor la atiende, y el
+     * documento sigue siendo el de antes —como un 204, una descarga denegada
+     * o un `window.stop()` en Chromium (FV-1)—.
+     */
+    principal?: boolean;
+    /** Sale cuando el reloj llega a `enMs`, y no apenas termina la navegación (necesita `reloj.alcanzar`). */
+    enMs?: number;
+  }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
    * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
@@ -184,7 +244,9 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     atender: (p: PedidoDelNavegador) => Promise<void>,
     url: string,
     tipo: string,
-    esDocumentoPrincipal: boolean
+    esDocumentoPrincipal: boolean,
+    urlDelMarco: string | null,
+    urlDeLaPagina: string | null
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
@@ -194,6 +256,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       encabezados: { accept: "*/*", "user-agent": "doble" },
       tipo,
       esDocumentoPrincipal,
+      urlDelMarco,
+      urlDeLaPagina,
       continuar: async () => resolver({ tipo: "continuado" }),
       abortar: async () => resolver({ tipo: "abortado" }),
       responder: async (r) => {
@@ -226,7 +290,9 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
         for (let saltos = 0; saltos < 10 && !documento; saltos++) {
-          const d = await emitir(atender, actual, "document", true);
+          // Mientras la cadena no termina, la pestaña sigue en el documento
+          // anterior: nada confirmado todavía, o el de una navegación previa.
+          const d = await emitir(atender, actual, "document", true, urlDelDocumento || null, urlDelDocumento || null);
           if (d.tipo !== "respondido") throw new Error(`net::ERR_BLOCKED_BY_CLIENT at ${actual}`);
           const destino = d.encabezados.location;
           if (d.status >= 300 && d.status < 400 && typeof destino === "string") {
@@ -248,7 +314,9 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
             [/<img[^>]*\ssrc="([^"]+)"/g, "image"],
             [/<iframe[^>]*\ssrc="([^"]+)"/g, "document"],
           ] as const) {
-            for (const m of documentoHtml.matchAll(patron)) await emitir(atender, new URL(m[1], actual).toString(), tipo, false);
+            for (const m of documentoHtml.matchAll(patron)) {
+              await emitir(atender, new URL(m[1], actual).toString(), tipo, false, tipo === "document" ? "about:blank" : actual, actual);
+            }
           }
           html = documentoHtml;
           registro.paginasSinJs += 1;
@@ -265,7 +333,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
 
         for (const r of declarados) {
           const absoluta = new URL(r.url, actual).toString();
-          const d = await emitir(atender, absoluta, r.tipo, r.principal);
+          const d = await emitir(atender, absoluta, r.tipo, r.principal, r.tipo === "document" ? "about:blank" : actual, actual);
           if (d.tipo === "respondido" && (r.tipo === "script" || r.tipo === "fetch")) {
             partes.push(escrito(d.cuerpo.toString("utf8")));
           }
@@ -274,11 +342,26 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         registro.textoDibujado = html;
         navegadoEn = opciones.reloj?.ahora() ?? null;
         for (const r of opciones.enSegundoPlano ?? []) {
-          void emitir(atender, new URL(r.url, actual).toString(), r.tipo, false).then((d) => {
-            if (d.tipo !== "respondido") return;
-            html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
-            registro.textoDibujado = html;
-          });
+          const deUnMarco = typeof r.marco === "string";
+          const marco = r.marco === null ? null : deUnMarco ? new URL(r.marco as string, actual).toString() : actual;
+          const principal = r.principal === true;
+          const at = atender;
+          // La URL de la página se lee al SALIR el pedido, como en Chromium.
+          const salir = () =>
+            emitir(at, new URL(r.url, actual).toString(), r.tipo, principal, marco, urlDelDocumento || null).then((d) => {
+              // Una navegación de la pestaña que no se confirma no cambia el
+              // documento: ni su DOM ni su URL.
+              if (d.tipo !== "respondido" || deUnMarco || principal) return;
+              html = `${html}\n${escrito(d.cuerpo.toString("utf8"))}`;
+              registro.textoDibujado = html;
+            });
+          if (r.enMs === undefined) {
+            void salir();
+          } else {
+            const alcanzar = opciones.reloj?.alcanzar;
+            if (!alcanzar) throw new Error("el doble necesita `reloj.alcanzar` para un pedido con `enMs`");
+            void alcanzar(r.enMs).then(salir);
+          }
         }
       },
       async esperarQuietud() {},

@@ -62,7 +62,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { abrirChromium, BANDERAS_SIN_RED, capasDeRed } from "../chromium";
 import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
 import { AGENTES_IA, contarCaracteres, MINIMO_DE_TEXTO, textoSinJavaScript } from "../lectura";
-import { medirRenderizado, nuevaBitacora, OPCIONES_RENDER, type Bitacora, type DependenciasRender } from "../renderizado";
+import {
+  medirRenderizado,
+  nuevaBitacora,
+  OPCIONES_RENDER,
+  type Bitacora,
+  type DependenciasRender,
+  type Transporte,
+} from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
 
@@ -79,6 +86,12 @@ const MOTIVO = DE_PRODUCCION
 const PUBLICA = "93.184.216.34";
 /** Una IPv6 pública (la de 1.1.1.1), sólo para el examen: el socket va a 100::1. */
 const IPV6_SIN_RUTA = "2606:4700:4700::1111";
+/**
+ * RT-4: la dirección pública de los marcos de OTRO SITIO (`video.test`,
+ * `reto.test`). Pasa el examen y el socket va al mismo SITIO local, que
+ * contesta por la ruta: el origen lo decide la URL, no el servidor.
+ */
+const PUBLICA_DE_TERCEROS = "151.101.1.1";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
@@ -185,6 +198,175 @@ const BUNDLE = `document.getElementById("app").textContent = ${JSON.stringify(CO
 function hibrida(script: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>${script}</body></html>`;
 }
+
+/**
+ * RT-4: la forma de https://vulkan-studios.com que salía `subrecurso-sin-respuesta`.
+ * La página trae su bundle y un reproductor de otro sitio (`player.vimeo.com`);
+ * adentro del reproductor, el desafío de otro sitio más
+ * (`challenges.cloudflare.com`) hace un `fetch` a un nombre con SÓLO registros
+ * AAAA (`brunhild.challenges.cloudflare.com`), que sin ruta IPv6 no llega
+ * —tampoco a un Chrome normal en la misma red: `net::ERR_ADDRESS_UNREACHABLE`—.
+ */
+const CON_VIDEO = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/embed"></iframe>`);
+const EMBED = `<!doctype html><html><body><p>Reproductor</p><iframe src="http://reto.test/reto"></iframe></body></html>`;
+const RETO = `<!doctype html><html><body><p>Desafío</p>
+<script>fetch("https://cdn-v6.test/sonda").catch(() => {});</script></body></html>`;
+
+/**
+ * FV-1, RED-121-1, F1: la página manda la PESTAÑA a otro sitio y esa
+ * navegación NO se confirma —un 204, un archivo que Chromium trata como
+ * descarga (las descargas están denegadas), un `window.stop()`—: el documento
+ * que se lee sigue siendo la página. Después la página pide sus datos y los
+ * escribe en `#app`. Reproducido por la revisión con Chrome 155 y el headless
+ * shell 153: con los datos en un nombre sólo-IPv6, `medido 1249/1249`, punto
+ * VERDE y `noLlegaron=[]`, porque el sitio de la página salía del último
+ * PEDIDO de navegación y el `fetch` propio pasaba por uno de otro sitio.
+ */
+function seVa(destino: string, datos: string, detener = false): string {
+  return hibrida(`<script>addEventListener("load", () => {
+  setTimeout(() => {
+    location.href = ${JSON.stringify(destino)};
+    ${detener ? "setTimeout(() => window.stop(), 100);" : ""}
+  }, 200);
+  setTimeout(() => {
+    fetch(${JSON.stringify(datos)}).then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {});
+  }, 1200);
+});</script>`);
+}
+
+/** FV-1: el pedido propio sale ANTES de que la pestaña intente irse, y no llega después. */
+const SE_VA_EN_VUELO = hibrida(`<script>addEventListener("load", () => {
+  fetch("/corta-tarde").then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {});
+  setTimeout(() => { location.href = "http://otro.test/vacio"; }, 300);
+});</script>`);
+
+/**
+ * Lo que NO LLEGA sin depender de la red de la máquina: cualquier ruta que
+ * empieza con `/caido/` corta la conexión en el acto, sea cual sea el host
+ * (`sin-respuesta`). El `cdn-v6.test` de arriba falla en el acto sólo en un
+ * host sin ruta IPv6; en uno con ruta, el connect a 100::1 espera el plazo.
+ */
+const CAIDO = "/caido/";
+
+/** Escribe `texto` en `#app` cuando un marco se lo manda con `postMessage`. */
+const ESCUCHA = `<script>addEventListener("message", (e) => {
+  if (e.data && typeof e.data.texto === "string") document.getElementById("app").textContent = e.data.texto;
+});</script>`;
+
+/**
+ * F2: un marco `blob:` que arma la página —hereda su origen— pide un script
+ * que no llega. Adentro de un documento `blob:` una URL relativa no se
+ * resuelve: va absoluta.
+ */
+const CON_MARCO_BLOB = hibrida(`<script>
+  const doc = '<script src="http://sitio.test${CAIDO}blob.js"><\\/script>';
+  const f = document.createElement("iframe");
+  f.src = URL.createObjectURL(new Blob([doc], { type: "text/html" }));
+  document.body.appendChild(f);
+</script>`);
+
+/** F2: lo mismo con un `<iframe srcdoc>` (`about:srcdoc`). */
+const CON_MARCO_SRCDOC = hibrida(`<iframe srcdoc='<script src="${CAIDO}srcdoc.js"></script>'></iframe>`);
+
+/**
+ * RED-121-3: un marco de OTRO sitio que intenta todo lo que la página de
+ * SUBRECURSOS hostiles intenta, desde adentro del marco —que Chromium corre
+ * en otro proceso (OOPIF)—, más un nombre que cambia de respuesta (rebinding),
+ * redirecciones a loopback y a la metadata, un `fetch` keepalive, un beacon,
+ * un `EventSource`, un worker, un `SharedWorker`, un formulario POST y la
+ * navegación del propio marco a la metadata.
+ */
+function marcoHostil(): string {
+  const canario = `127.0.0.1:${puertoCanario}`;
+  return `<!doctype html><html><head><meta charset="utf-8">
+<link rel="preconnect" href="http://${canario}">
+<link rel="stylesheet" href="http://interno.test/ajeno.css">
+</head><body><p>Reproductor hostil</p>
+<img src="http://${canario}/pixel.gif">
+<iframe src="http://169.254.169.254/latest/meta-data/marco"></iframe>
+<iframe name="destino" src="about:blank"></iframe>
+<form id="f" method="post" action="http://${canario}/form" target="destino"><input name="x" value="1"></form>
+<script src="http://interno.test/ajeno.js"></script>
+<script src="http://${canario}/ajeno.js"></script>
+<script>
+  for (const u of [
+    "http://169.254.169.254/latest/meta-data/iam/ajeno",
+    "http://10.0.0.7/ajeno",
+    "http://mixto.test/ajeno",
+    "http://rebind.test/ajeno",
+    "/redir-loopback",
+    "/redir-metadata",
+    "http://${canario}/fetch",
+  ]) fetch(u).catch(() => {});
+  fetch("http://${canario}/keepalive", { method: "POST", body: "x", keepalive: true }).catch(() => {});
+  navigator.sendBeacon && navigator.sendBeacon("http://${canario}/beacon", "x");
+  try { new WebSocket("ws://${canario}/ws"); } catch (e) {}
+  try { new WebSocket("ws://169.254.169.254/ws"); } catch (e) {}
+  try { new EventSource("http://${canario}/sse"); } catch (e) {}
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${puertoUdp}" }] });
+    pc.createDataChannel("d");
+    pc.createOffer().then((o) => pc.setLocalDescription(o));
+  } catch (e) {}
+  new Worker(URL.createObjectURL(new Blob([
+    "fetch('http://169.254.169.254/w-ajeno').catch(()=>{}); fetch('http://${canario}/w-ajeno').catch(()=>{}); try { importScripts('http://${canario}/imp') } catch (e) {}"
+  ])));
+  try { new SharedWorker("/compartido-hostil.js"); } catch (e) {}
+  document.getElementById("f").submit();
+  setTimeout(() => { location.href = "http://169.254.169.254/latest/meta-data/navegacion"; }, 800);
+</script></body></html>`;
+}
+
+/**
+ * RED-121-2: un marco de otro sitio que pide 12 segmentos de 450 KB EN
+ * PARALELO. Con un presupuesto ajeno de 1 MB, antes se entregaban los 12
+ * (5,4 MB): cada uno miraba lo que quedaba al salir.
+ */
+const SEGMENTO_BYTES = 450_000;
+const CON_MARCO_QUE_BAJA = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/baja-mucho"></iframe>`);
+const BAJA_MUCHO = `<!doctype html><html><body><p>Video</p><script>
+  for (let i = 0; i < 12; i++) fetch("/segmento-" + i).catch(() => {});
+</script></body></html>`;
+
+/**
+ * FV-4: el contenido lo trae un worker con `importScripts`, o un
+ * `EventSource`. `ok` llega; `caido` no.
+ */
+function conWorker(cual: "ok" | "caido"): string {
+  return hibrida(`<script>
+  const w = new Worker("/wi-${cual}.js");
+  w.onmessage = (e) => { document.getElementById("app").textContent = e.data; };
+</script>`);
+}
+function conEventSource(cual: "ok" | "caido"): string {
+  const url = cual === "ok" ? "/sse" : `${CAIDO}sse`;
+  return hibrida(`<script>
+  const s = new EventSource(${JSON.stringify(url)});
+  s.onmessage = (e) => { document.getElementById("app").textContent = e.data; s.close(); };
+  s.onerror = () => s.close();
+</script>`);
+}
+
+/**
+ * LO QUE NO CUBRE (`renderizado.ts`). FV-2: el silent-auth de OIDC. El marco
+ * pide `/authorize?prompt=none` al IdP —otro sitio—, que redirige al callback
+ * del PROPIO sitio, y el callback escribe en la página. FV-3: el IdP avisa a
+ * la página con `postMessage` (Auth0 `web_message`, MSAL), y la página recién
+ * entonces pide lo suyo; o un widget de otro sitio trae datos y se los pasa.
+ */
+const OIDC = (cual: "ok" | "caido") =>
+  hibrida(`<iframe src="http://idp.test/${cual === "ok" ? "" : CAIDO.slice(1)}authorize"></iframe>`);
+const AVISA = (cual: "ok" | "caido") =>
+  hibrida(`<script>addEventListener("message", (e) => {
+  if (e.data && e.data.sesion) fetch("/datos").then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; });
+});</script><iframe hidden src="http://idp.test/${cual === "ok" ? "" : CAIDO.slice(1)}silencioso"></iframe>`);
+const WIDGET_PM = (cual: "ok" | "caido") =>
+  hibrida(`${ESCUCHA}<iframe src="http://widget.test/pm-${cual}"></iframe>`);
+const COMPARTIDO = hibrida(`<script>
+  const w = new SharedWorker("/compartido.js");
+  w.port.onmessage = (e) => { document.getElementById("app").textContent = e.data; };
+  w.port.start();
+</script>`);
 
 /**
  * PU-2: el contenido real dibujado por JavaScript DENTRO de un shadow root
@@ -326,7 +508,99 @@ beforeAll(async () => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(cuerpo);
     };
+    const js = (cuerpo: string) => {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      res.end(cuerpo);
+    };
+    if (req.url?.startsWith(CAIDO)) return req.socket.destroy();
+    if (req.url?.startsWith("/segmento-")) {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      return res.end(Buffer.alloc(SEGMENTO_BYTES, 118));
+    }
     switch (req.url) {
+      case "/con-marco-blob":
+        return html(CON_MARCO_BLOB);
+      case "/con-marco-srcdoc":
+        return html(CON_MARCO_SRCDOC);
+      case "/con-anidado":
+        return html(hibrida(`<iframe src="http://video.test/externo"></iframe>`));
+      case "/con-anidado-ok":
+        return html(hibrida(`<iframe src="http://video.test/externo-ok"></iframe>`));
+      case "/externo":
+        // Un marco de OTRO sitio con un marco del sitio de la página adentro.
+        return html(`<!doctype html><html><body><iframe src="http://sitio.test/interno"></iframe></body></html>`);
+      case "/externo-ok":
+        return html(`<!doctype html><html><body><iframe src="http://sitio.test/interno-ok"></iframe></body></html>`);
+      case "/interno":
+        return html(`<!doctype html><html><body><script src="${CAIDO}adentro.js"></script></body></html>`);
+      case "/interno-ok":
+        // Del sitio de la página, adentro de un marco de otro sitio: escribe
+        // en la página por `window.top`.
+        return html(`<!doctype html><html><body><script>
+          top.document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};
+        </script></body></html>`);
+      case "/con-marco-hostil":
+        return html(hibrida(`<iframe src="http://video.test/hostil-ajeno"></iframe>`));
+      case "/hostil-ajeno":
+        return html(marcoHostil());
+      case "/compartido-hostil.js":
+        return js(`fetch("http://127.0.0.1:${puertoCanario}/shared").catch(() => {});`);
+      case "/con-marco-que-baja":
+        return html(CON_MARCO_QUE_BAJA);
+      case "/baja-mucho":
+        return html(BAJA_MUCHO);
+      case "/worker-ok":
+        return html(conWorker("ok"));
+      case "/worker-caido":
+        return html(conWorker("caido"));
+      case "/wi-ok.js":
+        return js(`importScripts("/lib.js"); postMessage(self.TEXTO);`);
+      case "/wi-caido.js":
+        return js(`importScripts("${CAIDO}lib.js"); postMessage(self.TEXTO);`);
+      case "/lib.js":
+        return js(`self.TEXTO = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};`);
+      case "/eventsource-ok":
+        return html(conEventSource("ok"));
+      case "/eventsource-caido":
+        return html(conEventSource("caido"));
+      case "/sse":
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        return res.end(`retry: 600000\ndata: ${CONTENIDO_DEL_BUNDLE}\n\n`);
+      case "/oidc-ok":
+        return html(OIDC("ok"));
+      case "/oidc-caido":
+        return html(OIDC("caido"));
+      case "/authorize":
+        // El IdP: `prompt=none` con sesión, y de vuelta al callback del sitio.
+        res.writeHead(302, { location: "http://sitio.test/callback" });
+        return res.end();
+      case "/callback":
+        return html(`<!doctype html><html><body><script>
+          parent.document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};
+        </script></body></html>`);
+      case "/avisa-ok":
+        return html(AVISA("ok"));
+      case "/avisa-caido":
+        return html(AVISA("caido"));
+      case "/silencioso":
+        return html(`<!doctype html><html><body><script>parent.postMessage({ sesion: 1 }, "*");</script></body></html>`);
+      case "/widget-pm-ok":
+        return html(WIDGET_PM("ok"));
+      case "/widget-pm-caido":
+        return html(WIDGET_PM("caido"));
+      case "/pm-ok":
+      case "/pm-caido":
+        return html(`<!doctype html><html><body><script>
+          fetch(${JSON.stringify(req.url === "/pm-ok" ? "/datos" : `${CAIDO}datos`)})
+            .then((r) => r.text()).then((t) => parent.postMessage({ texto: t }, "*")).catch(() => {});
+        </script></body></html>`);
+      case "/compartido":
+        return html(COMPARTIDO);
+      case "/compartido.js":
+        return js(`onconnect = (e) => {
+          const port = e.ports[0];
+          fetch("/datos").then((r) => r.text()).then((t) => port.postMessage(t));
+        };`);
       case "/control":
         return html(CONTROL);
       case "/sana":
@@ -345,6 +619,56 @@ beforeAll(async () => {
         return html(hibrida(`<script src="/app-lento.js"></script>`));
       case "/hibrida-v6":
         return html(hibrida(`<script src="https://cdn-v6.test/app.js"></script>`));
+      case "/con-video":
+        return html(CON_VIDEO);
+      case "/embed":
+        return html(EMBED);
+      case "/reto":
+        return html(RETO);
+      case "/con-video-caido":
+        return html(hibrida(`<script src="/app.js"></script><iframe src="https://cdn-v6.test/embed"></iframe>`));
+      case "/con-marco-propio":
+        return html(hibrida(`<script src="/app.js"></script><iframe src="/marco-propio"></iframe>`));
+      case "/marco-propio":
+        // Un marco del MISMO origen: su JavaScript puede escribir en la página.
+        return html(`<!doctype html><html><body><script src="https://cdn-v6.test/widget.js"></script></body></html>`);
+      case "/se-va-204":
+        return html(seVa("http://otro.test/vacio", "https://cdn-v6.test/datos"));
+      case "/se-va-descarga":
+        return html(seVa("http://otro.test/catalogo.zip", "https://cdn-v6.test/datos"));
+      case "/se-va-detenida":
+        return html(seVa("http://otro.test/lento", "https://cdn-v6.test/datos", true));
+      case "/se-va-en-vuelo":
+        return html(SE_VA_EN_VUELO);
+      case "/se-va-y-llega":
+        return html(seVa("http://otro.test/vacio", "/datos"));
+      case "/vacio":
+        // 204: Chromium no confirma la navegación, y la pestaña se queda en la página.
+        res.writeHead(204);
+        return res.end();
+      case "/catalogo.zip":
+        // Sin `Content-Disposition`: el interceptor lo entrega, y Chromium lo
+        // trata como descarga, que está denegada. Tampoco se confirma.
+        res.writeHead(200, { "content-type": "application/zip" });
+        return res.end("PK\u0003\u0004");
+      case "/lento": {
+        const reloj = setTimeout(() => {
+          res.writeHead(204);
+          res.end();
+        }, 2_000);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
+      case "/datos":
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        return res.end(CONTENIDO_DEL_BUNDLE);
+      case "/corta-tarde": {
+        // Contesta NADA: corta la conexión a los 1,5 s, con la pestaña ya
+        // intentando irse a otro sitio.
+        const reloj = setTimeout(() => req.socket.destroy(), 1_500);
+        res.on("close", () => clearTimeout(reloj));
+        return;
+      }
       case "/hibrida-grande":
         return html(hibrida(`<script src="/app-grande.js"></script>`));
       case "/hibrida-chunk":
@@ -442,6 +766,9 @@ function deps(
 ): DependenciasRender & { aperturas: () => number; cierres: () => number } {
   let aperturas = 0;
   let cierres = 0;
+  // RED-121-3: un DNS que cambia de respuesta. La primera, pública; las
+  // siguientes, loopback. El examinador pregunta UNA vez por medición.
+  let consultasRebind = 0;
   const abrir = abrirChromium({ ejecutable: CHROME, banderas, quitarWebRtc });
   return {
     abrirNavegador: async () => {
@@ -465,10 +792,16 @@ function deps(
       conectarA: ({ ip }) =>
         ip === IPV6_SIN_RUTA
           ? { ip: "100::1", puerto: 443 }
-          : { ip: "127.0.0.1", puerto: ip === PUBLICA ? puertoSitio : puertoCanario },
+          : { ip: "127.0.0.1", puerto: ip === PUBLICA || ip === PUBLICA_DE_TERCEROS ? puertoSitio : puertoCanario },
     }),
     resolver: resolvedorDoble({
       "cdn-v6.test": [IPV6_SIN_RUTA],
+      "video.test": [PUBLICA_DE_TERCEROS],
+      "reto.test": [PUBLICA_DE_TERCEROS],
+      "otro.test": [PUBLICA_DE_TERCEROS],
+      "widget.test": [PUBLICA_DE_TERCEROS],
+      "idp.test": [PUBLICA_DE_TERCEROS],
+      "rebind.test": () => (consultasRebind++ === 0 ? [PUBLICA_DE_TERCEROS] : ["127.0.0.1"]),
       "sitio.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
@@ -481,6 +814,47 @@ function deps(
 function bitacora(): Bitacora {
   return nuevaBitacora();
 }
+
+/**
+ * Las mismas dependencias, anotando cada pedido que el navegador le pasa al
+ * interceptor con el marco desde el que sale: para afirmar que un pedido
+ * SALIÓ de un marco de otro sitio, y no de la página.
+ */
+function registrando(d: DependenciasRender) {
+  const vistos: Array<{ url: string; tipo: string; urlDelMarco: string | null }> = [];
+  const abrir = d.abrirNavegador;
+  const conRegistro: DependenciasRender = {
+    ...d,
+    abrirNavegador: async () => {
+      const n = await abrir();
+      return {
+        nuevaPagina: async (opciones) => {
+          const p = await n.nuevaPagina(opciones);
+          return {
+            ...p,
+            interceptar: (atender) =>
+              p.interceptar((pedido) => {
+                vistos.push({ url: pedido.url, tipo: pedido.tipo, urlDelMarco: pedido.urlDelMarco });
+                return atender(pedido);
+              }),
+          };
+        },
+        cerrar: () => n.cerrar(),
+      };
+    },
+  };
+  return { deps: conRegistro, vistos };
+}
+
+/** El punto de una página híbrida: el menú servido contra lo que se contó. */
+const puntoHibrida = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+  contenidoSinJs({
+    acceso: TODOS_ENTRAN,
+    caracteresSinJs: textoSinJavaScript(hibrida("")),
+    caracteresRenderizados: render,
+    schema: [],
+    tieneLlmsTxt: false,
+  }).estado;
 
 /** Chromium pide `/favicon.ico` por su cuenta, al mismo origen: no es de la página. */
 function sinFavicon<T extends { url: string }>(pedidos: T[]): T[] {
@@ -636,6 +1010,316 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     },
     60_000
   );
+
+  describe("RT-4 — lo que pide un marco de OTRO SITIO no decide si la página se midió", () => {
+    const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+      contenidoSinJs({
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: textoSinJavaScript(CON_VIDEO),
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      }).estado;
+    const noLlego = (b: Bitacora, url: string) =>
+      b.bloqueados.some((x) => x.url === url && (x.motivo === "sin-respuesta" || x.motivo === "timeout"));
+
+    it(
+      "el caso de vulkan-studios.com: el `fetch` sólo-IPv6 del desafío, dentro del reproductor, no deja la página sin número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-video", deps(), undefined, b);
+        console.log(`[RT-4 /con-video] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        // El marco del desafío PIDIÓ, y no le llegó: si no, esto no prueba nada.
+        expect(noLlego(b, "https://cdn-v6.test/sonda")).toBe(true);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        // Y el bundle de la página se contó: el punto sale ROJO.
+        expect(punto(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "el documento de un marco de otro sitio que no llega tampoco decide: la página se mide",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-video-caido", deps(), undefined, b);
+        console.log(`[RT-4 /con-video-caido] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(noLlego(b, "https://cdn-v6.test/embed")).toBe(true);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+      },
+      60_000
+    );
+
+    it(
+      "lo que no le llega a un marco del MISMO origen sigue dejando la página sin número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-marco-propio", deps(), undefined, b);
+        console.log(`[RT-4 /con-marco-propio] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/widget.js"]);
+      },
+      60_000
+    );
+  });
+
+  describe("FV-1 — una navegación de la PESTAÑA que no se confirma no cambia de qué sitio es la página", () => {
+    const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+      contenidoSinJs({
+        acceso: TODOS_ENTRAN,
+        caracteresSinJs: textoSinJavaScript(hibrida("")),
+        caracteresRenderizados: render,
+        schema: [],
+        tieneLlmsTxt: false,
+      }).estado;
+
+    it.each([
+      ["/se-va-204", "http://otro.test/vacio", "un 204"],
+      ["/se-va-descarga", "http://otro.test/catalogo.zip", "un archivo que Chromium trata como descarga"],
+      ["/se-va-detenida", "http://otro.test/lento", "una navegación cortada con `window.stop()`"],
+    ])(
+      "%s: la pestaña intenta irse a otro sitio (%s, %s) y el `fetch` propio que no llega deja la página sin número",
+      async (ruta, destino) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[FV-1 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        // La navegación salió por el transporte: si no, esto no prueba nada.
+        expect(b.pedidos.map((p) => p.url)).toContain(destino);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/datos"]);
+        expect(punto(render)).toBe("no-medido");
+      },
+      60_000
+    );
+
+    it(
+      "y un pedido de la página que estaba EN VUELO cuando la pestaña intentó irse tampoco se descarta al no llegar",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/se-va-en-vuelo", deps(), undefined, b);
+        console.log(`[FV-1 /se-va-en-vuelo] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(b.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
+        expect(b.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/corta-tarde"]);
+      },
+      60_000
+    );
+
+    it(
+      "el control: con los datos al alcance, la misma página se mide y lo que escriben se cuenta —ROJO—",
+      async () => {
+        // Sin esto, los rojos de arriba podrían venir de que la navegación
+        // rompe la medición y no de que el `fetch` propio cuenta.
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/se-va-y-llega", deps(), undefined, b);
+        console.log(`[FV-1 /se-va-y-llega] renderizado=${JSON.stringify(render)}`);
+        expect(b.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+        expect(render.estado).toBe("medido");
+        if (render.estado !== "medido") return;
+        expect(render.caracteres).toBeGreaterThan((render.servidos ?? 0) + contarCaracteres(CONTENIDO_DEL_BUNDLE) - 10);
+        expect(punto(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
+  describe("F2 — los marcos que RT-4 cuenta como de la página, con Chromium", () => {
+    it.each([
+      ["/con-marco-blob", `http://sitio.test${CAIDO}blob.js`, "un marco `blob:` que armó la página"],
+      ["/con-marco-srcdoc", `http://sitio.test${CAIDO}srcdoc.js`, "un marco `srcdoc`"],
+      ["/con-anidado", `http://sitio.test${CAIDO}adentro.js`, "un marco del sitio de la página ADENTRO de uno de otro sitio"],
+    ])(
+      "%s: el script que no llega a %s (%s) deja la página sin número",
+      async (ruta, perdido) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[F2 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+        expect(b.noLlegaron.map((n) => n.url)).toEqual([perdido]);
+      },
+      60_000
+    );
+
+    it(
+      "el control del anidado: el marco del sitio de la página, adentro de uno de otro sitio, ESCRIBE en ella por `window.top` —ROJO—",
+      async () => {
+        // Por esto cuenta: si se juzgara por el marco de afuera (otro sitio),
+        // lo que no le llega a éste quedaría fuera, y escribe en la página.
+        const render = await medirRenderizado("http://sitio.test/con-anidado-ok", deps());
+        console.log(`[F2 /con-anidado-ok] renderizado=${JSON.stringify(render)}`);
+        expect(render.estado).toBe("medido");
+        if (render.estado !== "medido") return;
+        expect(render.caracteres).toBeGreaterThan((render.servidos ?? 0) + contarCaracteres(CONTENIDO_DEL_BUNDLE) - 10);
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
+  it(
+    "RED-121-3 — un marco de OTRO sitio (OOPIF) que intenta loopback, metadata, 10.x, rebinding, redirecciones, keepalive, beacon, WebSocket, EventSource, workers, un formulario y su propia navegación: CERO al canario",
+    async () => {
+      const r = registrando(deps());
+      const b = bitacora();
+      const render = await medirRenderizado("http://sitio.test/con-marco-hostil", r.deps, undefined, b);
+      const visto = await canarioDespues(1_500);
+      console.log(
+        `[RED-121-3 /con-marco-hostil] render=${JSON.stringify(render)} pedidos=${JSON.stringify(b.pedidos)} canario=${JSON.stringify(visto)}`
+      );
+      expect(render.estado).toBe("medido");
+      expect(visto, "ni un socket ni un datagrama llegó a una dirección que no es pública").toEqual({
+        conexiones: 0,
+        pedidos: [],
+        udp: 0,
+      });
+      // Todo lo que el transporte pidió de verdad fue a una dirección pública.
+      expect(b.pedidos.filter((p) => p.ip !== PUBLICA && p.ip !== PUBLICA_DE_TERCEROS)).toEqual([]);
+      // Esos pedidos SALIERON DEL MARCO de otro sitio: lo que se ejerció es
+      // la rama de los marcos ajenos, no la de la página.
+      const delMarco = r.vistos.filter((v) => v.urlDelMarco?.startsWith("http://video.test/")).map((v) => v.url);
+      const hostiles = [
+        "http://169.254.169.254/latest/meta-data/iam/ajeno",
+        "http://10.0.0.7/ajeno",
+        "http://mixto.test/ajeno",
+        "http://interno.test/ajeno.js",
+      ];
+      expect(delMarco).toEqual(expect.arrayContaining([...hostiles, "http://video.test/redir-loopback", "http://rebind.test/ajeno"]));
+      expect(b.bloqueados).toEqual(
+        expect.arrayContaining([
+          ...hostiles.map((url) => ({ url, motivo: "red-no-publica" })),
+          // Las redirecciones del marco, y su navegación a la metadata.
+          { url: "http://127.0.0.1/admin", motivo: "red-no-publica" },
+          { url: "http://169.254.169.254/latest/meta-data/", motivo: "red-no-publica" },
+          { url: "http://169.254.169.254/latest/meta-data/navegacion", motivo: "red-no-publica" },
+        ])
+      );
+      // El rebinding: el nombre se resolvió UNA vez, y se conectó a ESA dirección.
+      expect(b.pedidos).toContainEqual({ url: "http://rebind.test/ajeno", ip: PUBLICA_DE_TERCEROS });
+    },
+    60_000
+  );
+
+  it(
+    "RED-121-2 — 12 segmentos EN PARALELO de un marco de otro sitio no pasan SU presupuesto, y la página se mide igual —ROJO—",
+    async () => {
+      const d = deps();
+      const tope = 1_000_000;
+      let entregados = 0;
+      let bajados = 0;
+      const transporte: Transporte = async (p) => {
+        const segmento = p.url.includes("/segmento-");
+        const presupuesto =
+          segmento && p.presupuesto
+            ? (bytes: number) => {
+                const alcanza = p.presupuesto?.(bytes) ?? true;
+                if (alcanza) bajados += bytes;
+                return alcanza;
+              }
+            : p.presupuesto;
+        const r = await d.transporte({ ...p, ...(presupuesto ? { presupuesto } : {}) });
+        if (segmento && r.tipo === "respuesta") entregados += r.cuerpo.length;
+        return r;
+      };
+      const b = bitacora();
+      const render = await medirRenderizado(
+        "http://sitio.test/con-marco-que-baja",
+        { ...d, transporte },
+        { ...OPCIONES_RENDER, maxBytesDeOtrosSitios: tope, maxBytesPorRespuesta: 600_000 },
+        b
+      );
+      const salieron = b.pedidos.filter((p) => p.url.includes("/segmento-")).length;
+      console.log(
+        `[RED-121-2 /con-marco-que-baja] render=${JSON.stringify(render)} salieron=${salieron} entregados=${entregados} bajados=${bajados}`
+      );
+      // Salieron varios a la vez: si no, esto no prueba el paralelo.
+      expect(salieron).toBeGreaterThan(2);
+      // Antes: 12 × 450 000 = 5,4 MB entregados contra 1 MB.
+      expect(entregados).toBeLessThanOrEqual(tope);
+      expect(bajados).toBeLessThanOrEqual(tope);
+      expect(b.bloqueados.some((x) => x.url.includes("/segmento-") && x.motivo === "presupuesto")).toBe(true);
+      // Y lo de otro sitio no decide: la página se midió, con su bundle.
+      expect(render.estado).toBe("medido");
+      expect(puntoHibrida(render)).toBe("rojo");
+    },
+    60_000
+  );
+
+  describe("FV-4 — un worker y un `EventSource` también escriben el texto", () => {
+    it.each([
+      ["/worker-caido", `http://sitio.test${CAIDO}lib.js`, "el `importScripts` de un worker"],
+      ["/eventsource-caido", `http://sitio.test${CAIDO}sse`, "un `EventSource`"],
+    ])(
+      "%s: si no llega %s (%s), la página queda sin número",
+      async (ruta, perdido) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[FV-4 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+        expect(b.noLlegaron.map((n) => n.url)).toEqual([perdido]);
+      },
+      60_000
+    );
+
+    it.each(["/worker-ok", "/eventsource-ok"])(
+      "el control (%s): lo que trae se escribe y se cuenta —ROJO—",
+      async (ruta) => {
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps());
+        console.log(`[FV-4 ${ruta}] renderizado=${JSON.stringify(render)}`);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
+  /**
+   * LO QUE NO CUBRE, fijado. El encabezado de `renderizado.ts` dice que estas
+   * formas salen `medido` y VERDE; reproducidas por la revisión con Chrome
+   * 155 y el headless shell 153. Cada una con su oráculo: la misma página con
+   * todo al alcance es ROJA, así que el verde es falso. Si un cambio las
+   * vuelve «no medidas», este test se pone rojo, y el encabezado se corrige.
+   */
+  describe("LO QUE NO CUBRE: hoy salen VERDES, con su oráculo ROJO", () => {
+    it.each([
+      ["/oidc", "FV-2: el silent-auth de OIDC cuyo primer salto (el IdP, otro sitio) no llega"],
+      ["/avisa", "FV-3: la página espera el `postMessage` de un marco de otro sitio cuyo DOCUMENTO no llega"],
+      ["/widget-pm", "FV-3: un widget de otro sitio cuyo `fetch` no llega le pasa los datos a la página"],
+    ])(
+      "%s (%s)",
+      async (base) => {
+        const ok = await medirRenderizado(`http://sitio.test${base}-ok`, deps());
+        const b = bitacora();
+        const caido = await medirRenderizado(`http://sitio.test${base}-caido`, deps(), undefined, b);
+        console.log(`[NO CUBRE ${base}] ok=${JSON.stringify(ok)} caido=${JSON.stringify(caido)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(ok.estado).toBe("medido");
+        expect(puntoHibrida(ok)).toBe("rojo");
+        // Lo que no llegó, no llegó —está en la bitácora—, y no decidió.
+        expect(b.bloqueados.some((x) => x.url.includes(CAIDO) && x.motivo === "sin-respuesta")).toBe(true);
+        expect(caido.estado).toBe("medido");
+        expect(puntoHibrida(caido)).toBe("verde");
+      },
+      90_000
+    );
+
+    it(
+      "un `SharedWorker` (FV-4): lo que pide no pasa por la intercepción, así que ni con los datos al alcance escribe —VERDE—",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/compartido", deps());
+        console.log(`[NO CUBRE /compartido] renderizado=${JSON.stringify(render)}`);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("verde");
+      },
+      60_000
+    );
+  });
 
   it.each(["/sombra-abierta", "/sombra-cerrada"])(
     "PU-2 — el contenido dibujado por JavaScript en un shadow root (%s) cuenta del lado renderizado: punto ROJO",

@@ -172,6 +172,16 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
     cuerpo,
     tipo: req.resourceType(),
     esDocumentoPrincipal: req.isNavigationRequest() && req.frame() === page.mainFrame(),
+    // El marco que pide (RT-4). En un `<iframe>` de otro sitio —que Chromium
+    // corre en otro proceso— puppeteer igual lo da: es el marco hijo, con su
+    // URL. Sin marco (un worker), `null`, y eso cuenta como de la página.
+    urlDelMarco: req.frame()?.url() ?? null,
+    // El documento CONFIRMADO de la pestaña (FV-1): puppeteer cambia la URL
+    // del marco con `Page.frameNavigated`, que Chromium manda al confirmar,
+    // no al pedir. Un 204, una descarga denegada o un `window.stop()` no la
+    // cambian. Antes `renderizado.ts` tomaba el último PEDIDO de navegación,
+    // y con un 204 a otro sitio los `fetch` de la página pasaban por ajenos.
+    urlDeLaPagina: page.mainFrame().url(),
     continuar: () => req.continue(),
     abortar: () => req.abort("blockedbyclient"),
     responder: (r) => req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }),

@@ -144,6 +144,113 @@
  * (PU-3). Tampoco cuenta lo que no escribe texto: imágenes, fuentes, CSS y
  * videos.
  *
+ * Los tipos que escriben texto son `script`, `xhr`, `fetch`, `document` (un
+ * marco) y `eventsource`, y además `other` cuando no sale de ningún marco:
+ * así nombra Chromium el `importScripts` de un worker. MEDIDO por la revisión
+ * con Chrome 155 y el headless shell 153 (FV-4), también en main: un worker
+ * cuyo `importScripts` no llegaba, o un `EventSource` que no llegaba, dejaban
+ * la página `medido 1249/1249`, VERDE. El costo, dicho: una página con un
+ * `EventSource` que no se cierra nunca no termina de llegar, y queda
+ * `subrecurso-timeout`. Se cuenta de más, nunca de menos.
+ *
+ * NI LO QUE PIDE UN MARCO DE OTRO SITIO (RT-4)
+ *
+ * Lo que decide es DESDE DÓNDE sale el pedido, no sólo su tipo. Cuentan los
+ * de la página, los de sus marcos del mismo sitio —su JavaScript puede
+ * escribir en ella— y los que no salen de ningún marco: los de un worker
+ * DEDICADO —sus `fetch`, `xhr` e `importScripts`—, que le puede pasar los
+ * datos a la página. Chromium no dice de qué marco es un worker, así que
+ * también cuentan los del worker de un marco de otro sitio: de más, no de
+ * menos. Un `SharedWorker` no entra: ver «Lo que NO cubre». No cuentan los
+ * que salen de un marco de OTRO sitio, ni la navegación de ese marco a otro
+ * sitio: mientras su documento sea de otro sitio, la política del mismo
+ * origen no le deja escribir en el DOM de la página, y su propio contenido no
+ * está en la serialización (`chromium.ts`, PU-2). Ante la duda —un marco
+ * `about:blank`, `about:srcdoc`, `blob:` o sin URL— cuenta. El sitio se
+ * aproxima hacia arriba (los dos últimos rótulos del nombre): se cuenta de
+ * más, nunca de menos.
+ *
+ * La página es el documento CONFIRMADO de la pestaña (`urlDeLaPagina`, que
+ * `chromium.ts` lee de `page.mainFrame().url()`), y no el último PEDIDO de
+ * navegación. Reproducido por la revisión con Chrome 155 y el headless shell
+ * 153 (FV-1): una página que mandaba la pestaña a otro sitio con una
+ * navegación que no se confirma —un 204, un archivo que Chromium trata como
+ * descarga, un `window.stop()`— seguía siendo el documento que se lee, pero
+ * sus propios `fetch` se juzgaban «de otro sitio»: el que no llegaba no
+ * contaba, y salía `medido 1249/1249`, VERDE. Y lo que se decide de un pedido
+ * se decide al entrar: uno de la página que estaba en vuelo cuando la pestaña
+ * intentó irse cuenta igual si después no llega.
+ *
+ * MEDIDO contra la web real. https://vulkan-studios.com salía
+ * `subrecurso-sin-respuesta` en producción (2 de 2), y acá con Chrome 155 con
+ * todo lo de la página entregado. El que no llegaba era un `fetch` a
+ * `brunhild.challenges.cloudflare.com` —un nombre con SÓLO registros AAAA—
+ * desde el desafío de Cloudflare, dentro del reproductor de
+ * `player.vimeo.com`, dentro de la página: sin ruta IPv6 no llega, y un Chrome
+ * normal en una red sin IPv6 tampoco lo trae (`net::ERR_ADDRESS_UNREACHABLE`).
+ * Con el headless shell 153 en un contenedor AL2023 salía
+ * `subrecurso-presupuesto` 3 de 3: los `xhr` del video de Vimeo y de los
+ * cinco reproductores de YouTube se esperaban como si escribieran texto, y
+ * bajaban 25 MB contra 1,35 MB de la página. Con esta regla, 10 de 11
+ * corridas con los dos binarios dieron `medido`, 5 892 renderizados contra
+ * 5 456 servidos; la otra, un script DE LA PÁGINA que no conectó en 8 s, y
+ * eso sigue siendo `subrecurso-timeout`. Por lo mismo, los bytes de esos
+ * marcos salen de un presupuesto aparte (`maxBytesDeOtrosSitios`): no le
+ * quitan bytes a la página.
+ *
+ * Y CADA PRESUPUESTO DE BYTES SE DESCUENTA MIENTRAS SE BAJA (RED-121-2)
+ *
+ * No al terminar cada pedido. MEDIDO por la revisión: un marco de otro sitio
+ * con 30 `fetch` EN PARALELO de 4,5 MB bajó 40,5 MB contra los 10 MB
+ * declarados con Chrome 155, y 36 MB con el headless shell 153; la página y
+ * el marco juntos, 81 y 90 MB contra 35. Cada pedido miraba lo que quedaba
+ * ANTES de salir, y nadie lo descontaba hasta que llegaba: los treinta veían
+ * el presupuesto entero. Ahora el transporte descuenta cada parte del cuerpo
+ * al recibirla (`PedidoHttp.presupuesto`) y corta el pedido cuando no
+ * alcanza, así que lo bajado entre todos los pedidos en vuelo no pasa el
+ * tope. Lo descontado no se devuelve: un pedido que se cortó o no se
+ * entregó igual se bajó. Una página cuyo pedido propio se corta así queda
+ * `subrecurso-presupuesto`, como antes; uno de otro sitio sólo no sale.
+ *
+ * LO QUE NO CUBRE, DICHO
+ *
+ * Reproducido por la revisión de este cambio con Chrome 155 y el headless
+ * shell 153 (FV-2, FV-3, FV-4, FV-5, RED-121-4, F4). Las dos primeras formas
+ * salen `medido` y VERDE donde main decía `subrecurso-sin-respuesta`: son el
+ * costo de no contar lo que pide un marco de otro sitio, porque al momento
+ * del pedido un reproductor caído y un marco de autenticación caído no se
+ * distinguen. Las otras tres ya estaban en main. La integración
+ * (`renderizado.integracion.test.ts`, «LO QUE NO CUBRE») fija hoy las tres
+ * primeras: si una cambia, ese test se pone rojo y esta lista se corrige.
+ *
+ *   1. Un marco de otro sitio que le pasa datos a la página con `postMessage`
+ *      y la página escribe texto con ellos (FV-3). Si a ese marco no le llegó
+ *      algo —un `fetch` suyo, o su propio DOCUMENTO—, la página escribe menos,
+ *      o se queda en «Cargando…», y no se ve. Es la autenticación silenciosa
+ *      de muchas SPA: Auth0 con `response_mode=web_message`, el iframe oculto
+ *      de MSAL. La página espera el mensaje del marco para pedir lo suyo.
+ *   2. Un marco cuyo PRIMER salto es de otro sitio y redirige al origen de la
+ *      página (FV-2): el documento del mismo origen sí puede escribir en
+ *      `parent`, pero si el primer salto no llega, ese documento nunca carga.
+ *      Es el silent-auth de OIDC: iframe → `/authorize?prompt=none` del IdP →
+ *      302 → el callback del propio sitio, que escribe o avisa al padre.
+ *   3. Un `SharedWorker`: lo que pide no pasa por la intercepción de
+ *      puppeteer (FV-4), y muere en la red apagada de Chromium sin que nadie
+ *      lo anote. Si la página escribe con eso, escribe menos y no se ve. La
+ *      red sigue cerrada: el canario de la integración lo afirma.
+ *   4. Un marco de otro sitio que SE NAVEGA a sí mismo al origen de la
+ *      página (FV-5): la navegación se intercepta y cuenta —se juzga por la
+ *      URL del pedido—, pero con Chrome 155 los subrecursos del documento al
+ *      que llega NO pasan por la intercepción: MEDIDO, ni su `script` ni su
+ *      `fetch` llegan al interceptor, 3 de 3. No llegan y no se anotan. Con
+ *      el headless shell 153, el de producción, sí se interceptan y cuentan,
+ *      y con una redirección HTTP en vez de `location.href`, con los dos.
+ *   5. `falloDocumento` y `statusDocumento` se miran UNA vez, después de la
+ *      quietud de red. Si la página manda la pestaña a otra parte durante el
+ *      recorrido o la lectura, y ese salto se rechaza o contesta 4xx/5xx, el
+ *      fallo no se ve, y lo que se lee puede ser la página de error de
+ *      Chromium y no el sitio.
+ *
  * EL TIEMPO
  *
  * `topeMs` es TOTAL: arranque del navegador —en Vercel incluye descomprimir
@@ -251,6 +358,15 @@ export interface PedidoHttp {
   /** Bytes de cuerpo como máximo, ya descomprimido. Pasado eso, `demasiado-grande`. */
   maxBytes: number;
   /**
+   * El presupuesto de bytes que este pedido COMPARTE con los que van en
+   * paralelo (RED-121-2): el transporte le pasa cada parte del cuerpo al
+   * recibirla, y si devuelve `false` corta el pedido como
+   * `demasiado-grande` —el interceptor sabe que fue el presupuesto y lo
+   * anota así—. Sin esto, cada pedido paralelo veía el presupuesto entero.
+   * Lo usa el navegador; los pedidos de la ruta (`red.ts`) no lo pasan.
+   */
+  presupuesto?: (bytes: number) => boolean;
+  /**
    * Sólo el status y los encabezados: el cuerpo no se lee y la conexión se
    * corta. Lo usan los pedidos de la ruta que preguntan «¿cómo trata el sitio a
    * este agente?» (`red.ts`), no el navegador, que necesita el cuerpo.
@@ -282,6 +398,25 @@ export interface PedidoDelNavegador {
   tipo: string;
   /** La navegación del documento de la pestaña, incluido cada salto de redirección. */
   esDocumentoPrincipal: boolean;
+  /**
+   * La URL del documento del MARCO desde el que sale el pedido: la de la
+   * página para lo que pide la página, la de un `<iframe>` para lo que pide
+   * ese marco (RT-4). `null` si no sale de un marco —un worker— o no se sabe.
+   * En la navegación de un marco (`document` que no es el principal) no se
+   * usa: ahí el marco todavía tiene el documento anterior, y manda la URL del
+   * pedido.
+   */
+  urlDelMarco: string | null;
+  /**
+   * La URL del documento CONFIRMADO de la pestaña cuando sale el pedido —el
+   * que se lee—, no la del último PEDIDO de navegación (RT-4, FV-1). Una
+   * navegación de la pestaña que no se confirma —un 204, una descarga
+   * denegada, un `window.stop()`, una que sigue en vuelo— no cambia el
+   * documento ni esto. `null`, o una URL que no es `http(s)` —`about:blank`
+   * antes de la primera navegación—, no dice de qué sitio es la página, y el
+   * pedido cuenta como de ella.
+   */
+  urlDeLaPagina: string | null;
   /** Sólo para lo que no sale a la red: `data:`, `blob:`, `about:`. */
   continuar(): Promise<void>;
   abortar(): Promise<void>;
@@ -355,7 +490,21 @@ export interface OpcionesRender {
   /** Cuánto se espera al cierre antes de matar el proceso. */
   cierreMs: number;
   maxBytesPorRespuesta: number;
+  /**
+   * Bytes de lo que pide la PÁGINA —el documento, sus subrecursos y sus
+   * marcos del mismo sitio—, sumados MIENTRAS SE BAJAN: también con pedidos
+   * en paralelo, lo bajado no pasa esto (RED-121-2).
+   */
   maxBytesTotales: number;
+  /**
+   * Bytes de lo que piden los marcos de OTRO SITIO, sumados igual, en un
+   * presupuesto aparte: no escriben el texto que se cuenta (RT-4), y no le
+   * pueden quitar bytes a la página. MEDIDO en https://vulkan-studios.com:
+   * sus cinco reproductores de YouTube y uno de Vimeo bajaron de 8,4 a 25 MB
+   * por corrida, contra 1,35 MB de la página. Con los dos presupuestos, una
+   * medición baja como mucho 25 + 10 MB.
+   */
+  maxBytesDeOtrosSitios: number;
 }
 
 export const OPCIONES_RENDER: OpcionesRender = {
@@ -369,6 +518,7 @@ export const OPCIONES_RENDER: OpcionesRender = {
   cierreMs: 5_000,
   maxBytesPorRespuesta: 5 * 1024 * 1024,
   maxBytesTotales: 25 * 1024 * 1024,
+  maxBytesDeOtrosSitios: 10 * 1024 * 1024,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -508,13 +658,69 @@ export function nuevaBitacora(): Bitacora {
 
 /**
  * Los tipos de pedido con los que el JavaScript de la página escribe texto en
- * el DOM: el código, los datos que el código trae, y un marco (`document` que
- * no es el principal), que puede ser del mismo origen y escribir en él.
+ * el DOM: el código, los datos que el código trae —también por un
+ * `EventSource` (FV-4)—, y un marco (`document` que no es el principal), que
+ * puede ser del mismo origen y escribir en él.
  */
-const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "document"]);
+const ESCRIBEN_TEXTO = new Set(["script", "xhr", "fetch", "document", "eventsource"]);
 
+/**
+ * El sitio de un host, aproximado HACIA ARRIBA: la IP tal cual, o los dos
+ * últimos rótulos del nombre (`player.vimeo.com` → `vimeo.com`). Dos marcos
+ * que comparten dominio registrable —lo único con lo que `document.domain`
+ * los deja tocarse— comparten siempre esos dos rótulos; al revés no
+ * (`a.co.uk` y `b.co.uk`), y entonces se los trata como del mismo sitio:
+ * se cuentan de más, que empuja a «no medido», nunca a verde (RT-4).
+ */
+function sitioAproximado(hostname: string): string {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (ipLiteral(host) !== null) return host;
+  return host.split(".").slice(-2).join(".");
+}
+
+/** La URL si es `http(s)`; si no lo es, o no es una URL, `null`. */
+function urlDeRed(url: string | null): URL | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return ESQUEMAS_DE_RED.has(u.protocol) ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Si el pedido sale de un marco de OTRO SITIO que la página, o es la
+ * navegación de un marco a otro sitio (RT-4). Ante la duda, `false`: un
+ * pedido sin marco (un worker de la página puede traer datos y pasárselos),
+ * un marco `about:blank`, `blob:` o `srcdoc` —heredan el origen de quien lo
+ * creó— y una página que todavía no se conoce cuentan como de la página.
+ *
+ * La página es `urlDeLaPagina`, el documento CONFIRMADO de la pestaña y no el
+ * último pedido de navegación (FV-1, ver el encabezado). Se decide sólo con
+ * lo que el pedido trae, sin estado del interceptor.
+ */
+function deOtroSitio(pedido: PedidoDelNavegador): boolean {
+  if (pedido.esDocumentoPrincipal) return false;
+  const pagina = urlDeRed(pedido.urlDeLaPagina);
+  const desde = urlDeRed(pedido.tipo === "document" ? pedido.url : pedido.urlDelMarco);
+  if (pagina === null || desde === null) return false;
+  return sitioAproximado(desde.hostname) !== sitioAproximado(pagina.hostname);
+}
+
+/**
+ * Si un pedido puede cambiar el texto que se cuenta: es de un tipo que lo
+ * escribe y sale de un lugar desde el que se puede escribir en la página.
+ *
+ * `other` SIN marco es el `importScripts` de un worker (MEDIDO con Chrome 155
+ * y el headless shell 153, FV-4): el código del worker que trae los datos.
+ * Con marco, `other` es, por ejemplo, el `favicon.ico` que Chromium pide por
+ * su cuenta, que no escribe nada.
+ */
 function escribeTexto(pedido: PedidoDelNavegador): boolean {
-  return !pedido.esDocumentoPrincipal && ESCRIBEN_TEXTO.has(pedido.tipo);
+  if (pedido.esDocumentoPrincipal) return false;
+  const escribe = ESCRIBEN_TEXTO.has(pedido.tipo) || (pedido.tipo === "other" && pedido.urlDelMarco === null);
+  return escribe && !deOtroSitio(pedido);
 }
 
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
@@ -553,9 +759,40 @@ export function crearInterceptor(
     soloDocumento?: boolean;
   } = {}
 ) {
-  let bytesTotales = 0;
+  // Los dos presupuestos de bytes (RT-4), descontados MIENTRAS se baja
+  // (RED-121-2): `usados` es lo que ya se bajó, también lo de los pedidos que
+  // siguen en vuelo. Sólo crece: lo que se bajó no se devuelve.
+  const bolsas = {
+    pagina: { tope: opciones.maxBytesTotales, usados: 0 },
+    deOtrosSitios: { tope: opciones.maxBytesDeOtrosSitios, usados: 0 },
+  };
 
   return async function atender(pedido: PedidoDelNavegador): Promise<void> {
+    // Si escribe el texto que se cuenta, y si sale de otro sitio (RT-4): se
+    // decide UNA vez, al entrar, con lo que el pedido trae. Antes se volvía a
+    // juzgar al fallar contra el último pedido de navegación, y un `fetch` de
+    // la página que estaba en vuelo cuando la pestaña intentó irse a otro
+    // sitio se descartaba al no llegar (FV-1).
+    const escribe = escribeTexto(pedido);
+    const ajeno = deOtroSitio(pedido);
+    // Lo de un marco de otro sitio sale de su propio presupuesto (RT-4). Lo
+    // que ESTE pedido ya descontó de su bolsa, y si la bolsa le dijo que no:
+    // el transporte llama `tomar` con cada parte del cuerpo que llega, así lo
+    // que bajan los pedidos en paralelo sale de la misma cuenta, y no cada
+    // uno de lo que veía al salir (RED-121-2).
+    const bolsa = ajeno ? bolsas.deOtrosSitios : bolsas.pagina;
+    let tomados = 0;
+    let sinPresupuesto = false;
+    const tomar = (bytes: number): boolean => {
+      if (bytes <= 0) return true;
+      if (bolsa.usados + bytes > bolsa.tope) {
+        sinPresupuesto = true;
+        return false;
+      }
+      bolsa.usados += bytes;
+      tomados += bytes;
+      return true;
+    };
     // Si este pedido ya tiene un desenlace decidido —se bloqueó con su
     // motivo, o se le entregó la respuesta—. Lo que tire ANTES de eso, en el
     // `catch` de abajo, es un pedido que no llegó y nadie anotó (PU-3).
@@ -564,7 +801,7 @@ export function crearInterceptor(
       decidido = true;
       bitacora.bloqueados.push({ url: pedido.url, motivo });
       if (
-        escribeTexto(pedido) &&
+        escribe &&
         (motivo === "timeout" ||
           motivo === "sin-respuesta" ||
           motivo === "tls" ||
@@ -614,7 +851,7 @@ export function crearInterceptor(
       if (!examen.ok) return await bloquear(examen.motivo);
 
       const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
-      const quedan = opciones.maxBytesTotales - bytesTotales;
+      const quedan = bolsa.tope - bolsa.usados;
       if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
 
       const encabezados: Record<string, string> = {};
@@ -626,8 +863,7 @@ export function crearInterceptor(
       // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
       // la lectura no se da por buena mientras un pedido que escribe texto
       // siga en camino.
-      const cuenta = escribeTexto(pedido);
-      if (cuenta) bitacora.enVuelo += 1;
+      if (escribe) bitacora.enVuelo += 1;
       try {
         let respuesta: RespuestaHttp;
         try {
@@ -640,6 +876,7 @@ export function crearInterceptor(
             cuerpo: pedido.cuerpo,
             timeoutMs: plazo,
             maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
+            presupuesto: tomar,
           });
         } catch {
           // Un transporte que RECHAZA no trajo nada: es «sin respuesta», con
@@ -651,7 +888,7 @@ export function crearInterceptor(
         }
         await entregar(respuesta, url.toString());
       } finally {
-        if (cuenta) bitacora.enVuelo -= 1;
+        if (escribe) bitacora.enVuelo -= 1;
       }
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
@@ -660,17 +897,22 @@ export function crearInterceptor(
       // Y si escribe texto y no tenía desenlace —tiró el examen, o el
       // navegador no aceptó la respuesta (`responder` tira con un encabezado
       // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
-      if (!decidido && escribeTexto(pedido)) {
+      if (!decidido && escribe) {
         bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta" });
       }
       await pedido.abortar().catch(() => {});
     }
 
     async function entregar(respuesta: RespuestaHttp, clave: string) {
-      if (respuesta.tipo === "error") return await bloquear(respuesta.motivo);
+      // Un corte del transporte porque la bolsa no alcanzó es «presupuesto»,
+      // no «demasiado-grande»: la respuesta podía caber en su tope propio.
+      if (respuesta.tipo === "error") return await bloquear(sinPresupuesto ? "presupuesto" : respuesta.motivo);
       if (esDescarga(respuesta.encabezados)) return await bloquear("descarga");
+      // Lo que el transporte no descontó parte por parte —lo que creció al
+      // descomprimir, o un transporte que no usa `presupuesto`— se descuenta
+      // ahora, y si no alcanza, no se entrega.
+      if (!tomar(respuesta.cuerpo.length - tomados)) return await bloquear("presupuesto");
 
-      bytesTotales += respuesta.cuerpo.length;
       if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = respuesta.status;
 
       const devueltos: Record<string, string | string[]> = {};
@@ -678,7 +920,10 @@ export function crearInterceptor(
         if (!DE_LA_RESPUESTA.has(nombre.toLowerCase())) devueltos[nombre.toLowerCase()] = valor;
       }
       const entregada = { status: respuesta.status, encabezados: devueltos, cuerpo: respuesta.cuerpo };
-      if (pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(clave, entregada);
+      // Sólo el documento: la pestaña sin JavaScript no pide otra cosa
+      // (`soloDocumento`), y guardar lo demás —los segmentos de video de un
+      // reproductor— era memoria de la función sin uso (F3).
+      if (pedido.esDocumentoPrincipal && pedido.metodo.toUpperCase() === "GET") pestana.guardarEn?.set(clave, entregada);
       await pedido.responder(entregada);
       decidido = true;
     }

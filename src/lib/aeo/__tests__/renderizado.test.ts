@@ -23,11 +23,15 @@ import { contenidoSinJs, hallazgos, type LecturaDelSitio } from "../hallazgos";
 import { AGENTES_IA, contarCaracteres, textoSinJavaScript } from "../lectura";
 import {
   crearExaminador,
+  crearInterceptor,
   medirRenderizado,
   nuevaBitacora,
   OPCIONES_RENDER,
   type Bitacora,
+  type CacheDeRespuestas,
   type DependenciasRender,
+  type PedidoDelNavegador,
+  type PedidoHttp,
 } from "../renderizado";
 import { navegadorDoble, relojVirtual, resolvedorDoble, transporteDoble, type Sitio } from "./navegadorDoble";
 
@@ -44,6 +48,13 @@ const DNS = {
   "metadata.test": ["169.254.169.254"],
   "mixto.test": [PUBLICA, "127.0.0.1"],
   "localhost": ["127.0.0.1", "::1"],
+  // RT-4: un reproductor de otro sitio, y un nombre con SÓLO registros AAAA
+  // —como `brunhild.challenges.cloudflare.com`—, pública y sin ruta.
+  "video.test": [OTRA_PUBLICA],
+  "solo-v6.test": ["2606:4700::6812:1092"],
+  "www.mudado.test": [PUBLICA],
+  // FV-1: el otro sitio al que la página manda la pestaña, sin confirmarse.
+  "otro.test": [OTRA_PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -447,6 +458,471 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
 });
 
 /**
+ * RT-4. MEDIDO contra la web real: https://vulkan-studios.com (WordPress con
+ * Elementor) salía `subrecurso-sin-respuesta` en producción, 2 de 2, y acá con
+ * Chrome 154. El pedido que no llegaba era un `fetch` a
+ * `brunhild.challenges.cloudflare.com` —un nombre con SÓLO registros AAAA—
+ * desde el marco del desafío de Cloudflare, dentro del marco de
+ * `player.vimeo.com`, dentro de la página. Un Chrome normal en la misma red
+ * sin IPv6 tampoco lo trae (`net::ERR_ADDRESS_UNREACHABLE`): el transporte
+ * no tiene defecto. Lo que estaba mal era contarlo: un marco de otro sitio no
+ * escribe en el DOM que se cuenta.
+ */
+describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se midió", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+  const CON_VIDEO = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script><iframe src="http://video.test/embed"></iframe></body></html>`;
+  const SITIO: Sitio = {
+    "http://sitio.test/": { cuerpo: CON_VIDEO },
+    "http://sitio.test/app.js": { cuerpo: CONTENIDO },
+    "http://video.test/embed": { cuerpo: "<p>reproductor</p>" },
+    "http://solo-v6.test/sonda": { error: "sin-respuesta" },
+  };
+  const rojo = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+    contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(CON_VIDEO), caracteresRenderizados: render }).estado;
+
+  it("el caso de vulkan-studios.com: el `fetch` que un marco de otro sitio no recibe no deja la página sin número", async () => {
+    const { deps, bitacora } = armar(SITIO, {
+      enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://video.test/embed" }],
+    });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    // El pedido salió y no llegó —está en la bitácora con su motivo—, pero no
+    // cuenta: la prueba no pasa porque el marco no haya pedido nada.
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://solo-v6.test/sonda", motivo: "sin-respuesta" });
+    expect(bitacora.noLlegaron).toEqual([]);
+    // Y el bundle de la página, que sí llegó, se contó: el punto sale ROJO.
+    expect(rojo(render)).toBe("rojo");
+  });
+
+  it("el DOCUMENTO de un marco de otro sitio que no llega tampoco: un reproductor caído no es la página", async () => {
+    const { deps, bitacora } = armar({ ...SITIO, "http://video.test/embed": { error: "timeout" } });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://video.test/embed", motivo: "timeout" });
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  it("y un pedido de ese marco que no termina nunca no deja la lectura esperándolo: no es `subrecurso-pendiente`", async () => {
+    const { deps } = armar(
+      { ...SITIO, "http://video.test/player.js": { cuerpo: "x", llegaCuando: () => new Promise(() => {}) } },
+      { enSegundoPlano: [{ url: "http://video.test/player.js", tipo: "script", marco: "http://video.test/embed" }] }
+    );
+    expect((await medirRenderizado("http://sitio.test/", deps)).estado).toBe("medido");
+  });
+
+  it("el MISMO pedido desde la página sigue sin número: lo que la página pide y no le llega es `subrecurso-<motivo>`", async () => {
+    const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch" }] });
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-sin-respuesta",
+    });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta" }]);
+  });
+
+  it.each([
+    ["un marco del MISMO origen, que puede escribir en la página", "http://sitio.test/widget"],
+    ["un marco de otro origen del MISMO sitio (`document.domain`)", "http://widgets.sitio.test/w"],
+    ["un marco `about:blank`, que hereda el origen de quien lo creó", "about:blank"],
+    // F2: lo que la tabla del PR afirma y ningún test ataba. MEDIDO con
+    // Chrome 155: el `script` de un `<iframe srcdoc>` sale con el marco
+    // `about:srcdoc`, y el de un `<iframe src=blob:…>` con el marco
+    // `blob:http://sitio.test/<uuid>`. Los dos heredan el origen de la página.
+    ["un marco `about:srcdoc`", "about:srcdoc"],
+    ["un marco `blob:` que armó la página", "blob:http://sitio.test/6f1c2a9e-3b7d-4e2a-9c1f-0d8e7b6a5c4d"],
+    ["un pedido SIN marco: un worker de la página, que le pasa los datos", null],
+  ])("lo que no llega a %s sigue dejando la página sin número", async (_caso, marco) => {
+    const { deps } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco }] });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+  });
+
+  it("F2 — un marco de otro sitio que SE NAVEGA al sitio de la página se juzga por la URL a la que va: si no llega, la página no se mide", async () => {
+    // El marco ya tiene un documento de red de otro sitio (`video.test`); la
+    // navegación sale con ese marco y va a `sitio.test`. El documento que
+    // llegaría es del sitio de la página y podría escribir en ella: cuenta.
+    const { deps, bitacora } = armar(SITIO, {
+      enSegundoPlano: [{ url: "http://sitio.test/corta", tipo: "document", marco: "http://video.test/embed" }],
+    });
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-sin-respuesta",
+    });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/corta", tipo: "document", motivo: "sin-respuesta" }]);
+    // Y la misma navegación del marco a OTRO sitio no cuenta.
+    const aOtro = armar(SITIO, {
+      enSegundoPlano: [{ url: "http://cdn.test/corta", tipo: "document", marco: "http://video.test/embed" }],
+    });
+    expect((await medirRenderizado("http://sitio.test/", aOtro.deps)).estado).toBe("medido");
+  });
+
+  /**
+   * FV-4. Reproducido por la revisión con Chrome 155 y el headless shell 153,
+   * también en main: `importScripts` de un worker sale con tipo `other` y sin
+   * marco, y un `EventSource` con tipo `eventsource`. Ninguno de los dos
+   * contaba, y la página que escribía con ellos salía VERDE si no llegaban.
+   */
+  it.each([
+    ["el `importScripts` de un worker (`other`, sin marco)", { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null }],
+    ["un `EventSource` de la página", { url: "http://solo-v6.test/sse", tipo: "eventsource" }],
+  ] as const)("FV-4 — %s que no llega deja la página sin número", async (_caso, pedido) => {
+    const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [pedido] });
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-sin-respuesta",
+    });
+    expect(bitacora.noLlegaron.map((n) => n.url)).toEqual([pedido.url]);
+  });
+
+  it("FV-4 — y un `other` CON marco no cuenta: el `favicon.ico` que Chromium pide por su cuenta no escribe nada", async () => {
+    const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [{ url: "/favicon.ico", tipo: "other" }] });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://sitio.test/favicon.ico", motivo: "sin-respuesta" });
+    expect(render.estado).toBe("medido");
+  });
+
+  /**
+   * F3: los dos topes son DISTINTOS a propósito —la página 1 000, los marcos
+   * de otro sitio 1 200—, y se afirma en qué pedido corta cada uno. Con los
+   * dos en 1 000, cambiar el tope ajeno por el de la página pasaba igual.
+   */
+  it("los bytes de un marco de otro sitio salen de SU presupuesto, y cada presupuesto corta en su tope", async () => {
+    const SEGMENTO = "v".repeat(600);
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://video.test/seg1": { cuerpo: SEGMENTO },
+      "http://video.test/seg2": { cuerpo: SEGMENTO },
+      "http://video.test/seg3": { cuerpo: SEGMENTO },
+      "http://sitio.test/chunk.js": { cuerpo: "c".repeat(300) },
+      "http://sitio.test/chunk2.js": { cuerpo: "d".repeat(800) },
+    });
+    const bitacora = bitacoraVacia();
+    const opciones = { ...OPCIONES_RENDER, maxBytesTotales: 1_000, maxBytesDeOtrosSitios: 1_200 };
+    const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, string> = {};
+    // Uno por vez, en orden.
+    const pedir = (url: string, tipo: string, esDocumentoPrincipal: boolean, urlDelMarco: string | null) =>
+      atender({
+        url,
+        metodo: "GET",
+        encabezados: {},
+        tipo,
+        esDocumentoPrincipal,
+        urlDelMarco,
+        // La pestaña ya tiene la página confirmada, salvo mientras la pide.
+        urlDeLaPagina: esDocumentoPrincipal ? null : "http://sitio.test/",
+        continuar: async () => void (desenlaces[url] = "continuado"),
+        abortar: async () => void (desenlaces[url] = "abortado"),
+        responder: async () => void (desenlaces[url] = "respondido"),
+      });
+    await pedir("http://sitio.test/", "document", true, null);
+    for (const n of [1, 2, 3]) await pedir(`http://video.test/seg${n}`, "xhr", false, "http://video.test/embed");
+    await pedir("http://sitio.test/chunk.js", "script", false, "http://sitio.test/");
+    // El reproductor gastó el SUYO: 1 200 alcanzan para dos segmentos de 600
+    // y no para el tercero. Con el tope de la página (1 000) cortaba en el
+    // segundo.
+    expect(desenlaces["http://video.test/seg2"]).toBe("respondido");
+    expect(desenlaces["http://video.test/seg3"]).toBe("abortado");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://video.test/seg3", motivo: "presupuesto" });
+    // ...y el chunk de la página salió con el de la página: con un solo
+    // presupuesto, los 1 200 bytes del video lo dejaban `subrecurso-presupuesto`.
+    expect(desenlaces["http://sitio.test/chunk.js"]).toBe("respondido");
+    expect(bitacora.noLlegaron).toEqual([]);
+    // Y la página corta en el SUYO: 11 + 300 + 800 pasan los 1 000 (con el
+    // tope ajeno, 1 200, pasaba).
+    await pedir("http://sitio.test/chunk2.js", "script", false, "http://sitio.test/");
+    expect(desenlaces["http://sitio.test/chunk2.js"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/chunk2.js", tipo: "script", motivo: "presupuesto" }]);
+  });
+
+  it("F3 — los topes de producción: 25 MB la página, 10 MB los marcos de otro sitio, 5 MB cada respuesta", () => {
+    expect(OPCIONES_RENDER.maxBytesTotales).toBe(25 * 1024 * 1024);
+    expect(OPCIONES_RENDER.maxBytesDeOtrosSitios).toBe(10 * 1024 * 1024);
+    expect(OPCIONES_RENDER.maxBytesPorRespuesta).toBe(5 * 1024 * 1024);
+  });
+
+  it("F3 — la caché para la pestaña sin JavaScript guarda SÓLO el documento: no los bytes de un reproductor", async () => {
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://video.test/seg1": { cuerpo: "v".repeat(600) },
+      "http://sitio.test/app.js": { cuerpo: "c".repeat(300) },
+    });
+    const cache: CacheDeRespuestas = new Map();
+    const atender = crearInterceptor(deps, OPCIONES_RENDER, bitacoraVacia(), () => 5_000, new AbortController().signal, undefined, {
+      guardarEn: cache,
+    });
+    const pedir = (url: string, tipo: string, esDocumentoPrincipal: boolean, urlDelMarco: string | null) =>
+      atender({
+        url,
+        metodo: "GET",
+        encabezados: {},
+        tipo,
+        esDocumentoPrincipal,
+        urlDelMarco,
+        urlDeLaPagina: esDocumentoPrincipal ? null : "http://sitio.test/",
+        continuar: async () => {},
+        abortar: async () => {},
+        responder: async () => {},
+      });
+    await pedir("http://sitio.test/", "document", true, null);
+    await pedir("http://video.test/seg1", "xhr", false, "http://video.test/embed");
+    await pedir("http://sitio.test/app.js", "script", false, "http://sitio.test/");
+    expect([...cache.keys()]).toEqual(["http://sitio.test/"]);
+  });
+
+  it("el sitio de la página es el del ÚLTIMO salto: después de una redirección, un marco del sitio nuevo cuenta", async () => {
+    const pagina = `<html><body>${MENU}<main id="app"></main></body></html>`;
+    const sitio: Sitio = {
+      "http://sitio.test/": { status: 301, encabezados: { location: "http://www.mudado.test/" } },
+      "http://www.mudado.test/": { cuerpo: pagina },
+      "http://solo-v6.test/sonda": { error: "sin-respuesta" },
+    };
+    const delNuevo = armar(sitio, {
+      enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://cdn.mudado.test/w" }],
+    });
+    expect(await medirRenderizado("http://sitio.test/", delNuevo.deps)).toEqual({
+      estado: "fallo",
+      codigo: "subrecurso-sin-respuesta",
+    });
+    // Y uno del sitio del PRIMER salto ya es de otro sitio que la página.
+    const delViejo = armar(sitio, {
+      enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: "http://sitio.test/w" }],
+    });
+    expect((await medirRenderizado("http://sitio.test/", delViejo.deps)).estado).toBe("medido");
+  });
+
+  /**
+   * FV-1, RED-121-1, F1. Reproducido por la revisión con Chrome 155 y con el
+   * headless shell 153: el sitio de la página salía del último PEDIDO de
+   * navegación de la pestaña, no del documento que se lee. Una página que
+   * manda la pestaña a otro sitio que no se confirma —un 204, una descarga
+   * denegada, un `window.stop()`, una navegación que sigue en vuelo— y
+   * después hace un `fetch` propio que no llega salía `medido 1249/1249`,
+   * punto VERDE y `noLlegaron=[]`. En main, `subrecurso-sin-respuesta`.
+   */
+  it.each([
+    ["un 204", { status: 204 }],
+    ["una navegación que sigue en vuelo", { llegaCuando: () => new Promise<void>(() => {}) }],
+  ] as const)(
+    "una navegación de la PESTAÑA que no se confirma (%s) no cambia el sitio de la página: su `fetch` que no llega la deja sin número",
+    async (_caso, destino) => {
+      const { deps, bitacora, red } = armar(
+        { ...SITIO, "http://otro.test/vacio": destino },
+        {
+          enSegundoPlano: [
+            { url: "http://otro.test/vacio", tipo: "document", principal: true },
+            { url: "http://solo-v6.test/sonda", tipo: "fetch" },
+          ],
+        }
+      );
+      const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+      // La navegación SALIÓ por el transporte: si no, esto no prueba nada.
+      expect(red.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+      expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+      expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta" }]);
+    }
+  );
+
+  it("y un pedido de la página que estaba EN VUELO cuando la pestaña intentó irse tampoco se descarta al no llegar", async () => {
+    // El `fetch` sale con la página, la pestaña intenta irse a los 1 000 ms y
+    // el `fetch` falla a los 3 000. Lo que se decidió al salir no cambia:
+    // antes, `bloquear` lo volvía a juzgar contra la navegación nueva.
+    const { deps, bitacora } = armar(
+      (reloj) => ({
+        ...SITIO,
+        "http://otro.test/vacio": { status: 204 },
+        "http://sitio.test/api/datos": { error: "sin-respuesta", llegaCuando: () => reloj.alcanzar(3_000) },
+      }),
+      {
+        enSegundoPlano: [
+          { url: "/api/datos", tipo: "fetch" },
+          { url: "http://otro.test/vacio", tipo: "document", principal: true, enMs: 1_000 },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(bitacora.pedidos.map((p) => p.url)).toContain("http://otro.test/vacio");
+    expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://sitio.test/api/datos", tipo: "fetch", motivo: "sin-respuesta" }]);
+  });
+
+  it("y si el `fetch` LLEGA después de esa navegación, lo que escribe se cuenta: la página sigue siendo la misma, punto ROJO", async () => {
+    // El control: la navegación no se confirmó, el documento es el de la
+    // página, y el `fetch` que llega escribe en él. Sin esto, los dos casos
+    // de arriba podrían ser rojos porque la navegación rompió la medición.
+    const { deps, bitacora } = armar(
+      { ...SITIO, "http://otro.test/vacio": { status: 204 }, "http://sitio.test/api/datos": { cuerpo: "Datos del negocio. ".repeat(20) } },
+      {
+        enSegundoPlano: [
+          { url: "http://otro.test/vacio", tipo: "document", principal: true },
+          { url: "/api/datos", tipo: "fetch" },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(textoSinJavaScript(CON_VIDEO) + contarCaracteres(CONTENIDO));
+    expect(rojo(render)).toBe("rojo");
+  });
+});
+
+/**
+ * RED-121-2 y RED-121-3. Reproducido por la revisión con Chrome 155 y el
+ * headless shell 153: un marco de otro sitio con 30 `fetch` EN PARALELO de
+ * 4,5 MB bajó 40,5 MB (36 con el headless shell) contra 10 MB de
+ * presupuesto, porque cada pedido miraba lo que quedaba antes de salir y
+ * nadie lo descontaba hasta que llegaba. Y la rama de los marcos de otro
+ * sitio —su examen, su plazo, su tope de bytes— no tenía un test que se
+ * pusiera rojo si se rompía.
+ */
+describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también para lo que piden los marcos de otro sitio", () => {
+  /** N pedidos que el transporte tiene EN VUELO a la vez: ninguno termina hasta que salieron todos. */
+  function enParalelo(urls: string[], cuerpo: string, porPartes?: number) {
+    let salieron = 0;
+    let todos!: () => void;
+    const juntos = new Promise<void>((listo) => (todos = listo));
+    const llegaCuando = () => {
+      salieron += 1;
+      if (salieron === urls.length) todos();
+      return juntos;
+    };
+    const sitio: Sitio = { "http://sitio.test/": { cuerpo: "<p>hola</p>" } };
+    for (const u of urls) sitio[u] = { cuerpo, llegaCuando };
+    const red = transporteDoble(sitio, { porPartes });
+    const deps: DependenciasRender = {
+      abrirNavegador: navegadorDoble().abrirNavegador,
+      transporte: red.transporte,
+      resolver: resolvedorDoble(DNS).resolver,
+    };
+    return { deps, red };
+  }
+
+  function pedidoA(
+    url: string,
+    tipo: string,
+    urlDelMarco: string | null,
+    desenlaces: Record<string, number | "abortado">
+  ): PedidoDelNavegador {
+    return {
+      url,
+      metodo: "GET",
+      encabezados: {},
+      tipo,
+      esDocumentoPrincipal: false,
+      urlDelMarco,
+      urlDeLaPagina: "http://sitio.test/",
+      continuar: async () => {},
+      abortar: async () => void (desenlaces[url] = "abortado"),
+      responder: async (r) => void (desenlaces[url] = r.cuerpo.length),
+    };
+  }
+
+  const entregados = (desenlaces: Record<string, number | "abortado">) =>
+    Object.values(desenlaces).reduce<number>((suma, d) => suma + (d === "abortado" ? 0 : d), 0);
+
+  it.each([
+    ["descontado parte por parte, como el transporte de producción", 100],
+    ["un transporte que no descuenta: el interceptor descuenta al entregar", undefined],
+  ] as const)(
+    "30 pedidos EN PARALELO de un marco de otro sitio no bajan ni entregan más que su tope (%s)",
+    async (_caso, porPartes) => {
+      const urls = Array.from({ length: 30 }, (_, i) => `http://video.test/seg${i}`);
+      const { deps, red } = enParalelo(urls, "v".repeat(450), porPartes);
+      const bitacora = bitacoraVacia();
+      const opciones = { ...OPCIONES_RENDER, maxBytesPorRespuesta: 500, maxBytesDeOtrosSitios: 1_000, maxBytesTotales: 1_000_000 };
+      const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
+      const desenlaces: Record<string, number | "abortado"> = {};
+      await Promise.all(urls.map((u) => atender(pedidoA(u, "xhr", "http://video.test/embed", desenlaces))));
+      // Salieron TODOS al transporte —si no, esto no prueba el paralelo—…
+      expect(red.pedidos.length).toBe(30);
+      // …y entre todos no se entregó ni se bajó más que el tope ajeno. Antes:
+      // 30 × 450 = 13 500 entregados contra 1 000.
+      expect(entregados(desenlaces)).toBeLessThanOrEqual(1_000);
+      if (porPartes) expect(Object.values(red.bajados).reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(1_000);
+      expect(bitacora.bloqueados.filter((b) => b.motivo === "presupuesto").length).toBeGreaterThan(0);
+      // Lo de otro sitio no decide: nada en `noLlegaron`.
+      expect(bitacora.noLlegaron).toEqual([]);
+    }
+  );
+
+  it.each([
+    ["parte por parte", 100],
+    ["al entregar", undefined],
+  ] as const)("y lo mismo con el presupuesto de la PÁGINA (%s): lo que no cupo es `presupuesto` en `noLlegaron`", async (_caso, porPartes) => {
+    const urls = Array.from({ length: 30 }, (_, i) => `http://sitio.test/chunk${i}.js`);
+    const { deps, red } = enParalelo(urls, "c".repeat(450), porPartes);
+    const bitacora = bitacoraVacia();
+    const opciones = { ...OPCIONES_RENDER, maxBytesPorRespuesta: 500, maxBytesTotales: 1_000, maxBytesDeOtrosSitios: 1_000_000 };
+    const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, number | "abortado"> = {};
+    await Promise.all(urls.map((u) => atender(pedidoA(u, "script", "http://sitio.test/", desenlaces))));
+    expect(red.pedidos.length).toBe(30);
+    expect(entregados(desenlaces)).toBeLessThanOrEqual(1_000);
+    if (porPartes) expect(Object.values(red.bajados).reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(1_000);
+    // Los de la página que no cupieron NO LLEGARON: la página queda sin número.
+    expect(bitacora.noLlegaron.length).toBeGreaterThan(0);
+    expect(new Set(bitacora.noLlegaron.map((n) => n.motivo))).toEqual(new Set(["presupuesto"]));
+  });
+
+  it("RED-121-3 — un pedido de un marco de otro sitio sale con el plazo que QUEDA y con los bytes que le quedan a SU presupuesto", async () => {
+    const vistos: PedidoHttp[] = [];
+    const deps: DependenciasRender = {
+      abrirNavegador: navegadorDoble().abrirNavegador,
+      // Un origen que no termina nunca: lo que lo corta es el plazo que el
+      // interceptor le da al transporte.
+      transporte: async (p) => {
+        vistos.push(p);
+        if (p.url.endsWith("/sin-fin")) return await new Promise(() => {});
+        return { tipo: "respuesta", status: 200, encabezados: {}, cuerpo: Buffer.alloc(900, 118) };
+      },
+      resolver: resolvedorDoble(DNS).resolver,
+    };
+    const opciones = { ...OPCIONES_RENDER, plazoPorPedidoMs: 8_000, maxBytesPorRespuesta: 5_000, maxBytesDeOtrosSitios: 1_200 };
+    const atender = crearInterceptor(deps, opciones, bitacoraVacia(), () => 3_000, new AbortController().signal);
+    const desenlaces: Record<string, number | "abortado"> = {};
+    await atender(pedidoA("http://video.test/seg", "xhr", "http://video.test/embed", desenlaces));
+    void atender(pedidoA("http://video.test/sin-fin", "xhr", "http://video.test/embed", desenlaces));
+    await new Promise((listo) => setImmediate(listo));
+    const sinFin = vistos.find((p) => p.url === "http://video.test/sin-fin");
+    expect(sinFin).toBeDefined();
+    if (!sinFin) return;
+    // El plazo: el de cada pedido, recortado a lo que le queda a la medición.
+    expect(sinFin.timeoutMs).toBeLessThanOrEqual(3_000);
+    // Los bytes: lo que le queda al presupuesto de OTROS sitios (1 200 − 900),
+    // no el de la página ni el tope de una respuesta.
+    expect(sinFin.maxBytes).toBeLessThanOrEqual(300);
+    // Y el presupuesto compartido no le deja bajar más que eso.
+    expect(sinFin.presupuesto?.(301)).toBe(false);
+    expect(sinFin.presupuesto?.(300)).toBe(true);
+    expect(sinFin.presupuesto?.(1)).toBe(false);
+  });
+
+  it("RED-121-3 — y un pedido de un marco de otro sitio a una red que no es pública no sale: el mismo examen que la página", async () => {
+    const { deps, red } = armar({ "http://sitio.test/": { cuerpo: "<p>hola</p>" } });
+    const bitacora = bitacoraVacia();
+    const atender = crearInterceptor(deps, OPCIONES_RENDER, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, number | "abortado"> = {};
+    const hostiles = [
+      "http://127.0.0.1/admin",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://10.0.0.7/",
+      "http://interno.test/",
+      "http://mixto.test/",
+      "http://metadata.test/",
+      "http://[::1]/",
+    ];
+    for (const url of hostiles) {
+      await atender(pedidoA(url, "fetch", "http://video.test/embed", desenlaces));
+      await atender(pedidoA(url, "script", "http://video.test/embed", desenlaces));
+    }
+    expect(red.pedidos).toEqual([]);
+    expect(bitacora.pedidos).toEqual([]);
+    for (const url of hostiles) expect(desenlaces[url]).toBe("abortado");
+    expect(new Set(bitacora.bloqueados.map((b) => b.motivo))).toEqual(new Set(["red-no-publica"]));
+  });
+});
+
+/**
  * RT-2. Medido con el headless shell de producción en AL2023 con 1 vCPU y
  * `/tmp` vacío: el arranque en frío (descomprimir y lanzar) tardó 3,8, 6,0 y
  * 7,1 s, y una página estática de Next.js, 13 a 22,9 s en frío —y una de 7
@@ -733,6 +1209,8 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
         encabezados: {},
         tipo: "fetch",
         esDocumentoPrincipal: false,
+        urlDelMarco: "http://sitio.test/",
+        urlDeLaPagina: "http://sitio.test/",
         continuar: async () => void vistos.push(`${metodo} continuado`),
         abortar: async () => void vistos.push(`${metodo} abortado`),
         responder: async () => void vistos.push(`${metodo} respondido`),
