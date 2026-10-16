@@ -202,6 +202,18 @@ export async function POST(req: Request) {
       medirRenderizado(base.toString(), deps),
     ]);
 
+    // Un render sin número se dice también en el log de la función, con el
+    // pedido que lo decidió si fue uno (`detalle`): la respuesta traía sólo el
+    // código y los logs de Vercel nada, y `subrecurso-sin-respuesta` no dice
+    // qué pedido faltó. El detalle sale de `renderizado.ts` sin query ni
+    // fragmento, y acá no se le agrega ninguna URL: un token no llega al log.
+    if (caracteresRenderizados.estado === "fallo") {
+      console.warn(
+        "[aeo/audit] render no medido:",
+        JSON.stringify({ codigo: caracteresRenderizados.codigo, detalle: caracteresRenderizados.detalle ?? null })
+      );
+    }
+
     // Un `robots.txt` que NO ESTÁ (4xx) se lee como vacío, que es lo que el
     // estándar dice: sin robots, se permite. Uno que no se pudo traer deja el
     // acceso en `null` por agente —«no se sabe»—, y el hallazgo lo dice como

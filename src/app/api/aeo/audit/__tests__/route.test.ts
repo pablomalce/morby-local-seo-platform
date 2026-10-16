@@ -379,18 +379,75 @@ describe("el DOM renderizado: la otra mitad del punto «contenido sin JavaScript
 
   it("un render que falla NO tumba la auditoría y se dice «no medido», no verde", async () => {
     opcionesNavegador = { arranqueFalla: true };
-    const res = await POST(pedido({ businessId: NEGOCIO }));
-    const cuerpo = (await res.json()) as {
-      ok: boolean;
-      lectura: { caracteresRenderizados: unknown };
-      hallazgos: Array<{ gravedad: string; quePasa: string }>;
-    };
+    const avisos = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await POST(pedido({ businessId: NEGOCIO }));
+      const cuerpo = (await res.json()) as {
+        ok: boolean;
+        lectura: { caracteresRenderizados: unknown };
+        hallazgos: Array<{ gravedad: string; quePasa: string }>;
+      };
 
-    expect(res.status).toBe(200);
-    expect(cuerpo.ok).toBe(true);
-    expect(cuerpo.lectura.caracteresRenderizados).toEqual({ estado: "fallo", codigo: "sin-navegador" });
-    expect(cuerpo.hallazgos.map((h) => h.gravedad)).toEqual(["no-medido"]);
-    expect(cuerpo.hallazgos[0].quePasa).toContain("sin-navegador");
+      expect(res.status).toBe(200);
+      expect(cuerpo.ok).toBe(true);
+      expect(cuerpo.lectura.caracteresRenderizados).toEqual({ estado: "fallo", codigo: "sin-navegador" });
+      expect(cuerpo.hallazgos.map((h) => h.gravedad)).toEqual(["no-medido"]);
+      expect(cuerpo.hallazgos[0].quePasa).toContain("sin-navegador");
+      // Y el log de la función lo dice, sin detalle: no lo decidió un pedido.
+      expect(avisos.mock.calls.map((c) => [c[0], JSON.parse(String(c[1]))])).toEqual([
+        ["[aeo/audit] render no medido:", { codigo: "sin-navegador", detalle: null }],
+      ]);
+    } finally {
+      avisos.mockRestore();
+    }
+  });
+
+  /**
+   * Con el #121 en producción, el negocio QA (https://vulkan-studios.com)
+   * seguía en `subrecurso-sin-respuesta` desde la red de Vercel, y ni la
+   * respuesta ni los logs decían qué pedido faltó.
+   */
+  it("un render al que no le llegó un pedido dice CUÁL —sin la query— en la respuesta y en el log de la función", async () => {
+    const conToken = `<html><body><p>${"contenido real ".repeat(80)}</p>
+      <script src="/static/app.js?token=SECRETO-de-la-ruta#SECRETO-fragmento"></script></body></html>`;
+    respuestas["https://ejemplo.com/"] = conToken;
+    // El navegador recibe la portada; el bundle con su token no lo sirve nadie.
+    paginasRender = { "https://ejemplo.com/": { cuerpo: conToken } };
+    const avisos = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await POST(pedido({ businessId: NEGOCIO }));
+      const texto = await res.text();
+      const cuerpo = JSON.parse(texto) as { lectura: { caracteresRenderizados: unknown }; hallazgos: Array<{ gravedad: string }> };
+
+      // El bundle SALIÓ con su token: si no, esto no prueba nada.
+      expect(redRender.pedidos.map((p) => p.url)).toContain(
+        "https://ejemplo.com/static/app.js?token=SECRETO-de-la-ruta#SECRETO-fragmento"
+      );
+      const detalle = { tipo: "script", host: "ejemplo.com", ruta: "/static/app.js", origen: "pagina", motivo: "sin-respuesta", noLlegaron: 1 };
+      expect(cuerpo.lectura.caracteresRenderizados).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta", detalle });
+      expect(cuerpo.hallazgos.map((h) => h.gravedad)).toContain("no-medido");
+      expect(texto).not.toContain("SECRETO");
+
+      expect(avisos).toHaveBeenCalledTimes(1);
+      expect(avisos.mock.calls[0][0]).toBe("[aeo/audit] render no medido:");
+      expect(JSON.parse(String(avisos.mock.calls[0][1]))).toEqual({ codigo: "subrecurso-sin-respuesta", detalle });
+      expect(avisos.mock.calls[0].map(String).join(" ")).not.toContain("SECRETO");
+    } finally {
+      avisos.mockRestore();
+    }
+  });
+
+  it("un render que midió no escribe nada en el log", async () => {
+    const avisos = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const cuerpo = (await (await POST(pedido({ businessId: NEGOCIO }))).json()) as {
+        lectura: { caracteresRenderizados: { estado: string } };
+      };
+      expect(cuerpo.lectura.caracteresRenderizados.estado).toBe("medido");
+      expect(avisos).not.toHaveBeenCalled();
+    } finally {
+      avisos.mockRestore();
+    }
   });
 
   it("sin sesión, sin negocio o sin portada no se arranca ningún navegador", async () => {

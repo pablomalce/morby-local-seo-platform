@@ -68,6 +68,9 @@ import {
   OPCIONES_RENDER,
   type Bitacora,
   type DependenciasRender,
+  type DetalleDelSubrecurso,
+  type MotivoDeSubrecurso,
+  type ResultadoRenderizado,
   type Transporte,
 } from "../renderizado";
 import { crearTransporteRender } from "../transporteRender";
@@ -247,6 +250,15 @@ const SE_VA_EN_VUELO = hibrida(`<script>addEventListener("load", () => {
  * host sin ruta IPv6; en uno con ruta, el connect a 100::1 espera el plazo.
  */
 const CAIDO = "/caido/";
+
+/**
+ * El detalle de un fallo, con Chromium: la página pide sus datos con un token
+ * en la query y un fragmento, y no le llegan. El detalle dice cuál, SIN eso.
+ */
+const CON_TOKEN = hibrida(`<script>
+  fetch("${CAIDO}datos;v=2?token=SECRETO-de-la-integracion&x=1#SECRETO-fragmento")
+    .then((r) => r.text()).then((t) => { document.getElementById("app").textContent = t; }).catch(() => {});
+</script>`);
 
 /** Escribe `texto` en `#app` cuando un marco se lo manda con `postMessage`. */
 const ESCUCHA = `<script>addEventListener("message", (e) => {
@@ -518,6 +530,8 @@ beforeAll(async () => {
       return res.end(Buffer.alloc(SEGMENTO_BYTES, 118));
     }
     switch (req.url) {
+      case "/con-token":
+        return html(CON_TOKEN);
       case "/con-marco-blob":
         return html(CON_MARCO_BLOB);
       case "/con-marco-srcdoc":
@@ -816,6 +830,19 @@ function bitacora(): Bitacora {
 }
 
 /**
+ * El detalle que se espera de un fallo cuyo MOTIVO depende de la máquina
+ * —`cdn-v6.test` falla en el acto sin ruta IPv6, y con ruta espera el plazo—:
+ * el motivo sale del código, y así se afirma además que son del mismo pedido.
+ */
+function detalleDe(
+  render: ResultadoRenderizado,
+  pedido: Omit<DetalleDelSubrecurso, "motivo" | "noLlegaron">
+): DetalleDelSubrecurso {
+  const motivo = render.estado === "fallo" ? render.codigo.replace(/^subrecurso-/, "") : "medido";
+  return { ...pedido, motivo: motivo as MotivoDeSubrecurso, noLlegaron: 1 };
+}
+
+/**
  * Las mismas dependencias, anotando cada pedido que el navegador le pasa al
  * interceptor con el marco desde el que sale: para afirmar que un pedido
  * SALIÓ de un marco de otro sitio, y no de la página.
@@ -1002,6 +1029,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         if (render.estado !== "fallo") return;
         expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
         expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/app.js"]);
+        expect(render.detalle).toEqual(detalleDe(render, { tipo: "script", host: "cdn-v6.test", ruta: "/app.js", origen: "pagina" }));
         await new Promise((listo) => setTimeout(listo, 100));
         expect(noCapturadas).toEqual([]);
       } finally {
@@ -1062,6 +1090,10 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         if (render.estado !== "fallo") return;
         expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
         expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/widget.js"]);
+        // Un marco con URL de red del sitio de la página, que no es la página.
+        expect(render.detalle).toEqual(
+          detalleDe(render, { tipo: "script", host: "cdn-v6.test", ruta: "/widget.js", origen: "mismo-sitio" })
+        );
       },
       60_000
     );
@@ -1093,6 +1125,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         if (render.estado !== "fallo") return;
         expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
         expect(b.noLlegaron.map((n) => n.url)).toEqual(["https://cdn-v6.test/datos"]);
+        expect(render.detalle).toEqual(detalleDe(render, { tipo: "fetch", host: "cdn-v6.test", ruta: "/datos", origen: "pagina" }));
         expect(punto(render)).toBe("no-medido");
       },
       60_000
@@ -1109,6 +1142,7 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         if (render.estado !== "fallo") return;
         expect(["subrecurso-sin-respuesta", "subrecurso-timeout"]).toContain(render.codigo);
         expect(b.noLlegaron.map((n) => n.url)).toEqual(["http://sitio.test/corta-tarde"]);
+        expect(render.detalle).toEqual(detalleDe(render, { tipo: "fetch", host: "sitio.test", ruta: "/corta-tarde", origen: "pagina" }));
       },
       60_000
     );
@@ -1132,17 +1166,28 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
   });
 
   describe("F2 — los marcos que RT-4 cuenta como de la página, con Chromium", () => {
+    // El cuarto valor es de dónde salió según el detalle, con lo que Chromium
+    // dice del marco: `blob:` y `about:srcdoc` no tienen URL de red.
     it.each([
-      ["/con-marco-blob", `http://sitio.test${CAIDO}blob.js`, "un marco `blob:` que armó la página"],
-      ["/con-marco-srcdoc", `http://sitio.test${CAIDO}srcdoc.js`, "un marco `srcdoc`"],
-      ["/con-anidado", `http://sitio.test${CAIDO}adentro.js`, "un marco del sitio de la página ADENTRO de uno de otro sitio"],
-    ])(
+      ["/con-marco-blob", `http://sitio.test${CAIDO}blob.js`, "un marco `blob:` que armó la página", "marco-desconocido"],
+      ["/con-marco-srcdoc", `http://sitio.test${CAIDO}srcdoc.js`, "un marco `srcdoc`", "marco-desconocido"],
+      [
+        "/con-anidado",
+        `http://sitio.test${CAIDO}adentro.js`,
+        "un marco del sitio de la página ADENTRO de uno de otro sitio",
+        "mismo-sitio",
+      ],
+    ] as const)(
       "%s: el script que no llega a %s (%s) deja la página sin número",
-      async (ruta, perdido) => {
+      async (ruta, perdido, _caso, origen) => {
         const b = bitacora();
         const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
         console.log(`[F2 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
-        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-sin-respuesta",
+          detalle: { tipo: "script", host: "sitio.test", ruta: new URL(perdido).pathname, origen, motivo: "sin-respuesta", noLlegaron: 1 },
+        });
         expect(b.noLlegaron.map((n) => n.url)).toEqual([perdido]);
       },
       60_000
@@ -1253,16 +1298,22 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
   );
 
   describe("FV-4 — un worker y un `EventSource` también escriben el texto", () => {
+    // El tipo y el origen son los que Chromium da: el `importScripts` sale
+    // `other` y sin marco; el `EventSource`, desde la página.
     it.each([
-      ["/worker-caido", `http://sitio.test${CAIDO}lib.js`, "el `importScripts` de un worker"],
-      ["/eventsource-caido", `http://sitio.test${CAIDO}sse`, "un `EventSource`"],
-    ])(
+      ["/worker-caido", `http://sitio.test${CAIDO}lib.js`, "el `importScripts` de un worker", "other", "worker"],
+      ["/eventsource-caido", `http://sitio.test${CAIDO}sse`, "un `EventSource`", "eventsource", "pagina"],
+    ] as const)(
       "%s: si no llega %s (%s), la página queda sin número",
-      async (ruta, perdido) => {
+      async (ruta, perdido, _caso, tipo, origen) => {
         const b = bitacora();
         const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
         console.log(`[FV-4 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
-        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-sin-respuesta" });
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-sin-respuesta",
+          detalle: { tipo, host: "sitio.test", ruta: new URL(perdido).pathname, origen, motivo: "sin-respuesta", noLlegaron: 1 },
+        });
         expect(b.noLlegaron.map((n) => n.url)).toEqual([perdido]);
       },
       60_000
@@ -1275,6 +1326,42 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         console.log(`[FV-4 ${ruta}] renderizado=${JSON.stringify(render)}`);
         expect(render.estado).toBe("medido");
         expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
+  /**
+   * Con el #121 en producción, el negocio QA (https://vulkan-studios.com)
+   * seguía en `subrecurso-sin-respuesta` desde la red de Vercel y nada decía
+   * qué pedido faltó. El detalle lo dice, con lo que Chromium da del pedido.
+   */
+  describe("el fallo dice CUÁL pedido no llegó, con Chromium", () => {
+    it(
+      "/con-token: el `fetch` propio que no llega sale en el detalle con su ruta, SIN la query ni el fragmento",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-token", deps(), undefined, b);
+        console.log(`[DETALLE /con-token] renderizado=${JSON.stringify(render)}`);
+        // El pedido llegó al interceptor CON su query y su fragmento —MEDIDO
+        // con Chrome: puppeteer da la URL con el `#`—; si no, esto no prueba
+        // nada.
+        expect(b.noLlegaron.map((n) => n.url)).toEqual([
+          `http://sitio.test${CAIDO}datos;v=2?token=SECRETO-de-la-integracion&x=1#SECRETO-fragmento`,
+        ]);
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-sin-respuesta",
+          detalle: {
+            tipo: "fetch",
+            host: "sitio.test",
+            ruta: `${CAIDO}datos;v=2`,
+            origen: "pagina",
+            motivo: "sin-respuesta",
+            noLlegaron: 1,
+          },
+        });
+        expect(JSON.stringify(render)).not.toMatch(/SECRETO|token=/);
       },
       60_000
     );
@@ -1418,7 +1505,11 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         const b = bitacora();
         const render = await medirRenderizado("http://sitio.test/hibrida-lenta", deps(), { ...OPCIONES_RENDER, plazoPorPedidoMs: 1_500 }, b);
         console.log(`[RT-1 /hibrida-lenta] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
-        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-timeout" });
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-timeout",
+          detalle: { tipo: "script", host: "sitio.test", ruta: "/app-lento.js", origen: "pagina", motivo: "timeout", noLlegaron: 1 },
+        });
         expect(punto(render)).toBe("no-medido");
       },
       60_000
@@ -1432,7 +1523,18 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           maxBytesPorRespuesta: 60_000,
         });
         console.log(`[RT-1 /hibrida-grande] renderizado=${JSON.stringify(render)}`);
-        expect(render).toEqual({ estado: "fallo", codigo: "subrecurso-demasiado-grande" });
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-demasiado-grande",
+          detalle: {
+            tipo: "script",
+            host: "sitio.test",
+            ruta: "/app-grande.js",
+            origen: "pagina",
+            motivo: "demasiado-grande",
+            noLlegaron: 1,
+          },
+        });
       },
       60_000
     );

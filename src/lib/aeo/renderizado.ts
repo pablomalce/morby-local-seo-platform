@@ -198,6 +198,21 @@
  * marcos salen de un presupuesto aparte (`maxBytesDeOtrosSitios`): no le
  * quitan bytes a la página.
  *
+ * Y CUANDO UN PEDIDO DEJA LA PÁGINA SIN NÚMERO, SE DICE CUÁL
+ *
+ * Un `subrecurso-<motivo>` solo no se puede diagnosticar. Con el #121 en
+ * producción, https://vulkan-studios.com seguía saliendo
+ * `subrecurso-sin-respuesta` desde la red de Vercel —en la Mac y en un
+ * contenedor `lambda/nodejs:24` medía 5 892 contra 5 456—: el pedido que no
+ * llegaba ya era de la página, de su sitio o de un worker, y ni la respuesta
+ * ni los logs de Vercel decían cuál. Por eso un fallo `subrecurso-*` lleva
+ * `detalle` (`DetalleDelSubrecurso`): el PRIMER pedido que lo decidió —el
+ * mismo que da el código—, con su tipo de recurso, su host, su ruta SIN query
+ * ni fragmento (un token en la query no sale de este archivo) y cortada a
+ * `MAX_RUTA_DEL_DETALLE`, de dónde salió (`OrigenDelPedido`), su motivo, y
+ * cuántos pedidos no llegaron en total. El detalle sólo describe: qué pedido
+ * decide sigue siendo lo de arriba, y se decide igual que antes.
+ *
  * Y CADA PRESUPUESTO DE BYTES SE DESCUENTA MIENTRAS SE BAJA (RED-121-2)
  *
  * No al terminar cada pedido. MEDIDO por la revisión: un marco de otro sitio
@@ -320,6 +335,46 @@ export type CodigoDeFallo =
   | `subrecurso-${MotivoDeSubrecurso}`
   | `http_${number}`;
 
+/**
+ * De dónde salió un pedido que escribe texto: SÓLO para decir cuál fue, no
+ * para decidir si cuenta (eso es `escribeTexto`). Se lee de lo mismo que
+ * `deOtroSitio`, al entrar el pedido:
+ *
+ *   - `pagina`: del documento de la pestaña —su marco es el de la página—;
+ *   - `mismo-sitio`: de un marco con URL `http(s)` del sitio de la página, o
+ *     la navegación de un marco a ese sitio;
+ *   - `worker`: sin marco, como lo que pide un worker dedicado;
+ *   - `marco-desconocido`: de un marco sin URL de red —`about:blank`,
+ *     `about:srcdoc`, `blob:`—, o con la página todavía sin documento
+ *     confirmado: cuenta por la duda, y no se sabe más que eso.
+ *
+ * Un `<iframe>` del mismo sitio con la MISMA URL que la página sale `pagina`:
+ * la URL es lo único que el pedido trae para distinguirlos.
+ */
+export type OrigenDelPedido = "pagina" | "mismo-sitio" | "worker" | "marco-desconocido";
+
+/** El largo máximo de `ruta` en el detalle: lo que se ve en la pantalla y en un log. */
+export const MAX_RUTA_DEL_DETALLE = 120;
+
+/**
+ * El PRIMER pedido que dejó el render sin número (`subrecurso-<motivo>`), sin
+ * la query, ni el fragmento, ni credenciales (que el examen ya rechaza). Ver
+ * «SE DICE CUÁL» en el encabezado. Lo que NO tapa, dicho: un token escrito
+ * en la RUTA misma (`/s/<token>/app.js`) sale como está, cortado a
+ * `MAX_RUTA_DEL_DETALLE`.
+ */
+export interface DetalleDelSubrecurso {
+  /** El tipo de recurso como lo nombra Chromium: `script`, `fetch`, `document`… */
+  tipo: string;
+  host: string;
+  /** La ruta de la URL, sin query ni fragmento, de `MAX_RUTA_DEL_DETALLE` caracteres como mucho. */
+  ruta: string;
+  origen: OrigenDelPedido;
+  motivo: MotivoDeSubrecurso;
+  /** Cuántos pedidos que escriben texto no llegaron, éste incluido, contando los que seguían en vuelo. */
+  noLlegaron: number;
+}
+
 export type ResultadoRenderizado =
   | {
       estado: "medido";
@@ -333,7 +388,12 @@ export type ResultadoRenderizado =
        */
       servidos?: number;
     }
-  | { estado: "fallo"; codigo: CodigoDeFallo };
+  | {
+      estado: "fallo";
+      codigo: CodigoDeFallo;
+      /** Sólo en un `subrecurso-<motivo>`: cuál pedido lo decidió. */
+      detalle?: DetalleDelSubrecurso;
+    };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Lo que se inyecta
@@ -647,13 +707,32 @@ export interface Bitacora {
    * Los pedidos que ESCRIBEN texto (scripts, datos, marcos) y no llegaron por
    * el transporte o por el presupuesto. Uno solo deja el render sin número.
    */
-  noLlegaron: Array<{ url: string; tipo: string; motivo: MotivoDeTransporte | "presupuesto" | "dns-sin-respuesta" }>;
+  noLlegaron: Array<{
+    url: string;
+    tipo: string;
+    motivo: MotivoDeTransporte | "presupuesto" | "dns-sin-respuesta";
+    origen: OrigenDelPedido;
+  }>;
   /** Cuántos de esos pedidos están en el transporte ahora mismo. */
   enVuelo: number;
+  /**
+   * Los mismos pedidos en vuelo, en el orden en que salieron: si la lectura
+   * termina en `subrecurso-pendiente`, el detalle es el primero. No decide
+   * nada: lo que decide es `enVuelo`.
+   */
+  enCamino: Set<{ url: string; tipo: string; origen: OrigenDelPedido }>;
 }
 
 export function nuevaBitacora(): Bitacora {
-  return { bloqueados: [], pedidos: [], statusDocumento: null, falloDocumento: null, noLlegaron: [], enVuelo: 0 };
+  return {
+    bloqueados: [],
+    pedidos: [],
+    statusDocumento: null,
+    falloDocumento: null,
+    noLlegaron: [],
+    enVuelo: 0,
+    enCamino: new Set(),
+  };
 }
 
 /**
@@ -723,6 +802,42 @@ function escribeTexto(pedido: PedidoDelNavegador): boolean {
   return escribe && !deOtroSitio(pedido);
 }
 
+/**
+ * De dónde salió un pedido que `escribeTexto` cuenta (ver `OrigenDelPedido`).
+ * Lee lo mismo que `deOtroSitio` y no decide nada: sólo lo nombra.
+ */
+function origenDelPedido(pedido: PedidoDelNavegador): OrigenDelPedido {
+  // La navegación de un marco se juzga por la URL a la que va: si cuenta, va
+  // al sitio de la página.
+  if (pedido.tipo === "document") return urlDeRed(pedido.urlDeLaPagina) === null ? "marco-desconocido" : "mismo-sitio";
+  if (pedido.urlDelMarco === null) return "worker";
+  if (urlDeRed(pedido.urlDeLaPagina) === null || urlDeRed(pedido.urlDelMarco) === null) return "marco-desconocido";
+  return pedido.urlDelMarco === pedido.urlDeLaPagina ? "pagina" : "mismo-sitio";
+}
+
+/**
+ * El detalle de UN pedido que no llegó. La ruta sale de `pathname`, que no
+ * trae ni la query ni el fragmento: una URL firmada o con un token no se
+ * copia a la respuesta ni al log.
+ */
+function detalleDelSubrecurso(
+  pedido: { url: string; tipo: string; origen: OrigenDelPedido },
+  motivo: MotivoDeSubrecurso,
+  noLlegaron: number
+): DetalleDelSubrecurso {
+  let host = "";
+  let ruta = "";
+  try {
+    const url = new URL(pedido.url);
+    host = url.hostname;
+    ruta = url.pathname;
+  } catch {
+    // Sin URL legible no hay ni host ni ruta que decir: el resto vale igual.
+  }
+  if (ruta.length > MAX_RUTA_DEL_DETALLE) ruta = `${ruta.slice(0, MAX_RUTA_DEL_DETALLE - 1)}…`;
+  return { tipo: pedido.tipo, host, ruta, origen: pedido.origen, motivo, noLlegaron };
+}
+
 function esDescarga(encabezados: Record<string, string | string[]>): boolean {
   const disposicion = encabezados["content-disposition"];
   const valor = Array.isArray(disposicion) ? disposicion.join(",") : (disposicion ?? "");
@@ -775,6 +890,8 @@ export function crearInterceptor(
     // sitio se descartaba al no llegar (FV-1).
     const escribe = escribeTexto(pedido);
     const ajeno = deOtroSitio(pedido);
+    // De dónde salió, para el detalle de un fallo: también al entrar.
+    const origen = origenDelPedido(pedido);
     // Lo de un marco de otro sitio sale de su propio presupuesto (RT-4). Lo
     // que ESTE pedido ya descontó de su bolsa, y si la bolsa le dijo que no:
     // el transporte llama `tomar` con cada parte del cuerpo que llega, así lo
@@ -809,7 +926,7 @@ export function crearInterceptor(
           motivo === "presupuesto" ||
           motivo === "dns-sin-respuesta")
       ) {
-        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo });
+        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo, origen });
       }
       if (pedido.esDocumentoPrincipal && motivo !== "sin-texto") {
         bitacora.falloDocumento =
@@ -863,7 +980,11 @@ export function crearInterceptor(
       // En vuelo desde que sale hasta que el navegador lo tiene (o se aborta):
       // la lectura no se da por buena mientras un pedido que escribe texto
       // siga en camino.
-      if (escribe) bitacora.enVuelo += 1;
+      const enCamino = { url: pedido.url, tipo: pedido.tipo, origen };
+      if (escribe) {
+        bitacora.enVuelo += 1;
+        bitacora.enCamino.add(enCamino);
+      }
       try {
         let respuesta: RespuestaHttp;
         try {
@@ -888,7 +1009,10 @@ export function crearInterceptor(
         }
         await entregar(respuesta, url.toString());
       } finally {
-        if (escribe) bitacora.enVuelo -= 1;
+        if (escribe) {
+          bitacora.enVuelo -= 1;
+          bitacora.enCamino.delete(enCamino);
+        }
       }
     } catch {
       // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
@@ -898,7 +1022,7 @@ export function crearInterceptor(
       // navegador no aceptó la respuesta (`responder` tira con un encabezado
       // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
       if (!decidido && escribe) {
-        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta" });
+        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta", origen });
       }
       await pedido.abortar().catch(() => {});
     }
@@ -1108,14 +1232,29 @@ export async function medirRenderizado(
       // que no deja de pedir, y al acabarse el presupuesto se dice
       // `subrecurso-pendiente`. Una página que pide cada tanto (un sondeo
       // corto) se lee en un momento en que no hay nada en vuelo.
+      //
+      // Y el fallo dice CUÁL pedido lo decidió: el primero, el mismo que da
+      // el código. `noLlegaron` cuenta también los que siguen en vuelo.
       while (bitacora.enVuelo > 0) {
         while (bitacora.enVuelo > 0 && restante() > 1_000) await esperar(opciones.sondeoMs);
-        if (bitacora.enVuelo > 0) return fallo("subrecurso-pendiente");
+        if (bitacora.enVuelo > 0) {
+          const primero = bitacora.enCamino.values().next().value;
+          const total = bitacora.noLlegaron.length + bitacora.enVuelo;
+          return primero
+            ? { estado: "fallo", codigo: "subrecurso-pendiente", detalle: detalleDelSubrecurso(primero, "pendiente", total) }
+            : fallo("subrecurso-pendiente");
+        }
         caracteres = await leer();
         if (typeof caracteres !== "number") return caracteres;
       }
       const perdido = bitacora.noLlegaron[0];
-      if (perdido) return fallo(`subrecurso-${perdido.motivo}`);
+      if (perdido) {
+        return {
+          estado: "fallo",
+          codigo: `subrecurso-${perdido.motivo}`,
+          detalle: detalleDelSubrecurso(perdido, perdido.motivo, bitacora.noLlegaron.length),
+        };
+      }
 
       // El lado servido, del MISMO documento y con la misma extracción: ver
       // el encabezado. Si no se puede medir, el resultado no se da: un número
