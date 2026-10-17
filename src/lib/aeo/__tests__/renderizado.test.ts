@@ -63,6 +63,10 @@ const DNS = {
   "api.sitio.test": [PUBLICA],
   "mio.app.test": [PUBLICA],
   "otro.app.test": [OTRA_PUBLICA],
+  // R7-SEC-A2: un nombre que TERMINA como el sitio sin ser un subdominio, y
+  // el sitio con su `www.`.
+  "xsitio.test": [OTRA_PUBLICA],
+  "www.sitio.test": [PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -1516,10 +1520,17 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
   });
 
   it("y sus POST a otros sitios también: la analítica de un reproductor no le gasta el tope a la de la página", async () => {
+    // Los `?2` ESTÁN en el sitio del doble (R7-SEC-A2): sin ellos, el doble
+    // contestaba `sin-respuesta` y se abortaban con tope o sin él. Medido por
+    // la revisión: sin el tope de los marcos de otro sitio, sin el tope para
+    // lo que no escribe, o juzgando el POST contra el marco y no contra el
+    // documento, este test seguía verde.
     const { deps } = armar({
       "http://sitio.test/": { cuerpo: "<p>hola</p>" },
       "http://video.test/log": { cuerpo: "ok" },
+      "http://video.test/log?2": { cuerpo: "ok" },
       "http://cdn.test/collect": { cuerpo: "ok" },
+      "http://cdn.test/collect?2": { cuerpo: "ok" },
     });
     const bitacora = bitacoraVacia();
     const desenlaces: Record<string, string> = {};
@@ -1534,7 +1545,84 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
     expect(desenlaces["http://cdn.test/collect"]).toBe("respondido");
     await pedir("http://cdn.test/collect?2", "http://sitio.test/", { metodo: "POST", cuerpo: "4" });
     expect(desenlaces["http://cdn.test/collect?2"]).toBe("abortado");
-    expect(bitacora.noLlegaron.map((n) => n.url)).toEqual(["http://cdn.test/collect?2"]);
+    // Los dos, por el TOPE: no porque el doble no los tuviera.
+    expect(bitacora.bloqueados).toEqual([
+      { url: "http://video.test/log?2", motivo: "presupuesto" },
+      { url: "http://cdn.test/collect?2", motivo: "presupuesto" },
+    ]);
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://cdn.test/collect?2", tipo: "xhr", motivo: "presupuesto", origen: "pagina" },
+    ]);
+  });
+
+  it("R7-SEC-A2 — «el mismo sitio» es por rótulos, no por sufijo: `xsitio.test` NO es del sitio de `sitio.test`", async () => {
+    // Medido por la revisión con Chrome 155: con `h.endsWith(base)` sin el
+    // punto, de 25 POST de sitio.test a xsitio.test llegaban los 25, un relé
+    // sin tope hacia cualquier dominio que termine igual.
+    const { deps, red } = armar({ "http://xsitio.test/api": { cuerpo: "ajeno" }, "http://api.sitio.test/api": { cuerpo: "propio" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://xsitio.test/api", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://xsitio.test/api"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual([{ url: "http://xsitio.test/api", motivo: "presupuesto" }]);
+    // Anti-vacuidad: un subdominio de verdad sí es del sitio, con el mismo tope en cero.
+    await pedir("http://api.sitio.test/api", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://api.sitio.test/api"]).toBe("respondido");
+    expect(red.pedidos.map((p) => `${p.metodo} ${p.url}`)).toEqual(["POST http://api.sitio.test/api"]);
+  });
+
+  it("R7-SEC-A2 — con el documento en `www.sitio.test`, `api.sitio.test` y `sitio.test` son del sitio: se le saca el `www.`", async () => {
+    const { deps, red } = armar({
+      "http://api.sitio.test/graphql": { cuerpo: "texto" },
+      "http://sitio.test/graphql": { cuerpo: "texto" },
+      "http://xsitio.test/graphql": { cuerpo: "ajeno" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    const enWww = { metodo: "POST", cuerpo: "{}", tipo: "fetch", urlDeLaPagina: "http://www.sitio.test/" };
+    await pedir("http://api.sitio.test/graphql", "http://www.sitio.test/", enWww);
+    await pedir("http://sitio.test/graphql", "http://www.sitio.test/", enWww);
+    expect(desenlaces["http://api.sitio.test/graphql"]).toBe("respondido");
+    expect(desenlaces["http://sitio.test/graphql"]).toBe("respondido");
+    // Sacarle el `www.` no abre los nombres que sólo TERMINAN igual.
+    await pedir("http://xsitio.test/graphql", "http://www.sitio.test/", enWww);
+    expect(desenlaces["http://xsitio.test/graphql"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://xsitio.test/graphql", tipo: "fetch", motivo: "presupuesto", origen: "pagina" },
+    ]);
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://api.sitio.test/graphql", "http://sitio.test/graphql"]);
+  });
+
+  it("R7-SEC-A2 — un POST cuenta para `maxPedidos`, del sitio o ajeno: no es un pedido gratis", async () => {
+    const { deps, red } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://sitio.test/graphql": { cuerpo: "texto" },
+      "http://sitio.test/graphql?2": { cuerpo: "texto" },
+      "http://sitio.test/chunk.js": { cuerpo: "c" },
+      "http://sitio.test/chunk2.js": { cuerpo: "d" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPedidos: 3 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    await pedir("http://sitio.test/graphql", "http://sitio.test/", { metodo: "POST", cuerpo: "{}", tipo: "fetch" });
+    await pedir("http://sitio.test/chunk.js", "http://sitio.test/", { tipo: "script" });
+    // Tres: el documento, el POST y el chunk. Lo que sigue, POST o GET, ya no sale.
+    await pedir("http://sitio.test/graphql?2", "http://sitio.test/", { metodo: "POST", cuerpo: "{}", tipo: "fetch" });
+    await pedir("http://sitio.test/chunk2.js", "http://sitio.test/", { tipo: "script" });
+    expect(desenlaces).toMatchObject({
+      "http://sitio.test/graphql": "respondido",
+      "http://sitio.test/chunk.js": "respondido",
+      "http://sitio.test/graphql?2": "abortado",
+      "http://sitio.test/chunk2.js": "abortado",
+    });
+    expect(red.pedidos).toHaveLength(3);
+    expect(bitacora.noLlegaron.map((n) => `${n.url} ${n.motivo}`)).toEqual([
+      "http://sitio.test/graphql?2 presupuesto",
+      "http://sitio.test/chunk2.js presupuesto",
+    ]);
   });
 
   it("y sus turnos: un reproductor con todos los suyos ocupados no deja esperando a la página", async () => {
