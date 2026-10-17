@@ -422,28 +422,72 @@ export function tiposDeSchema(html: string): string[] {
       // lo va a poder leer. Se ignora, y la ausencia habla sola.
       continue;
     }
-    recolectar(datos, tipos);
+    for (const raiz of raicesDelBloque(datos)) {
+      if (!raiz || typeof raiz !== "object") continue;
+      for (const nodo of nodosDeLaRaiz(raiz as Record<string, unknown>)) {
+        // Un `@type` vacío no es un tipo: es el error que `erroresDeSchema`
+        // informa (PU-4). Antes `""` entraba como tipo y el punto salía verde.
+        const tipo = nodo["@type"];
+        for (const t of Array.isArray(tipo) ? tipo : [tipo]) {
+          if (typeof t === "string" && t.trim() !== "") tipos.add(t.trim());
+        }
+      }
+    }
   }
 
   return [...tipos].sort();
 }
 
-function recolectar(nodo: unknown, tipos: Set<string>): void {
-  if (Array.isArray(nodo)) {
-    for (const hijo of nodo) recolectar(hijo, tipos);
-    return;
-  }
-  if (!nodo || typeof nodo !== "object") return;
+/** Las raíces de un bloque: el objeto, o cada elemento si el bloque es un arreglo. */
+function raicesDelBloque(datos: unknown): unknown[] {
+  return Array.isArray(datos) ? datos : [datos];
+}
 
-  const objeto = nodo as Record<string, unknown>;
-  // Un `@type` vacío no es un tipo: es el error que `erroresDeSchema` informa
-  // (PU-4). Antes `""` entraba como tipo y el punto salía verde.
-  const tipo = objeto["@type"];
-  for (const t of Array.isArray(tipo) ? tipo : [tipo]) {
-    if (typeof t === "string" && t.trim() !== "") tipos.add(t.trim());
+/**
+ * Los nodos de una raíz que se ACREDITAN y se JUZGAN: el ÚNICO recorrido, el
+ * mismo para `tiposDeSchema` y para `erroresDeSchema` (FV-125-1). Antes cada
+ * una recorría a su manera: `tiposDeSchema` sumaba el `@type` de una raíz que
+ * además traía `@graph` y bajaba a los `@graph` anidados, y `erroresDeSchema`
+ * miraba sólo el `@graph` de primer nivel. Reproducido por la revisión:
+ * `{"@type":"Bananaa","@graph":[…]}`, un `LocalBusiness` sin `name` ni
+ * `address` en esa raíz, y uno con un `FAQPage` sin preguntas en un `@graph`
+ * anidado salían VERDES, con el tipo acreditado y sin un error.
+ *
+ * Qué es un nodo:
+ *   - una raíz sin `@graph` (o con un `@graph` que no es un arreglo): ella;
+ *   - una raíz con `@graph`: ELLA si declara `@type` —sin `@type` es sólo el
+ *     envase, como siempre—, y cada elemento de su `@graph`;
+ *   - cada elemento de un `@graph`, tenga o no su propio `@graph`, tiene que
+ *     decir qué es, como antes; y si trae `@graph`, sus elementos también, a
+ *     cualquier profundidad.
+ *
+ * Lo que dentro de un `@graph` no es un objeto se ignora, como antes. Un
+ * arreglo dentro de un `@graph` es un nodo sin `@type` —el error de siempre—
+ * y no se abre: lo que trae adentro no se acredita, porque no se juzga.
+ *
+ * Con una pila y no con recursión: un `@graph` anidado mil veces no agota la
+ * pila del proceso.
+ */
+function nodosDeLaRaiz(raiz: Record<string, unknown>): Array<Record<string, unknown>> {
+  const grafo = raiz["@graph"];
+  if (!Array.isArray(grafo)) return [raiz];
+  const nodos: Array<Record<string, unknown>> = [];
+  if ("@type" in raiz) nodos.push(raiz);
+  const pila: Array<{ elementos: unknown[]; i: number }> = [{ elementos: grafo, i: 0 }];
+  while (pila.length > 0) {
+    const tope = pila[pila.length - 1];
+    if (tope.i >= tope.elementos.length) {
+      pila.pop();
+      continue;
+    }
+    const elemento = tope.elementos[tope.i++];
+    if (!elemento || typeof elemento !== "object") continue;
+    const nodo = elemento as Record<string, unknown>;
+    nodos.push(nodo);
+    const adentro = nodo["@graph"];
+    if (Array.isArray(adentro)) pila.push({ elementos: adentro, i: 0 });
   }
-
-  if (Array.isArray(objeto["@graph"])) recolectar(objeto["@graph"], tipos);
+  return nodos;
 }
 
 /**
@@ -482,15 +526,20 @@ function recolectar(nodo: unknown, tipos: Set<string>): void {
  *     `address: 42` y `openingHours: true`, salía verde. Ver
  *     `erroresDeLosTiposQueImportan`.
  *
+ * Los nodos que se juzgan son los de `nodosDeLaRaiz`, los MISMOS que
+ * `tiposDeSchema` acredita (FV-125-1): una raíz con `@type` y `@graph`, y los
+ * `@graph` anidados a cualquier profundidad, también.
+ *
  * Lo que NO valida, dicho: las propiedades de los DEMÁS tipos, ni las de los
- * nodos anidados (el `publisher` de un `Article`), ni que una propiedad
- * pertenezca a su tipo. Esas faltas no ponen el punto en verde por sí solas:
- * no lo ponen en ningún color.
+ * nodos que cuelgan de una PROPIEDAD (el `publisher` de un `Article`), ni que
+ * una propiedad pertenezca a su tipo. Esas faltas no ponen el punto en verde
+ * por sí solas: no lo ponen en ningún color. Un nodo que cuelga de una
+ * propiedad tampoco se acredita como tipo.
  */
 export function erroresDeSchema(html: string): string[] {
   const errores: string[] = [];
-  /** Los nodos de primer nivel, con su bloque, para mirar los tipos que importan al final. */
-  const delPrimerNivel: Array<{ nodo: Record<string, unknown>; bloque: number }> = [];
+  /** Los nodos juzgados —los de `nodosDeLaRaiz`—, con su bloque, para mirar los tipos que importan al final. */
+  const juzgados: Array<{ nodo: Record<string, unknown>; bloque: number }> = [];
   bloquesJsonLd(html).forEach((bloque, i) => {
     const n = i + 1;
     let datos: unknown;
@@ -500,8 +549,7 @@ export function erroresDeSchema(html: string): string[] {
       errores.push(`bloque ${n}: no parsea (${(e as Error).message})`);
       return;
     }
-    const raices = Array.isArray(datos) ? datos : [datos];
-    for (const raiz of raices) {
+    for (const raiz of raicesDelBloque(datos)) {
       if (!raiz || typeof raiz !== "object") {
         errores.push(`bloque ${n}: la raíz no es un objeto`);
         continue;
@@ -511,17 +559,13 @@ export function erroresDeSchema(html: string): string[] {
       else if (!esContextoDeSchemaOrg(objeto["@context"])) {
         errores.push(`bloque ${n}: @context no es schema.org (${JSON.stringify(objeto["@context"]).slice(0, 80)})`);
       }
-      const nodos = Array.isArray(objeto["@graph"]) ? objeto["@graph"] : [objeto];
-      for (const nodo of nodos) {
-        if (!nodo || typeof nodo !== "object") continue;
-        delPrimerNivel.push({ nodo: nodo as Record<string, unknown>, bloque: n });
-        if (!("@type" in (nodo as object))) errores.push(`bloque ${n}: un nodo sin @type`);
-        else if (!tipoValido((nodo as Record<string, unknown>)["@type"])) {
-          errores.push(
-            `bloque ${n}: un nodo con @type vacío o que no es texto (${JSON.stringify((nodo as Record<string, unknown>)["@type"]).slice(0, 40)})`
-          );
+      for (const nodo of nodosDeLaRaiz(objeto)) {
+        juzgados.push({ nodo, bloque: n });
+        if (!("@type" in nodo)) errores.push(`bloque ${n}: un nodo sin @type`);
+        else if (!tipoValido(nodo["@type"])) {
+          errores.push(`bloque ${n}: un nodo con @type vacío o que no es texto (${JSON.stringify(nodo["@type"]).slice(0, 40)})`);
         } else {
-          for (const tipo of tiposDelNodo(nodo as Record<string, unknown>)) {
+          for (const tipo of tiposDelNodo(nodo)) {
             if (!CLASES_DE_SCHEMA_ORG.has(tipo)) {
               errores.push(`bloque ${n}: @type "${tipo.slice(0, 60)}" no es un tipo de schema.org`);
             }
@@ -530,7 +574,7 @@ export function erroresDeSchema(html: string): string[] {
       }
     }
   });
-  errores.push(...erroresDeLosTiposQueImportan(delPrimerNivel));
+  errores.push(...erroresDeLosTiposQueImportan(juzgados));
   return errores;
 }
 
@@ -594,10 +638,10 @@ const FORMA_DE_PROPIEDAD: Record<string, { valida: (v: unknown) => boolean; que:
 };
 
 /**
- * Los mínimos de los tipos que la auditoría pide (F6), sobre los nodos de
- * primer nivel FUSIONADOS por `@id` —como los fusiona JSON-LD: un plugin
- * puede declarar el `LocalBusiness` en un nodo y su dirección en otro con el
- * mismo `@id`—:
+ * Los mínimos de los tipos que la auditoría pide (F6), sobre los nodos
+ * juzgados (`nodosDeLaRaiz`) FUSIONADOS por `@id` —como los fusiona JSON-LD:
+ * un plugin puede declarar el `LocalBusiness` en un nodo y su dirección en
+ * otro con el mismo `@id`—:
  *
  *   - `Organization` y sus subtipos: `name`;
  *   - `LocalBusiness` y sus subtipos: además, `address` —sin ella no es un

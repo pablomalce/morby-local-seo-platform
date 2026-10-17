@@ -555,10 +555,96 @@ describe("F6: un @type que schema.org no define, o un tipo que importa sin lo m�
     expect(erroresDeSchema(repartido)).toEqual([]);
   });
 
+  /**
+   * FV-125-1: `tiposDeSchema` y `erroresDeSchema` recorrían nodos DISTINTOS.
+   * El primero sumaba el `@type` de una raíz que además traía `@graph`, y
+   * bajaba a los `@graph` anidados; el segundo miraba sólo el `@graph` de
+   * primer nivel. Reproducido por la revisión con las funciones reales y
+   * `puntosDeLaPuerta`: las tres formas de abajo salían VERDES, con el tipo
+   * acreditado y `errores = []`.
+   */
+  it("FV-125-1 — la raíz con @type Y @graph se valida: «Bananaa» y un LocalBusiness vacío arriba de un @graph salen ROJOS", () => {
+    const bananaa = ld('{"@context":"https://schema.org","@type":"Bananaa","@graph":[{"@type":"WebSite","name":"x"}]}');
+    expect(erroresDeSchema(bananaa)).toEqual(['bloque 1: @type "Bananaa" no es un tipo de schema.org']);
+    expect(puntoSchema(bananaa)).toBe("rojo");
+
+    const local = ld('{"@context":"https://schema.org","@type":"LocalBusiness","@graph":[{"@type":"WebSite","name":"x"}]}');
+    expect(tiposDeSchema(local)).toEqual(["LocalBusiness", "WebSite"]);
+    expect(erroresDeSchema(local)).toEqual(['bloque 1: LocalBusiness sin "name"', 'bloque 1: LocalBusiness sin "address"']);
+    expect(puntoSchema(local)).toBe("rojo");
+
+    // Un @type vacío arriba de un @graph tampoco es un envase: dice que es algo, y no dice qué.
+    expect(erroresDeSchema(ld('{"@context":"https://schema.org","@type":"","@graph":[{"@type":"WebSite","name":"x"}]}'))).toEqual([
+      'bloque 1: un nodo con @type vacío o que no es texto ("")',
+    ]);
+  });
+
+  it("FV-125-1 — un @graph ANIDADO se valida a cualquier profundidad: lo que se acredita es lo que se juzgó", () => {
+    const anidado = ld(
+      '{"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"x","@graph":[{"@type":"LocalBusiness"},{"@type":"FAQPage"},{"@type":"Bananaa"}]}]}'
+    );
+    expect(tiposDeSchema(anidado)).toEqual(["Bananaa", "FAQPage", "LocalBusiness", "WebSite"]);
+    expect(erroresDeSchema(anidado)).toEqual([
+      'bloque 1: @type "Bananaa" no es un tipo de schema.org',
+      'bloque 1: LocalBusiness sin "name"',
+      'bloque 1: LocalBusiness sin "address"',
+      'bloque 1: FAQPage sin "mainEntity" (las preguntas)',
+    ]);
+    expect(puntoSchema(anidado)).toBe("rojo");
+
+    // Tres niveles abajo, y un elemento anidado sin @type: también es un nodo.
+    const hondo = ld(
+      '{"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"x","@graph":[{"@type":"WebPage","@graph":[{"@type":"Organization"},{"name":"sin tipo"}]}]}]}'
+    );
+    expect(tiposDeSchema(hondo)).toEqual(["Organization", "WebPage", "WebSite"]);
+    expect(erroresDeSchema(hondo)).toEqual(["bloque 1: un nodo sin @type", 'bloque 1: Organization sin "name"']);
+  });
+
+  it("FV-125-1 — un solo recorrido: TODO tipo que se acredita pasa por el vocabulario, en cada forma de anidar", () => {
+    // Para cada forma y cada tipo que `tiposDeSchema` acredita, el mismo
+    // JSON-LD con ese tipo cambiado por uno que schema.org no define tiene que
+    // dar SU error. Un recorrido que acredite un nodo sin juzgarlo deja ese
+    // tipo cambiado sin error, y esto se pone rojo.
+    const formas = [
+      '{"@context":"https://schema.org","@type":"Organization","name":"X"}',
+      '{"@context":"https://schema.org","@graph":[{"@type":"Organization","name":"X"},{"@type":"WebSite","name":"X"}]}',
+      '{"@context":"https://schema.org","@type":"WebPage","@graph":[{"@type":"Organization","name":"X"}]}',
+      '{"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"X","@graph":[{"@type":"Organization","name":"X","@graph":[{"@type":"Article"}]}]}]}',
+      '[{"@context":"https://schema.org","@type":"Article"},{"@context":"https://schema.org","@type":"Person","@graph":[{"@type":"Place"}]}]',
+      // Lo que cuelga de una PROPIEDAD no se juzga, y tampoco se acredita.
+      '{"@context":"https://schema.org","@type":"Article","headline":"Hola","publisher":{"@type":"Organization"}}',
+    ];
+    let vistos = 0;
+    for (const forma of formas) {
+      expect(erroresDeSchema(ld(forma)), forma).toEqual([]);
+      for (const tipo of tiposDeSchema(ld(forma))) {
+        const cambiado = forma.replace(`"@type":"${tipo}"`, `"@type":"Zz${tipo}"`);
+        expect(cambiado, `${tipo} en ${forma}`).not.toBe(forma);
+        expect(erroresDeSchema(ld(cambiado)), `${tipo} en ${forma}`).toContain(`bloque 1: @type "Zz${tipo}" no es un tipo de schema.org`);
+        vistos += 1;
+      }
+    }
+    // Anti-vacuidad: doce tipos acreditados entre las seis formas.
+    expect(vistos).toBe(12);
+  });
+
+  it("FV-125-1 — esas formas BIEN escritas siguen VERDES, con todos sus tipos", () => {
+    const bien = ld(`{"@context":"https://schema.org","@type":"WebSite","name":"X","@graph":[
+      {"@type":"Organization","name":"X"},
+      {"@type":"WebPage","@graph":[{"@type":"LocalBusiness","name":"X","address":"Calle 1"},
+        {"@type":"FAQPage","mainEntity":{"@type":"Question","name":"¿Abren?","acceptedAnswer":{"@type":"Answer","text":"Sí."}}}]}
+    ]}`);
+    expect(erroresDeSchema(bien)).toEqual([]);
+    expect(tiposDeSchema(bien)).toEqual(["FAQPage", "LocalBusiness", "Organization", "WebPage", "WebSite"]);
+    expect(puntoSchema(bien)).toBe("verde");
+  });
+
   it("lo que NO valida, dicho: un nodo ANIDADO no pide lo mínimo (el publisher de un Article)", () => {
     const anidado = ld(
       '{"@context":"https://schema.org","@type":"Article","headline":"Hola","publisher":{"@type":"Organization"}}'
     );
     expect(erroresDeSchema(anidado)).toEqual([]);
+    // Y por eso tampoco se acredita: lo que se cuenta como presente es lo que se juzgó (FV-125-1).
+    expect(tiposDeSchema(anidado)).toEqual(["Article"]);
   });
 });
