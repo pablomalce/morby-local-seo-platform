@@ -132,6 +132,35 @@ jobs:
           AEO_CHROMIUM_DE_PRODUCCION: "1"
         run: npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
 
+      # RTV-3: el paso de arriba corre el binario de producción con las
+      # bibliotecas de UBUNTU. `@sparticuz/chromium` sólo descomprime las suyas
+      # (`al2023.tar.br`) y fija `LD_LIBRARY_PATH` cuando ve `VERCEL` o
+      # `AWS_EXECUTION_ENV`, y acá no estaban: un cambio que rompiera ese camino
+      # salía verde, y en producción cada render daba `sin-navegador`.
+      # REPRODUCIDO en esta misma imagen sin esas variables: «libnspr4.so:
+      # cannot open shared object file», Code 127.
+      #
+      # Este paso corre la integración en AL2023, que es lo que corre la
+      # función de Vercel, con las variables que Vercel pone. Usa el
+      # node_modules del `npm ci` de arriba: Ubuntu y AL2023 son x64 con glibc.
+      # `AEO_EN_AL2023` hace que el test afirme el entorno —el sistema, el
+      # binario y las bibliotecas que cargó—, para que este paso no pueda
+      # quedar verde midiendo otra cosa.
+      - name: integración con el headless shell de producción, en AL2023 como Vercel
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/app" -w /app \
+            -e CI \
+            -e AEO_INTEGRACION_OBLIGATORIA=1 \
+            -e AEO_CHROMIUM_DE_PRODUCCION=1 \
+            -e AEO_EN_AL2023=1 \
+            -e VERCEL=1 \
+            -e AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x \
+            --entrypoint npx \
+            public.ecr.aws/lambda/nodejs:24 \
+            vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
+
   # El esquema es la otra mitad del repo y hasta ahora nada lo verificaba: los
   # tests de arriba corren contra dobles, así que probaban la LÓGICA y nunca
   # que una policy aislara a un tenant de otro.

@@ -99,6 +99,8 @@ import type {
   NavegadorAbierto,
   PaginaAbierta,
   PedidoDelNavegador,
+  SalidaPropia,
+  SalidaPropiaVista,
 } from "./renderizado";
 import { crearTransporteRender } from "./transporteRender";
 
@@ -188,10 +190,140 @@ async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador
   };
 }
 
-function envolverPagina(page: Page): PaginaAbierta {
-  // Una sesión de CDP por pestaña, para serializar con las sombras (`html`).
-  let sesion: Promise<CDPSession> | undefined;
+/**
+ * El nombre de la función que Chromium pone en cada contexto de la pestaña
+ * (`Runtime.addBinding`) para que `avisarSalidas` le diga qué socket abre. Lo
+ * llama la página y lo recibe CDP con el contexto que lo llamó.
+ */
+const AVISO_DE_SALIDA = "__aeoSalidaPropia";
+
+/**
+ * Corre en cada documento antes que el JavaScript de la página, como
+ * `sinWebRtc` y por la misma razón viaja como texto. Envuelve `WebSocket` y
+ * `WebTransport` para que, DESPUÉS de construir uno, el contexto avise su URL
+ * por la función de CDP. El aviso no decide si cuenta: sólo dice DESDE QUÉ
+ * CONTEXTO salió, y el origen de ese contexto lo pone Chromium, no la página
+ * (ver `vigilarSalidasPropias`). La función se toma y se borra del global
+ * antes de que corra nada de la página.
+ *
+ * Una página que esquiva el envoltorio —`WebSocket.prototype.constructor`—
+ * sólo se queda sin aviso, y un socket sin aviso cuenta: esquivarlo no da un
+ * verde. Y la URL se normaliza como lo hace el navegador (relativa al
+ * documento, `http(s)` → `ws(s)` en un `WebSocket`), para que coincida con la
+ * que avisa CDP; si no coincide, tampoco hay aviso, y cuenta.
+ */
+const avisarSalidas = `(() => {
+  const avisar = globalThis[${JSON.stringify(AVISO_DE_SALIDA)}];
+  try { delete globalThis[${JSON.stringify(AVISO_DE_SALIDA)}]; } catch (e) {}
+  if (typeof avisar !== "function") return;
+  const envolver = (nombre, tipo, deSocket) => {
+    const Original = globalThis[nombre];
+    if (typeof Original !== "function") return;
+    const Envuelto = new Proxy(Original, {
+      construct(objetivo, args, nuevo) {
+        const abierto = Reflect.construct(objetivo, args, nuevo);
+        try {
+          const u = new URL(String(args[0]), document.baseURI);
+          if (deSocket && u.protocol === "http:") u.protocol = "ws:";
+          else if (deSocket && u.protocol === "https:") u.protocol = "wss:";
+          avisar(JSON.stringify({ tipo, url: u.href }));
+        } catch (e) {}
+        return abierto;
+      },
+    });
+    try { Object.defineProperty(globalThis, nombre, { value: Envuelto, writable: true, configurable: true }); } catch (e) {}
+  };
+  envolver("WebSocket", "websocket", true);
+  envolver("WebTransport", "webtransport", false);
+})();`;
+
+/**
+ * Lo que la pestaña intenta abrir SIN pasar por la intercepción (F3): un
+ * `WebSocket` o un `WebTransport`. El navegador no tiene red, así que nunca
+ * conectan, y lo que iban a traer no está en el DOM: sin este aviso, eso no
+ * dejaba rastro y el render salía `medido` —MEDIDO por la revisión con Chrome
+ * 155: un menú de 619 y un `WebSocket` que escribía 4 499, `medido 619/619`
+ * y VERDE—.
+ *
+ * Lo avisa Chromium por CDP (`Network.webSocketCreated`), no la página: un
+ * envoltorio en JavaScript lo podría deshacer la página, y no llega a los
+ * workers. MEDIDO con Chrome 155: el evento sale en la sesión de la pestaña
+ * para el documento y sus marcos del mismo proceso, y en la del WORKER para
+ * el socket que abre un worker. Por eso se escucha también cada worker, y
+ * SINCRÓNICAMENTE en `workercreated`: puppeteer lo emite antes de soltar el
+ * worker (`Runtime.runIfWaitingForDebugger`), así que el `Network.enable` le
+ * llega antes que su primera línea.
+ *
+ * Y DESDE QUÉ MARCO (RT-4). El evento no dice de qué marco es, y MEDIDO con
+ * el headless shell 153 —que corre con `--single-process` y sin aislamiento
+ * de sitios, así que los marcos de otro sitio viven en la misma sesión—: el
+ * `WebSocket` de un `<iframe>` de otro sitio salía en la sesión de la
+ * pestaña igual que el de la página, y la dejaba «no medida». Con Chrome 155,
+ * que aísla los sitios, ese marco es otro proceso y su socket no se ve. Para
+ * que los dos binarios juzguen igual, cada contexto avisa lo que abre
+ * (`avisarSalidas`) y CDP dice el ORIGEN de ese contexto
+ * (`Runtime.executionContextCreated`): MEDIDO con los dos binarios, el del
+ * marco de otro sitio sale con su origen, el de un `srcdoc` con el de la
+ * página, y el del marco del mismo sitio con el suyo. Cada evento de la
+ * pestaña se empareja con el primer aviso de la misma URL que no se usó; uno
+ * sin aviso cuenta, y `renderizado.ts` decide con la regla de RT-4.
+ *
+ * Lo que NO ve, dicho: un `SharedWorker`, que no es de la pestaña. Su red
+ * tampoco sale (el proxy que no existe), pero si trajera el contenido, el
+ * render no se enteraría. Y un marco de otro sitio que la página controla
+ * puede avisar la URL de un socket de la página como suyo: es la misma
+ * puerta que su `postMessage` (FV-3, «LO QUE NO CUBRE» en `renderizado.ts`).
+ */
+async function vigilarSalidasPropias(page: Page, sesion: CDPSession): Promise<() => SalidaPropiaVista[]> {
+  const vistas: Array<{ url: string; tipo: SalidaPropia; deUnWorker: boolean; urlDeLaPagina: string }> = [];
+  const avisos: Array<{ url: string; tipo: SalidaPropia; origen: string | null }> = [];
+  const origenes = new Map<number, string>();
+  const vista = (tipo: SalidaPropia, deUnWorker: boolean) => (e: { url: string }) => {
+    vistas.push({ url: e.url, tipo, deUnWorker, urlDeLaPagina: page.mainFrame().url() });
+  };
+  sesion.on("Runtime.executionContextCreated", (e) => origenes.set(e.context.id, e.context.origin));
+  sesion.on("Runtime.bindingCalled", (e) => {
+    if (e.name !== AVISO_DE_SALIDA) return;
+    try {
+      const dicho = JSON.parse(e.payload) as { tipo?: unknown; url?: unknown };
+      if ((dicho.tipo !== "websocket" && dicho.tipo !== "webtransport") || typeof dicho.url !== "string") return;
+      avisos.push({ url: dicho.url, tipo: dicho.tipo, origen: origenes.get(e.executionContextId) ?? null });
+    } catch {
+      // Un aviso ilegible no es un aviso: el socket queda sin él, y cuenta.
+    }
+  });
+  sesion.on("Network.webSocketCreated", vista("websocket", false));
+  sesion.on("Network.webTransportCreated", vista("webtransport", false));
+  await sesion.send("Runtime.enable");
+  await sesion.send("Runtime.addBinding", { name: AVISO_DE_SALIDA });
+  await sesion.send("Network.enable");
+  await page.evaluateOnNewDocument(avisarSalidas);
+  page.on("workercreated", (worker) => {
+    worker.client.on("Network.webSocketCreated", vista("websocket", true));
+    worker.client.on("Network.webTransportCreated", vista("webtransport", true));
+    void worker.client.send("Network.enable").catch(() => {});
+  });
+  return () => {
+    const libres = [...avisos];
+    return vistas.map((v) => {
+      let origenDelMarco: string | null = null;
+      if (!v.deUnWorker) {
+        const i = libres.findIndex((a) => a.tipo === v.tipo && a.url === v.url);
+        if (i >= 0) origenDelMarco = libres.splice(i, 1)[0].origen;
+      }
+      return { url: v.url, tipo: v.tipo, deUnWorker: v.deUnWorker, origenDelMarco, urlDeLaPagina: v.urlDeLaPagina };
+    });
+  };
+}
+
+function envolverPagina(page: Page, vigilada?: { sesion: CDPSession; salidas: () => SalidaPropiaVista[] }): PaginaAbierta {
+  // Una sesión de CDP por pestaña, para serializar con las sombras (`html`):
+  // la de la vigilancia si la hay, y si no, una que se abre al leer.
+  let sesion: Promise<CDPSession> | undefined = vigilada ? Promise.resolve(vigilada.sesion) : undefined;
   return {
+    salidasPropias() {
+      return vigilada?.salidas() ?? [];
+    },
     async interceptar(atender) {
       await page.setBypassServiceWorker(true);
       await page.setRequestInterception(true);
@@ -271,7 +403,10 @@ function envolverNavegador(browser: Browser, cierreMs: number, quitarWebRtc: boo
       // contestar otra página que la que ve una persona.
       const agente = (await browser.userAgent()).replace("HeadlessChrome", "Chrome");
       await page.setUserAgent({ userAgent: `${agente} VulkanGrowthOS/1.0 (auditoria AEO; renderizado)` });
-      return envolverPagina(page);
+      // Sin JavaScript no hay quien abra un socket: sólo se vigila la otra (F3).
+      if (sinJavaScript) return envolverPagina(page);
+      const sesion = await page.createCDPSession();
+      return envolverPagina(page, { sesion, salidas: await vigilarSalidasPropias(page, sesion) });
     },
     async cerrar() {
       const proceso = browser.process();

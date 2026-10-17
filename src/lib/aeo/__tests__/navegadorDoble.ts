@@ -40,7 +40,10 @@
  * Lo que NO simula, dicho: la red propia de Chromium —WebSocket, preconnect,
  * WebRTC—. Eso no pasa por el interceptor y por eso no se puede probar con un
  * doble: lo mide `renderizado.integracion.test.ts` con un Chrome de verdad y un
- * canario que cuenta conexiones TCP.
+ * canario que cuenta conexiones TCP. Del `WebSocket` simula sólo el AVISO que
+ * Chromium da por CDP (`salidasPropias`, F3), con el origen del contexto que
+ * lo abrió: que el aviso llegue con ese origen lo mide la integración, con los
+ * dos binarios.
  */
 import type {
   AbrirNavegador,
@@ -51,6 +54,8 @@ import type {
   PedidoHttp,
   Resolvedor,
   RespuestaHttp,
+  SalidaPropia,
+  SalidaPropiaVista,
   Transporte,
 } from "../renderizado";
 
@@ -217,13 +222,29 @@ export interface OpcionesDoble {
     principal?: boolean;
     /** Sale cuando el reloj llega a `enMs`, y no apenas termina la navegación (necesita `reloj.alcanzar`). */
     enMs?: number;
+    /** El método y el cuerpo, si no es un `GET` (SEC-A2, F2). */
+    metodo?: string;
+    cuerpo?: string;
   }>;
+  /**
+   * Lo que la pestaña con JavaScript intenta abrir SIN pasar por el
+   * interceptor —un `WebSocket`—, como lo avisaría Chromium por CDP (F3).
+   * `origen` es el del contexto que lo abrió: sin decirlo, el de la página;
+   * `null`, sin aviso. `worker`, lo abrió un worker.
+   */
+  salidasPropias?: Array<{ url: string; tipo: SalidaPropia; origen?: string | null; worker?: boolean }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
    * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
    * (PU-3).
    */
   responderFalla?: (url: string) => boolean;
+  /**
+   * La pestaña con JavaScript termina la navegación con ESTE documento sin
+   * que el interceptor lo haya visto —lo sirvió Chromium por su cuenta, de su
+   * caché—: la medición no tiene status del documento (M12).
+   */
+  documentoPorFuera?: string;
 }
 
 export function navegadorDoble(opciones: OpcionesDoble = {}) {
@@ -246,14 +267,17 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     tipo: string,
     esDocumentoPrincipal: boolean,
     urlDelMarco: string | null,
-    urlDeLaPagina: string | null
+    urlDeLaPagina: string | null,
+    metodo = "GET",
+    cuerpo?: string
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
     const pedido: PedidoDelNavegador = {
       url,
-      metodo: "GET",
+      metodo,
       encabezados: { accept: "*/*", "user-agent": "doble" },
+      ...(cuerpo !== undefined ? { cuerpo } : {}),
       tipo,
       esDocumentoPrincipal,
       urlDelMarco,
@@ -279,6 +303,17 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     let recorrida = false;
 
     return {
+      salidasPropias(): SalidaPropiaVista[] {
+        // Sólo la pestaña que corre JavaScript abre sockets, y sólo después de navegar.
+        if (sinJs || urlDelDocumento === "") return [];
+        return (opciones.salidasPropias ?? []).map((s) => ({
+          url: s.url,
+          tipo: s.tipo,
+          deUnWorker: s.worker === true,
+          origenDelMarco: s.worker ? null : s.origen === undefined ? new URL(urlDelDocumento).origin : s.origen,
+          urlDeLaPagina: urlDelDocumento,
+        }));
+      },
       async interceptar(a) {
         atender = a;
       },
@@ -286,6 +321,13 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         if (!atender) throw new Error("el doble necesita el interceptor antes de navegar");
         if (opciones.navegacionColgada) await new Promise(() => {});
         if (!sinJs && opciones.navegacionVirtualMs) await opciones.reloj?.esperar?.(opciones.navegacionVirtualMs);
+        if (!sinJs && opciones.documentoPorFuera !== undefined) {
+          urlDelDocumento = url;
+          html = opciones.documentoPorFuera;
+          registro.textoDibujado = html;
+          navegadoEn = opciones.reloj?.ahora() ?? null;
+          return;
+        }
 
         let actual = url;
         let documento: Extract<Desenlace, { tipo: "respondido" }> | null = null;
@@ -348,7 +390,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
           const at = atender;
           // La URL de la página se lee al SALIR el pedido, como en Chromium.
           const salir = () =>
-            emitir(at, new URL(r.url, actual).toString(), r.tipo, principal, marco, urlDelDocumento || null).then((d) => {
+            emitir(at, new URL(r.url, actual).toString(), r.tipo, principal, marco, urlDelDocumento || null, r.metodo, r.cuerpo).then((d) => {
               // Una navegación de la pestaña que no se confirma no cambia el
               // documento: ni su DOM ni su URL.
               if (d.tipo !== "respondido" || deUnMarco || principal) return;

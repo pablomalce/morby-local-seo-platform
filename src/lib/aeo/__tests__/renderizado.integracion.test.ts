@@ -34,9 +34,12 @@
  * mismo camino que la ruta en Vercel, el headless shell de
  * `@sparticuz/chromium`. Es el binario que importa, y no se porta igual que
  * Chrome (RV-1: una bandera de WebRTC que en Chrome 154 cierra el UDP, en
- * headless shell 153 no). Se corre en un contenedor
- * `public.ecr.aws/lambda/nodejs:24` con `VERCEL=1` y
- * `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, con su propio `npm ci`.
+ * headless shell 153 no). Y en el sistema que importa: el CI lo corre en un
+ * contenedor `public.ecr.aws/lambda/nodejs:24` (AL2023, como la función de
+ * Vercel) con `VERCEL=1` y `AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x`, que son
+ * las que hacen que `@sparticuz/chromium` use SUS bibliotecas (RTV-3). En el
+ * runner de Ubuntu, sin ellas, Chromium arranca con las del sistema, y un
+ * cambio que rompiera las de AL2023 salía verde.
  *
  * Sin ninguna de las dos se saltea con el motivo escrito en el nombre del
  * bloque, y eso NO es un verde. Por eso el CI tiene un job propio
@@ -97,6 +100,7 @@ const IPV6_SIN_RUTA = "2606:4700:4700::1111";
 const PUBLICA_DE_TERCEROS = "151.101.1.1";
 const CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-control", "index.html"), "utf8");
 const SANA = readFileSync(path.join(process.cwd(), "public", "aeo-sana", "index.html"), "utf8");
+const HIBRIDA_DE_CONTROL = readFileSync(path.join(process.cwd(), "public", "aeo-hibrida", "index.html"), "utf8");
 const SSR = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Clínica de prueba</title></head>
 <body><main><h1>Clínica de prueba</h1>
 <p>${"Atendemos de lunes a viernes, con turnos por teléfono y en el mostrador. ".repeat(30)}</p>
@@ -413,6 +417,62 @@ const DSD_SERVIDO = `<!doctype html><html><head><meta charset="utf-8"></head><bo
 <x-pie><template shadowrootmode="closed"><footer>Pie servido en una sombra cerrada.</footer></template></x-pie>
 </body></html>`;
 
+/** F2, F3: escribe en `#app` lo que le llega. */
+const ESCRIBIR = `(t) => { document.getElementById("app").textContent = t; }`;
+
+/**
+ * F3: el contenido llega por un `WebSocket`. Desde la página, desde su
+ * worker, desde un `srcdoc`, desde un marco de un subdominio del sitio y
+ * desde uno de OTRO sitio —que no decide—.
+ */
+const CON_SOCKET = hibrida(
+  `<script>try { const s = new WebSocket("ws://sitio.test/ws?token=SECRETO-del-socket"); s.onmessage = (e) => (${ESCRIBIR})(e.data); } catch (e) {}</script>`
+);
+const CON_SOCKET_EN_WORKER = hibrida(`<script>
+  const w = new Worker(URL.createObjectURL(new Blob([
+    "try { const s = new WebSocket('ws://sitio.test/ws-worker'); s.onmessage = (e) => postMessage(e.data); } catch (e) {}"
+  ])));
+  w.onmessage = (e) => (${ESCRIBIR})(e.data);
+</script>`);
+const CON_SOCKET_EN_SRCDOC = hibrida(`<iframe srcdoc="<script>try { new WebSocket('ws://sitio.test/desde-srcdoc'); } catch (e) {}</script>"></iframe>`);
+const CON_SOCKET_DEL_SITIO = hibrida(`<script src="/app.js"></script><iframe src="http://chat.sitio.test/socket-propio"></iframe>`);
+const CON_SOCKET_AJENO = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/socket-ajeno"></iframe>`);
+const SOCKET_EN_MARCO = (url: string) => `<!doctype html><html><body><p>Chat</p><script>
+  try { const s = new WebSocket(${JSON.stringify(url)}); s.onmessage = (e) => parent.postMessage({ texto: e.data }, "*"); } catch (e) {}
+</script></body></html>`;
+
+/** F3: un `EventSource` cuyo stream no termina nunca. */
+const CON_STREAM = hibrida(`<script>const es = new EventSource("/eventos-sin-fin"); es.onmessage = (e) => (${ESCRIBIR})(e.data);</script>`);
+
+/**
+ * SEC-A2: la página que usa el render como relé contra un tercero, y la
+ * misma desde un marco de otro sitio —con el bundle de la página al lado—.
+ */
+const RELEVO = `for (let i = 0; i < 3000; i++) fetch("http://tercero.test/p" + i, { mode: "no-cors" }).catch(() => {});`;
+const CON_RELEVO = hibrida(`<script>${RELEVO}</script>`);
+const CON_RELEVO_EN_MARCO = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/relevo-ajeno"></iframe>`);
+const CON_POSTS_AJENOS = hibrida(`<script>
+  for (let i = 0; i < 25; i++) fetch("http://tercero.test/post", { method: "POST", mode: "no-cors", body: "datos-de-la-pagina" }).catch(() => {});
+  fetch("http://tercero.test/post-grande", { method: "POST", mode: "no-cors", body: "x".repeat(100000) }).catch(() => {});
+</script>`);
+
+/**
+ * CSP-SIN-TEXTO-MUERTO: una política de CSP que REPORTA a un tercero —sólo
+ * informa, `report-only`, y treinta imágenes la violan— y, un segundo y
+ * medio después, el contenido llega por un `POST` a ese tercero (un GraphQL
+ * ajeno). MEDIDO por la revisión con Chrome 155: los reportes llegaban al
+ * interceptor como `other POST`, salían al tercero, le gastaban a la página
+ * sus `maxPostsAjenos`, y el `POST` del contenido quedaba
+ * `subrecurso-presupuesto`; main, con la misma página, medía.
+ */
+const CSP_QUE_REPORTA = "img-src 'none'; report-uri http://tercero.test/csp-report";
+const CON_REPORTES_CSP = hibrida(`${Array.from({ length: 30 }, (_, i) => `<img src="/x${i}.png" alt="">`).join("")}<script>
+  setTimeout(() => fetch("http://tercero.test/graphql", { method: "POST", body: "{}" }).then((r) => r.text()).then(${ESCRIBIR}).catch(() => {}), 1500);
+</script>`);
+
+/** Lo que el tercero recibió, contado en el servidor: pedidos, el pico a la vez y los POST. */
+const enTercero = { pedidos: 0, enCurso: 0, pico: 0, posts: [] as string[] };
+
 /**
  * RV-1: un popup es otro target. Ni la intercepción ni `evaluateOnNewDocument`
  * llegan a él, así que el constructor de WebRTC está entero adentro, y su
@@ -516,6 +576,28 @@ beforeAll(async () => {
   );
 
   sitio = http.createServer((req, res) => {
+    if (req.headers.host === "tercero.test") {
+      // SEC-A2: el tercero cuenta lo que le llega, y retiene cada respuesta
+      // 50 ms para que la concurrencia se vea.
+      enTercero.pedidos += 1;
+      enTercero.enCurso += 1;
+      enTercero.pico = Math.max(enTercero.pico, enTercero.enCurso);
+      const partes: Buffer[] = [];
+      req.on("data", (p: Buffer) => partes.push(p));
+      req.on("end", () => {
+        if (req.method === "POST") enTercero.posts.push(`${req.url} ${Buffer.concat(partes).length}`);
+        setTimeout(() => {
+          enTercero.enCurso -= 1;
+          // CSP-SIN-TEXTO-MUERTO: el GraphQL ajeno trae el contenido, legible desde la página.
+          if (req.url === "/graphql") {
+            res.writeHead(200, { "access-control-allow-origin": "*", "content-type": "text/plain; charset=utf-8" });
+            return res.end(CONTENIDO_DEL_BUNDLE);
+          }
+          res.end("ok");
+        }, 50);
+      });
+      return;
+    }
     const html = (cuerpo: string) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(cuerpo);
@@ -530,6 +612,49 @@ beforeAll(async () => {
       return res.end(Buffer.alloc(SEGMENTO_BYTES, 118));
     }
     switch (req.url) {
+      case "/hibrida-de-control":
+        return html(HIBRIDA_DE_CONTROL);
+      case "/puerto-fetch":
+        return html(
+          hibrida(`<script>fetch("https://sitio.test:8443/api/contenido").then((r) => r.text()).then(${ESCRIBIR}).catch(() => {});</script>`)
+        );
+      case "/puerto-script":
+        return html(hibrida(`<script src="https://cdn.sitio.test:8443/app.js"></script>`));
+      case "/websocket":
+        return html(CON_SOCKET);
+      case "/websocket-worker":
+        return html(CON_SOCKET_EN_WORKER);
+      case "/websocket-srcdoc":
+        return html(CON_SOCKET_EN_SRCDOC);
+      case "/websocket-del-sitio":
+        return html(CON_SOCKET_DEL_SITIO);
+      case "/socket-propio":
+        return html(SOCKET_EN_MARCO("wss://chat.sitio.test/vivo"));
+      case "/websocket-ajeno":
+        return html(CON_SOCKET_AJENO);
+      case "/socket-ajeno":
+        return html(SOCKET_EN_MARCO("wss://video.test/chat"));
+      case "/eventsource-sin-fin":
+        return html(CON_STREAM);
+      case "/eventos-sin-fin":
+        // Un stream que no termina: manda un evento y deja la conexión abierta.
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${CONTENIDO_DEL_BUNDLE}\n\n`);
+        return;
+      case "/relevo":
+        return html(CON_RELEVO);
+      case "/relevo-en-marco":
+        return html(CON_RELEVO_EN_MARCO);
+      case "/relevo-ajeno":
+        return html(`<!doctype html><html><body><p>Reproductor</p><script>${RELEVO}</script></body></html>`);
+      case "/posts-ajenos":
+        return html(CON_POSTS_AJENOS);
+      case "/reportes-csp":
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy-report-only": CSP_QUE_REPORTA,
+        });
+        return res.end(CON_REPORTES_CSP);
       case "/con-token":
         return html(CON_TOKEN);
       case "/con-marco-blob":
@@ -772,6 +897,10 @@ beforeEach(() => {
   enCanario.conexiones = 0;
   enCanario.pedidos = [];
   enCanario.udp = 0;
+  enTercero.pedidos = 0;
+  enTercero.enCurso = 0;
+  enTercero.pico = 0;
+  enTercero.posts = [];
 });
 
 function deps(
@@ -817,6 +946,9 @@ function deps(
       "idp.test": [PUBLICA_DE_TERCEROS],
       "rebind.test": () => (consultasRebind++ === 0 ? [PUBLICA_DE_TERCEROS] : ["127.0.0.1"]),
       "sitio.test": [PUBLICA],
+      // F3: un subdominio del sitio. SEC-A2: el tercero que cuenta lo que le llega.
+      "chat.sitio.test": [PUBLICA],
+      "tercero.test": [PUBLICA],
       "interno.test": ["10.0.0.7"],
       "mixto.test": [PUBLICA, "127.0.0.1"],
     }).resolver,
@@ -900,6 +1032,31 @@ describe.runIf(process.env.AEO_INTEGRACION_OBLIGATORIA === "1")("en el CI la int
   it("hay un Chromium con el que correrla: si falta, esto es rojo y no un salteo", () => {
     expect(HAY_CHROME, MOTIVO).toBe(true);
   });
+});
+
+/**
+ * RTV-3: el camino de bibliotecas de Vercel. `@sparticuz/chromium` sólo
+ * descomprime `al2023.tar.br` y fija `LD_LIBRARY_PATH` cuando cree estar en
+ * AL2023 (`VERCEL`, `AWS_EXECUTION_ENV`). En el runner de Ubuntu no lo cree, y
+ * Chromium arranca con las bibliotecas del sistema: un cambio que rompiera las
+ * de AL2023 salía verde. REPRODUCIDO en `public.ecr.aws/lambda/nodejs:24` sin
+ * esas variables: «libnspr4.so: cannot open shared object file», Code 127.
+ *
+ * El paso del CI que corre este archivo en ese contenedor exporta
+ * `AEO_EN_AL2023=1`, y esto afirma que el entorno es el que el paso dice: si
+ * alguien le cambia la imagen o le saca las variables, no queda un paso verde
+ * que mide otra cosa.
+ */
+describe.runIf(process.env.AEO_EN_AL2023 === "1")("RTV-3: la integración corre como en Vercel, en AL2023", () => {
+  it("es Amazon Linux 2023, con el headless shell de producción, y Chromium arranca con las bibliotecas de al2023", async () => {
+    expect(readFileSync("/etc/os-release", "utf8")).toMatch(/Amazon Linux[\s\S]*VERSION_ID="2023"/);
+    expect(DE_PRODUCCION, "AEO_CHROMIUM_DE_PRODUCCION=1, en Linux y sin AEO_CHROME_PATH").toBe(true);
+    const navegador = await abrirChromium()();
+    await navegador.cerrar();
+    const bibliotecas = path.join(os.tmpdir(), "al2023", "lib");
+    expect(process.env.LD_LIBRARY_PATH ?? "").toContain(bibliotecas);
+    expect(existsSync(path.join(bibliotecas, "libnspr4.so"))).toBe(true);
+  }, 60_000);
 });
 
 describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO})`, { retry: process.env.CI ? 1 : 0 }, () => {
@@ -1219,7 +1376,18 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       console.log(
         `[RED-121-3 /con-marco-hostil] render=${JSON.stringify(render)} pedidos=${JSON.stringify(b.pedidos)} canario=${JSON.stringify(visto)}`
       );
-      expect(render.estado).toBe("medido");
+      // F2 con la regla de RT-4: lo que la política le rechazó al MARCO no
+      // decidió —nada suyo está en `noLlegaron`—. Lo que le rechazó a su
+      // WORKER sí: Chromium no dice de qué marco es un worker, y cuenta de
+      // más. Por eso el render queda sin número, y el detalle lo dice.
+      expect(render.estado).toBe("fallo");
+      expect(b.noLlegaron.length).toBeGreaterThan(0);
+      expect(b.noLlegaron.every((n) => n.origen === "worker")).toBe(true);
+      if (render.estado === "fallo") expect(render.detalle?.origen).toBe("worker");
+      // Y sus `WebSocket` tampoco decidieron (F3): con Chrome, el marco es otro
+      // proceso y no se ven; con el headless shell se ven, con el origen del
+      // marco, que es de otro sitio.
+      for (const s of b.salidasPropias.filter((x) => !x.deUnWorker)) expect(s.origenDelMarco).toBe("http://video.test");
       expect(visto, "ni un socket ni un datagrama llegó a una dirección que no es pública").toEqual({
         conexiones: 0,
         pedidos: [],
@@ -1362,6 +1530,216 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           },
         });
         expect(JSON.stringify(render)).not.toMatch(/SECRETO|token=/);
+      },
+      60_000
+    );
+  });
+
+  it(
+    "F5 — el control HÍBRIDO de `public/aeo-hibrida/`: lo servido pasa el mínimo, y el punto sale ROJO por la proporción",
+    async () => {
+      const render = await medirRenderizado("http://sitio.test/hibrida-de-control", deps());
+      const enHtml = textoSinJavaScript(HIBRIDA_DE_CONTROL);
+      console.log(`[F5 /hibrida-de-control] html=${enHtml} renderizado=${JSON.stringify(render)}`);
+      expect(render.estado).toBe("medido");
+      if (render.estado !== "medido") return;
+      expect(render.servidos ?? 0).toBeGreaterThan(MINIMO_DE_TEXTO);
+      expect(render.caracteres).toBeGreaterThan(3 * (render.servidos ?? 0));
+      expect(
+        contenidoSinJs({ acceso: TODOS_ENTRAN, caracteresSinJs: enHtml, caracteresRenderizados: render, schema: [], tieneLlmsTxt: false })
+          .estado
+      ).toBe("rojo");
+    },
+    60_000
+  );
+
+  describe("F2 — lo que la política no deja salir y decide, no llegó", () => {
+    it.each([
+      ["/puerto-fetch", "https://sitio.test:8443/api/contenido", "fetch"],
+      ["/puerto-script", "https://cdn.sitio.test:8443/app.js", "script"],
+    ])(
+      "el contenido detrás de un puerto que no es 80/443 (%s): `subrecurso-puerto`, y el punto no sale verde",
+      async (ruta, url, tipo) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[F2 ${ruta}] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        const destino = new URL(url);
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-puerto",
+          detalle: { tipo, host: destino.hostname, ruta: destino.pathname, origen: "pagina", motivo: "puerto", noLlegaron: 1 },
+        });
+        expect(b.noLlegaron).toEqual([{ url, tipo, motivo: "puerto", origen: "pagina" }]);
+        expect(puntoHibrida(render)).toBe("no-medido");
+        expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+      },
+      60_000
+    );
+  });
+
+  describe("F3 — un WebSocket que decide, con Chromium avisándolo", () => {
+    it.each([
+      ["/websocket", "ws://sitio.test/ws?token=SECRETO-del-socket", "/ws", "la página", "pagina"],
+      ["/websocket-worker", "ws://sitio.test/ws-worker", "/ws-worker", "un worker", "worker"],
+      ["/websocket-srcdoc", "ws://sitio.test/desde-srcdoc", "/desde-srcdoc", "un `srcdoc`, que tiene el origen de la página", "pagina"],
+    ] as const)(
+      "%s: el `WebSocket` que abre %s (%s) nunca llega, y es `subrecurso-websocket`",
+      async (ruta, url, rutaDelDetalle, _caso, origen) => {
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, deps(), undefined, b);
+        console.log(`[F3 ${ruta}] renderizado=${JSON.stringify(render)} salidasPropias=${JSON.stringify(b.salidasPropias)}`);
+        expect(b.salidasPropias.map((x) => x.url)).toEqual([url]);
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-websocket",
+          detalle: { tipo: "websocket", host: "sitio.test", ruta: rutaDelDetalle, origen, motivo: "websocket", noLlegaron: 1 },
+        });
+        expect(JSON.stringify(render)).not.toMatch(/SECRETO/);
+        expect(await canarioDespues(300)).toEqual({ conexiones: 0, pedidos: [], udp: 0 });
+      },
+      60_000
+    );
+
+    it(
+      "el de un marco de un SUBDOMINIO del sitio decide: `mismo-sitio`, con los dos binarios",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/websocket-del-sitio", deps(), undefined, b);
+        console.log(`[F3 /websocket-del-sitio] renderizado=${JSON.stringify(render)} salidasPropias=${JSON.stringify(b.salidasPropias)}`);
+        expect(b.salidasPropias).toEqual([
+          expect.objectContaining({ url: "wss://chat.sitio.test/vivo", deUnWorker: false, origenDelMarco: "http://chat.sitio.test" }),
+        ]);
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-websocket",
+          detalle: { tipo: "websocket", host: "chat.sitio.test", ruta: "/vivo", origen: "mismo-sitio", motivo: "websocket", noLlegaron: 1 },
+        });
+      },
+      60_000
+    );
+
+    it(
+      "el de un marco de OTRO sitio no decide (RT-4): la página se mide, y con su bundle es ROJA",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/websocket-ajeno", deps(), undefined, b);
+        console.log(`[F3 /websocket-ajeno] renderizado=${JSON.stringify(render)} salidasPropias=${JSON.stringify(b.salidasPropias)}`);
+        // MEDIDO: con Chrome el marco de otro sitio es otro proceso y su socket
+        // no se ve; el headless shell de producción lo corre en el mismo, lo
+        // avisa, y el origen del contexto dice que es de otro sitio.
+        expect(b.salidasPropias.map((x) => [x.url, x.origenDelMarco])).toEqual(
+          DE_PRODUCCION ? [["wss://video.test/chat", "http://video.test"]] : []
+        );
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "un `EventSource` cuyo stream no termina: escribe texto, no llegó, y el render no da número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado(
+          "http://sitio.test/eventsource-sin-fin",
+          deps(),
+          { ...OPCIONES_RENDER, plazoPorPedidoMs: 1_500 },
+          b
+        );
+        console.log(`[F3 /eventsource-sin-fin] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+        expect(render.estado).toBe("fallo");
+        if (render.estado !== "fallo") return;
+        expect(["subrecurso-timeout", "subrecurso-pendiente"]).toContain(render.codigo);
+        expect(render.detalle).toMatchObject({ tipo: "eventsource", host: "sitio.test", ruta: "/eventos-sin-fin", origen: "pagina" });
+      },
+      60_000
+    );
+  });
+
+  describe("SEC-A2 — el render no es un relé, con Chromium", () => {
+    it(
+      "3 000 `fetch` de la página a un tercero: le llegan menos de `maxPedidos`, nunca más de `maxConcurrencia` a la vez, y el render no da número",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/relevo", deps(), undefined, b);
+        await new Promise((listo) => setTimeout(listo, 300));
+        console.log(
+          `[SEC-A2 /relevo] renderizado=${JSON.stringify(render)} tercero=${JSON.stringify({ ...enTercero, posts: enTercero.posts.length })} pico=${JSON.stringify(b.picoConcurrente)}`
+        );
+        expect(enTercero.pedidos).toBeGreaterThan(OPCIONES_RENDER.maxConcurrencia);
+        expect(enTercero.pedidos).toBeLessThanOrEqual(OPCIONES_RENDER.maxPedidos - 1);
+        expect(enTercero.pico).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+        expect(b.picoConcurrente.pagina).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+        expect(render).toMatchObject({
+          estado: "fallo",
+          codigo: "subrecurso-presupuesto",
+          detalle: { tipo: "fetch", host: "tercero.test", origen: "pagina", motivo: "presupuesto" },
+        });
+      },
+      60_000
+    );
+
+    it(
+      "los mismos 3 000 desde un marco de OTRO sitio gastan SU tope: al tercero le llegan menos de `maxPedidos`, y la página se mide —ROJA—",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/relevo-en-marco", deps(), undefined, b);
+        await new Promise((listo) => setTimeout(listo, 300));
+        console.log(
+          `[SEC-A2 /relevo-en-marco] renderizado=${JSON.stringify(render)} tercero=${enTercero.pedidos} pico=${JSON.stringify(b.picoConcurrente)}`
+        );
+        expect(enTercero.pedidos).toBeGreaterThan(OPCIONES_RENDER.maxConcurrencia);
+        expect(enTercero.pedidos).toBeLessThanOrEqual(OPCIONES_RENDER.maxPedidos);
+        expect(enTercero.pico).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+        expect(b.picoConcurrente.deOtrosSitios).toBeLessThanOrEqual(OPCIONES_RENDER.maxConcurrencia);
+        expect(b.bloqueados.some((x) => x.url.startsWith("http://tercero.test/") && x.motivo === "presupuesto")).toBe(true);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "25 POST de la página a un tercero y uno de 100 KB: le llegan `maxPostsAjenos`, ninguno grande",
+      async () => {
+        const render = await medirRenderizado("http://sitio.test/posts-ajenos", deps());
+        await new Promise((listo) => setTimeout(listo, 300));
+        console.log(
+          `[SEC-A2 /posts-ajenos] renderizado=${JSON.stringify(render)} posts=${JSON.stringify(enTercero.posts.slice(0, 3))}… (${enTercero.posts.length})`
+        );
+        expect(enTercero.posts).toHaveLength(OPCIONES_RENDER.maxPostsAjenos);
+        expect(enTercero.posts.every((p) => p === `/post ${"datos-de-la-pagina".length}`)).toBe(true);
+        expect(render).toMatchObject({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+      },
+      60_000
+    );
+
+    it(
+      "CSP-SIN-TEXTO-MUERTO — treinta reportes de CSP a un tercero no salen ni gastan los POST ajenos: el del contenido, que viene después, llega, y la página es ROJA",
+      async () => {
+        const { deps: conRegistro, vistos } = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/reportes-csp", conRegistro, undefined, b);
+        await new Promise((listo) => setTimeout(listo, 300));
+        const reportesVistos = vistos.filter((v) => v.url === "http://tercero.test/csp-report");
+        console.log(
+          `[CSP /reportes-csp] renderizado=${JSON.stringify(render)} vistos=${reportesVistos.length} (${[...new Set(reportesVistos.map((v) => v.tipo))].join(",")}) alTercero=${JSON.stringify(enTercero.posts.slice(0, 3))}… (${enTercero.posts.length}) noLlegaron=${JSON.stringify(b.noLlegaron)}`
+        );
+        // Anti-vacuidad: la política reportó MÁS de lo que entra en el tope, y
+        // los de la pestaña que se mide —la bitácora es la suya; la pestaña
+        // sin JavaScript tiene otra y no sale a la red— se cortaron TODOS
+        // como `sin-texto`. Medido con Chrome 155: 61 vistos entre las dos
+        // pestañas, 31 en ésta.
+        expect(reportesVistos.length).toBeGreaterThan(OPCIONES_RENDER.maxPostsAjenos);
+        const cortados = b.bloqueados.filter((x) => x.url === "http://tercero.test/csp-report");
+        expect(cortados.length).toBeGreaterThan(OPCIONES_RENDER.maxPostsAjenos);
+        expect(cortados.every((x) => x.motivo === "sin-texto")).toBe(true);
+        // Al tercero no le llegó ningún reporte; sí el POST del contenido.
+        expect(enTercero.posts).toEqual(["/graphql 2"]);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
       },
       60_000
     );
@@ -1641,8 +2019,13 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       const visto = await canarioDespues();
       console.log(`[ssrf ${capa}] render=${JSON.stringify(render)} bloqueados=${b.bloqueados.length} canario=${JSON.stringify(visto)}`);
 
-      expect(render.estado).toBe("medido");
-      if (render.estado === "medido") expect(render.caracteres).toBeGreaterThan(MINIMO_DE_TEXTO);
+      // F2: los scripts a direcciones internas escriben texto que no se vio, y
+      // el render queda sin número. El examen de red de abajo es el mismo.
+      expect(render).toMatchObject({
+        estado: "fallo",
+        codigo: "subrecurso-red-no-publica",
+        detalle: { tipo: "script", host: "interno.test", ruta: "/interno.js", origen: "pagina" },
+      });
       expect(visto, "ni un socket ni un datagrama llegó a una dirección que no es pública").toEqual({
         conexiones: 0,
         pedidos: [],
