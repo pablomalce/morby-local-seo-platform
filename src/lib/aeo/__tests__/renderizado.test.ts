@@ -67,6 +67,8 @@ const DNS = {
   // el sitio con su `www.`.
   "xsitio.test": [OTRA_PUBLICA],
   "www.sitio.test": [PUBLICA],
+  // CSP-SIN-TEXTO-MUERTO: el tercero al que la página manda sus reportes.
+  "tercero.test": [OTRA_PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -1459,12 +1461,19 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
     return (
       url: string,
       urlDelMarco: string | null,
-      opciones: { tipo?: string; metodo?: string; cuerpo?: string; principal?: boolean; urlDeLaPagina?: string | null } = {}
+      opciones: {
+        tipo?: string;
+        metodo?: string;
+        cuerpo?: string;
+        principal?: boolean;
+        urlDeLaPagina?: string | null;
+        encabezados?: Record<string, string>;
+      } = {}
     ) =>
       atender({
         url,
         metodo: opciones.metodo ?? "GET",
-        encabezados: {},
+        encabezados: opciones.encabezados ?? {},
         ...(opciones.cuerpo !== undefined ? { cuerpo: opciones.cuerpo } : {}),
         tipo: opciones.tipo ?? (opciones.principal ? "document" : "xhr"),
         esDocumentoPrincipal: opciones.principal === true,
@@ -1623,6 +1632,71 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
       "http://sitio.test/graphql?2 presupuesto",
       "http://sitio.test/chunk2.js presupuesto",
     ]);
+  });
+
+  /**
+   * CSP-SIN-TEXTO-MUERTO: `SIN_TEXTO` nombraba `csp_violation_report`, que
+   * ningún Chromium dice. MEDIDO por la revisión con Chrome 155: un reporte
+   * de `report-uri` llega al interceptor como `other POST`, salía al tercero
+   * y le gastaba a la página sus 20 `POST` ajenos; el `fetch` con el
+   * contenido que venía después quedaba `subrecurso-presupuesto`.
+   */
+  it("CSP — un reporte del navegador no sale ni gasta: `other POST` con `application/csp-report` o `reports+json` es `sin-texto`", async () => {
+    const { deps, red } = armar({ "http://tercero.test/csp-report": { cuerpo: "ok" }, "http://cdn.test/graphql": { cuerpo: "contenido" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 1 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    const reportes = [
+      ["http://tercero.test/csp-report", { "content-type": "application/csp-report" }],
+      ["http://tercero.test/csp-report?2", { "Content-Type": "application/csp-report; charset=utf-8" }],
+      ["http://tercero.test/csp-report?3", { "content-type": "Application/Reports+JSON" }],
+    ] as const;
+    for (const [url, encabezados] of reportes) {
+      await pedir(url, "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: '{"csp-report":{}}', encabezados });
+      expect(desenlaces[url], url).toBe("abortado");
+    }
+    // El tipo de CDP, como lo da puppeteer, también; sin `content-type`.
+    await pedir("http://tercero.test/csp-report?4", "http://sitio.test/", { tipo: "cspviolationreport", metodo: "POST", cuerpo: "{}" });
+    expect(desenlaces["http://tercero.test/csp-report?4"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual(
+      ["", "?2", "?3", "?4"].map((q) => ({ url: `http://tercero.test/csp-report${q}`, motivo: "sin-texto" }))
+    );
+    // Ninguno salió, y el único `POST` ajeno sigue libre para lo que la página escribe.
+    await pedir("http://cdn.test/graphql", "http://sitio.test/", { tipo: "fetch", metodo: "POST", cuerpo: "{}" });
+    expect(desenlaces["http://cdn.test/graphql"]).toBe("respondido");
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://cdn.test/graphql"]);
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  it("CSP — lo que NO es un reporte sigue su camino: un `other POST` sin ese `content-type`, y un `fetch` de la página que lo trae", async () => {
+    const { deps, red } = armar({
+      "http://tercero.test/log": { cuerpo: "ok" },
+      "http://tercero.test/log?2": { cuerpo: "ok" },
+      "http://cdn.test/datos": { cuerpo: "contenido" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 1 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    // Un `other POST` con otro cuerpo gasta el tope como cualquier POST ajeno.
+    await pedir("http://tercero.test/log", "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: "x", encabezados: { "content-type": "text/plain" } });
+    expect(desenlaces["http://tercero.test/log"]).toBe("respondido");
+    await pedir("http://tercero.test/log?2", "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: "x", encabezados: { "content-type": "text/plain" } });
+    expect(desenlaces["http://tercero.test/log?2"]).toBe("abortado");
+    // Un `fetch` lo arma la página y lee la respuesta: con `application/csp-report`
+    // no se vuelve un reporte. Si decide y no sale, NO LLEGÓ (F2), no `sin-texto`.
+    await pedir("http://cdn.test/datos", "http://sitio.test/", {
+      tipo: "fetch",
+      metodo: "POST",
+      cuerpo: "{}",
+      encabezados: { "content-type": "application/csp-report" },
+    });
+    expect(desenlaces["http://cdn.test/datos"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual([
+      { url: "http://tercero.test/log?2", motivo: "presupuesto" },
+      { url: "http://cdn.test/datos", motivo: "presupuesto" },
+    ]);
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://cdn.test/datos", tipo: "fetch", motivo: "presupuesto", origen: "pagina" }]);
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://tercero.test/log"]);
   });
 
   it("y sus turnos: un reproductor con todos los suyos ocupados no deja esperando a la página", async () => {

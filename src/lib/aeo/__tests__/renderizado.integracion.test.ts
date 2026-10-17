@@ -456,6 +456,20 @@ const CON_POSTS_AJENOS = hibrida(`<script>
   fetch("http://tercero.test/post-grande", { method: "POST", mode: "no-cors", body: "x".repeat(100000) }).catch(() => {});
 </script>`);
 
+/**
+ * CSP-SIN-TEXTO-MUERTO: una política de CSP que REPORTA a un tercero —sólo
+ * informa, `report-only`, y treinta imágenes la violan— y, un segundo y
+ * medio después, el contenido llega por un `POST` a ese tercero (un GraphQL
+ * ajeno). MEDIDO por la revisión con Chrome 155: los reportes llegaban al
+ * interceptor como `other POST`, salían al tercero, le gastaban a la página
+ * sus `maxPostsAjenos`, y el `POST` del contenido quedaba
+ * `subrecurso-presupuesto`; main, con la misma página, medía.
+ */
+const CSP_QUE_REPORTA = "img-src 'none'; report-uri http://tercero.test/csp-report";
+const CON_REPORTES_CSP = hibrida(`${Array.from({ length: 30 }, (_, i) => `<img src="/x${i}.png" alt="">`).join("")}<script>
+  setTimeout(() => fetch("http://tercero.test/graphql", { method: "POST", body: "{}" }).then((r) => r.text()).then(${ESCRIBIR}).catch(() => {}), 1500);
+</script>`);
+
 /** Lo que el tercero recibió, contado en el servidor: pedidos, el pico a la vez y los POST. */
 const enTercero = { pedidos: 0, enCurso: 0, pico: 0, posts: [] as string[] };
 
@@ -574,6 +588,11 @@ beforeAll(async () => {
         if (req.method === "POST") enTercero.posts.push(`${req.url} ${Buffer.concat(partes).length}`);
         setTimeout(() => {
           enTercero.enCurso -= 1;
+          // CSP-SIN-TEXTO-MUERTO: el GraphQL ajeno trae el contenido, legible desde la página.
+          if (req.url === "/graphql") {
+            res.writeHead(200, { "access-control-allow-origin": "*", "content-type": "text/plain; charset=utf-8" });
+            return res.end(CONTENIDO_DEL_BUNDLE);
+          }
           res.end("ok");
         }, 50);
       });
@@ -630,6 +649,12 @@ beforeAll(async () => {
         return html(`<!doctype html><html><body><p>Reproductor</p><script>${RELEVO}</script></body></html>`);
       case "/posts-ajenos":
         return html(CON_POSTS_AJENOS);
+      case "/reportes-csp":
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy-report-only": CSP_QUE_REPORTA,
+        });
+        return res.end(CON_REPORTES_CSP);
       case "/con-token":
         return html(CON_TOKEN);
       case "/con-marco-blob":
@@ -1686,6 +1711,35 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         expect(enTercero.posts).toHaveLength(OPCIONES_RENDER.maxPostsAjenos);
         expect(enTercero.posts.every((p) => p === `/post ${"datos-de-la-pagina".length}`)).toBe(true);
         expect(render).toMatchObject({ estado: "fallo", codigo: "subrecurso-presupuesto" });
+      },
+      60_000
+    );
+
+    it(
+      "CSP-SIN-TEXTO-MUERTO — treinta reportes de CSP a un tercero no salen ni gastan los POST ajenos: el del contenido, que viene después, llega, y la página es ROJA",
+      async () => {
+        const { deps: conRegistro, vistos } = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/reportes-csp", conRegistro, undefined, b);
+        await new Promise((listo) => setTimeout(listo, 300));
+        const reportesVistos = vistos.filter((v) => v.url === "http://tercero.test/csp-report");
+        console.log(
+          `[CSP /reportes-csp] renderizado=${JSON.stringify(render)} vistos=${reportesVistos.length} (${[...new Set(reportesVistos.map((v) => v.tipo))].join(",")}) alTercero=${JSON.stringify(enTercero.posts.slice(0, 3))}… (${enTercero.posts.length}) noLlegaron=${JSON.stringify(b.noLlegaron)}`
+        );
+        // Anti-vacuidad: la política reportó MÁS de lo que entra en el tope, y
+        // los de la pestaña que se mide —la bitácora es la suya; la pestaña
+        // sin JavaScript tiene otra y no sale a la red— se cortaron TODOS
+        // como `sin-texto`. Medido con Chrome 155: 61 vistos entre las dos
+        // pestañas, 31 en ésta.
+        expect(reportesVistos.length).toBeGreaterThan(OPCIONES_RENDER.maxPostsAjenos);
+        const cortados = b.bloqueados.filter((x) => x.url === "http://tercero.test/csp-report");
+        expect(cortados.length).toBeGreaterThan(OPCIONES_RENDER.maxPostsAjenos);
+        expect(cortados.every((x) => x.motivo === "sin-texto")).toBe(true);
+        // Al tercero no le llegó ningún reporte; sí el POST del contenido.
+        expect(enTercero.posts).toEqual(["/graphql 2"]);
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
       },
       60_000
     );

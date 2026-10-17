@@ -166,7 +166,10 @@
  * (`dns-sin-respuesta`): antes los dos eran `no-resuelve`, y un bundle cuyo
  * CDN tuvo un timeout de DNS quedaba fuera (PU-3). Y no cuenta lo que no
  * escribe texto: imágenes, fuentes, videos, CSS, y los `ping` y reportes de
- * CSP, que la página no puede leer.
+ * CSP, que la página no puede leer. Un reporte de CSP se reconoce por su
+ * `content-type`, no por su tipo: MEDIDO por la revisión con Chrome 155,
+ * Chromium se lo pasa al interceptor como `other` con `POST`, y antes salía
+ * al tercero y le gastaba a la página sus `POST` ajenos (ver `esReporte`).
  *
  * NI UN WEBSOCKET (F3). Un `WebSocket` o un `WebTransport` no pasa por el
  * interceptor: muere en el proxy que no existe y no dejaba rastro. MEDIDO
@@ -783,8 +786,42 @@ const METODOS = new Set(["GET", "HEAD", "POST", "OPTIONS"]);
  * tampoco cuenta. Un `ping` (`sendBeacon`, `<a ping>`) y un reporte de CSP
  * tampoco: la página no puede leer su respuesta, y son justo el `POST` con
  * cuerpo propio que hace del render un relé (SEC-A2).
+ *
+ * `csp_violation_report` no lo nombra así ningún Chromium: puppeteer da el
+ * tipo de CDP en minúsculas (`cspviolationreport`), y en Chrome 155 un
+ * reporte de `report-uri` llega como `other` (CSP-SIN-TEXTO-MUERTO). Se queda
+ * por unión; el reporte se reconoce en `esReporte`.
  */
-const SIN_TEXTO = new Set(["image", "media", "font", "ping", "csp_violation_report"]);
+const SIN_TEXTO = new Set(["image", "media", "font", "ping", "csp_violation_report", "cspviolationreport"]);
+
+/**
+ * El cuerpo de un reporte que arma el NAVEGADOR: `report-uri` de CSP
+ * (`application/csp-report`) y el Reporting API (`application/reports+json`).
+ */
+const CUERPO_DE_REPORTE = /^\s*application\/(?:csp-report|reports\+json)\s*(?:;|$)/i;
+
+/**
+ * Si el pedido es un reporte del navegador —de CSP o del Reporting API—, que
+ * no escribe texto y no tiene por qué salir (CSP-SIN-TEXTO-MUERTO). MEDIDO
+ * por la revisión con Chrome 155 y una página con `report-uri` a un tercero
+ * y 30 imágenes bloqueadas: el interceptor vio 30 `other POST` por pestaña,
+ * al tercero le llegaron 20 con el cuerpo que arma el navegador, y el `fetch`
+ * con el contenido que la página hacía después quedaba sin `POST` ajenos:
+ * `subrecurso-presupuesto` donde main medía.
+ *
+ * Se reconoce por el `content-type` del pedido, y SÓLO en un tipo con el que
+ * la página no escribe: `other` —como lo pasa Chromium— y
+ * `cspviolationreport`. Un `fetch` o un `xhr` con ese `content-type` lo arma
+ * la página, que sí lee su respuesta: sigue el camino de cualquier pedido, y
+ * si decide y no sale, no llegó (F2). Si no, una página podía esconder un
+ * pedido que escribe detrás de un `content-type`.
+ */
+function esReporte(pedido: PedidoDelNavegador): boolean {
+  if (pedido.tipo !== "other" && pedido.tipo !== "cspviolationreport") return false;
+  return Object.entries(pedido.encabezados).some(
+    ([nombre, valor]) => nombre.toLowerCase() === "content-type" && CUERPO_DE_REPORTE.test(valor)
+  );
+}
 
 /** Encabezados que no se reenvían: son del salto, o los pone el transporte. */
 const DEL_SALTO = new Set([
@@ -1149,7 +1186,7 @@ export function crearInterceptor(
       if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
       const metodo = pedido.metodo.toUpperCase();
       if (!METODOS.has(metodo)) return await bloquear("metodo");
-      if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || pestana.soloDocumento)) {
+      if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || esReporte(pedido) || pestana.soloDocumento)) {
         return await bloquear("sin-texto");
       }
       if (senal.aborted) return await bloquear("presupuesto");
