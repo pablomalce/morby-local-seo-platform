@@ -70,8 +70,10 @@
  *                    (ver abajo);
  *   globales         los valores globales que declaran el lenguaje o Node y
  *                    que el módulo nombra (`JSON`, `fetch`, `BroadcastChannel`):
- *                    lo de afuera que se usa sin importarlo. También se juzgan
- *                    sólo en la puerta y los receptores;
+ *                    lo de afuera que se usa sin importarlo. De `Object` y
+ *                    `Reflect`, cada miembro (`Object.freeze`; ver
+ *                    `GLOBALES_POR_MIEMBRO`). También se juzgan sólo en los que
+ *                    tienen el token (ver abajo);
  *   sinResolver      un `import()` o `require()` cuyo destino no es un literal,
  *                    todo especificador literal que `tsc` no resuelve a un
  *                    módulo del árbol ni a un paquete, y toda carga que resuelve
@@ -116,14 +118,18 @@
  *                    `process`, el entorno, el objeto global, o un valor global
  *                    que no declaran el lenguaje ni Node (un `declare global {
  *                    var x }`, una función, una clase, un enum o un namespace,
- *                    propio o de otro archivo). Y cada sitio donde ESCRIBE en
- *                    algo que ven otros módulos: un import, un valor que
- *                    declara otro archivo (`fetch`, `JSON`) o un export propio,
- *                    por asignación, `++`, `delete`, destructuring, `for…of`, o
- *                    `Object.assign`, `Reflect.set` y sus vecinas (ver
- *                    `raizCompartida`). Sólo se juzga en los que tienen el
- *                    token: la puerta, los RECEPTORES y los TENEDORES (ver
- *                    abajo).
+ *                    propio o de otro archivo). Cada sitio donde ESCRIBE en
+ *                    algo que no se sabe privado —todo salvo una variable
+ *                    propia y un objeto que nació acá en un literal—: un
+ *                    import, un valor que declara otro archivo (`fetch`,
+ *                    `JSON`), un export propio, un parámetro, un local, lo
+ *                    heredado de un literal; por asignación, `++`, `delete`,
+ *                    destructuring, `for…of`, o `Object.assign`, `Reflect.set`
+ *                    y sus vecinas (ver `objetoEscrito`). Y cada sitio donde
+ *                    llega a la cadena de prototipos: un nombre de
+ *                    `REFLEXIVOS`, o una clave que no está escrita. Sólo se
+ *                    juzga en los que tienen el token: la puerta, los
+ *                    RECEPTORES y los TENEDORES (ver abajo).
  *
  * POR QUÉ TAMBIÉN SÍMBOLOS, Y NO SÓLO EL GRAFO DE ARCHIVOS
  *
@@ -225,33 +231,70 @@
  * de lo global —LEER el entorno, por el `env = process.env` de sus firmas— está
  * declarado sitio por sitio, sin la línea y con repetidos (`tocanLoGlobal`).
  *
+ * Y LA CADENA DE PROTOTIPOS (segunda vuelta de la revisión del #123)
+ *
+ * Escribir en lo compartido se medía por la RAÍZ de la escritura, leída del
+ * texto: un identificador que ven otros (un import, un global, un export).
+ * Medido el 2026-10-21 con tsc, eslint, la pared y la suite entera en verde:
+ * con la raíz en un literal, una llamada o un local —`({}).constructor.
+ * prototype.__t = token`, `vivos.constructor.prototype.__t = …`,
+ * `Object.getPrototypeOf(vivos).__t = …`— la puerta, `tokenStore.ts` o
+ * `searchConsole.ts` dejaban el token en `Object.prototype` o en
+ * `Array.prototype`, y una ruta o una server action nueva SIN NINGÚN IMPORT lo
+ * leía con `({}).__t`. Desde cualquier valor se llega a lo que comparte todo el
+ * proceso. Ahora, en los que tienen el token:
+ *
+ *   - el mundo es cerrado también para escribir: escribirle a un objeto es
+ *     tocar lo global salvo que haya nacido acá, en una constante con un literal
+ *     (`nacioAca`). Un parámetro, un local, una llamada o un `let` pueden valer
+ *     algo que ya existía, y lo heredado es de todos: `({}).toString` es la
+ *     función de `Object.prototype`;
+ *   - llegar a la cadena de prototipos es tocar lo global, escriba o no: un
+ *     método que muta no es una escritura (`Object.getPrototypeOf(vivos).push(
+ *     token)`, y `[][0]` lo lee en cualquier módulo). Cuenta cada nombre de
+ *     `REFLEXIVOS` —en un acceso, en una clave escrita, en un destructuring— y
+ *     toda clave que no está escrita, que puede ser cualquiera de ellos. Una
+ *     clave de un `for…of` sobre un arreglo literal está escrita (`clavesDe`);
+ *   - de `Object` y `Reflect`, la API reflexiva del lenguaje, lo que se usa se
+ *     declara por miembro (`GLOBALES_POR_MIEMBRO`): `Object.getOwnPropertyDescriptors`
+ *     o `Reflect.get` llegan a un prototipo sin nombrarlo.
+ *
+ * Eso cierra también dos que estaban en «QUÉ NO VE»: escribir en algo
+ * compartido guardado antes en un local (`const f = fetch; f.t = token`), y en
+ * un valor de otro módulo recibido por otro nombre (`deps.readState` en
+ * `tokenStore.ts`, que es `agencyTokenState`).
+ *
  * QUÉ NO VE, Y ESTÁ DICHO
  *
- *   - Uno que tiene el token y lo escribe en un objeto que comparte con otros
- *     por el heap y no por un nombre: el `ahora` o la entrada que le pasa quien
- *     llama, el resultado que devuelve, lo que le devuelve una función de otro
- *     módulo que la guarda (el cliente de sesión, si `server.ts` lo
- *     recordara), o algo compartido guardado antes en una variable local
- *     (`const f = fetch; f.t = token`): la raíz de una escritura se lee del
- *     texto. Lo de otro módulo del árbol sí se ve así, porque guardarlo es
- *     usarlo como valor (`usaComo`). Lo que los receptores de hoy devuelven lo
- *     miden los tests de comportamiento de la puerta y de sus dos llamadores
- *     (`orchestrator.servicioCompartido.test.ts` y el de la publicación).
- *   - Un valor de otro módulo que un tenedor ya usa como valor, escrito por
- *     otro nombre: `tokenStore.ts` le inyecta `agencyTokenState` a
- *     `resolveAccessToken` como `readState`, y una propiedad escrita sobre
- *     `deps.readState` la leería quien use `agencyTokenState` (la pantalla de
- *     conexión, declarada en CONEXION).
+ *   - Uno que tiene el token y lo deja en un objeto compartido SIN escribirle:
+ *     con un método que muta a quien lo llama (`push`, `set`, `append`,
+ *     también prestado por `.call`) sobre algo que le pasan —el `ahora` o la
+ *     entrada de quien llama— o que le devuelve una llamada, sin pasar por la
+ *     cadena de prototipos. Es el cliente de sesión de la puerta: la forma de
+ *     `createSupabaseServerClient(0)` está medida, lo que se le llama después
+ *     (`.auth.setSession({ access_token: token, … })`, que escribe una cookie)
+ *     no. La escritura se mide sobre todo lo que no nació acá, y la cadena de
+ *     prototipos aunque no se escriba; un método que muta, no: haría falta
+ *     seguir el valor. Los heredados de `Object.prototype` que escriben sobre
+ *     otro objeto (`__defineGetter__`) sí, porque están en `REFLEXIVOS`.
+ *   - Lo que se escribe en un objeto que nació acá y después se va: se
+ *     devuelve, o se pasa como argumento (ver abajo). Lo que los receptores de
+ *     hoy devuelven lo miden los tests de comportamiento de la puerta y de sus
+ *     dos llamadores (`orchestrator.servicioCompartido.test.ts` y el de la
+ *     publicación).
  *   - Lo que lleva adentro un argumento de una llamada declarada: la forma dice
  *     cuántos argumentos, no qué valen (`resolveAgencyOrgId({ ...env, T: token
  *     })` tiene la misma forma que `resolveAgencyOrgId(env)`).
- *   - Una función del lenguaje que escribe, llamada por `.call`, `.apply` o
- *     `Reflect.apply`: lo que se mira es la firma que resuelve la llamada.
+ *   - Una función del lenguaje que escribe, llamada por `.call` o `.apply`
+ *     (`Object.assign.call(null, fetch, { t })`): lo que se mira es la firma que
+ *     resuelve la llamada. En los que tienen el token hace falta haber declarado
+ *     ese miembro (`Object.assign`), y `Reflect.apply` es otro.
  *   - Un módulo que se carga por un nombre armado en ejecución sin `import()` ni
  *     `require()` (un `eval`, un `new Function`, que también pueden devolver
- *     `process` sin tipo). En la puerta y los receptores, `eval` y `Function`
- *     son globales que habría que declarar; el `constructor` de una función
- *     (`f.constructor("...")`) no es un global, y no se ve.
+ *     `process` sin tipo). En los que tienen el token, `eval` y `Function` son
+ *     globales que habría que declarar, y el `constructor` de una función
+ *     (`f.constructor("...")`) es la cadena de prototipos: se ve. En el resto
+ *     del árbol, no.
  *   - Un global del lenguaje o un import de afuera que la puerta, un receptor o
  *     un tenedor ya usan, usado para otra cosa: el `console.warn` de la puerta
  *     con el token adentro, o la cookie del `state` del callback con el token en
@@ -517,13 +560,31 @@ function clavesDe(checker: ts.TypeChecker, nodo: ts.Node, vistos: Set<ts.Node> =
       decl &&
       ts.isVariableDeclaration(decl) &&
       ts.isIdentifier(decl.name) &&
-      decl.initializer &&
       (ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const) !== 0 &&
       !enContextoAmbiental(decl) &&
       !vistos.has(decl)
     ) {
-      vistos.add(decl);
-      return clavesDe(checker, decl.initializer, vistos);
+      if (decl.initializer) {
+        vistos.add(decl);
+        return clavesDe(checker, decl.initializer, vistos);
+      }
+      // La constante de un `for…of` sobre un arreglo LITERAL vale uno de sus
+      // elementos: el arreglo nace en el bucle y nadie más lo ve. Es
+      // `fila?.[campo]` en `searchConsole.ts`, con `campo` de `["clicks", …]`.
+      // Un elemento que no está escrito, un spread o un hueco: no se sabe.
+      // Y un `for…in` recorre las CLAVES, no los elementos: tampoco.
+      const bucle = decl.parent.parent;
+      const lista = ts.isForOfStatement(bucle) ? sinEnvoltorios(bucle.expression) : null;
+      if (lista && ts.isArrayLiteralExpression(lista)) {
+        vistos.add(decl);
+        const claves: string[] = [];
+        for (const e of lista.elements) {
+          const c = ts.isSpreadElement(e) ? null : clavesDe(checker, e, vistos);
+          if (c === null) return null;
+          claves.push(...c);
+        }
+        return [...new Set(claves)];
+      }
     }
     return null;
   }
@@ -555,6 +616,41 @@ function formaDelUso(uso: ts.Node): string {
 
 /** Los métodos de un cliente de Supabase que nombran algo de la base. */
 const METODOS_DE_LA_BASE = new Set(["rpc", "from", "schema"]);
+
+/**
+ * Los nombres que llevan de CUALQUIER valor a lo que comparte todo el proceso:
+ * la cadena de prototipos (`constructor`, `prototype`, `__proto__`,
+ * `getPrototypeOf`) y los accesores heredados de `Object.prototype` que
+ * definen o leen una propiedad sobre otro objeto (`__defineGetter__` y sus
+ * vecinos, también por `.call`). Medido el 2026-10-21 en la segunda vuelta de
+ * la revisión del #123, con tsc, eslint, la pared y la suite entera en verde:
+ * `({}).constructor.prototype.__t = token` en la puerta, en `tokenStore.ts` o
+ * en `searchConsole.ts`, `vivos.constructor.prototype.__t = …` y
+ * `Object.getPrototypeOf(vivos).__t = …` dejaban el token en `Object.prototype`
+ * o en `Array.prototype`, donde lo lee `({}).__t` en cualquier módulo, sin
+ * ningún import. Ver `tocaLoGlobal`.
+ */
+const REFLEXIVOS = new Set([
+  "constructor",
+  "prototype",
+  "__proto__",
+  "getPrototypeOf",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
+
+/**
+ * Los globales que son la API reflexiva del lenguaje: desde ellos se llega a
+ * cualquier objeto (`Object.getPrototypeOf`, `Object.getOwnPropertyDescriptors`,
+ * `Reflect.get` con una clave que no está escrita, `Reflect.apply`). En
+ * `globales` se cosechan por MIEMBRO (`Object.freeze`), no enteros: lo que la
+ * puerta declara es congelar, no reflexionar. Usados como valor —`const O =
+ * Object`, `const { getPrototypeOf } = Object`, una clave que no se lee— van
+ * enteros, y eso es otra declaración.
+ */
+const GLOBALES_POR_MIEMBRO = new Set(["Object", "Reflect"]);
 
 /** Los textos literales de código: los que viajan, no los comentarios. */
 function textoLiteral(nodo: ts.Node): string | null {
@@ -590,6 +686,22 @@ function esNombreDeclarado(nodo: ts.Node): boolean {
   if (ts.isPropertyAccessExpression(padre)) return padre.name === nodo;
   if (ts.isQualifiedName(padre)) return true;
   return padre.name === nodo || padre.propertyName === nodo;
+}
+
+/**
+ * Un literal que es el LADO IZQUIERDO de un destructuring, que lee las claves
+ * que nombra: `({ a } = x)`, el de un `for (… of)` o `for (… in)`, y uno
+ * adentro de otro —en una propiedad, en un elemento o en el resto de un
+ * arreglo—, con o sin valor por defecto (`[{ a } = d] = x`).
+ */
+function esPatronDeAsignacion(n: ts.Node): boolean {
+  if (!ts.isObjectLiteralExpression(n) && !ts.isArrayLiteralExpression(n)) return false;
+  const p = n.parent;
+  if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.left === n) return true;
+  if ((ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.initializer === n) return true;
+  if (ts.isPropertyAssignment(p) && p.initializer === n) return esPatronDeAsignacion(p.parent);
+  if (ts.isSpreadElement(p)) return esPatronDeAsignacion(p.parent);
+  return ts.isArrayLiteralExpression(p) && esPatronDeAsignacion(p);
 }
 
 /**
@@ -875,16 +987,18 @@ export function analizar(
     const vistos = new Set<ts.Node>();
 
     // ¿La raíz de `n` —a través de envoltorios y de accesos a propiedades— es
-    // algo que ven otros módulos? Un import (del árbol o de un paquete), un
-    // valor que declara otro archivo (el lenguaje, Node: `fetch`, `Object`) o
-    // un export de este módulo. Ver `escribe`. Lo que ya se marca por su cuenta
-    // —`process`, el objeto global, un global del repositorio— no se repite.
-    const raizCompartida = (n: ts.Node): { raiz: ts.Identifier; que: string } | null => {
+    // algo que ven otros módulos POR SU NOMBRE? Un import (del árbol o de un
+    // paquete), un valor que declara otro archivo (el lenguaje, Node: `fetch`,
+    // `Object`) o un export de este módulo. Lo que ya se marca por su cuenta
+    // —`process`, el objeto global, un global del repositorio— es `"marcado"`,
+    // y no se repite. Ver `objetoEscrito`.
+    const raizCompartida = (n: ts.Node): { raiz: ts.Identifier; que: string } | "marcado" | null => {
       let x = sinEnvoltorios(n);
       while (ts.isPropertyAccessExpression(x) || ts.isElementAccessExpression(x)) x = sinEnvoltorios(x.expression);
       if (!ts.isIdentifier(x)) return null;
       const s = checker.getSymbolAtLocation(x);
-      if (!s || fuenteDe(x) !== null || globalAjeno(s, sf) !== null) return null;
+      if (!s) return null;
+      if (fuenteDe(x) !== null || globalAjeno(s, sf) !== null) return "marcado";
       const declaraciones = s.declarations ?? [];
       if (s.flags & ts.SymbolFlags.Alias) return { raiz: x, que: "que es un import" };
       if (declaraciones.length > 0 && declaraciones.every((d) => d.getSourceFile() !== sf)) {
@@ -892,6 +1006,49 @@ export function analizar(
       }
       if (exportado.get(s)?.startsWith(`${rel(abs)}#`)) return { raiz: x, que: "que este módulo exporta" };
       return null;
+    };
+    // ¿`o` es un objeto que NACIÓ en este módulo y no tiene otro dueño? Una
+    // constante inicializada con un literal (`const pedido = {}`, `const xs =
+    // []`): lo único que se sabe privado sin seguir el valor. Por su NOMBRE: la
+    // propiedad de un namespace (`g.ultimoToken`, con `g` el de otro módulo)
+    // resuelve a la constante de otro archivo. Un `let` puede
+    // valer después cualquier cosa; un parámetro, lo que le pase quien llama;
+    // una propiedad, una llamada o un local inicializado con otra cosa, lo que
+    // sea que ya existía —también lo heredado: `({}).toString` es la función de
+    // `Object.prototype`, la misma en todo el proceso—. Que no se exporte lo
+    // mira `raizCompartida` antes.
+    const nacioAca = (o: ts.Node): boolean => {
+      if (!ts.isIdentifier(o)) return false;
+      const d = checker.getSymbolAtLocation(o)?.valueDeclaration;
+      if (!d || !ts.isVariableDeclaration(d) || !d.initializer) return false;
+      if ((ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) === 0) return false;
+      const valor = sinEnvoltorios(d.initializer);
+      return ts.isObjectLiteralExpression(valor) || ts.isArrayLiteralExpression(valor);
+    };
+    // A quién se le escribe una propiedad, si no es privado: `null` si es un
+    // objeto que nació acá (`nacioAca`) o si ya está marcado por su cuenta; si
+    // no, la raíz que ven otros por su nombre, o el objeto mismo. El mundo es
+    // cerrado: hasta la segunda vuelta de la revisión del #123 era al revés —se
+    // marcaba sólo una raíz compartida por su NOMBRE—, y una escritura cuya
+    // raíz era un literal, una llamada o un local (`({}).constructor.prototype.__t
+    // = token`) no se veía. Ver `REFLEXIVOS`.
+    const objetoEscrito = (objeto: ts.Node): string | null => {
+      const o = sinEnvoltorios(objeto);
+      const r = raizCompartida(o);
+      if (r === "marcado") return null;
+      if (r) return `${r.raiz.text}, ${r.que}`;
+      if (nacioAca(o)) return null;
+      return `${o.getText(sf).slice(0, 60)}, que no se sabe privado`;
+    };
+    // Lo que escribe una asignación sobre `destino`: si es una propiedad, el
+    // objeto que la tiene; si no, una variable (los patrones ya los abrió
+    // `destinos`), que es privada salvo que la vean otros por su nombre: un
+    // export, un global.
+    const destinoEscrito = (destino: ts.Node): string | null => {
+      const x = sinEnvoltorios(destino);
+      if (ts.isPropertyAccessExpression(x) || ts.isElementAccessExpression(x)) return objetoEscrito(x.expression);
+      const r = raizCompartida(x);
+      return r === null || r === "marcado" ? null : `${r.raiz.text}, ${r.que}`;
     };
     // Lo que una asignación escribe: el lado izquierdo, o cada destino de un
     // destructuring (`({ a: x.t } = y)`, `[x.t] = y`, con su valor por defecto).
@@ -907,8 +1064,32 @@ export function analizar(
       return [x];
     };
     const escribe = (destino: ts.Node, sitio: ts.Node) => {
-      const r = raizCompartida(destino);
-      if (r) lectura.tocaLoGlobal.push(`${donde(sitio)} escribe en ${r.raiz.text}, ${r.que}: ${sitio.getText(sf).slice(0, 80)}`);
+      const que = destinoEscrito(destino);
+      if (que) lectura.tocaLoGlobal.push(`${donde(sitio)} escribe en ${que}: ${sitio.getText(sf).slice(0, 80)}`);
+    };
+    // Lo que lleva de cualquier valor a lo que comparte todo el proceso. Ver
+    // `REFLEXIVOS`: por la cadena de prototipos, con un nombre escrito o con
+    // una clave que no se lee (que puede ser cualquiera de esos nombres).
+    const navega = (sitio: ts.Node, clave: string) =>
+      lectura.tocaLoGlobal.push(
+        `${donde(sitio)} ${clave}: la cadena de prototipos, que comparte todo el proceso: ${sitio.getText(sf).slice(0, 80)}`
+      );
+    const claveQueNoSeLee = (sitio: ts.Node) =>
+      lectura.tocaLoGlobal.push(
+        `${donde(sitio)} una clave que no está escrita, que puede ser constructor, prototype o __proto__: ${sitio.getText(sf).slice(0, 80)}`
+      );
+    const porClave = (sitio: ts.Node, claves: string[] | null) => {
+      if (claves === null) claveQueNoSeLee(sitio);
+      else for (const c of claves) if (REFLEXIVOS.has(c)) navega(sitio, c);
+    };
+    // `Object` y `Reflect`, por miembro. Ver `GLOBALES_POR_MIEMBRO`.
+    const comoGlobal = (nodo: ts.Identifier): string[] => {
+      if (!GLOBALES_POR_MIEMBRO.has(nodo.text)) return [nodo.text];
+      const e = envueltoHasta(nodo);
+      const p = e.parent;
+      if (ts.isPropertyAccessExpression(p) && p.expression === e) return [`${nodo.text}.${p.name.text}`];
+      const claves = ts.isElementAccessExpression(p) && p.expression === e ? clavesDe(checker, p.argumentExpression) : null;
+      return claves === null ? [nodo.text] : claves.map((c) => `${nodo.text}.${c}`);
     };
 
     const leerClaves = (nodoClave: ts.Node, sitio: ts.Node) => {
@@ -1310,8 +1491,9 @@ export function analizar(
               `${donde(nodo)} ${nodo.text}, un valor global que declara ${rel(ajeno.getSourceFile().fileName)}`
             );
           }
-          // O uno que sí declaran. Ver `globalDelRuntime`.
-          if (globalDelRuntime(s)) lectura.globales.add(nodo.text);
+          // O uno que sí declaran. Ver `globalDelRuntime`; `Object` y `Reflect`,
+          // por miembro (`comoGlobal`).
+          if (globalDelRuntime(s)) for (const g of comoGlobal(nodo)) lectura.globales.add(g);
         }
       }
       // Un acceso por elemento sobre un namespace que no se nombró arriba (el de
@@ -1347,11 +1529,21 @@ export function analizar(
       }
       if (ts.isCallExpression(nodo) && nodo.arguments.length > 0) {
         const primero = nodo.arguments[0];
-        const r = ts.isSpreadElement(primero) ? null : raizCompartida(primero);
-        if ((r || ts.isSpreadElement(primero)) && escribeElPrimero(checker.getResolvedSignature(nodo)?.getDeclaration())) {
-          const a = r ? `${r.raiz.text}, ${r.que}` : "lo que trae un spread, que no se lee";
+        const a = ts.isSpreadElement(primero) ? "lo que trae un spread, que no se lee" : objetoEscrito(primero);
+        if (a && escribeElPrimero(checker.getResolvedSignature(nodo)?.getDeclaration())) {
           lectura.tocaLoGlobal.push(`${donde(nodo)} le escribe propiedades a ${a}: ${nodo.getText(sf).slice(0, 80)}`);
         }
+      }
+      // La cadena de prototipos (ver `REFLEXIVOS`): por un nombre escrito —en
+      // un acceso, en una clave escrita, en un destructuring— o por una clave
+      // que no se lee, que puede ser cualquiera de esos nombres.
+      if (ts.isPropertyAccessExpression(nodo) && REFLEXIVOS.has(nodo.name.text)) navega(nodo, nodo.name.text);
+      if (ts.isElementAccessExpression(nodo)) porClave(nodo, clavesDe(checker, nodo.argumentExpression));
+      if (ts.isObjectBindingPattern(nodo)) {
+        for (const e of nodo.elements) if (!e.dotDotDotToken) porClave(nodo, claveDeElemento(e));
+      }
+      if (esPatronDeAsignacion(nodo) && ts.isObjectLiteralExpression(nodo)) {
+        for (const p of nodo.properties) if (!ts.isSpreadAssignment(p)) porClave(nodo, claveDePropiedad(p));
       }
       // El entorno, `process` y el objeto global. Ver `fuenteDe`: por símbolo,
       // no por expresión.

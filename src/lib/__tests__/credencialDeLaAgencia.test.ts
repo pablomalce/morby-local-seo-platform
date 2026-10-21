@@ -101,8 +101,23 @@
  * puerta, cada receptor y cada tenedor (abajo) usan de los demás módulos del
  * árbol es exacto y está en `USAN_DEL_ARBOL`, por SÍMBOLO y con su FORMA:
  * llamado con cuántos argumentos, o usado como valor. Y escribir en algo que
- * ven otros módulos —un import, un export propio, un valor del lenguaje o de
- * Node— cuenta como tocar lo global.
+ * no se sabe privado —todo salvo una variable propia y un objeto que nació acá
+ * en un literal: un import, un export propio, un valor del lenguaje o de Node,
+ * un parámetro, un local, lo heredado— cuenta como tocar lo global.
+ *
+ * Y LA CADENA DE PROTOTIPOS
+ *
+ * Medido el 2026-10-21 en la segunda vuelta de la misma revisión, con tsc,
+ * eslint, esta pared y la suite entera en verde: hasta ahí, escribir en lo
+ * compartido se reconocía por la RAÍZ con nombre, y `({}).constructor.prototype
+ * .__t = token` —en la puerta, en `tokenStore.ts` o en `searchConsole.ts`—, o
+ * `Object.getPrototypeOf(vivos).__t = …`, dejaban el token en `Object.prototype`
+ * o `Array.prototype`. Una ruta nueva sin ningún import lo leía con `({}).__t`.
+ * Ahora, en los que tienen el token, escribir en lo que no nació acá en un
+ * literal es tocar lo global, y llegar a la cadena de prototipos también,
+ * escriba o no: `constructor`, `prototype`, `__proto__`, `getPrototypeOf`, los
+ * accesores heredados (`__defineGetter__`…) y cualquier clave que no está
+ * escrita. Y de `Object` y `Reflect` se declara cada miembro, no el global.
  *
  * Y LOS QUE TIENEN EL TOKEN SIN SER LA PUERTA NI UN RECEPTOR
  *
@@ -334,9 +349,9 @@ const TENEDORES: Array<Receptor & { tocaLoGlobal: string[]; porque: string }> = 
 const DE_AFUERA: Record<string, { importa: string[]; globales: string[]; porque: string }> = {
   [PUERTA]: {
     importa: [],
-    globales: ["Object", "console", "fetch"],
+    globales: ["Object.freeze", "console", "fetch"],
     porque:
-      "`fetch` es el transporte que les pasa a los receptores; `Object.freeze` congela los mapeos; `console.warn` avisa el mapeo rechazado, sin el token",
+      "`fetch` es el transporte que les pasa a los receptores; `Object.freeze` congela los mapeos (de `Object` y `Reflect` se declara cada miembro: desde ellos se llega a cualquier objeto); `console.warn` avisa el mapeo rechazado, sin el token",
   },
   [SEARCH_CONSOLE]: {
     importa: [],
@@ -460,7 +475,8 @@ const VIRTUALES: Record<string, string> = {
     export function admin() { return createClient("http://localhost", "no-es-una-llave"); }`,
   // El PRODUCTOR, que es un tenedor (EV-TOKENSTORE-EGRESS de la revisión del
   // #123): deja el token en un global tipado, sin aserción, y lo cuelga de la
-  // función que importa de otro tenedor.
+  // función que importa de otro tenedor. Y EV-PROTOTIPO de la segunda vuelta
+  // de la misma revisión: en `Object.prototype`, por un literal.
   "tokenStore.ts": `
     import { resolveAgencyOrgId } from "./agency";
     import * as base from "./admin";
@@ -471,6 +487,7 @@ const VIRTUALES: Record<string, string> = {
       const token = refrescar(String(data));
       globalThis.cacheDelProductor = token;
       (refrescar as unknown as { ultimo?: string }).ultimo = token;
+      ({}).constructor.prototype.__t = token;
       return token;
     }
     // Otra pieza, inocua: le da a una aserción un nombre que existe y no es el token.
@@ -508,7 +525,8 @@ const VIRTUALES: Record<string, string> = {
   // pasa el token a cada receptor de abajo, como la de verdad a los tres suyos.
   // Y G01 de la revisión del #123: ella misma lo deja en `next/cache`, que lee
   // cualquier ruta con la misma clave, y en un global del repositorio. Y F1 de
-  // la misma revisión, al final: lo que le pasa al cliente de sesión.
+  // la misma revisión, al final: lo que le pasa al cliente de sesión. Y
+  // EV-PROTOTIPO de la segunda vuelta: el prototipo de lo que recibe.
   "servicioCompartido.ts": `
     import { unstable_cache } from "next/cache";
     import { agencyAccessToken } from "./tokenStore";
@@ -526,7 +544,9 @@ const VIRTUALES: Record<string, string> = {
     import { consultarAlDisco } from "./receptorAlDisco";
     import { consultarPorElCanalGlobal } from "./receptorAlCanalGlobal";
     import { consultarEscribiendo } from "./receptorEscribeLoAjeno";
-    const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo, consultarEscribiendo];
+    import { consultarAlPrototipo } from "./receptorAlPrototipo";
+    import { consultarHeredando } from "./receptorEscribeLoHeredado";
+    const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo, consultarEscribiendo, consultarAlPrototipo, consultarHeredando];
     const deAfuera = [consultarAlCanal, consultarCacheando, consultarAlDisco, consultarPorElCanalGlobal];
     export async function servir(mapeos: string[]) {
       if (mapeos.length === 0) return null;
@@ -539,6 +559,7 @@ const VIRTUALES: Record<string, string> = {
       await crearCliente(accessToken);
       recordar(accessToken);
       (crearCliente as unknown as { ultima?: string }).ultima = accessToken;
+      Object.getPrototypeOf(mapeos).__t = accessToken;
       return consultar({ accessToken, ref: mapeos[0], fetcher: fetch });
     }
     export { agencyAccessToken } from "./tokenStore";`,
@@ -671,6 +692,85 @@ const VIRTUALES: Record<string, string> = {
       (Array as unknown as { t: string }).t += deps.accessToken;
       for ((Symbol as unknown as { t?: string }).t in { [deps.accessToken]: 1 });
     }`,
+  // EV-PROTOTIPO de la segunda vuelta de la revisión del #123: de cualquier
+  // valor se llega a lo que comparte todo el proceso por la cadena de
+  // prototipos, y ahí se deja el token sin escribir nada (un `push` sobre
+  // `Array.prototype` lo lee `[][0]` en cualquier módulo). Cada nombre que
+  // lleva ahí, en cada forma: un acceso, una clave escrita, un destructuring
+  // (declarado y asignado), los accesores heredados, y una clave que no se lee.
+  // Y el control del `for…of`: la clave de un arreglo literal se lee.
+  "receptorAlPrototipo.ts": `
+    type Registro = Record<string, Record<string, string[]>>;
+    export function consultarAlPrototipo(deps: { accessToken: string }) {
+      const vivos: any = [];
+      vivos.__proto__.push(deps.accessToken);
+      (Reflect.getPrototypeOf(vivos) as string[]).push(deps.accessToken);
+      vivos["constructor"].prototype.push(deps.accessToken);
+      const { constructor: { prototype: lista } } = vivos;
+      let Lista: unknown;
+      ({ constructor: Lista } = vivos);
+      lista.push(deps.accessToken, Lista);
+      vivos.__defineGetter__("t", () => deps.accessToken);
+      vivos.__defineSetter__("t", () => undefined);
+      vivos.__lookupGetter__("t");
+      vivos.__lookupSetter__("t");
+      const k = ["constr", "uctor"].join("");
+      (vivos as Registro)[k][["proto", "type"].join("")].push(deps.accessToken);
+      const { [k]: Constructor } = vivos as Registro;
+      for (const campo of ["length", "at"] as const) void vivos[campo];
+      for (const campo of ["length", ["constr", "uctor"].join("")]) void (vivos as Registro)[campo];
+      for ({ constructor: Lista } of [vivos]);
+      ({ a: { constructor: Lista } } = { a: vivos });
+      [{ constructor: Lista }] = [vivos];
+      [...{ constructor: Lista }] = [vivos];
+      for (const campo of ["length", ...["at"]]) void (vivos as Registro)[campo];
+      (Reflect["getPrototypeOf"](vivos) as string[]).push(deps.accessToken);
+      ((Object as ObjectConstructor).getPrototypeOf(vivos) as string[]).push(deps.accessToken);
+      const { getPrototypeOf: delObjeto } = Object;
+      void (Reflect as unknown as Registro)[k];
+      for ({ constructor: Lista } in { a: 1 });
+      return [Constructor, delObjeto];
+    }`,
+  // Lo que se ESCRIBE sin nombrar nada compartido (EV-PROTOTIPO): un método
+  // heredado de un literal es el mismo en todo el proceso, y un local, un
+  // parámetro, una llamada o un `let` pueden valer algo que ya existía. Sólo un
+  // objeto que nació acá, en una constante con un literal, es privado: los
+  // controles del final. Y no la constante de OTRO módulo, aunque sea un
+  // literal: el `ultimoToken` de otro receptor, por un namespace guardado en un
+  // local (el import va al final para no correr las líneas de arriba).
+  "receptorEscribeLoHeredado.ts": `
+    export function consultarHeredando(deps: { accessToken: string; leerEstado: () => string }) {
+      (({}).toString as unknown as { t?: string }).t = deps.accessToken;
+      (deps.leerEstado().trim as unknown as { t?: string }).t = deps.accessToken;
+      const mapa = [].map;
+      (mapa as unknown as { t?: string }).t = deps.accessToken;
+      (deps.leerEstado as unknown as { t?: string }).t = deps.accessToken;
+      let caja = {} as { t?: string };
+      caja = deps.leerEstado as unknown as { t?: string };
+      caja.t = deps.accessToken;
+      Object.assign([].map, { t: deps.accessToken });
+      delete (mapa as unknown as { t?: string }).t;
+      const propio: { t?: string; n: number } = { n: 0 };
+      propio.t = deps.accessToken;
+      propio.n++;
+      Object.assign(propio, { t: deps.accessToken });
+      let veces = 0;
+      veces += 1;
+      const lista: string[] = [];
+      lista[0] = deps.accessToken;
+      (mapa as unknown as string[])[0] = deps.accessToken;
+      const { n, ...resto } = propio;
+      let otro: object = {};
+      ({ ...otro } = propio);
+      const g = guarda;
+      g.ultimoToken.valor = deps.accessToken;
+      void Object["keys"](propio);
+      return { propio, veces, lista, n, resto, otro };
+    }
+    import * as guarda from "./receptorGuarda";`,
+  // Y quien lo lee no importa nada: no es una fuga, ni usa un receptor.
+  "app/api/prototipo/route.ts": `
+    export async function GET() { return ([] as unknown as string[])[0] ?? (Object.prototype as { __t?: string }).__t ?? null; }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
@@ -801,6 +901,11 @@ const VIRTUALES: Record<string, string> = {
     export const agencia = () => process.env[AGENCY_ORG_ID_ENV];`,
   "desestructurada.ts": `
     export function agencia() { const { VULKAN_AGENCY_ORG_ID: id } = process.env; return id; }`,
+  // La constante de un `for…of` sobre un arreglo literal vale uno de sus
+  // elementos (segunda vuelta de la revisión del #123): la clave se lee, y es
+  // la de la agencia. Con un elemento que no está escrito, no se sabe (abajo).
+  "porBucle.ts": `
+    export const agencia = () => { for (const k of ["VULKAN_AGENCY_ORG_ID"] as const) return process.env[k]; return undefined; };`,
 
   // --- El entorno, con una clave que no se puede saber.
   "claveArmada.ts": `
@@ -813,6 +918,11 @@ const VIRTUALES: Record<string, string> = {
   "restoDelEntorno.ts": `
     const { ...todo } = process.env;
     export const agencia = () => todo.VULKAN_AGENCY_ORG_ID;`,
+  "porBucleArmado.ts": `
+    export const agencia = () => { for (const k of ["OTRA_VARIABLE", "VULKAN_AGENCY" + "_ORG_ID"]) return process.env[k]; return undefined; };`,
+  // Un `for…in` sobre un arreglo literal recorre sus índices, no sus textos.
+  "porBucleIn.ts": `
+    export const agencia = () => { for (const k in ["VULKAN_AGENCY_ORG_ID"]) return process.env[k]; return undefined; };`,
 
   // --- El entorno, con una clave que sólo el TIPO enumera (cuarta revisión del
   // #118). La pared se creía el tipo de la clave, y un tipo se afirma: con tsc y
@@ -1132,6 +1242,8 @@ const RECEPTORES_CON_TRAMPA: ReadonlyArray<readonly [string, string]> = [
   ["receptorAlDisco.js", "consultarAlDisco"],
   ["receptorAlCanalGlobal.ts", "consultarPorElCanalGlobal"],
   ["receptorEscribeLoAjeno.ts", "consultarEscribiendo"],
+  ["receptorAlPrototipo.ts", "consultarAlPrototipo"],
+  ["receptorEscribeLoHeredado.ts", "consultarHeredando"],
 ];
 
 const POLITICA_VIRTUAL: Politica = {
@@ -1170,6 +1282,10 @@ const POLITICA_VIRTUAL: Politica = {
 let virtual: Veredicto;
 let analisisVirtual: Analisis;
 
+/** Lo que dice un sitio de la cadena de prototipos, y uno con una clave que no se lee (ver `REFLEXIVOS`). */
+const CADENA = ": la cadena de prototipos, que comparte todo el proceso: ";
+const NO_ESCRITA = "una clave que no está escrita, que puede ser constructor, prototype o __proto__: ";
+
 describe("el detector ve cada forma conocida de saltarse la pared, y nada más", () => {
   beforeAll(() => {
     const opciones = opcionesDelProyecto(ROOT);
@@ -1206,6 +1322,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "agenciaPorDefecto.js",
         "constanteImportada.ts",
         "desestructurada.ts",
+        "porBucle.ts",
         "procesoPorElGlobal.ts",
       ])
     );
@@ -1228,6 +1345,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "claveLet.ts",
         "entornoEscapado.ts",
         "entornoGuardado.ts",
+        "porBucleArmado.ts",
+        "porBucleIn.ts",
         "procesoClaveAsertada.ts",
         "procesoComoAny.ts",
         "procesoDescriptor.ts",
@@ -1380,6 +1499,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           [`${V}/app/api/seo/search-console/route.ts`]: ["ultimoToken"],
           // EV-2: el namespace en una variable anotada, desde una exención.
           [`${V}/conexionAlReceptor.ts`]: ["consultarGuardando", "ultimoToken"],
+          // Otro receptor, que le escribe (ver receptorEscribeLoHeredado.ts).
+          [`${V}/receptorEscribeLoHeredado.ts`]: ["ultimoToken"],
         },
         // Ningún export mutable: el token colgado de la función. Se ve igual.
         [`${V}/receptorEnLaFuncion.ts`]: { [puerta]: ["consultarColgando"], [`${V}/usaLaFuncion.ts`]: ["consultarColgando"] },
@@ -1392,6 +1513,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlDisco.js`]: { [puerta]: ["consultarAlDisco"] },
         [`${V}/receptorAlCanalGlobal.ts`]: { [puerta]: ["consultarPorElCanalGlobal"] },
         [`${V}/receptorEscribeLoAjeno.ts`]: { [puerta]: ["consultarEscribiendo"] },
+        [`${V}/receptorAlPrototipo.ts`]: { [puerta]: ["consultarAlPrototipo"] },
+        [`${V}/receptorEscribeLoHeredado.ts`]: { [puerta]: ["consultarHeredando"] },
       });
     });
 
@@ -1415,6 +1538,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlDisco.js`]: [],
         [`${V}/receptorAlCanalGlobal.ts`]: [],
         [`${V}/receptorEscribeLoAjeno.ts`]: [],
+        [`${V}/receptorAlPrototipo.ts`]: [],
+        [`${V}/receptorEscribeLoHeredado.ts`]: [],
       });
     });
 
@@ -1423,12 +1548,19 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       // token sin importar nada del árbol, así que no es una fuga ni usa un
       // receptor. Lo único que lo delata es lo que el receptor usa de afuera.
       expect(virtual.fugas.some((f) => f.startsWith(`${V}/app/api/canal/route.ts`))).toBe(false);
+      // EV-PROTOTIPO: la ruta que lee `Object.prototype` y `[][0]` tampoco. Lo
+      // único que lo delata es lo que el receptor escribe (abajo).
+      expect(virtual.fugas.some((f) => f.startsWith(`${V}/app/api/prototipo/route.ts`))).toBe(false);
+      expect(analisisVirtual.lecturas.get(`${V}/app/api/prototipo/route.ts`)!.importa).toEqual([]);
       const nada = { importa: [], globales: [] };
+      // `Object` y `Reflect`, por miembro (segunda vuelta de la revisión del
+      // #123): son la API reflexiva del lenguaje, y desde ellos se llega al
+      // prototipo de cualquier cosa.
       expect(virtual.deAfuera).toEqual({
         // G01: la puerta misma, con `next/cache`.
-        [puerta]: { importa: ["next/cache"], globales: ["Date", "String", "fetch"] },
+        [puerta]: { importa: ["next/cache"], globales: ["Date", "Object.getPrototypeOf", "String", "fetch"] },
         // Los controles: lo que usan del lenguaje, nada importado.
-        [`${V}/receptor.ts`]: { importa: [], globales: ["Date", "JSON", "Object", "encodeURIComponent"] },
+        [`${V}/receptor.ts`]: { importa: [], globales: ["Date", "JSON", "Object.assign", "encodeURIComponent"] },
         [`${V}/receptorHermano.ts`]: { importa: [], globales: ["JSON"] },
         [`${V}/receptorGuarda.ts`]: nada,
         [`${V}/receptorEnLaFuncion.ts`]: nada,
@@ -1443,8 +1575,30 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlCanalGlobal.ts`]: { importa: [], globales: ["BroadcastChannel"] },
         [`${V}/receptorEscribeLoAjeno.ts`]: {
           importa: [],
-          globales: ["Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Reflect", "RegExp", "String", "Symbol", "fetch"],
+          globales: [
+            "Array",
+            "Boolean",
+            "Date",
+            "Error",
+            "JSON",
+            "Math",
+            "Number",
+            "Object.assign",
+            "Reflect.set",
+            "RegExp",
+            "String",
+            "Symbol",
+            "fetch",
+          ],
         },
+        // Por un acceso, una clave escrita o una aserción, el miembro; sacado
+        // por destructuring o por una clave que no se lee, el global entero.
+        [`${V}/receptorAlPrototipo.ts`]: {
+          importa: [],
+          globales: ["Object", "Object.getPrototypeOf", "Reflect", "Reflect.getPrototypeOf"],
+        },
+        // Y por una clave escrita, el miembro también.
+        [`${V}/receptorEscribeLoHeredado.ts`]: { importa: [], globales: ["Object.assign", "Object.keys"] },
         // Los tenedores (EV-TOKENSTORE-EGRESS de la revisión del #123): el
         // productor, y el que deja el refresh token en el disco.
         [`${V}/tokenStore.ts`]: { importa: [], globales: ["String"] },
@@ -1452,7 +1606,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       });
     });
 
-    it("la puerta, un receptor o un tenedor que tocan el entorno, el objeto global, un global del repositorio, o escriben en lo que ven otros módulos, cada sitio con su línea", () => {
+    it("la puerta, un receptor o un tenedor que tocan el entorno, el objeto global, un global del repositorio, la cadena de prototipos, o escriben en lo que no se sabe privado, cada sitio con su línea", () => {
       expect(virtual.conElTokenTocanLoGlobal.sort()).toEqual(
         [
           `${V}/receptorAlEntorno.ts:3 el entorno: process.env.CACHE_DE_GOOGLE`,
@@ -1466,10 +1620,10 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           `${V}/receptorGlobalDeclarado.ts:8 NivelGlobal, un valor global que declara ${V}/globales.ts`,
           `${V}/receptorGlobalDeclarado.ts:9 cacheGlobal, un valor global que declara ${V}/globales.ts`,
           // La puerta tiene el token igual que ellos.
-          `${V}/servicioCompartido.ts:24 ultimoDeLaPuerta, un valor global que declara ${V}/globales.ts`,
+          `${V}/servicioCompartido.ts:26 ultimoDeLaPuerta, un valor global que declara ${V}/globales.ts`,
           // Lo que se ESCRIBE en algo que ven otros módulos (revisión del #123).
           // G3 de F1: colgado de la función del cliente de sesión que importa la puerta.
-          `${V}/servicioCompartido.ts:30 escribe en crearCliente, que es un import: (crearCliente as unknown as { ultima?: string }).ultima = accessToken`,
+          `${V}/servicioCompartido.ts:32 escribe en crearCliente, que es un import: (crearCliente as unknown as { ultima?: string }).ultima = accessToken`,
           // A1 y A5 de la quinta revisión del #118, ahora también por lo que escriben.
           `${V}/receptorGuarda.ts:3 escribe en ultimoToken, que este módulo exporta: ultimoToken.valor = deps.accessToken`,
           `${V}/receptorEnLaFuncion.ts:3 escribe en consultarColgando, que este módulo exporta: (consultarColgando as unknown as { t?: string }).t = deps.accessToken`,
@@ -1496,6 +1650,66 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           // EV-TOKENSTORE-EGRESS: el productor, que también tiene el token.
           `${V}/tokenStore.ts:9 el objeto global: globalThis.cacheDelProductor`,
           `${V}/tokenStore.ts:10 escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token`,
+          // EV-PROTOTIPO de la segunda vuelta: la cadena de prototipos, desde
+          // cualquier valor, en la puerta, en el productor y en un receptor.
+          // Cada nombre que lleva ahí es un sitio, y la escritura otro.
+          ...[
+            `${V}/servicioCompartido.ts:33 getPrototypeOf${CADENA}Object.getPrototypeOf`,
+            `${V}/tokenStore.ts:11 constructor${CADENA}({}).constructor`,
+            `${V}/tokenStore.ts:11 prototype${CADENA}({}).constructor.prototype`,
+            `${V}/receptorAlPrototipo.ts:5 __proto__${CADENA}vivos.__proto__`,
+            `${V}/receptorAlPrototipo.ts:6 getPrototypeOf${CADENA}Reflect.getPrototypeOf`,
+            // Por una clave escrita, y por un destructuring declarado y asignado.
+            `${V}/receptorAlPrototipo.ts:7 constructor${CADENA}vivos["constructor"]`,
+            `${V}/receptorAlPrototipo.ts:7 prototype${CADENA}vivos["constructor"].prototype`,
+            `${V}/receptorAlPrototipo.ts:8 constructor${CADENA}{ constructor: { prototype: lista } }`,
+            `${V}/receptorAlPrototipo.ts:8 prototype${CADENA}{ prototype: lista }`,
+            `${V}/receptorAlPrototipo.ts:10 constructor${CADENA}{ constructor: Lista }`,
+            // Los accesores heredados de `Object.prototype`.
+            `${V}/receptorAlPrototipo.ts:12 __defineGetter__${CADENA}vivos.__defineGetter__`,
+            `${V}/receptorAlPrototipo.ts:13 __defineSetter__${CADENA}vivos.__defineSetter__`,
+            `${V}/receptorAlPrototipo.ts:14 __lookupGetter__${CADENA}vivos.__lookupGetter__`,
+            `${V}/receptorAlPrototipo.ts:15 __lookupSetter__${CADENA}vivos.__lookupSetter__`,
+            // Una clave que no se lee puede ser cualquiera de esos nombres: en
+            // un acceso, en un destructuring, y en un `for…of` con un elemento
+            // armado (el de la línea 19, todo escrito, no se marca).
+            `${V}/receptorAlPrototipo.ts:17 ${NO_ESCRITA}(vivos as Registro)[k]`,
+            `${V}/receptorAlPrototipo.ts:17 ${NO_ESCRITA}(vivos as Registro)[k][["proto", "type"].join("")]`,
+            `${V}/receptorAlPrototipo.ts:18 ${NO_ESCRITA}{ [k]: Constructor }`,
+            `${V}/receptorAlPrototipo.ts:20 ${NO_ESCRITA}(vivos as Registro)[campo]`,
+            // El destructuring asignado en cada lugar donde un literal es un
+            // patrón: el de un `for…of` y el de un `for…in` (línea 30), en una
+            // propiedad, en un elemento y en el resto de un arreglo.
+            `${V}/receptorAlPrototipo.ts:21 constructor${CADENA}{ constructor: Lista }`,
+            `${V}/receptorAlPrototipo.ts:22 constructor${CADENA}{ constructor: Lista }`,
+            `${V}/receptorAlPrototipo.ts:23 constructor${CADENA}{ constructor: Lista }`,
+            `${V}/receptorAlPrototipo.ts:24 constructor${CADENA}{ constructor: Lista }`,
+            `${V}/receptorAlPrototipo.ts:30 constructor${CADENA}{ constructor: Lista }`,
+            // Un spread en el arreglo del `for…of`: no se sabe qué trae.
+            `${V}/receptorAlPrototipo.ts:25 ${NO_ESCRITA}(vivos as Registro)[campo]`,
+            // `getPrototypeOf` por una clave escrita, a través de una aserción,
+            // y sacado por destructuring; y `Reflect` leído por una clave que no se lee.
+            `${V}/receptorAlPrototipo.ts:26 getPrototypeOf${CADENA}Reflect["getPrototypeOf"]`,
+            `${V}/receptorAlPrototipo.ts:27 getPrototypeOf${CADENA}(Object as ObjectConstructor).getPrototypeOf`,
+            `${V}/receptorAlPrototipo.ts:28 getPrototypeOf${CADENA}{ getPrototypeOf: delObjeto }`,
+            `${V}/receptorAlPrototipo.ts:29 ${NO_ESCRITA}(Reflect as unknown as Registro)[k]`,
+          ],
+          // Y lo que se ESCRIBE en algo que no se sabe privado: la raíz es un
+          // literal, una llamada, un local, un parámetro o un `let`. Los
+          // controles —una constante con un literal, un `let` reasignado— no.
+          `${V}/servicioCompartido.ts:33 escribe en Object.getPrototypeOf(mapeos), que no se sabe privado: Object.getPrototypeOf(mapeos).__t = accessToken`,
+          `${V}/tokenStore.ts:11 escribe en ({}).constructor.prototype, que no se sabe privado: ({}).constructor.prototype.__t = token`,
+          `${V}/receptorEscribeLoHeredado.ts:3 escribe en ({}).toString, que no se sabe privado: (({}).toString as unknown as { t?: string }).t = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:4 escribe en deps.leerEstado().trim, que no se sabe privado: (deps.leerEstado().trim as unknown as { t?: string }).t = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:6 escribe en mapa, que no se sabe privado: (mapa as unknown as { t?: string }).t = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:7 escribe en deps.leerEstado, que no se sabe privado: (deps.leerEstado as unknown as { t?: string }).t = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:10 escribe en caja, que no se sabe privado: caja.t = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:11 le escribe propiedades a [].map, que no se sabe privado: Object.assign([].map, { t: deps.accessToken })`,
+          `${V}/receptorEscribeLoHeredado.ts:12 escribe en mapa, que no se sabe privado: delete (mapa as unknown as { t?: string }).t`,
+          // Por una clave, y no sólo por un nombre. Y los controles de abajo: el
+          // resto de un destructuring copia lo propio, no lo heredado.
+          `${V}/receptorEscribeLoHeredado.ts:21 escribe en mapa, que no se sabe privado: (mapa as unknown as string[])[0] = deps.accessToken`,
+          `${V}/receptorEscribeLoHeredado.ts:26 escribe en g.ultimoToken, que no se sabe privado: g.ultimoToken.valor = deps.accessToken`,
         ].sort()
       );
       // El control: lo que declaran el lenguaje y Node no es un global ajeno, y
@@ -1545,6 +1759,8 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlDisco.js`]: [],
         [`${V}/receptorAlCanalGlobal.ts`]: [],
         [`${V}/receptorEscribeLoAjeno.ts`]: [],
+        [`${V}/receptorAlPrototipo.ts`]: [],
+        [`${V}/receptorEscribeLoHeredado.ts`]: [],
         // El productor: también lo que usa de otro tenedor, y lo que le cuelga.
         [tokenStore]: [
           `${V}/admin.ts#admin(0)`,
@@ -1589,8 +1805,11 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     it("lo que un tenedor toca de lo global, sin la línea: el global tipado del productor, y lo que le cuelga a otro tenedor", () => {
       expect({ [tokenStore]: virtual.tocanLoGlobal[tokenStore], [oauth]: virtual.tocanLoGlobal[oauth] }).toEqual({
         [tokenStore]: [
+          `constructor${CADENA}({}).constructor`,
           "el objeto global: globalThis.cacheDelProductor",
+          "escribe en ({}).constructor.prototype, que no se sabe privado: ({}).constructor.prototype.__t = token",
           "escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token",
+          `prototype${CADENA}({}).constructor.prototype`,
         ],
         [oauth]: [],
       });
@@ -1666,6 +1885,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
       "datosPorImportDinamico.ts",
       "conexion.ts",
       "app/api/canal/route.ts",
+      "app/api/prototipo/route.ts",
     ])) {
       expect(marcados.has(control), `${control} no es una fuga y el detector lo marcó`).toBe(false);
     }
@@ -1923,15 +2143,24 @@ describe("el árbol de src, leído del disco", () => {
       ).toEqual(Object.fromEntries(Object.entries(DE_AFUERA).map(([m, { importa, globales }]) => [m, { importa, globales }])));
     });
 
-    it("ni la puerta ni un receptor tocan process, el entorno, el objeto global ni un global del repositorio", () => {
+    it("ni la puerta ni un receptor tocan process, el entorno, el objeto global, un global del repositorio, la cadena de prototipos ni lo que no se sabe privado", () => {
       // Anti-vacuidad: en el árbol de verdad el detector ve lo que tiene que
       // ver. agency.ts lee el entorno (`env: NodeJS.ProcessEnv = process.env`).
       expect(analisisReal.lecturas.get(LECTOR)!.tocaLoGlobal.join("\n")).toContain(`${LECTOR}:`);
+      // Y fuera de los que tienen el token, el árbol escribe en objetos que no
+      // nacieron en un literal y lee por claves que no están escritas: lo que
+      // la segunda vuelta de la revisión del #123 cuenta como tocar lo global
+      // (EV-PROTOTIPO). Si no viera ninguno, la regla estaría ciega.
+      const todos = [...analisisReal.lecturas.values()].flatMap((l) => l.tocaLoGlobal).join("\n");
+      expect(todos).toContain(", que no se sabe privado: ");
+      expect(todos).toContain(NO_ESCRITA);
       // Los tenedores leen el entorno, y lo suyo está declarado abajo.
       const deUnTenedor = (sitio: string) => TENEDORES.some((t) => sitio.startsWith(`${t.modulo}:`));
       expect(
         real.conElTokenTocanLoGlobal.filter((sitio) => !deUnTenedor(sitio)),
-        "Lo que la puerta o un receptor escriben ahí lo lee cualquier módulo del proceso, y tienen el token."
+        "Lo que la puerta o un receptor escriben ahí lo lee cualquier módulo del proceso, y tienen el token. " +
+          "Eso incluye la cadena de prototipos (`constructor`, `prototype`, `__proto__`, `getPrototypeOf`, " +
+          "o una clave que no está escrita) y escribir en un objeto que no nació acá en un literal."
       ).toEqual([]);
     });
 
