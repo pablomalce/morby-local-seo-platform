@@ -557,6 +557,48 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
   });
 
+  /**
+   * R7-F2-DESCARGA: un pedido de datos que vuelve con `Content-Disposition:
+   * attachment` no se le entrega a la página (ver `esDescarga`), así que lo
+   * que traía no está en el DOM. Si decide, NO LLEGÓ: `subrecurso-descarga`.
+   * Ningún test lo fijaba. Con `descarga` fuera de `esNoLlegada`, la revisión
+   * midió con el navegador doble `medido 1249/1249`: el contenido detrás del
+   * `fetch` no se vio, y había número (y el punto salía VERDE). Con la regla de
+   * RT-4: el mismo pedido desde un marco de OTRO sitio no decide.
+   */
+  it.each([
+    ["la página: decide", undefined, "pagina"],
+    ["un worker: decide", null, "worker"],
+    ["un marco del MISMO sitio: decide", "http://widgets.sitio.test/w", "mismo-sitio"],
+    ["un marco de OTRO sitio: no decide", "http://video.test/embed", null],
+  ] as const)("F2 — un fetch que vuelve como descarga (attachment), desde %s", async (_caso, marco, origen) => {
+    const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
+    const url = "http://sitio.test/api/contenido";
+    const { deps, bitacora, red, navegador } = armar(
+      {
+        "http://sitio.test/": { cuerpo: html },
+        [url]: { cuerpo: CONTENIDO, encabezados: { "content-disposition": 'attachment; filename="contenido.json"' } },
+      },
+      { enSegundoPlano: [{ url, tipo: "fetch", ...(marco === undefined ? {} : { marco }) }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    // El pedido salió y volvió: lo que lo frenó es la respuesta, no la política.
+    expect(red.pedidos.map((p) => p.url)).toContain(url);
+    expect(bitacora.bloqueados).toContainEqual({ url, motivo: "descarga" });
+    // Y no se entregó: el DOM no tiene lo que traía.
+    expect(navegador.registro.pedidos.find((p) => p.url === url)?.desenlace).toBe("abortado");
+    if (origen === null) {
+      expect(bitacora.noLlegaron).toEqual([]);
+      expect(render.estado).toBe("medido");
+      return;
+    }
+    expect(render).toEqual(falloPor("descarga", { tipo: "fetch", host: "sitio.test", ruta: "/api/contenido", origen }));
+    expect(bitacora.noLlegaron).toEqual([{ url, tipo: "fetch", motivo: "descarga", origen }]);
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe(
+      "no-medido"
+    );
+  });
+
   it("F2 — lo que NO cuenta: una imagen a una red privada (no escribe texto) y un nombre que NO EXISTE", async () => {
     const html = `<html><body>${MENU}<img src="http://10.1.2.3/foto.jpg"><script src="http://nadie.test/app.js"></script></body></html>`;
     const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html } });
