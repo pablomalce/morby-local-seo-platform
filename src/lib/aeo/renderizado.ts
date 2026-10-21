@@ -142,7 +142,13 @@
  *
  *   1. si al leer queda alguno de esos pedidos EN VUELO, se lo espera y se
  *      vuelve a leer, mientras quede presupuesto; si se acaba con algo en
- *      vuelo, `subrecurso-pendiente`;
+ *      vuelo, `subrecurso-pendiente`. En vuelo es desde que el pedido ENTRA
+ *      al interceptor, también mientras su examen espera al DNS (FV125-1):
+ *      MEDIDO por la revisión con Chrome 155 y el resolvedor de producción,
+ *      una sección que pedía su script al verse a un host con el DNS mudo
+ *      salía `medido 1249/1249`, VERDE 3 de 3, porque sólo se contaba desde
+ *      que pedía turno, y la lectura terminaba antes de que el DNS dijera que
+ *      no;
  *   2. si alguno no llegó, `subrecurso-<motivo>`, sin número: el punto queda
  *      «no medido», nunca verde.
  *
@@ -867,7 +873,10 @@ export interface Bitacora {
     motivo: MotivoDeNoLlegada;
     origen: OrigenDelPedido;
   }>;
-  /** Cuántos de esos pedidos están en camino ahora mismo: esperando turno o en el transporte. */
+  /**
+   * Cuántos de esos pedidos están en camino ahora mismo, desde que entraron al
+   * interceptor: esperando al DNS, esperando turno o en el transporte (FV125-1).
+   */
   enVuelo: number;
   /**
    * Los mismos pedidos en vuelo, en el orden en que salieron: si la lectura
@@ -1171,117 +1180,130 @@ export function crearInterceptor(
       await pedido.abortar();
     };
 
+    // EN VUELO DESDE QUE ENTRA, y no desde que pide turno (FV125-1): el
+    // examen espera al DNS, y con el resolvedor de producción (c-ares, 1,5 s
+    // × 2) un DNS que no contesta tarda segundos en decirlo. MEDIDO por la
+    // revisión con Chrome 155: una sección que pedía su script al verse, a un
+    // host con el DNS mudo, salía `medido 1249/1249` y VERDE 3 de 3 —la
+    // lectura terminaba con `enVuelo` en cero y `noLlegaron` vacío, y el
+    // `dns-sin-respuesta` se anotaba después—; con la AAAA muda y la A
+    // contestada, el contenido no llegaba a contarse. Sale en el `finally` de
+    // afuera, DESPUÉS de anotar su desenlace: entre una cosa y la otra nunca
+    // están los dos en cero.
+    const enCamino = { url: pedido.url, tipo: pedido.tipo, origen };
+    if (escribe) {
+      bitacora.enVuelo += 1;
+      bitacora.enCamino.add(enCamino);
+    }
     try {
-      let url: URL;
       try {
-        url = new URL(pedido.url);
-      } catch {
-        return await bloquear("esquema");
-      }
-
-      if (ESQUEMAS_LOCALES.has(url.protocol)) {
-        decidido = true;
-        return await pedido.continuar();
-      }
-      if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
-      const metodo = pedido.metodo.toUpperCase();
-      if (!METODOS.has(metodo)) return await bloquear("metodo");
-      if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || esReporte(pedido) || pestana.soloDocumento)) {
-        return await bloquear("sin-texto");
-      }
-      if (senal.aborted) return await bloquear("presupuesto");
-
-      // La pestaña sin JavaScript recibe lo MISMO que recibió la primera, sin
-      // volver a la red: el examen ya se hizo cuando se pidió.
-      const guardada = metodo === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
-      if (guardada) {
-        if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
-        await pedido.responder(guardada);
-        decidido = true;
-        return;
-      }
-
-      const examen = await examinar(url, senal);
-      if (!examen.ok) return await bloquear(examen.motivo);
-
-      // SEC-A2: el render no es un relé. Un tope de pedidos por presupuesto, y
-      // un `POST` a otro sitio que el documento CONFIRMADO de la pestaña
-      // (FV-1) sólo dentro de su propio tope y con un cuerpo acotado. Lo que
-      // pasa un tope es `presupuesto`: si el pedido decide, no llegó.
-      if (bolsa.pedidos >= opciones.maxPedidos) return await bloquear("presupuesto");
-      if (metodo === "POST" && !mismoSitio(url.hostname, urlDeRed(pedido.urlDeLaPagina)?.hostname ?? null)) {
-        const largo = Buffer.byteLength(pedido.cuerpo ?? "");
-        if (bolsa.postsAjenos >= opciones.maxPostsAjenos || largo > opciones.maxCuerpoAjeno) {
-          return await bloquear("presupuesto");
-        }
-        bolsa.postsAjenos += 1;
-      }
-      bolsa.pedidos += 1;
-
-      const encabezados: Record<string, string> = {};
-      for (const [nombre, valor] of Object.entries(pedido.encabezados)) {
-        if (!DEL_SALTO.has(nombre.toLowerCase())) encabezados[nombre.toLowerCase()] = valor;
-      }
-
-      // En vuelo desde que pide turno hasta que el navegador lo tiene (o se
-      // aborta): la lectura no se da por buena mientras un pedido que decide
-      // siga en camino, tampoco si está esperando turno.
-      const enCamino = { url: pedido.url, tipo: pedido.tipo, origen };
-      if (escribe) {
-        bitacora.enVuelo += 1;
-        bitacora.enCamino.add(enCamino);
-      }
-      let turno = false;
-      try {
-        turno = await tomarTurno(bolsa);
-        if (!turno) return await bloquear("presupuesto");
-        // El plazo y los bytes, recién con el turno: esperarlo gasta tiempo, y
-        // mientras tanto otros pedidos gastaron bytes.
-        const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
-        const quedan = bolsa.tope - bolsa.usados;
-        if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
-
-        bitacora.pedidos.push({ url: pedido.url, ip: examen.ip });
-        let respuesta: RespuestaHttp;
+        let url: URL;
         try {
-          respuesta = await deps.transporte({
-            url: url.toString(),
-            ip: examen.ip,
-            ...(examen.alternativas ? { alternativas: examen.alternativas } : {}),
-            metodo,
-            encabezados,
-            cuerpo: pedido.cuerpo,
-            timeoutMs: plazo,
-            maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
-            presupuesto: tomar,
-          });
+          url = new URL(pedido.url);
         } catch {
-          // Un transporte que RECHAZA no trajo nada: es «sin respuesta», con
-          // su lugar en `noLlegaron`, y no una excepción que el `catch` de
-          // abajo sólo aborta. MEDIDO (PU-3): el `TypeError` de un connect
-          // IPv6 sin ruta dejaba fuera de RT-1 al bundle, y el render salía
-          // `medido` y VERDE.
-          respuesta = { tipo: "error", motivo: "sin-respuesta" };
+          return await bloquear("esquema");
         }
-        await entregar(respuesta, url.toString());
-      } finally {
-        if (turno) soltarTurno(bolsa);
-        if (escribe) {
-          bitacora.enVuelo -= 1;
-          bitacora.enCamino.delete(enCamino);
+
+        if (ESQUEMAS_LOCALES.has(url.protocol)) {
+          decidido = true;
+          return await pedido.continuar();
         }
+        if (!ESQUEMAS_DE_RED.has(url.protocol)) return await bloquear("esquema");
+        const metodo = pedido.metodo.toUpperCase();
+        if (!METODOS.has(metodo)) return await bloquear("metodo");
+        if (!pedido.esDocumentoPrincipal && (SIN_TEXTO.has(pedido.tipo) || esReporte(pedido) || pestana.soloDocumento)) {
+          return await bloquear("sin-texto");
+        }
+        if (senal.aborted) return await bloquear("presupuesto");
+
+        // La pestaña sin JavaScript recibe lo MISMO que recibió la primera, sin
+        // volver a la red: el examen ya se hizo cuando se pidió.
+        const guardada = metodo === "GET" ? pestana.servirDesde?.get(url.toString()) : undefined;
+        if (guardada) {
+          if (pedido.esDocumentoPrincipal) bitacora.statusDocumento = guardada.status;
+          await pedido.responder(guardada);
+          decidido = true;
+          return;
+        }
+
+        const examen = await examinar(url, senal);
+        if (!examen.ok) return await bloquear(examen.motivo);
+
+        // SEC-A2: el render no es un relé. Un tope de pedidos por presupuesto, y
+        // un `POST` a otro sitio que el documento CONFIRMADO de la pestaña
+        // (FV-1) sólo dentro de su propio tope y con un cuerpo acotado. Lo que
+        // pasa un tope es `presupuesto`: si el pedido decide, no llegó.
+        if (bolsa.pedidos >= opciones.maxPedidos) return await bloquear("presupuesto");
+        if (metodo === "POST" && !mismoSitio(url.hostname, urlDeRed(pedido.urlDeLaPagina)?.hostname ?? null)) {
+          const largo = Buffer.byteLength(pedido.cuerpo ?? "");
+          if (bolsa.postsAjenos >= opciones.maxPostsAjenos || largo > opciones.maxCuerpoAjeno) {
+            return await bloquear("presupuesto");
+          }
+          bolsa.postsAjenos += 1;
+        }
+        bolsa.pedidos += 1;
+
+        const encabezados: Record<string, string> = {};
+        for (const [nombre, valor] of Object.entries(pedido.encabezados)) {
+          if (!DEL_SALTO.has(nombre.toLowerCase())) encabezados[nombre.toLowerCase()] = valor;
+        }
+
+        // Esperando turno también está en vuelo (ya lo está desde que entró):
+        // la lectura no se da por buena mientras un pedido que decide siga en
+        // camino.
+        let turno = false;
+        try {
+          turno = await tomarTurno(bolsa);
+          if (!turno) return await bloquear("presupuesto");
+          // El plazo y los bytes, recién con el turno: esperarlo gasta tiempo, y
+          // mientras tanto otros pedidos gastaron bytes.
+          const plazo = Math.min(opciones.plazoPorPedidoMs, restanteMs());
+          const quedan = bolsa.tope - bolsa.usados;
+          if (plazo <= 0 || quedan <= 0) return await bloquear("presupuesto");
+
+          bitacora.pedidos.push({ url: pedido.url, ip: examen.ip });
+          let respuesta: RespuestaHttp;
+          try {
+            respuesta = await deps.transporte({
+              url: url.toString(),
+              ip: examen.ip,
+              ...(examen.alternativas ? { alternativas: examen.alternativas } : {}),
+              metodo,
+              encabezados,
+              cuerpo: pedido.cuerpo,
+              timeoutMs: plazo,
+              maxBytes: Math.min(opciones.maxBytesPorRespuesta, quedan),
+              presupuesto: tomar,
+            });
+          } catch {
+            // Un transporte que RECHAZA no trajo nada: es «sin respuesta», con
+            // su lugar en `noLlegaron`, y no una excepción que el `catch` de
+            // abajo sólo aborta. MEDIDO (PU-3): el `TypeError` de un connect
+            // IPv6 sin ruta dejaba fuera de RT-1 al bundle, y el render salía
+            // `medido` y VERDE.
+            respuesta = { tipo: "error", motivo: "sin-respuesta" };
+          }
+          await entregar(respuesta, url.toString());
+        } finally {
+          if (turno) soltarTurno(bolsa);
+        }
+      } catch {
+        // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
+        // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
+        //
+        // Y si escribe texto y no tenía desenlace —tiró el examen, o el
+        // navegador no aceptó la respuesta (`responder` tira con un encabezado
+        // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
+        if (!decidido && escribe) {
+          bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta", origen });
+        }
+        await pedido.abortar().catch(() => {});
       }
-    } catch {
-      // Un pedido que el interceptor no supo atender NO sale: abortado. Dejarlo
-      // colgado frenaría el `load`, y dejarlo seguir sería salir sin examen.
-      //
-      // Y si escribe texto y no tenía desenlace —tiró el examen, o el
-      // navegador no aceptó la respuesta (`responder` tira con un encabezado
-      // inválido)—, NO LLEGÓ: se anota, y el render no da número (PU-3).
-      if (!decidido && escribe) {
-        bitacora.noLlegaron.push({ url: pedido.url, tipo: pedido.tipo, motivo: "sin-respuesta", origen });
+    } finally {
+      if (escribe) {
+        bitacora.enVuelo -= 1;
+        bitacora.enCamino.delete(enCamino);
       }
-      await pedido.abortar().catch(() => {});
     }
 
     async function entregar(respuesta: RespuestaHttp, clave: string) {

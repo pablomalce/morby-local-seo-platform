@@ -440,6 +440,72 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect((await medirRenderizado("http://sitio.test/", deps)).estado).toBe("medido");
   });
 
+  /**
+   * FV125-1: un pedido que decide está EN VUELO desde que entra al
+   * interceptor, también mientras el examen espera al DNS. Reproducido por la
+   * revisión con Chrome 155 y el resolvedor de producción (c-ares, 1,5 s × 2)
+   * contra un DNS local que no contestaba: una sección que carga su script al
+   * verse daba `medido 1249/1249` y VERDE 3 de 3, y la bitácora anotaba
+   * `dns-sin-respuesta` DESPUÉS de leer. El DNS contesta acá a los 5 s del
+   * reloj, cuando la lectura (2 s de quietud) ya terminó.
+   */
+  function conDnsLento(respuesta: { ok: false; transitorio: true } | { ok: true; direcciones: string[] }) {
+    const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
+    const armado = armar(
+      { "http://sitio.test/": { cuerpo: html }, "http://cdn.test/seccion.js": { cuerpo: CONTENIDO } },
+      { enSegundoPlano: [{ url: "http://cdn.test/seccion.js", tipo: "script" }] }
+    );
+    const resolver = armado.deps.resolver;
+    armado.deps.resolver = async (host, senal) => {
+      if (host !== "cdn.test") return resolver(host, senal);
+      await armado.reloj.alcanzar(5_000);
+      return respuesta;
+    };
+    return { ...armado, html };
+  }
+
+  it("FV125-1 — el DNS de un pedido que decide no contesta MIENTRAS se lee: `subrecurso-dns-sin-respuesta`, no VERDE", async () => {
+    const { deps, bitacora, reloj } = conDnsLento({ ok: false, transitorio: true });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual(falloPor("dns-sin-respuesta", { tipo: "script", host: "cdn.test", ruta: "/seccion.js", origen: "pagina" }));
+    // Se esperó al DNS: si no, esto no prueba nada.
+    expect(reloj.ahora()).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it("FV125-1 — el DNS contesta TARDE (una AAAA muda): lo que trae se espera y se cuenta —ROJO, no VERDE—", async () => {
+    const { deps, red, html } = conDnsLento({ ok: true, direcciones: [OTRA_PUBLICA] });
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(red.pedidos.map((p) => p.url)).toContain("http://cdn.test/seccion.js");
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(contarCaracteres(CONTENIDO));
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe("rojo");
+  });
+
+  it("FV125-1 — en vuelo desde que ENTRA al interceptor, antes del examen; lo que no decide, no", async () => {
+    const { deps } = armar({});
+    deps.resolver = () => new Promise(() => {});
+    const bitacora = bitacoraVacia();
+    const atender = crearInterceptor(deps, OPCIONES_RENDER, bitacora, () => 5_000, new AbortController().signal);
+    const pedido = (url: string, tipo: string): PedidoDelNavegador => ({
+      url,
+      metodo: "GET",
+      encabezados: {},
+      tipo,
+      esDocumentoPrincipal: false,
+      urlDelMarco: "http://sitio.test/",
+      urlDeLaPagina: "http://sitio.test/",
+      continuar: async () => {},
+      abortar: async () => {},
+      responder: async () => {},
+    });
+    void atender(pedido("http://cdn.test/seccion.js", "script"));
+    void atender(pedido("http://cdn.test/estilo.css", "stylesheet"));
+    await new Promise((listo) => setImmediate(listo));
+    expect(bitacora.enVuelo).toBe(1);
+    expect([...bitacora.enCamino]).toEqual([{ url: "http://cdn.test/seccion.js", tipo: "script", origen: "pagina" }]);
+  });
+
   it("PU-3 — el examen pasa la IPv4 primero y las demás de alternativa, aunque el DNS traiga la AAAA antes", async () => {
     const { deps, red } = armar({ "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } });
     deps.resolver = async () => ({ ok: true, direcciones: ["2606:4700:4700::1111", PUBLICA, OTRA_PUBLICA] });
