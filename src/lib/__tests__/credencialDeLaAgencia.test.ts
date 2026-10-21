@@ -92,6 +92,30 @@
  * el cliente de sesión, y nada más. Un módulo nuevo al que le pase el token
  * tiene que importarlo, y entonces es un receptor declarado o un rojo.
  *
+ * Salvo el cliente de sesión, que importa cualquiera. Medido el 2026-10-21 en
+ * la revisión del #123, con tsc, eslint y esta pared en verde: la puerta le
+ * pasaba el token al `createSupabaseServerClient` que importa —colgado de la
+ * función (`(createSupabaseServerClient as unknown as { ultima?: string
+ * }).ultima = token`), en un export nuevo de `server.ts`, o como argumento que
+ * termina en una cookie—, y una server action nueva lo leía. Ahora lo que la
+ * puerta, cada receptor y cada tenedor (abajo) usan de los demás módulos del
+ * árbol es exacto y está en `USAN_DEL_ARBOL`, por SÍMBOLO y con su FORMA:
+ * llamado con cuántos argumentos, o usado como valor. Y escribir en algo que
+ * ven otros módulos —un import, un export propio, un valor del lenguaje o de
+ * Node— cuenta como tocar lo global.
+ *
+ * Y LOS QUE TIENEN EL TOKEN SIN SER LA PUERTA NI UN RECEPTOR
+ *
+ * Medido el 2026-10-21 en la misma revisión: `tokenStore.ts`, que PRODUCE el
+ * token y tiene en claro el access y el refresh token, dejaba el access token en
+ * un global tipado (`globalThis.__cacheDeGoogle = token`, sin aserción) y una
+ * ruta nueva lo devolvía, con la pared en verde: lo de afuera y lo global se
+ * medían sólo en la puerta y los receptores. Ahora `tokenStore.ts`, `oauth.ts`
+ * (parsea el secreto y refresca con el refresh token) y el callback del OAuth
+ * (trae el token de Google) son TENEDORES: quién usa sus exports es exacto, lo
+ * que usan de afuera y del árbol también, y lo que tocan de lo global —leen el
+ * entorno, y nada más— está escrito sitio por sitio en `TENEDORES`.
+ *
  * Eso medía sólo lo de ADENTRO del árbol. Medido el 2026-10-16 en la revisión
  * del #123, con tsc, eslint y esta pared en verde: un receptor —o la puerta—
  * le dejaba el token a `node:diagnostics_channel`, a `next/cache`, a `node:fs`,
@@ -242,14 +266,71 @@ const RECEPTORES: Array<Receptor & { porque: string }> = [
 ];
 
 /**
- * Lo que la puerta y cada receptor usan de AFUERA del árbol, exacto: lo que
- * importan como valor (un paquete, un módulo de Node) y los globales del
- * lenguaje y de Node que nombran. Los cuatro tienen el token en la mano.
+ * Lo que la puerta, cada receptor y cada tenedor usan de AFUERA del árbol,
+ * exacto: lo que importan como valor (un paquete, un módulo de Node) y los
+ * globales del lenguaje y de Node que nombran. Todos tienen el token en la mano.
  *
  * Uno nuevo es una decisión: `next/cache`, `node:fs`, `node:diagnostics_channel`
  * o un `BroadcastChannel` guardan el token donde lo lea otra ruta, y una cookie
  * lo manda al navegador. Si es inocuo —un `Math`—, va acá con su razón.
  */
+const OAUTH = "src/lib/integrations/google/oauth.ts";
+const CALLBACK = "src/app/api/auth/google/callback/route.ts";
+const START = "src/app/api/auth/google/start/route.ts";
+const SESION = "src/lib/supabase/server.ts";
+
+/**
+ * Los que tienen el token en claro sin ser la puerta ni un receptor, quién usa
+ * cada export de valor suyo en producción, y dónde tocan lo global —sin la
+ * línea, con repetidos—. Exacto, como los receptores.
+ *
+ * Lo global de los tres es LEER el entorno: la organización de la agencia y las
+ * credenciales del OAuth, por el `env = process.env` que dejan inyectar los
+ * tests. Un sitio nuevo —escribir el token en `env`, en `globalThis`, en un
+ * import— es un rojo.
+ */
+const TENEDORES: Array<Receptor & { tocaLoGlobal: string[]; porque: string }> = [
+  {
+    modulo: TOKEN_STORE,
+    usadoPor: { [PUERTA]: ["agencyAccessToken"], [CALLBACK]: ["saveAgencyToken"] },
+    tocaLoGlobal: [
+      // `saveAgencyToken` y `agencyAccessToken`: el entorno por defecto, y la
+      // organización de la agencia que se lee de él.
+      ...Array<string>(2).fill("el entorno: env: NodeJS.ProcessEnv = process.env"),
+      ...Array<string>(2).fill("process: process.env"),
+      ...Array<string>(2).fill("el entorno: resolveAgencyOrgId(env)"),
+      // `agencyAccessToken`: las credenciales del OAuth, para refrescar.
+      "el entorno: resolveOAuthConfig(env)",
+    ],
+    porque:
+      "PRODUCE el token: lee el secreto de la custodia, lo refresca con el refresh token y le da el access token a la puerta; el callback guarda el que trae de Google",
+  },
+  {
+    modulo: OAUTH,
+    usadoPor: {
+      [TOKEN_STORE]: ["parseStoredToken", "refreshAccessToken", "resolveOAuthConfig", "serializeToken"],
+      [START]: ["buildConsentUrl", "resolveOAuthConfig"],
+      [CALLBACK]: ["exchangeCode", "readCallback", "resolveOAuthConfig"],
+    },
+    tocaLoGlobal: [
+      "el entorno: env: NodeJS.ProcessEnv = process.env",
+      "process: process.env",
+      "el entorno: env.GOOGLE_CLIENT_ID",
+      "el entorno: env.GOOGLE_CLIENT_SECRET",
+      "el entorno: env.GOOGLE_REDIRECT_URI",
+    ],
+    porque:
+      "parsea y serializa el secreto, y canjea el código o el refresh token contra Google: tiene los dos en claro. El arranque del OAuth arma la URL de consentimiento",
+  },
+  {
+    modulo: CALLBACK,
+    usadoPor: {},
+    tocaLoGlobal: ["el entorno: process.env.NODE_ENV", "process: process.env"],
+    porque:
+      "canjea el código por el token de la agencia y lo guarda; lo llama Next, nadie lo importa. `NODE_ENV` decide si el motivo de una vuelta fallida va al log",
+  },
+];
+
 const DE_AFUERA: Record<string, { importa: string[]; globales: string[]; porque: string }> = {
   [PUERTA]: {
     importa: [],
@@ -272,6 +353,69 @@ const DE_AFUERA: Record<string, { importa: string[]; globales: string[]; porque:
     globales: ["JSON", "encodeURIComponent"],
     porque: "arma la URL de la ficha y el cuerpo del post",
   },
+  [TOKEN_STORE]: {
+    importa: [],
+    globales: ["Date", "fetch", "process"],
+    porque: "`fetch` es el transporte del refresco; `Date`, el momento; `process.env`, el entorno por defecto (ver TENEDORES)",
+  },
+  [OAUTH]: {
+    importa: [],
+    globales: ["Date", "Error", "JSON", "Number", "URL", "URLSearchParams", "process"],
+    porque:
+      "arma la URL de consentimiento y el cuerpo del canje (`URL`, `URLSearchParams`), parsea el secreto y la respuesta (`JSON`, `Number`, `Error`), calcula el vencimiento (`Date`) y lee las credenciales del entorno",
+  },
+  [CALLBACK]: {
+    importa: ["next/headers", "next/server", "node:crypto"],
+    globales: ["Buffer", "Date", "URL", "console", "fetch", "process"],
+    porque:
+      "la cookie del `state` (`next/headers`), la redirección (`next/server`) y su comparación en tiempo constante (`node:crypto`, `Buffer`); `fetch` es el transporte del canje; `console.warn` anota el motivo fuera de producción, sin el token",
+  },
+};
+
+/**
+ * Lo que la puerta, cada receptor y cada tenedor usan de los DEMÁS módulos del
+ * árbol —salvo de un receptor, cuyos exports los usa sólo la puerta y lo
+ * declarado—, exacto, con repetidos, y con su forma: `ruta#nombre(n)` es una
+ * llamada con n argumentos, y `ruta#nombre` a secas, un VALOR (se guarda, se
+ * pasa, se le escribe una propiedad).
+ *
+ * Un uso nuevo es una decisión, como un import de afuera: el módulo usado lo
+ * puede usar cualquiera, y lo que se le pase o se le cuelgue lo lee él.
+ */
+const USAN_DEL_ARBOL: Record<string, { usa: string[]; porque: string }> = {
+  [PUERTA]: {
+    usa: [`${SESION}#createSupabaseServerClient(0)`, `${TOKEN_STORE}#agencyAccessToken(0)`],
+    porque: "el cliente de SESIÓN lee los mapeos con la RLS de quien llama, sin argumentos; el token lo pide sin argumentos",
+  },
+  [SEARCH_CONSOLE]: { usa: [], porque: "no usa nada del árbol fuera de los receptores" },
+  [GA4]: { usa: [], porque: "la ventana es de Search Console, otro receptor" },
+  [BUSINESS_PROFILE]: { usa: [], porque: "no usa nada del árbol" },
+  [TOKEN_STORE]: {
+    usa: [
+      ...Array<string>(2).fill("src/lib/integrations/google/agency.ts#resolveAgencyOrgId(1)"),
+      "src/lib/integrations/google/agencyToken.ts#agencyTokenState",
+      `${OAUTH}#parseStoredToken(1)`,
+      `${OAUTH}#refreshAccessToken(4)`,
+      `${OAUTH}#resolveOAuthConfig(1)`,
+      ...Array<string>(2).fill(`${OAUTH}#serializeToken(1)`),
+      ...Array<string>(2).fill("src/lib/supabase/admin.ts#createSupabaseAdminClient(0)"),
+    ],
+    porque:
+      "la organización de la agencia y las credenciales del OAuth, del entorno; el cliente de `service_role` para la custodia; y `agencyTokenState` como el `readState` que se le inyecta a `resolveAccessToken` (un valor: ver «QUÉ NO VE»)",
+  },
+  [OAUTH]: { usa: [], porque: "no importa nada" },
+  [CALLBACK]: {
+    usa: [
+      "src/lib/integrations/google/agencyGuard.ts#esOperadorDeLaAgencia(0)",
+      `${OAUTH}#exchangeCode(4)`,
+      `${OAUTH}#readCallback(1)`,
+      `${OAUTH}#resolveOAuthConfig(0)`,
+      ...Array<string>(2).fill("src/lib/integrations/google/oauthCookie.ts#ESTADO_COOKIE"),
+      `${TOKEN_STORE}#saveAgencyToken(2)`,
+    ],
+    porque:
+      "el guardián del operador, el canje y su lectura, y el guardado; el nombre de la cookie del `state` es un texto (`get` y `delete`)",
+  },
 };
 
 const POLITICA: Politica = {
@@ -290,6 +434,7 @@ const POLITICA: Politica = {
   },
   conexion: CONEXION.map(({ modulo, usa }) => ({ modulo, usa })),
   receptores: RECEPTORES.map(({ modulo, usadoPor }) => ({ modulo, usadoPor })),
+  tenedores: TENEDORES.map(({ modulo, usadoPor }) => ({ modulo, usadoPor })),
 };
 
 // ---------------------------------------------------------------------------
@@ -313,16 +458,44 @@ const VIRTUALES: Record<string, string> = {
   "admin.ts": `
     import { createClient } from "@supabase/supabase-js";
     export function admin() { return createClient("http://localhost", "no-es-una-llave"); }`,
+  // El PRODUCTOR, que es un tenedor (EV-TOKENSTORE-EGRESS de la revisión del
+  // #123): deja el token en un global tipado, sin aserción, y lo cuelga de la
+  // función que importa de otro tenedor.
   "tokenStore.ts": `
     import { resolveAgencyOrgId } from "./agency";
     import { admin } from "./admin";
+    import { refrescar } from "./oauth";
     export async function agencyAccessToken() {
       const org = resolveAgencyOrgId();
       const { data } = await admin().rpc("integration_token_secret", { p_organization_id: org });
-      return data;
+      const token = refrescar(String(data));
+      globalThis.cacheDelProductor = token;
+      (refrescar as unknown as { ultimo?: string }).ultimo = token;
+      return token;
     }
     // Otra pieza, inocua: le da a una aserción un nombre que existe y no es el token.
     export const proveedor = () => "google";`,
+  // Otro tenedor, como oauth.ts: tiene el refresh token en claro, y lo deja en
+  // el disco. Y una ruta nueva que lee lo que el productor le colgó.
+  "oauth.ts": `
+    import { writeFileSync } from "node:fs";
+    export function refrescar(secreto: string) {
+      writeFileSync("/tmp/refresco", secreto);
+      return secreto + "-nuevo";
+    }`,
+  "app/api/oauth/route.ts": `
+    import { refrescar } from "../../../oauth";
+    export async function GET() { return (refrescar as unknown as { ultimo?: string }).ultimo ?? null; }`,
+  // El cliente de sesión: lo importa cualquiera, y la puerta también (F1 de la
+  // revisión del #123). La ruta que lo lee no importa nada de la credencial.
+  "sesion.ts": `
+    let visto: string | null = null;
+    export async function crearCliente(pista?: string) { return { pista: pista ?? null }; }
+    export const recordar = (t: string) => { visto = t; };
+    export const ultimaSesion = () => visto;`,
+  "app/api/sesion/route.ts": `
+    import { ultimaSesion } from "../../../sesion";
+    export async function GET() { return ultimaSesion(); }`,
   "agencyToken.ts": `
     import { admin } from "./admin";
     export async function estado(org: string) {
@@ -332,10 +505,12 @@ const VIRTUALES: Record<string, string> = {
   // detector tiene que verla en lo que la puerta exporta y en quién la usa. Le
   // pasa el token a cada receptor de abajo, como la de verdad a los tres suyos.
   // Y G01 de la revisión del #123: ella misma lo deja en `next/cache`, que lee
-  // cualquier ruta con la misma clave, y en un global del repositorio.
+  // cualquier ruta con la misma clave, y en un global del repositorio. Y F1 de
+  // la misma revisión, al final: lo que le pasa al cliente de sesión.
   "servicioCompartido.ts": `
     import { unstable_cache } from "next/cache";
     import { agencyAccessToken } from "./tokenStore";
+    import { crearCliente, recordar } from "./sesion";
     import { consultar } from "./receptor";
     import { consultarHermano } from "./receptorHermano";
     import { consultarGuardando } from "./receptorGuarda";
@@ -348,7 +523,8 @@ const VIRTUALES: Record<string, string> = {
     import { consultarCacheando } from "./receptorALaCache";
     import { consultarAlDisco } from "./receptorAlDisco";
     import { consultarPorElCanalGlobal } from "./receptorAlCanalGlobal";
-    const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo];
+    import { consultarEscribiendo } from "./receptorEscribeLoAjeno";
+    const conTrampa = [consultarGuardando, consultarColgando, consultarDepositando, consultarAlEntorno, consultarAlGlobal, consultarAlDesnudo, consultarEscribiendo];
     const deAfuera = [consultarAlCanal, consultarCacheando, consultarAlDisco, consultarPorElCanalGlobal];
     export async function servir(mapeos: string[]) {
       if (mapeos.length === 0) return null;
@@ -357,6 +533,10 @@ const VIRTUALES: Record<string, string> = {
       ultimoDeLaPuerta = accessToken;
       for (const r of [...conTrampa, ...deAfuera]) await r({ accessToken });
       await consultarHermano({ accessToken, ahora: new Date() });
+      await crearCliente();
+      await crearCliente(accessToken);
+      recordar(accessToken);
+      (crearCliente as unknown as { ultima?: string }).ultima = accessToken;
       return consultar({ accessToken, ref: mapeos[0], fetcher: fetch });
     }
     export { agencyAccessToken } from "./tokenStore";`,
@@ -364,11 +544,16 @@ const VIRTUALES: Record<string, string> = {
   // Los dos primeros son como searchConsole.ts y ga4.ts: usan el lenguaje
   // (`JSON`, `encodeURIComponent`, `Date`) y el hermano comparte la ventana. Los
   // demás guardan el token donde lo lea otro.
+  // El control de lo que se escribe: un objeto local, por asignación y por
+  // `Object.assign`, no lo ve nadie más.
   "receptor.ts": `
     export const VENTANA = 28;
     export const ventana = (ahora: Date) => new Date(ahora.getTime() - VENTANA * 86_400_000).toISOString();
     export async function consultar(deps: { accessToken: string; ref: string; fetcher: typeof fetch }) {
-      const r = await deps.fetcher("https://ejemplo.test/" + encodeURIComponent(deps.ref), { headers: { authorization: "Bearer " + deps.accessToken } });
+      const pedido: { url?: string; intentos?: number } = {};
+      pedido.url = "https://ejemplo.test/" + encodeURIComponent(deps.ref);
+      Object.assign(pedido, { intentos: 1 });
+      const r = await deps.fetcher(pedido.url, { headers: { authorization: "Bearer " + deps.accessToken } });
       return JSON.stringify({ ok: r.ok });
     }`,
   "receptorHermano.ts": `
@@ -423,6 +608,7 @@ const VIRTUALES: Record<string, string> = {
     declare global {
       var tokenAjeno: string | undefined;
       var ultimoDeLaPuerta: string | undefined;
+      var cacheDelProductor: string | undefined;
       function guardarTokenGlobal(t: string): void;
       class CajaGlobal { static token: string }
       enum NivelGlobal { Bajo }
@@ -463,6 +649,22 @@ const VIRTUALES: Record<string, string> = {
   // Sin importar nada: el BroadcastChannel que declaran el lenguaje y Node.
   "receptorAlCanalGlobal.ts": `
     export function consultarPorElCanalGlobal(deps: { accessToken: string }) { new BroadcastChannel("gsc").postMessage(deps.accessToken); }`,
+  // Escribir en lo que ven otros módulos (revisión del #123): un valor del
+  // lenguaje, un export propio, por cada forma de escribir —asignación,
+  // `Object.assign`, `Reflect.set`, destructuring, `for…of`, `++`, `delete`, y
+  // un `Object.assign` cuyo destino viene en un spread—.
+  "receptorEscribeLoAjeno.ts": `
+    export const registro: { t?: string } = {};
+    export function consultarEscribiendo(deps: { accessToken: string }) {
+      (fetch as unknown as { t?: string }).t = deps.accessToken;
+      Object.assign(registro, { t: deps.accessToken });
+      Reflect.set(JSON, "t", deps.accessToken);
+      [(Date as unknown as { t?: string }).t] = [deps.accessToken];
+      for ((Math as unknown as { t?: string }).t of [deps.accessToken]);
+      (Number as unknown as { n: number }).n++;
+      delete (consultarEscribiendo as unknown as { t?: string }).t;
+      Object.assign(...([registro, { t: deps.accessToken }] as const));
+    }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
     export const reporte = () => servir(["properties/1"]);`,
@@ -753,6 +955,27 @@ const VIRTUALES: Record<string, string> = {
       const c: unknown = admin();
       return (c as Indice)[["r", "p", "c"].join("")]("integration_token" + "_secret");
     };`,
+  // Cada clase de índice de texto que acepta TypeScript, y una unión que lo
+  // trae en uno solo de sus miembros (F2 de la revisión del #123: sin estos,
+  // contar sólo `string`, o mirar la unión entera, dejaba la suite en verde).
+  "clientePorIndicePlantilla.ts": `
+    import { admin } from "./admin";
+    type Indice = { [m: \`r\${string}\`]: (...a: unknown[]) => unknown };
+    export const secreto = () => { const c: unknown = admin(); return (c as Indice).rpc("integration_token" + "_secret"); };`,
+  "clientePorIndiceMinusculas.ts": `
+    import { admin } from "./admin";
+    type Indice = { [m: Lowercase<string>]: (...a: unknown[]) => unknown };
+    export const secreto = () => { const c: unknown = admin(); return (c as Indice).rpc("integration_token" + "_secret"); };`,
+  "clientePorUnion.js": `
+    import { admin } from "./admin";
+    /** @typedef {{ [m: string]: (...a: unknown[]) => unknown }} Indice */
+    /** @typedef {{ otra: number }} Otra */
+    export const secreto = () => {
+      /** @type {unknown} */
+      const c = admin();
+      const u = /** @type {Indice | Otra} */ (c);
+      return u.rpc("integration_token" + "_secret");
+    };`,
   "urlCruda.ts": `
     export const secreto = (url: string) => fetch(url + "/rest/v1/rpc/integration_token_secret", { method: "POST" });`,
   "esquemaDelVault.ts": `
@@ -902,6 +1125,7 @@ const RECEPTORES_CON_TRAMPA: ReadonlyArray<readonly [string, string]> = [
   ["receptorALaCache.ts", "consultarCacheando"],
   ["receptorAlDisco.js", "consultarAlDisco"],
   ["receptorAlCanalGlobal.ts", "consultarPorElCanalGlobal"],
+  ["receptorEscribeLoAjeno.ts", "consultarEscribiendo"],
 ];
 
 const POLITICA_VIRTUAL: Politica = {
@@ -930,6 +1154,10 @@ const POLITICA_VIRTUAL: Politica = {
     { modulo: `${V}/receptor.ts`, usadoPor: { [`${V}/servicioCompartido.ts`]: ["consultar"], [`${V}/receptorHermano.ts`]: ["ventana"] } },
     { modulo: `${V}/receptorHermano.ts`, usadoPor: { [`${V}/servicioCompartido.ts`]: ["consultarHermano"] } },
     ...RECEPTORES_CON_TRAMPA.map(([m, f]) => ({ modulo: `${V}/${m}`, usadoPor: { [`${V}/servicioCompartido.ts`]: [f] } })),
+  ],
+  tenedores: [
+    { modulo: `${V}/tokenStore.ts`, usadoPor: { [`${V}/servicioCompartido.ts`]: ["agencyAccessToken"] } },
+    { modulo: `${V}/oauth.ts`, usadoPor: { [`${V}/tokenStore.ts`]: ["refrescar"] } },
   ],
 };
 
@@ -1047,7 +1275,10 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "clienteJsdoc.js",
         "clientePorIndice.ts",
         "clientePorIndiceArmado.ts",
+        "clientePorIndiceMinusculas.ts",
+        "clientePorIndicePlantilla.ts",
         "clientePorRegistro.ts",
+        "clientePorUnion.js",
         "receptorAsertado.ts",
         "rpcArmada.ts",
         "rpcDesestructurada.ts",
@@ -1075,6 +1306,14 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     expect(sitios).toContain(`${V}/clientePorIndice.ts:4 una aserción de algo sin tipo a un índice que se puede llamar: c as Indice`);
     expect(sitios).toContain(`${V}/clientePorRegistro.ts:5 .rpc sin llamarlo`);
     expect(sitios).toContain(`${V}/clientePorIndiceArmado.ts:6 un método que puede ser de la base, con un nombre que no se lee`);
+    // F2 de la revisión del #123: el índice de un template literal, el de un
+    // `Lowercase<string>`, y una unión que trae el índice en uno de sus miembros.
+    for (const f of ["clientePorIndicePlantilla.ts", "clientePorIndiceMinusculas.ts"]) {
+      expect(sitios).toContain(`${V}/${f}:4 .rpc("integration_token" + "_secret")`);
+      expect(sitios).toContain(`${V}/${f}:4 una aserción de algo sin tipo a un índice que se puede llamar: c as Indice`);
+    }
+    expect(sitios).toContain(`${V}/clientePorUnion.js:8 una aserción de algo sin tipo a un índice que se puede llamar: (c)`);
+    expect(sitios).toContain(`${V}/clientePorUnion.js:9 .rpc("integration_token" + "_secret")`);
   });
 
   it("el grafo: un import() que no se puede seguir, uno con query, uno que no resuelve, y las cargas de webpack", () => {
@@ -1146,6 +1385,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorALaCache.ts`]: { [puerta]: ["consultarCacheando"] },
         [`${V}/receptorAlDisco.js`]: { [puerta]: ["consultarAlDisco"] },
         [`${V}/receptorAlCanalGlobal.ts`]: { [puerta]: ["consultarPorElCanalGlobal"] },
+        [`${V}/receptorEscribeLoAjeno.ts`]: { [puerta]: ["consultarEscribiendo"] },
       });
     });
 
@@ -1168,10 +1408,11 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorALaCache.ts`]: [],
         [`${V}/receptorAlDisco.js`]: [],
         [`${V}/receptorAlCanalGlobal.ts`]: [],
+        [`${V}/receptorEscribeLoAjeno.ts`]: [],
       });
     });
 
-    it("lo que la puerta y cada receptor usan de AFUERA del árbol: un paquete, un módulo de Node, un global del runtime", () => {
+    it("lo que la puerta, cada receptor y cada tenedor usan de AFUERA del árbol: un paquete, un módulo de Node, un global del runtime", () => {
       // EV-1 y F1 de la revisión del #123: la ruta de `app/api/canal` recibe el
       // token sin importar nada del árbol, así que no es una fuga ni usa un
       // receptor. Lo único que lo delata es lo que el receptor usa de afuera.
@@ -1181,7 +1422,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         // G01: la puerta misma, con `next/cache`.
         [puerta]: { importa: ["next/cache"], globales: ["Date", "String", "fetch"] },
         // Los controles: lo que usan del lenguaje, nada importado.
-        [`${V}/receptor.ts`]: { importa: [], globales: ["Date", "JSON", "encodeURIComponent"] },
+        [`${V}/receptor.ts`]: { importa: [], globales: ["Date", "JSON", "Object", "encodeURIComponent"] },
         [`${V}/receptorHermano.ts`]: { importa: [], globales: ["JSON"] },
         [`${V}/receptorGuarda.ts`]: nada,
         [`${V}/receptorEnLaFuncion.ts`]: nada,
@@ -1194,10 +1435,15 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         // Por `require()` y por `import()` literales.
         [`${V}/receptorAlDisco.js`]: { importa: ["node:fs", "node:fs/promises"], globales: ["require"] },
         [`${V}/receptorAlCanalGlobal.ts`]: { importa: [], globales: ["BroadcastChannel"] },
+        [`${V}/receptorEscribeLoAjeno.ts`]: { importa: [], globales: ["Date", "JSON", "Math", "Number", "Object", "Reflect", "fetch"] },
+        // Los tenedores (EV-TOKENSTORE-EGRESS de la revisión del #123): el
+        // productor, y el que deja el refresh token en el disco.
+        [`${V}/tokenStore.ts`]: { importa: [], globales: ["String"] },
+        [`${V}/oauth.ts`]: { importa: ["node:fs"], globales: [] },
       });
     });
 
-    it("la puerta o un receptor que tocan el entorno, el objeto global o un global del repositorio, cada sitio con su línea", () => {
+    it("la puerta, un receptor o un tenedor que tocan el entorno, el objeto global, un global del repositorio, o escriben en lo que ven otros módulos, cada sitio con su línea", () => {
       expect(virtual.conElTokenTocanLoGlobal.sort()).toEqual(
         [
           `${V}/receptorAlEntorno.ts:3 el entorno: process.env.CACHE_DE_GOOGLE`,
@@ -1211,13 +1457,124 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           `${V}/receptorGlobalDeclarado.ts:8 NivelGlobal, un valor global que declara ${V}/globales.ts`,
           `${V}/receptorGlobalDeclarado.ts:9 cacheGlobal, un valor global que declara ${V}/globales.ts`,
           // La puerta tiene el token igual que ellos.
-          `${V}/servicioCompartido.ts:22 ultimoDeLaPuerta, un valor global que declara ${V}/globales.ts`,
+          `${V}/servicioCompartido.ts:24 ultimoDeLaPuerta, un valor global que declara ${V}/globales.ts`,
+          // Lo que se ESCRIBE en algo que ven otros módulos (revisión del #123).
+          // G3 de F1: colgado de la función del cliente de sesión que importa la puerta.
+          `${V}/servicioCompartido.ts:30 escribe en crearCliente, que es un import: (crearCliente as unknown as { ultima?: string }).ultima = accessToken`,
+          // A1 y A5 de la quinta revisión del #118, ahora también por lo que escriben.
+          `${V}/receptorGuarda.ts:3 escribe en ultimoToken, que este módulo exporta: ultimoToken.valor = deps.accessToken`,
+          `${V}/receptorEnLaFuncion.ts:3 escribe en consultarColgando, que este módulo exporta: (consultarColgando as unknown as { t?: string }).t = deps.accessToken`,
+          // Cada forma de escribir, cada una con su línea.
+          `${V}/receptorEscribeLoAjeno.ts:4 escribe en fetch, que declara otro archivo: (fetch as unknown as { t?: string }).t = deps.accessToken`,
+          `${V}/receptorEscribeLoAjeno.ts:5 le escribe propiedades a registro, que este módulo exporta: Object.assign(registro, { t: deps.accessToken })`,
+          `${V}/receptorEscribeLoAjeno.ts:6 le escribe propiedades a JSON, que declara otro archivo: Reflect.set(JSON, "t", deps.accessToken)`,
+          `${V}/receptorEscribeLoAjeno.ts:7 escribe en Date, que declara otro archivo: [(Date as unknown as { t?: string }).t] = [deps.accessToken]`,
+          `${V}/receptorEscribeLoAjeno.ts:8 escribe en Math, que declara otro archivo: (Math as unknown as { t?: string }).t`,
+          `${V}/receptorEscribeLoAjeno.ts:9 escribe en Number, que declara otro archivo: (Number as unknown as { n: number }).n++`,
+          `${V}/receptorEscribeLoAjeno.ts:10 escribe en consultarEscribiendo, que este módulo exporta: delete (consultarEscribiendo as unknown as { t?: string }).t`,
+          // Con el destino en un spread no se sabe a quién: el mundo es cerrado.
+          `${V}/receptorEscribeLoAjeno.ts:11 le escribe propiedades a lo que trae un spread, que no se lee: Object.assign(...([registro, { t: deps.accessToken }] as const))`,
+          // EV-TOKENSTORE-EGRESS: el productor, que también tiene el token.
+          `${V}/tokenStore.ts:9 el objeto global: globalThis.cacheDelProductor`,
+          `${V}/tokenStore.ts:10 escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token`,
         ].sort()
       );
-      // El control: lo que declaran el lenguaje y Node no es un global ajeno.
+      // El control: lo que declaran el lenguaje y Node no es un global ajeno, y
+      // escribir en un objeto local (receptor.ts) no es escribir en lo compartido.
       for (const limpio of ["receptor.ts", "receptorHermano.ts"]) {
         expect(analisisVirtual.lecturas.get(`${V}/${limpio}`)!.tocaLoGlobal, limpio).toEqual([]);
       }
+    });
+  });
+
+  describe("los tenedores del token, y lo que la puerta usa del árbol (revisión del #123)", () => {
+    const puerta = `${V}/servicioCompartido.ts`;
+    const tokenStore = `${V}/tokenStore.ts`;
+    const oauth = `${V}/oauth.ts`;
+
+    it("lo que usan de los demás módulos del árbol, por símbolo y con su forma: G1, G2 y G3 en la puerta, y el productor", () => {
+      // F1: la puerta importa el cliente de sesión, que importa cualquiera. Las
+      // rutas que leen lo que le dejó no importan nada de la credencial.
+      for (const ruta of ["app/api/sesion/route.ts", "app/api/oauth/route.ts"]) {
+        expect(virtual.fugas.some((f) => f.startsWith(`${V}/${ruta}`)), ruta).toBe(false);
+      }
+      expect(virtual.usanDelArbol).toEqual({
+        [puerta]: [
+          // G3: colgado de la función importada, que es un VALOR.
+          `${V}/sesion.ts#crearCliente`,
+          // Lo legítimo, y G2: el mismo símbolo con el token como argumento.
+          `${V}/sesion.ts#crearCliente(0)`,
+          `${V}/sesion.ts#crearCliente(1)`,
+          // G1: un export nuevo del cliente de sesión.
+          `${V}/sesion.ts#recordar(1)`,
+          // La reexportación de la segunda revisión del #118 es un valor.
+          `${tokenStore}#agencyAccessToken`,
+          `${tokenStore}#agencyAccessToken(0)`,
+        ],
+        // Lo de otro receptor no cuenta: sus exports los usa la puerta y lo declarado.
+        [`${V}/receptor.ts`]: [],
+        [`${V}/receptorHermano.ts`]: [],
+        [`${V}/receptorGuarda.ts`]: [],
+        [`${V}/receptorEnLaFuncion.ts`]: [],
+        // El depósito, con el token como argumento: lo mismo que mide receptoresImportan, por símbolo.
+        [`${V}/receptorDeposita.ts`]: [`${V}/deposito.ts#guardar(1)`],
+        [`${V}/receptorAlEntorno.ts`]: [],
+        [`${V}/receptorAlGlobal.ts`]: [],
+        [`${V}/receptorGlobalDeclarado.ts`]: [],
+        [`${V}/receptorAlCanal.ts`]: [],
+        [`${V}/receptorALaCache.ts`]: [],
+        [`${V}/receptorAlDisco.js`]: [],
+        [`${V}/receptorAlCanalGlobal.ts`]: [],
+        [`${V}/receptorEscribeLoAjeno.ts`]: [],
+        // El productor: también lo que usa de otro tenedor, y lo que le cuelga.
+        [tokenStore]: [
+          `${V}/admin.ts#admin(0)`,
+          `${V}/agency.ts#resolveAgencyOrgId(0)`,
+          `${oauth}#refrescar`,
+          `${oauth}#refrescar(1)`,
+        ],
+        [oauth]: [],
+      });
+    });
+
+    it("quién usa cada export de un tenedor, por símbolo: la ruta nueva que lee lo que el productor colgó", () => {
+      expect(virtual.usosDeLosTenedores[oauth]).toEqual({
+        [tokenStore]: ["refrescar"],
+        [`${V}/app/api/oauth/route.ts`]: ["refrescar"],
+      });
+      // El productor: la puerta, y cada forma conocida de saltársela.
+      const usaElToken = (m: string) => [m, ["agencyAccessToken"]];
+      const usaTodo = (m: string) => [m, ["agencyAccessToken", "proveedor"]];
+      expect(virtual.usosDeLosTenedores[tokenStore]).toEqual(
+        Object.fromEntries([
+          ...[
+            "app/api/clics__tests__/route.ts",
+            "app/reports/template.tsx",
+            "atajoPorLaPuerta.ts",
+            "conexionConToken.ts",
+            "conexionPorCargador.ts",
+            "conexionPorClaveConst.ts",
+            "conexionPorElemento.ts",
+            "conexionPorImportDinamico.ts",
+            "conexionPorPatronComputado.ts",
+            "servicioCompartido.ts",
+            "usaAbreviado.ts",
+            "usaPorEstrella.ts",
+            "usaPorNamespace.ts",
+          ].map((m) => usaElToken(`${V}/${m}`)),
+          ...["cargadorDelAlmacen.ts", ...USAN_TODO_EL_ALMACEN].map((m) => usaTodo(`${V}/${m}`)),
+        ])
+      );
+    });
+
+    it("lo que un tenedor toca de lo global, sin la línea: el global tipado del productor, y lo que le cuelga a otro tenedor", () => {
+      expect({ [tokenStore]: virtual.tocanLoGlobal[tokenStore], [oauth]: virtual.tocanLoGlobal[oauth] }).toEqual({
+        [tokenStore]: [
+          "el objeto global: globalThis.cacheDelProductor",
+          "escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token",
+        ],
+        [oauth]: [],
+      });
     });
   });
 
@@ -1498,8 +1855,14 @@ describe("el árbol de src, leído del disco", () => {
   describe("los que reciben el token de la puerta", () => {
     it("la puerta importa como valor la custodia, el cliente de sesión y los receptores, y nada más", () => {
       // La lista de RECEPTORES se declara, no se mide: si la puerta le pasara el
-      // token a un módulo nuevo, la pared no lo sabría. Para pasárselo tiene que
-      // importarlo, y eso sí se mide.
+      // token a un módulo nuevo, la pared no lo sabría. Para pasárselo a uno que
+      // no importa tiene que importarlo, y eso se mide acá. A los que ya importa
+      // —el cliente de sesión, que importa cualquiera— no se lo pasa por esta
+      // lista: lo mide «lo que la puerta, cada receptor y cada tenedor usan de
+      // los demás módulos del árbol», por símbolo y con su forma, y «…tocan…»,
+      // que ve lo que se le escribe a lo importado. Medido el 2026-10-21 en la
+      // revisión del #123: sin esas dos, esta lista sola dejaba pasar el token
+      // colgado de `createSupabaseServerClient`.
       expect(
         [...new Set(analisisReal.lecturas.get(PUERTA)!.importa)].sort(),
         "La puerta importa un módulo nuevo. Si le pasa el token, es un receptor: va a RECEPTORES con su razón."
@@ -1527,7 +1890,7 @@ describe("el árbol de src, leído del disco", () => {
       ).toEqual(Object.fromEntries(RECEPTORES.map((r) => [r.modulo, []])));
     });
 
-    it("lo que la puerta y cada receptor usan de afuera del árbol es exactamente lo declarado", () => {
+    it("lo que la puerta, cada receptor y cada tenedor usan de afuera del árbol es exactamente lo declarado", () => {
       // EV-1 y F1 de la revisión del #123: `channel(...).publish(token)` de
       // `node:diagnostics_channel` en searchConsole.ts, y una ruta nueva que lo
       // recibía sin importar nada del árbol, pasaban tsc, eslint y esta pared.
@@ -1535,7 +1898,7 @@ describe("el árbol de src, leído del disco", () => {
       // detector no cosechara nada, el mapa de abajo no coincidiría.
       expect(
         real.deAfuera,
-        "La puerta o un receptor usan algo nuevo de afuera del árbol: un paquete, un módulo de Node o un " +
+        "La puerta, un receptor o un tenedor usan algo nuevo de afuera del árbol: un paquete, un módulo de Node o un " +
           "global del runtime. Tienen el token en la mano, y un next/cache, un node:fs, un canal o una cookie " +
           "lo guardan donde lo lea otra ruta. Si es inocuo, va a DE_AFUERA con su razón."
       ).toEqual(Object.fromEntries(Object.entries(DE_AFUERA).map(([m, { importa, globales }]) => [m, { importa, globales }])));
@@ -1545,10 +1908,51 @@ describe("el árbol de src, leído del disco", () => {
       // Anti-vacuidad: en el árbol de verdad el detector ve lo que tiene que
       // ver. agency.ts lee el entorno (`env: NodeJS.ProcessEnv = process.env`).
       expect(analisisReal.lecturas.get(LECTOR)!.tocaLoGlobal.join("\n")).toContain(`${LECTOR}:`);
+      // Los tenedores leen el entorno, y lo suyo está declarado abajo.
+      const deUnTenedor = (sitio: string) => TENEDORES.some((t) => sitio.startsWith(`${t.modulo}:`));
       expect(
-        real.conElTokenTocanLoGlobal,
+        real.conElTokenTocanLoGlobal.filter((sitio) => !deUnTenedor(sitio)),
         "Lo que la puerta o un receptor escriben ahí lo lee cualquier módulo del proceso, y tienen el token."
       ).toEqual([]);
+    });
+
+    it("lo que la puerta, cada receptor y cada tenedor usan de los demás módulos del árbol, y cómo, es exactamente lo declarado", () => {
+      // F1 de la revisión del #123: la puerta le pasaba el token al cliente de
+      // sesión —colgado de la función, en un export nuevo, como argumento— y una
+      // server action nueva lo leía, con tsc, eslint y esta pared en verde. Que
+      // el cliente de sesión esté, llamado sin argumentos, es también la
+      // anti-vacuidad: si no se cosechara nada, el mapa no coincidiría.
+      expect(
+        real.usanDelArbol,
+        "La puerta, un receptor o un tenedor usan algo nuevo de otro módulo del árbol, o lo usan de otra forma " +
+          "(con otros argumentos, o como valor). Tienen el token en la mano, y lo que le pasen o le cuelguen a ese " +
+          "módulo lo lee quien lo importe. Si es inocuo, va a USAN_DEL_ARBOL con su razón."
+      ).toEqual(Object.fromEntries(Object.entries(USAN_DEL_ARBOL).map(([m, { usa }]) => [m, [...usa].sort()])));
+    });
+  });
+
+  describe("los que tienen el token sin ser la puerta ni un receptor", () => {
+    it("cada export de un tenedor lo usa quien está declarado, y nadie más", () => {
+      // EV-TOKENSTORE-EGRESS de la revisión del #123: el productor y los suyos
+      // tienen el access y el refresh token en claro. Lo que dejen en sus
+      // exports lo lee quien los use.
+      expect(
+        real.usosDeLosTenedores,
+        "Un módulo nuevo usa un export de un tenedor del token (tokenStore.ts, oauth.ts, el callback). Lo que el " +
+          "tenedor deje ahí es el token de la agencia. Si es legítimo, va a TENEDORES con su razón."
+      ).toEqual(Object.fromEntries(TENEDORES.map((t) => [t.modulo, t.usadoPor])));
+    });
+
+    it("lo que cada tenedor toca de lo global es exactamente lo declarado: leer el entorno", () => {
+      // EV-TOKENSTORE-EGRESS: `globalThis.__cacheDeGoogle = token` en
+      // tokenStore.ts, sin aserción, pasaba la suite entera. Por sitio, sin la
+      // línea y con repetidos: uno nuevo, aunque diga lo mismo que otro, es un
+      // rojo.
+      expect(
+        Object.fromEntries(TENEDORES.map((t) => [t.modulo, real.tocanLoGlobal[t.modulo]])),
+        "Un tenedor del token toca algo nuevo de lo que comparte todo el proceso. Tiene el token en claro: lo " +
+          "que escriba ahí lo lee cualquier módulo. Si es una lectura nueva del entorno, va a TENEDORES con su razón."
+      ).toEqual(Object.fromEntries(TENEDORES.map((t) => [t.modulo, [...t.tocaLoGlobal].sort()])));
     });
   });
 });

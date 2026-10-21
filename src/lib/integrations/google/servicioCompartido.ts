@@ -117,6 +117,13 @@
  *     global. Medido el 2026-10-16 en la quinta revisión del #118: un export de
  *     `searchConsole.ts` que guardaba el token y una ruta nueva que lo gastaba
  *     pasaban la pared;
+ *   - del cliente de sesión, que importa cualquiera, este archivo usa
+ *     `createSupabaseServerClient()` sin argumentos y nada más, y no le escribe
+ *     nada; lo mismo vale para lo que usan del árbol los receptores y los
+ *     TENEDORES —`tokenStore.ts`, `oauth.ts` y el callback del OAuth, que tienen
+ *     el token en claro antes que este archivo—. Medido el 2026-10-21 en la
+ *     revisión del #123: el token colgado de `createSupabaseServerClient`, o
+ *     dejado en un global tipado por `tokenStore.ts`, pasaban la pared;
  *   - los de CONEXIÓN —el OAuth, la pantalla de integraciones, el mapeo y el
  *     guardián del operador— llegan a la credencial sin pasar por acá, y cada
  *     uno usa exactamente las piezas que declara allá, con su razón. Ninguno
