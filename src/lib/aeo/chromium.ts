@@ -164,29 +164,164 @@ const sinWebRtc = `(() => {
   }
 })();`;
 
-async function adaptar(req: HTTPRequest, page: Page): Promise<PedidoDelNavegador> {
+/**
+ * DE QUÉ WORKER ES CADA PEDIDO SIN MARCO (W-1). Lo que pide un worker llega
+ * al interceptor sin marco, y hasta acá eso contaba siempre como de la
+ * página: MEDIDO en producción el 2026-10-21 contra https://vulkan-studios.com,
+ * el `fetch` a `brunhild.challenges.cloudflare.com` que dejaba el render
+ * `subrecurso-sin-respuesta` lo hacía un WORKER que crea el desafío de
+ * Cloudflare, en su marco de otro sitio dentro del reproductor de Vimeo.
+ *
+ * Chromium sí dice de qué worker es: cada pedido de un worker sale, en la
+ * sesión de CDP de ESE worker, como `Network.requestWillBeSent` con la URL de
+ * su script en `documentURL`. MEDIDO con Chrome 155 y con el headless shell
+ * 153 en AL2023, también para el `importScripts`, el `fetch` de un worker
+ * creado por otro worker, uno `blob:` y uno `data:`. Lo que NO sirve es la
+ * sesión que trae el pedido interceptado (`req.client`): con el headless
+ * shell, el `fetch` de un worker —también el del desafío— llega por la
+ * sesión de la PESTAÑA, y con Chrome el `importScripts` y el de un worker
+ * anidado también. Ni la pila del `initiator`, que nombra el script que
+ * llamó, y ése puede ser una biblioteca de otro sitio que el worker importó.
+ *
+ * Por eso se escucha a cada worker desde que existe —`workercreated` sale
+ * antes de que corra su primera línea (ver `vigilarSalidasPropias`)— y se
+ * anota, por pedido, la URL de su script. Un pedido sin marco que no está
+ * anotado queda sin worker, y cuenta (falla cerrado).
+ *
+ * Y se anota también la SESIÓN de cada worker, para contestarle a cada
+ * pedido por la sesión que lo pausó (`contestarPorQuienLoPauso`).
+ */
+interface WorkersDeLaPestana {
+  /** Por `requestId` de CDP, la URL del script del worker que lo pidió (W-1). */
+  scripts: Map<string, string>;
+  /** Las sesiones de CDP de los workers de la pestaña (PRE-SESION-EQUIVOCADA). */
+  sesiones: WeakSet<CDPSession>;
+}
+
+function vigilarWorkers(page: Page): WorkersDeLaPestana {
+  const workers: WorkersDeLaPestana = { scripts: new Map(), sesiones: new WeakSet() };
+  page.on("workercreated", (worker) => {
+    const script = worker.url();
+    workers.sesiones.add(worker.client);
+    worker.client.on("Network.requestWillBeSent", (e) => {
+      workers.scripts.set(e.requestId, e.documentURL || script);
+    });
+  });
+  return workers;
+}
+
+/**
+ * A QUIÉN SE LE CONTESTA UN PEDIDO DE UN WORKER (PRE-SESION-EQUIVOCADA).
+ *
+ * Chromium pausa el pedido de un worker en la sesión del MARCO que lo creó
+ * —la de la pestaña, o la de un marco de otro sitio que corre en otro
+ * proceso—: el worker no tiene el dominio `Fetch`. Pero puppeteer 25.11.0 le
+ * asigna al pedido la sesión del ÚLTIMO de los dos avisos que empareja, y si
+ * el `Network.requestWillBeSent` de la sesión del worker llega DESPUÉS del
+ * `Fetch.requestPaused`, el pedido queda con la sesión del worker. Entonces
+ * `respond`, `continue` y `abort` fallan con «'Fetch.fulfillRequest' wasn't
+ * found», puppeteer se traga el error, y el pedido queda pausado para
+ * siempre: lo que el worker trae no llega a la página, nada lo anota, y el
+ * render salía `medido` y VERDE. REPRODUCIDO por la revisión y MEDIDO con
+ * Chrome 155 y con el headless shell 153 en AL2023, con los datos en un CDN
+ * de otro origen: un worker `blob:` que hace `importScripts` y después
+ * `fetch` —todo llega— dejaba la página vacía 3 de 3 y 4 de 4; uno con
+ * script propio, 2 de 3 con Chrome. Al mismo origen no se reprodujo.
+ *
+ * La sesión que lo pausó es la primera que NO es de un worker subiendo por
+ * `parentSession()` —la de auto-attach de CDP—: MEDIDO con los dos binarios,
+ * 4 corridas por caso, en cada pedido de un worker `blob:`, de uno con
+ * script, de uno `module`, del worker de un marco de otro sitio y de los de
+ * un marco de otro sitio dentro de otro; con esa sesión, todos llegaron.
+ * Subir más de un nivel (un worker creado por otro) lo prueba sólo el doble
+ * (`chromiumWorkers.test.ts`). Se cambia ANTES de contestar. `client` y
+ * `parentSession()` son `@internal` en puppeteer, fijado exacto como el
+ * `requestId`. Si subiendo no hay una sesión que no sea de un worker —o un
+ * día falta `parentSession`—, no hay a quién contestarle: `false`, y lo que
+ * se le responda no llegó —falla cerrado, nunca un pedido colgado que no
+ * cuenta—.
+ */
+function contestarPorQuienLoPauso(req: HTTPRequest, sesiones: WeakSet<CDPSession>): boolean {
+  const pedido = req as unknown as { client?: CDPSession };
+  let sesion = pedido.client;
+  if (sesion === undefined || !sesiones.has(sesion)) return true;
+  while (sesion !== undefined && sesiones.has(sesion)) {
+    const padre: CDPSession | undefined = (sesion as unknown as { parentSession?: () => CDPSession | undefined }).parentSession?.();
+    // Sin padre, puppeteer devuelve la misma sesión: no hay más arriba.
+    sesion = padre === sesion ? undefined : padre;
+  }
+  if (sesion === undefined) return false;
+  pedido.client = sesion;
+  return true;
+}
+
+/**
+ * El `requestId` de CDP del pedido: el mismo del `Network.requestWillBeSent`
+ * que anota `vigilarWorkers`. puppeteer lo tiene (`CdpHTTPRequest.id`)
+ * pero lo marca `@internal` y su tipo público no lo trae; la versión está
+ * fijada exacta (ver «QUÉ CHROMIUM»). Emparejar por URL no sirve: dos workers
+ * que piden la misma URL a la vez se confunden, y el de la página podía pasar
+ * por el de otro sitio. Si un día no está, el pedido queda sin worker y cuenta
+ * —falla cerrado—, y la integración con el marco de otro sitio se pone roja.
+ */
+function idDelPedido(req: HTTPRequest): string | null {
+  const id = (req as unknown as { id?: unknown }).id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+async function adaptar(req: HTTPRequest, page: Page, workers: WorkersDeLaPestana): Promise<PedidoDelNavegador> {
+  const { scripts } = workers;
+  // Lo que decide de dónde sale el pedido se lee AL ENTRAR (FV-1), antes de
+  // cualquier espera.
+  const marco = req.frame();
+  const urlDeLaPagina = page.mainFrame().url();
+  // El cuerpo, por la sesión con la que llegó: es la que avisó el pedido.
   let cuerpo = req.postData();
   if (cuerpo === undefined && req.hasPostData()) cuerpo = await req.fetchPostData();
+  // Y desde acá, todo lo que se le contesta va a la sesión que lo pausó.
+  const entregable = contestarPorQuienLoPauso(req, workers.sesiones);
+  const sinSesion = () => Promise.reject(new Error("el pedido de un worker no tiene una sesión que lo haya pausado"));
+  let urlDelWorker: string | null = null;
+  if (marco === null) {
+    // El aviso del worker puede llegar en el MISMO mensaje de CDP que suelta
+    // este pedido —puppeteer lo empareja con el `Fetch.requestPaused` que ya
+    // tenía—, y a un oyente que corre DESPUÉS del de puppeteer: se lo lee un
+    // turno más tarde. Si igual no está, el pedido queda sin worker y cuenta.
+    // Para el mismo mensaje alcanzaría una microtarea —es lo que prueba
+    // `chromiumWorkers.test.ts`, y el mutante que cambia el turno por una
+    // microtarea sobrevive, equivalente ahí—; el turno entero cubre además un
+    // aviso que llegue en otro mensaje del mismo lote de E/S, que un test no
+    // puede ordenar.
+    await new Promise<void>((listo) => setImmediate(listo));
+    const id = idDelPedido(req);
+    if (id !== null) {
+      urlDelWorker = scripts.get(id) ?? null;
+      scripts.delete(id);
+    }
+  }
   return {
     url: req.url(),
     metodo: req.method(),
     encabezados: req.headers(),
     cuerpo,
     tipo: req.resourceType(),
-    esDocumentoPrincipal: req.isNavigationRequest() && req.frame() === page.mainFrame(),
+    esDocumentoPrincipal: req.isNavigationRequest() && marco === page.mainFrame(),
     // El marco que pide (RT-4). En un `<iframe>` de otro sitio —que Chromium
     // corre en otro proceso— puppeteer igual lo da: es el marco hijo, con su
-    // URL. Sin marco (un worker), `null`, y eso cuenta como de la página.
-    urlDelMarco: req.frame()?.url() ?? null,
+    // URL. Sin marco (un worker), `null`, y se juzga por el worker (W-1).
+    urlDelMarco: marco?.url() ?? null,
+    urlDelWorker,
     // El documento CONFIRMADO de la pestaña (FV-1): puppeteer cambia la URL
     // del marco con `Page.frameNavigated`, que Chromium manda al confirmar,
     // no al pedir. Un 204, una descarga denegada o un `window.stop()` no la
     // cambian. Antes `renderizado.ts` tomaba el último PEDIDO de navegación,
     // y con un 204 a otro sitio los `fetch` de la página pasaban por ajenos.
-    urlDeLaPagina: page.mainFrame().url(),
-    continuar: () => req.continue(),
-    abortar: () => req.abort("blockedbyclient"),
-    responder: (r) => req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }),
+    urlDeLaPagina,
+    // Sin sesión que lo pausó, contestar no llega a ninguna parte: se dice,
+    // y `renderizado.ts` lo anota como un pedido que no llegó (PU-3).
+    continuar: () => (entregable ? req.continue() : sinSesion()),
+    abortar: () => (entregable ? req.abort("blockedbyclient") : sinSesion()),
+    responder: (r) => (entregable ? req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }) : sinSesion()),
   };
 }
 
@@ -268,6 +403,11 @@ const avisarSalidas = `(() => {
  * pestaña se empareja con el primer aviso de la misma URL que no se usó; uno
  * sin aviso cuenta, y `renderizado.ts` decide con la regla de RT-4.
  *
+ * Y EL DE UN WORKER, POR SU SCRIPT (W-1). El socket que avisa la sesión de
+ * un worker lleva la URL del script de ese worker (`worker.url()`), que dice
+ * su origen: `renderizado.ts` lo juzga como a los pedidos del worker, y el
+ * de un worker de un marco de otro sitio no decide.
+ *
  * Lo que NO ve, dicho: un `SharedWorker`, que no es de la pestaña. Su red
  * tampoco sale (el proxy que no existe), pero si trajera el contenido, el
  * render no se enteraría. Y un marco de otro sitio que la página controla
@@ -275,11 +415,13 @@ const avisarSalidas = `(() => {
  * puerta que su `postMessage` (FV-3, «LO QUE NO CUBRE» en `renderizado.ts`).
  */
 async function vigilarSalidasPropias(page: Page, sesion: CDPSession): Promise<() => SalidaPropiaVista[]> {
-  const vistas: Array<{ url: string; tipo: SalidaPropia; deUnWorker: boolean; urlDeLaPagina: string }> = [];
+  type Vista = { url: string; tipo: SalidaPropia; deUnWorker: boolean; urlDelWorker: string | null; urlDeLaPagina: string };
+  const vistas: Vista[] = [];
   const avisos: Array<{ url: string; tipo: SalidaPropia; origen: string | null }> = [];
   const origenes = new Map<number, string>();
-  const vista = (tipo: SalidaPropia, deUnWorker: boolean) => (e: { url: string }) => {
-    vistas.push({ url: e.url, tipo, deUnWorker, urlDeLaPagina: page.mainFrame().url() });
+  // `urlDelWorker`: el script del worker en cuya sesión Chromium lo avisó (W-1).
+  const vista = (tipo: SalidaPropia, deUnWorker: boolean, urlDelWorker: string | null) => (e: { url: string }) => {
+    vistas.push({ url: e.url, tipo, deUnWorker, urlDelWorker, urlDeLaPagina: page.mainFrame().url() });
   };
   sesion.on("Runtime.executionContextCreated", (e) => origenes.set(e.context.id, e.context.origin));
   sesion.on("Runtime.bindingCalled", (e) => {
@@ -292,15 +434,15 @@ async function vigilarSalidasPropias(page: Page, sesion: CDPSession): Promise<()
       // Un aviso ilegible no es un aviso: el socket queda sin él, y cuenta.
     }
   });
-  sesion.on("Network.webSocketCreated", vista("websocket", false));
-  sesion.on("Network.webTransportCreated", vista("webtransport", false));
+  sesion.on("Network.webSocketCreated", vista("websocket", false, null));
+  sesion.on("Network.webTransportCreated", vista("webtransport", false, null));
   await sesion.send("Runtime.enable");
   await sesion.send("Runtime.addBinding", { name: AVISO_DE_SALIDA });
   await sesion.send("Network.enable");
   await page.evaluateOnNewDocument(avisarSalidas);
   page.on("workercreated", (worker) => {
-    worker.client.on("Network.webSocketCreated", vista("websocket", true));
-    worker.client.on("Network.webTransportCreated", vista("webtransport", true));
+    worker.client.on("Network.webSocketCreated", vista("websocket", true, worker.url()));
+    worker.client.on("Network.webTransportCreated", vista("webtransport", true, worker.url()));
     void worker.client.send("Network.enable").catch(() => {});
   });
   return () => {
@@ -311,7 +453,14 @@ async function vigilarSalidasPropias(page: Page, sesion: CDPSession): Promise<()
         const i = libres.findIndex((a) => a.tipo === v.tipo && a.url === v.url);
         if (i >= 0) origenDelMarco = libres.splice(i, 1)[0].origen;
       }
-      return { url: v.url, tipo: v.tipo, deUnWorker: v.deUnWorker, origenDelMarco, urlDeLaPagina: v.urlDeLaPagina };
+      return {
+        url: v.url,
+        tipo: v.tipo,
+        deUnWorker: v.deUnWorker,
+        urlDelWorker: v.urlDelWorker,
+        origenDelMarco,
+        urlDeLaPagina: v.urlDeLaPagina,
+      };
     });
   };
 }
@@ -325,12 +474,13 @@ function envolverPagina(page: Page, vigilada?: { sesion: CDPSession; salidas: ()
       return vigilada?.salidas() ?? [];
     },
     async interceptar(atender) {
+      const workers = vigilarWorkers(page);
       await page.setBypassServiceWorker(true);
       await page.setRequestInterception(true);
       page.on("request", (req) => {
         // Si adaptar o atender fallan, el pedido se aborta: un pedido colgado
         // frena el `load`, y uno liberado sin examen es una salida.
-        void adaptar(req, page)
+        void adaptar(req, page, workers)
           .then(atender)
           .catch(() => req.abort("blockedbyclient").catch(() => {}));
       });

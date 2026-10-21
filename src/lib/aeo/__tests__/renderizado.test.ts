@@ -104,6 +104,38 @@ function armar(
   return { deps, navegador, red, dns, reloj, bitacora: bitacoraVacia() };
 }
 
+/** Un pedido al interceptor, uno por vez, con su desenlace anotado. */
+function pedidor(atender: (p: PedidoDelNavegador) => Promise<void>, desenlaces: Record<string, string>) {
+  return (
+    url: string,
+    urlDelMarco: string | null,
+    opciones: {
+      tipo?: string;
+      metodo?: string;
+      cuerpo?: string;
+      principal?: boolean;
+      urlDeLaPagina?: string | null;
+      encabezados?: Record<string, string>;
+      /** Sin marco: el script del worker del que sale (W-1). */
+      urlDelWorker?: string | null;
+    } = {}
+  ) =>
+    atender({
+      url,
+      metodo: opciones.metodo ?? "GET",
+      encabezados: opciones.encabezados ?? {},
+      ...(opciones.cuerpo !== undefined ? { cuerpo: opciones.cuerpo } : {}),
+      tipo: opciones.tipo ?? (opciones.principal ? "document" : "xhr"),
+      esDocumentoPrincipal: opciones.principal === true,
+      urlDelMarco,
+      urlDelWorker: opciones.urlDelWorker ?? null,
+      urlDeLaPagina: opciones.urlDeLaPagina !== undefined ? opciones.urlDeLaPagina : opciones.principal ? null : "http://sitio.test/",
+      continuar: async () => void (desenlaces[url] = "continuado"),
+      abortar: async () => void (desenlaces[url] = "abortado"),
+      responder: async () => void (desenlaces[url] = "respondido"),
+    });
+}
+
 const TEXTO_JS = "Contenido que sólo existe después de ejecutar JavaScript. ".repeat(30);
 
 describe("la medición contra el punto de la puerta", () => {
@@ -507,21 +539,24 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
 
   /**
    * F2 con la regla de RT-4: lo que la política le rechaza a un marco de OTRO
-   * sitio no decide, como no decide lo que no le llega. Lo mismo desde un
-   * worker —Chromium no dice de qué marco es— o desde un marco del mismo
+   * sitio no decide, como no decide lo que no le llega, y tampoco lo que le
+   * rechaza a un worker de otro sitio (W-1). Lo que le rechaza a un worker de
+   * la página, a uno que no se sabe de quién es, o a un marco del mismo
    * sitio, sí.
    */
   it.each([
-    ["un marco de OTRO sitio: no decide", "http://video.test/embed", null],
-    ["un worker: decide", null, "worker"],
-    ["un marco del MISMO sitio: decide", "http://widgets.sitio.test/w", "mismo-sitio"],
-  ] as const)("F2 — lo que la política le rechaza a %s", async (_caso, marco, origen) => {
+    ["un marco de OTRO sitio: no decide", { marco: "http://video.test/embed" }, null],
+    ["un worker de la página: decide", { marco: null, worker: "http://sitio.test/worker.js" }, "worker"],
+    ["un worker de OTRO sitio (W-1): no decide", { marco: null, worker: "blob:http://video.test/0b6c9a4e" }, null],
+    ["un pedido sin marco que no es de ningún worker conocido: decide", { marco: null }, "sin-origen"],
+    ["un marco del MISMO sitio: decide", { marco: "http://widgets.sitio.test/w" }, "mismo-sitio"],
+  ] as const)("F2 — lo que la política le rechaza a %s", async (_caso, donde, origen) => {
     const { deps, bitacora, red } = armar(
       { "http://sitio.test/": { cuerpo: `<html><body>${MENU}</body></html>` } },
       {
         enSegundoPlano: [
-          { url: "https://cdn.test:8443/datos", tipo: "fetch", marco },
-          { url: "http://interno.test/datos", tipo: "fetch", marco },
+          { url: "https://cdn.test:8443/datos", tipo: "fetch", ...donde },
+          { url: "http://interno.test/datos", tipo: "fetch", ...donde },
         ],
       }
     );
@@ -652,7 +687,9 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
     ["un marco `blob:` que armó la página", "blob:http://sitio.test/6f1c2a9e-3b7d-4e2a-9c1f-0d8e7b6a5c4d", "marco-desconocido"],
     ["un pedido SIN marco: un worker de la página, que le pasa los datos", null, "worker"],
   ] as const)("lo que no llega a %s sigue dejando la página sin número", async (_caso, marco, origen) => {
-    const { deps } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco }] });
+    // Sin marco, el worker es de la página: su script es del sitio (W-1).
+    const worker = marco === null ? { worker: "http://sitio.test/worker.js" } : {};
+    const { deps } = armar(SITIO, { enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco, ...worker }] });
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
       falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen })
     );
@@ -685,7 +722,11 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
    * contaba, y la página que escribía con ellos salía VERDE si no llegaban.
    */
   it.each([
-    ["el `importScripts` de un worker (`other`, sin marco)", { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null }, "worker"],
+    [
+      "el `importScripts` de un worker de la página (`other`, sin marco)",
+      { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null, worker: "http://sitio.test/worker.js" },
+      "worker",
+    ],
     ["un `EventSource` de la página", { url: "http://solo-v6.test/sse", tipo: "eventsource" }, "pagina"],
   ] as const)("FV-4 — %s que no llega deja la página sin número", async (_caso, pedido, origen) => {
     const { deps, bitacora } = armar(SITIO, { enSegundoPlano: [pedido] });
@@ -730,6 +771,7 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
         tipo,
         esDocumentoPrincipal,
         urlDelMarco,
+        urlDelWorker: null,
         // La pestaña ya tiene la página confirmada, salvo mientras la pide.
         urlDeLaPagina: esDocumentoPrincipal ? null : "http://sitio.test/",
         continuar: async () => void (desenlaces[url] = "continuado"),
@@ -782,6 +824,7 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
         tipo,
         esDocumentoPrincipal,
         urlDelMarco,
+        urlDelWorker: null,
         urlDeLaPagina: esDocumentoPrincipal ? null : "http://sitio.test/",
         continuar: async () => {},
         abortar: async () => {},
@@ -894,6 +937,191 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
 });
 
 /**
+ * W-1. MEDIDO en producción el 2026-10-21 (POST /api/aeo/audit sobre
+ * https://vulkan-studios.com): `subrecurso-sin-respuesta` con el detalle
+ * `fetch brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/… desde
+ * worker`. Lo pedía un WORKER que crea el desafío de Cloudflare en su marco de
+ * `challenges.cloudflare.com`, dentro del de `player.vimeo.com`: sin marco, y
+ * hasta acá «sin marco» decidía siempre. Ahora un pedido sin marco se juzga
+ * por el ORIGEN del script de su worker, que Chromium da (`urlDelWorker`).
+ */
+describe("W-1: lo que pide un WORKER se juzga por el origen de su script", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+  const CON_VIDEO = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script><iframe src="http://video.test/embed"></iframe></body></html>`;
+  const SITIO: Sitio = {
+    "http://sitio.test/": { cuerpo: CON_VIDEO },
+    "http://sitio.test/app.js": { cuerpo: CONTENIDO },
+    "http://video.test/embed": { cuerpo: "<p>reproductor</p>" },
+    "http://solo-v6.test/sonda": { error: "sin-respuesta" },
+  };
+  const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
+    contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(CON_VIDEO), caracteresRenderizados: render }).estado;
+  /** El `fetch` sólo-IPv6 del desafío, sin marco, desde el worker cuyo script es `worker`. */
+  const sonda = (worker?: string) =>
+    armar(SITIO, {
+      enSegundoPlano: [{ url: "http://solo-v6.test/sonda", tipo: "fetch", marco: null, ...(worker !== undefined ? { worker } : {}) }],
+    });
+
+  it("el caso de producción: el `fetch` que no llega desde el worker `blob:` de un marco de OTRO sitio no deja la página sin número —ROJA—", async () => {
+    const { deps, bitacora } = sonda("blob:http://challenges.test/2f6e0c1d-6b1a-4c39-9a55-7b1f3e0d9c21");
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    // Salió y no llegó —si no, esto no prueba nada—, y no decidió.
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://solo-v6.test/sonda", motivo: "sin-respuesta" });
+    expect(bitacora.noLlegaron).toEqual([]);
+    expect(render.estado).toBe("medido");
+    // Y el bundle de la página, que sí llegó, se contó.
+    expect(punto(render)).toBe("rojo");
+  });
+
+  // El tercer valor es de dónde salió según el detalle: lo nombra, y los
+  // cinco deciden igual.
+  it.each([
+    ["un worker de la página (`/worker.js`)", "http://sitio.test/worker.js", "worker"],
+    ["un worker `blob:` que creó la página", "blob:http://sitio.test/5d0e7c1a-1b2c-4d3e-8f90-a1b2c3d4e5f6", "worker"],
+    ["un worker de un SUBDOMINIO del sitio (de un marco del mismo sitio)", "https://chat.sitio.test/w.js", "worker"],
+    ["un worker `data:`, de origen opaco", "data:text/javascript,fetch('http://solo-v6.test/sonda')", "sin-origen"],
+    ["un worker `blob:null/…`, de un contexto de origen opaco", "blob:null/7c9e6679-7425-40de-944b-e07fc1f90ae7", "sin-origen"],
+    ["un pedido sin marco que Chromium no atribuyó a ningún worker", undefined, "sin-origen"],
+    ["un worker con algo que no es una URL", "no es una url", "sin-origen"],
+  ] as const)("el mismo `fetch` desde %s SÍ decide: `subrecurso-sin-respuesta`", async (_caso, worker, origen) => {
+    const { deps, bitacora } = sonda(worker);
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual(falloPor("sin-respuesta", { tipo: "fetch", host: "solo-v6.test", ruta: "/sonda", origen }));
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta", origen }]);
+    expect(punto(render)).toBe("no-medido");
+  });
+
+  it.each([
+    ["un worker `blob:` del marco de otro sitio", "blob:http://video.test/0b6c9a4e-3f2d-4e1c-8b7a-6d5c4b3a2f10"],
+    ["un worker con script `https` de otro sitio", "https://player.video.test/worker.js"],
+  ])("tampoco decide %s, y su `importScripts` que no llega tampoco", async (_caso, worker) => {
+    const { deps, bitacora } = armar(SITIO, {
+      enSegundoPlano: [
+        { url: "http://solo-v6.test/sonda", tipo: "fetch", marco: null, worker },
+        { url: "http://solo-v6.test/lib.js", tipo: "other", marco: null, worker },
+      ],
+    });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(bitacora.bloqueados.map((b) => b.url)).toEqual(
+      expect.arrayContaining(["http://solo-v6.test/sonda", "http://solo-v6.test/lib.js"])
+    );
+    expect(bitacora.noLlegaron).toEqual([]);
+    expect(render.estado).toBe("medido");
+  });
+
+  it("un pedido de un worker de otro sitio que no termina nunca no deja la lectura esperándolo: no es `subrecurso-pendiente`", async () => {
+    const { deps } = armar(
+      { ...SITIO, "http://video.test/eterno": { cuerpo: "x", llegaCuando: () => new Promise(() => {}) } },
+      { enSegundoPlano: [{ url: "http://video.test/eterno", tipo: "fetch", marco: null, worker: "blob:http://video.test/1a2b" }] }
+    );
+    expect((await medirRenderizado("http://sitio.test/", deps)).estado).toBe("medido");
+  });
+
+  it("con la página todavía sin documento confirmado, un worker cuenta: no hay sitio contra el cual llamarlo ajeno", async () => {
+    const { deps } = armar({ "http://solo-v6.test/sonda": { error: "sin-respuesta" } });
+    const bitacora = bitacoraVacia();
+    const atender = crearInterceptor(deps, OPCIONES_RENDER, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, string> = {};
+    await pedidor(atender, desenlaces)("http://solo-v6.test/sonda", null, {
+      tipo: "fetch",
+      urlDeLaPagina: "about:blank",
+      urlDelWorker: "blob:http://video.test/1a2b",
+    });
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://solo-v6.test/sonda", tipo: "fetch", motivo: "sin-respuesta", origen: "worker" }]);
+  });
+
+  /**
+   * Los presupuestos van con la regla (RT-4): lo de un worker de otro sitio
+   * sale del presupuesto de otros sitios, como lo de su marco. Los dos topes
+   * son DISTINTOS a propósito —la página 1 000, otros sitios 1 200—, y se
+   * afirma dónde corta cada uno.
+   */
+  it("los bytes de un worker de otro sitio salen del presupuesto de OTROS SITIOS, y los de un worker de la página del de la página", async () => {
+    const SEGMENTO = "v".repeat(600);
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://cdn.test/seg1": { cuerpo: SEGMENTO },
+      "http://cdn.test/seg2": { cuerpo: SEGMENTO },
+      "http://cdn.test/seg3": { cuerpo: SEGMENTO },
+      "http://sitio.test/datos-1": { cuerpo: "c".repeat(300) },
+      "http://sitio.test/datos-2": { cuerpo: "d".repeat(800) },
+    });
+    const bitacora = bitacoraVacia();
+    const opciones = { ...OPCIONES_RENDER, maxBytesTotales: 1_000, maxBytesDeOtrosSitios: 1_200 };
+    const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(atender, desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    const ajeno = "blob:http://video.test/0b6c9a4e";
+    for (const n of [1, 2, 3]) await pedir(`http://cdn.test/seg${n}`, null, { tipo: "fetch", urlDelWorker: ajeno });
+    // El worker ajeno gastó el SUYO: 1 200 alcanzan para dos de 600 y no para
+    // el tercero. Con el de la página (1 000) cortaba en el segundo.
+    expect(desenlaces["http://cdn.test/seg2"]).toBe("respondido");
+    expect(desenlaces["http://cdn.test/seg3"]).toBe("abortado");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://cdn.test/seg3", motivo: "presupuesto" });
+    expect(bitacora.noLlegaron).toEqual([]);
+    // El worker de la página sale del de la página, que sigue entero para él…
+    const propio = "http://sitio.test/worker.js";
+    await pedir("http://sitio.test/datos-1", null, { tipo: "fetch", urlDelWorker: propio });
+    expect(desenlaces["http://sitio.test/datos-1"]).toBe("respondido");
+    // …y corta en el SUYO: 11 + 300 + 800 pasan los 1 000, y como decide, no llegó.
+    await pedir("http://sitio.test/datos-2", null, { tipo: "fetch", urlDelWorker: propio });
+    expect(desenlaces["http://sitio.test/datos-2"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/datos-2", tipo: "fetch", motivo: "presupuesto", origen: "worker" },
+    ]);
+  });
+
+  it("y sus pedidos también salen del tope de PEDIDOS de otros sitios: no le quitan ninguno a la página", async () => {
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://cdn.test/a": { cuerpo: "a" },
+      "http://cdn.test/b": { cuerpo: "b" },
+      "http://sitio.test/app.js": { cuerpo: "c" },
+    });
+    const bitacora = bitacoraVacia();
+    const atender = crearInterceptor(deps, { ...OPCIONES_RENDER, maxPedidos: 2 }, bitacora, () => 5_000, new AbortController().signal);
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(atender, desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    for (const u of ["http://cdn.test/a", "http://cdn.test/b"]) {
+      await pedir(u, null, { tipo: "fetch", urlDelWorker: "https://video.test/w.js" });
+    }
+    // El worker ajeno gastó sus dos; la página, que gastó uno con el
+    // documento, todavía tiene el suyo para el bundle.
+    await pedir("http://sitio.test/app.js", "http://sitio.test/", { tipo: "script" });
+    expect(desenlaces).toEqual({
+      "http://sitio.test/": "respondido",
+      "http://cdn.test/a": "respondido",
+      "http://cdn.test/b": "respondido",
+      "http://sitio.test/app.js": "respondido",
+    });
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  it("el `WebSocket` de un worker de otro sitio no decide; el de un worker de la página sí (F3 con W-1)", async () => {
+    const HIBRIDA = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script></body></html>`;
+    const sitio: Sitio = { "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } };
+    const ajeno = armar(sitio, {
+      salidasPropias: [{ url: "wss://video.test/chat", tipo: "websocket", worker: "blob:http://video.test/3c4d" }],
+    });
+    const render = await medirRenderizado("http://sitio.test/", ajeno.deps, OPCIONES_RENDER, ajeno.bitacora);
+    // Chromium lo avisó —si no, esto no prueba nada—, con el script del worker.
+    expect(ajeno.bitacora.salidasPropias).toEqual([
+      expect.objectContaining({ url: "wss://video.test/chat", deUnWorker: true, urlDelWorker: "blob:http://video.test/3c4d" }),
+    ]);
+    expect(render.estado).toBe("medido");
+    const propio = armar(sitio, {
+      salidasPropias: [{ url: "wss://sitio.test/vivo", tipo: "websocket", worker: "blob:http://sitio.test/3c4d" }],
+    });
+    expect(await medirRenderizado("http://sitio.test/", propio.deps)).toEqual(
+      falloPor("websocket", { tipo: "websocket", host: "sitio.test", ruta: "/vivo", origen: "worker" })
+    );
+  });
+});
+
+/**
  * F3: lo que la página abre por fuera del interceptor. MEDIDO por la revisión
  * con Chrome 155: un menú de 619 y un `WebSocket` que escribía 4 499 daban
  * `medido 619/619`, `bloqueados=[]`, `noLlegaron=[]` y VERDE. Y con la regla
@@ -918,6 +1146,7 @@ describe("F3: un WebSocket o un WebTransport que la página abrió por fuera del
         url: "ws://sitio.test/ws?token=SECRETO",
         tipo: "websocket",
         deUnWorker: false,
+        urlDelWorker: null,
         origenDelMarco: "http://sitio.test",
         urlDeLaPagina: "http://sitio.test/",
       },
@@ -930,7 +1159,10 @@ describe("F3: un WebSocket o un WebTransport que la página abrió por fuera del
 
   // El tercer valor es de dónde salió según el detalle.
   it.each([
-    ["un worker (Chromium lo avisa en su sesión)", { worker: true }, "worker"],
+    ["un worker de la página (Chromium lo avisa en su sesión)", { worker: "blob:http://sitio.test/5d0e7c1a" }, "worker"],
+    ["un worker de un SUBDOMINIO del sitio", { worker: "https://chat.sitio.test/w.js" }, "worker"],
+    ["un worker `data:`, de origen opaco (W-1)", { worker: "data:text/javascript,1" }, "sin-origen"],
+    ["un worker cuyo script Chromium no dio", { worker: true }, "sin-origen"],
     ["un contexto que no avisó cuál era (esquivó el envoltorio)", { origen: null }, "marco-desconocido"],
     ["un marco con `sandbox`, de origen opaco", { origen: "null" }, "marco-desconocido"],
     ["un marco de un subdominio del sitio", { origen: "https://chat.sitio.test" }, "mismo-sitio"],
@@ -938,6 +1170,18 @@ describe("F3: un WebSocket o un WebTransport que la página abrió por fuera del
     const { deps } = armar(SITIO, { salidasPropias: [{ url: "wss://chat.test/socket", tipo: "websocket", ...de }] });
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
       falloPor("websocket", { tipo: "websocket", host: "chat.test", ruta: "/socket", origen })
+    );
+  });
+
+  // Sin documento confirmado no hay sitio contra el cual llamarlo ajeno:
+  // cuenta, venga de un marco o de un worker, aunque el origen sea de otro sitio.
+  it.each([
+    ["un marco", { origen: "https://video.test" }, "marco-desconocido"],
+    ["un worker", { worker: "blob:https://video.test/8e1f" }, "worker"],
+  ] as const)("el de %s avisado sin documento confirmado también decide", async (_caso, de, origen) => {
+    const { deps } = armar(SITIO, { salidasPropias: [{ url: "wss://video.test/socket", tipo: "websocket", pagina: null, ...de }] });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("websocket", { tipo: "websocket", host: "video.test", ruta: "/socket", origen })
     );
   });
 
@@ -964,7 +1208,8 @@ describe("F3: un WebSocket o un WebTransport que la página abrió por fuera del
       salidasPropias: [
         { url: "wss://video.test/chat", tipo: "websocket", origen: "https://video.test" },
         { url: "ws://sitio.test/vivo", tipo: "websocket" },
-        { url: "ws://sitio.test/del-worker", tipo: "websocket", worker: true },
+        { url: "ws://sitio.test/del-worker", tipo: "websocket", worker: "http://sitio.test/w.js" },
+        { url: "wss://video.test/del-worker-ajeno", tipo: "websocket", worker: "blob:http://video.test/9f3e" },
       ],
     });
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
@@ -1029,7 +1274,7 @@ describe("el fallo dice CUÁL pedido dejó el render sin número", () => {
         "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script></body></html>` },
         "http://sitio.test/app.js": { error: "timeout" },
       },
-      { enSegundoPlano: [{ url: "http://cdn.test/datos", tipo: "fetch", marco: null }] }
+      { enSegundoPlano: [{ url: "http://cdn.test/datos", tipo: "fetch", marco: null, worker: "http://sitio.test/worker.js" }] }
     );
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
     expect(bitacora.noLlegaron.map((n) => [n.url, n.motivo, n.origen])).toEqual([
@@ -1131,7 +1376,8 @@ describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también pa
     url: string,
     tipo: string,
     urlDelMarco: string | null,
-    desenlaces: Record<string, number | "abortado">
+    desenlaces: Record<string, number | "abortado">,
+    urlDelWorker: string | null = null
   ): PedidoDelNavegador {
     return {
       url,
@@ -1140,6 +1386,7 @@ describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también pa
       tipo,
       esDocumentoPrincipal: false,
       urlDelMarco,
+      urlDelWorker,
       urlDeLaPagina: "http://sitio.test/",
       continuar: async () => {},
       abortar: async () => void (desenlaces[url] = "abortado"),
@@ -1369,6 +1616,7 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
       tipo: "script",
       esDocumentoPrincipal: false,
       urlDelMarco: "http://sitio.test/",
+      urlDelWorker: null,
       urlDeLaPagina: "http://sitio.test/",
       continuar: async () => {},
       abortar: async () => void (desenlaces[url] = "abortado"),
@@ -1456,34 +1704,6 @@ describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y d
     expect(red.pedidos.map((p) => `${p.metodo} ${p.url}`)).toEqual(["GET http://mio.app.test/", "POST http://mio.app.test/api"]);
   });
 
-  /** Un pedido al interceptor, uno por vez, con su desenlace anotado. */
-  function pedidor(atender: (p: PedidoDelNavegador) => Promise<void>, desenlaces: Record<string, string>) {
-    return (
-      url: string,
-      urlDelMarco: string | null,
-      opciones: {
-        tipo?: string;
-        metodo?: string;
-        cuerpo?: string;
-        principal?: boolean;
-        urlDeLaPagina?: string | null;
-        encabezados?: Record<string, string>;
-      } = {}
-    ) =>
-      atender({
-        url,
-        metodo: opciones.metodo ?? "GET",
-        encabezados: opciones.encabezados ?? {},
-        ...(opciones.cuerpo !== undefined ? { cuerpo: opciones.cuerpo } : {}),
-        tipo: opciones.tipo ?? (opciones.principal ? "document" : "xhr"),
-        esDocumentoPrincipal: opciones.principal === true,
-        urlDelMarco,
-        urlDeLaPagina: opciones.urlDeLaPagina !== undefined ? opciones.urlDeLaPagina : opciones.principal ? null : "http://sitio.test/",
-        continuar: async () => void (desenlaces[url] = "continuado"),
-        abortar: async () => void (desenlaces[url] = "abortado"),
-        responder: async () => void (desenlaces[url] = "respondido"),
-      });
-  }
 
   it("sin documento confirmado todavía, todo POST es ajeno: no hay sitio contra el cual eximirlo", async () => {
     const { deps } = armar({ "http://sitio.test/api": { cuerpo: "ok" }, "http://sitio.test/api?2": { cuerpo: "ok" } });
@@ -2039,6 +2259,7 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
         tipo: "fetch",
         esDocumentoPrincipal: false,
         urlDelMarco: "http://sitio.test/",
+        urlDelWorker: null,
         urlDeLaPagina: "http://sitio.test/",
         continuar: async () => void vistos.push(`${metodo} continuado`),
         abortar: async () => void vistos.push(`${metodo} abortado`),
