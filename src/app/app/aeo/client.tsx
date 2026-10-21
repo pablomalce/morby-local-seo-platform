@@ -198,6 +198,7 @@ const DE_DONDE: Record<DetalleDelSubrecurso["origen"], string> = {
   pagina: "la página",
   "mismo-sitio": "un marco del mismo sitio",
   worker: "un worker",
+  "sin-origen": "un worker sin origen de red, o un pedido sin marco que no se pudo atribuir",
   "marco-desconocido": "un marco sin URL de red",
 };
 

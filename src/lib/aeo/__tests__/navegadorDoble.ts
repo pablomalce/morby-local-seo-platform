@@ -26,6 +26,11 @@
  *     navegación de un `<iframe>` sale de `about:blank`, como en Chromium:
  *     MEDIDO con Chrome 155 y el headless shell 153, el marco que navega
  *     todavía no tiene la URL a la que va;
+ *   - un pedido en segundo plano con `marco: null` sale SIN marco, como el de
+ *     un worker, y con `worker` dice la URL del script de ese worker como la
+ *     da Chromium (`urlDelWorker`, W-1). Lo que trae se escribe en el DOM
+ *     sea de quien sea el worker: los tests de un worker de otro sitio lo
+ *     usan con pedidos que no llegan;
  *   - cada pedido dice también cuál es el documento CONFIRMADO de la pestaña
  *     (`urlDeLaPagina`): el del último salto de la navegación que llegó, como
  *     `page.mainFrame().url()`. Una navegación de la pestaña en segundo plano
@@ -210,9 +215,15 @@ export interface OpcionesDoble {
      * que pide un `<iframe>` por dentro (RT-4). Lo que trae no se escribe en
      * el DOM de la página, como en Chromium: el contenido de un marco no está
      * en la serialización del documento. `null` es un pedido SIN marco —un
-     * worker de la página—, y lo que trae sí se escribe: el worker se lo pasa.
+     * worker—, y lo que trae sí se escribe: el worker se lo pasa.
      */
     marco?: string | null;
+    /**
+     * Con `marco: null`, la URL del script del worker del que sale, como la
+     * daría Chromium (`documentURL` en la sesión del worker, W-1). Sin esto,
+     * Chromium no lo atribuyó a ningún worker.
+     */
+    worker?: string;
     /**
      * Una navegación de la PESTAÑA (`location.href = …`) que no se confirma:
      * sale como documento principal, el interceptor la atiende, y el
@@ -230,9 +241,17 @@ export interface OpcionesDoble {
    * Lo que la pestaña con JavaScript intenta abrir SIN pasar por el
    * interceptor —un `WebSocket`—, como lo avisaría Chromium por CDP (F3).
    * `origen` es el del contexto que lo abrió: sin decirlo, el de la página;
-   * `null`, sin aviso. `worker`, lo abrió un worker.
+   * `null`, sin aviso. `worker`, lo abrió un worker: con la URL de su script
+   * como la da Chromium (W-1), o `true` si no se supo.
    */
-  salidasPropias?: Array<{ url: string; tipo: SalidaPropia; origen?: string | null; worker?: boolean }>;
+  salidasPropias?: Array<{
+    url: string;
+    tipo: SalidaPropia;
+    origen?: string | null;
+    worker?: string | true;
+    /** El documento de la pestaña cuando Chromium lo avisó, si no es el que se navegó: `null`, ninguno confirmado. */
+    pagina?: string | null;
+  }>;
   /**
    * `responder` TIRA para estas URLs, como el de puppeteer con un encabezado
    * que Chromium no acepta (`Invalid header`): el pedido queda sin entregar
@@ -269,7 +288,8 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
     urlDelMarco: string | null,
     urlDeLaPagina: string | null,
     metodo = "GET",
-    cuerpo?: string
+    cuerpo?: string,
+    urlDelWorker: string | null = null
   ): Promise<Desenlace> {
     let resolver!: (d: Desenlace) => void;
     const desenlace = new Promise<Desenlace>((r) => (resolver = r));
@@ -281,6 +301,7 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
       tipo,
       esDocumentoPrincipal,
       urlDelMarco,
+      urlDelWorker,
       urlDeLaPagina,
       continuar: async () => resolver({ tipo: "continuado" }),
       abortar: async () => resolver({ tipo: "abortado" }),
@@ -309,9 +330,10 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
         return (opciones.salidasPropias ?? []).map((s) => ({
           url: s.url,
           tipo: s.tipo,
-          deUnWorker: s.worker === true,
+          deUnWorker: s.worker !== undefined,
+          urlDelWorker: typeof s.worker === "string" ? s.worker : null,
           origenDelMarco: s.worker ? null : s.origen === undefined ? new URL(urlDelDocumento).origin : s.origen,
-          urlDeLaPagina: urlDelDocumento,
+          urlDeLaPagina: s.pagina === undefined ? urlDelDocumento : s.pagina,
         }));
       },
       async interceptar(a) {
@@ -390,7 +412,17 @@ export function navegadorDoble(opciones: OpcionesDoble = {}) {
           const at = atender;
           // La URL de la página se lee al SALIR el pedido, como en Chromium.
           const salir = () =>
-            emitir(at, new URL(r.url, actual).toString(), r.tipo, principal, marco, urlDelDocumento || null, r.metodo, r.cuerpo).then((d) => {
+            emitir(
+              at,
+              new URL(r.url, actual).toString(),
+              r.tipo,
+              principal,
+              marco,
+              urlDelDocumento || null,
+              r.metodo,
+              r.cuerpo,
+              marco === null ? (r.worker ?? null) : null
+            ).then((d) => {
               // Una navegación de la pestaña que no se confirma no cambia el
               // documento: ni su DOM ni su URL.
               if (d.tipo !== "respondido" || deUnMarco || principal) return;
