@@ -1092,6 +1092,14 @@ const VIRTUALES: Record<string, string> = {
       const u = /** @type {Indice | Otra} */ (c);
       return u.rpc("integration_token" + "_secret");
     };`,
+  // La misma unión con el índice en el SEGUNDO miembro (D15b de la segunda
+  // vuelta de la revisión del #123): con `Otra` declarada antes, el índice no
+  // es el primer miembro, y mirar sólo ése dejaba esto en verde.
+  "clientePorUnionInvertida.ts": `
+    import { admin } from "./admin";
+    type Otra = { otra: number };
+    type Indice = { [m: string]: (...a: unknown[]) => unknown };
+    export const secreto = () => { const c: unknown = admin(); return (c as Otra | Indice).rpc("integration_token" + "_secret"); };`,
   "urlCruda.ts": `
     export const secreto = (url: string) => fetch(url + "/rest/v1/rpc/integration_token_secret", { method: "POST" });`,
   "esquemaDelVault.ts": `
@@ -1404,6 +1412,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         "clientePorIndicePlantilla.ts",
         "clientePorRegistro.ts",
         "clientePorUnion.js",
+        "clientePorUnionInvertida.ts",
         "receptorAsertado.ts",
         "rpcArmada.ts",
         "rpcDesestructurada.ts",
@@ -1439,6 +1448,9 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
     }
     expect(sitios).toContain(`${V}/clientePorUnion.js:8 una aserción de algo sin tipo a un índice que se puede llamar: (c)`);
     expect(sitios).toContain(`${V}/clientePorUnion.js:9 .rpc("integration_token" + "_secret")`);
+    // D15b de la segunda vuelta: el índice en el segundo miembro de la unión.
+    expect(sitios).toContain(`${V}/clientePorUnionInvertida.ts:5 una aserción de algo sin tipo a un índice que se puede llamar: c as Otra | Indice`);
+    expect(sitios).toContain(`${V}/clientePorUnionInvertida.ts:5 .rpc("integration_token" + "_secret")`);
   });
 
   it("el grafo: un import() que no se puede seguir, uno con query, uno que no resuelve, y las cargas de webpack", () => {
