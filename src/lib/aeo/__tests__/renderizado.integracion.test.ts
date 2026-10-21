@@ -76,6 +76,7 @@ import {
   type ResultadoRenderizado,
   type Transporte,
 } from "../renderizado";
+import { crearResolvedorDns } from "@/lib/profile/nodeTransport";
 import { crearTransporteRender } from "../transporteRender";
 import { resolvedorDoble } from "./navegadorDoble";
 
@@ -204,6 +205,36 @@ const CONTENIDO_DEL_BUNDLE = "Contenido del negocio que dibuja el bundle de la p
 const BUNDLE = `document.getElementById("app").textContent = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};`;
 function hibrida(script: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>${MENU}<main id="app"></main>${script}</body></html>`;
+}
+
+/**
+ * FV125-1: una sección que pide su script AL VERSE —lo dispara el recorrido
+ * (`desplazar`), después del `load` y justo antes de leer— a un host que
+ * resuelve el resolvedor de PRODUCCIÓN contra un DNS UDP local.
+ */
+function seccionAlVerse(host: string): string {
+  return hibrida(`<div style="height: 4000px"></div><section id="abajo" style="min-height: 10px"></section>
+<script>new IntersectionObserver((entradas, o) => {
+  if (!entradas.some((e) => e.isIntersecting)) return;
+  o.disconnect();
+  const s = document.createElement("script");
+  s.src = "http://${host}/seccion.js";
+  document.body.appendChild(s);
+}).observe(document.getElementById("abajo"));</script>`);
+}
+
+/**
+ * FV125-1, la forma exacta de la revisión: un `fetch` de la página con un
+ * temporizador de 1,5 s, después de la quietud de red y mientras se lee. El
+ * temporizador sale al correr el script, antes del `load`, y la lectura
+ * termina como pronto 500 ms de red quieta más 2 s de DOM quieto después del
+ * `load`: el pedido entra al interceptor siempre ANTES de que termine la
+ * lectura, con cualquier binario.
+ */
+function fetchTarde(host: string): string {
+  return hibrida(
+    `<script>setTimeout(() => fetch("http://${host}/contenido-cors").then((r) => r.text()).then(${ESCRIBIR}).catch(() => {}), 1_500);</script>`
+  );
 }
 
 /**
@@ -894,6 +925,21 @@ beforeAll(async () => {
         return html(hibrida(`<script src="/app-lento.js"></script>`));
       case "/hibrida-v6":
         return html(hibrida(`<script src="https://cdn-v6.test/app.js"></script>`));
+      case "/seccion-dns-mudo":
+        return html(seccionAlVerse("mudo.dns.test"));
+      case "/seccion-aaaa-muda":
+        return html(seccionAlVerse("aaaa-muda.dns.test"));
+      case "/seccion-dns-rapido":
+        return html(seccionAlVerse("rapido.dns.test"));
+      case "/fetch-tarde-dns-mudo":
+        return html(fetchTarde("mudo.dns.test"));
+      case "/fetch-tarde-dns-rapido":
+        return html(fetchTarde("rapido.dns.test"));
+      case "/contenido-cors":
+        res.writeHead(200, { "access-control-allow-origin": "*", "content-type": "text/plain; charset=utf-8" });
+        return res.end(CONTENIDO_DEL_BUNDLE);
+      case "/seccion.js":
+        return js(BUNDLE);
       case "/con-video":
         return html(CON_VIDEO);
       case "/embed":
@@ -2246,6 +2292,143 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
       },
       60_000
     );
+
+    /**
+     * FV125-1: un pedido que decide está EN VUELO desde que entra al
+     * interceptor, también mientras su examen espera al DNS. Con el
+     * resolvedor de PRODUCCIÓN (c-ares, 1,5 s × 2) contra un DNS UDP local en
+     * un puerto efímero: los nombres `*.dns.test` los contesta ESTE servidor,
+     * y los demás, el doble de siempre. Reproducido por la revisión con
+     * Chrome 155: la sección con el DNS mudo daba `medido 1249/1249`, VERDE
+     * 3 de 3, y la de la AAAA muda también, sin que el script llegara nunca
+     * al servidor.
+     */
+    describe("FV125-1 — lo que espera al DNS está EN VUELO", () => {
+      let dnsUdp: dgram.Socket;
+      let puertoDns = 0;
+
+      beforeAll(async () => {
+        dnsUdp = dgram.createSocket("udp4");
+        dnsUdp.on("message", (consulta, desde) => {
+          let i = 12;
+          const rotulos: string[] = [];
+          while (consulta[i] !== 0) {
+            rotulos.push(consulta.subarray(i + 1, i + 1 + consulta[i]).toString());
+            i += consulta[i] + 1;
+          }
+          const nombre = rotulos.join(".");
+          const tipo = consulta.readUInt16BE(i + 1);
+          // `mudo`: no contesta nada. `aaaa-muda`: la A sí, la AAAA no.
+          if (nombre === "mudo.dns.test" || (nombre === "aaaa-muda.dns.test" && tipo === 28)) return;
+          const cabecera = Buffer.from(consulta.subarray(0, 12));
+          const pregunta = consulta.subarray(12, i + 5);
+          const conA = tipo === 1 && (nombre === "aaaa-muda.dns.test" || nombre === "rapido.dns.test");
+          const existe = nombre === "aaaa-muda.dns.test" || nombre === "rapido.dns.test";
+          // Respuesta, recursión disponible; NXDOMAIN si el nombre no es de acá.
+          cabecera.writeUInt16BE(existe ? 0x8180 : 0x8183, 2);
+          cabecera.writeUInt16BE(1, 4);
+          cabecera.writeUInt16BE(conA ? 1 : 0, 6);
+          cabecera.writeUInt16BE(0, 8);
+          cabecera.writeUInt16BE(0, 10);
+          const ip = PUBLICA.split(".").map(Number);
+          const registro = conA ? Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, ...ip]) : Buffer.alloc(0);
+          dnsUdp.send(Buffer.concat([cabecera, pregunta, registro]), desde.port, desde.address);
+        });
+        puertoDns = await new Promise<number>((listo) => dnsUdp.bind(0, "127.0.0.1", () => listo(dnsUdp.address().port)));
+      });
+
+      afterAll(async () => {
+        await new Promise<void>((listo) => dnsUdp.close(() => listo()));
+      });
+
+      function conDnsReal(): DependenciasRender {
+        const d = deps();
+        const doble = d.resolver;
+        const real = crearResolvedorDns({ servidores: [`127.0.0.1:${puertoDns}`] });
+        return { ...d, resolver: (host, senal) => (host.endsWith(".dns.test") ? real(host, senal) : doble(host, senal)) };
+      }
+
+      it(
+        "el control del instrumento: con el DNS que contesta, la sección llega y la página es ROJA",
+        async () => {
+          const render = await medirRenderizado("http://sitio.test/seccion-dns-rapido", conDnsReal());
+          console.log(`[FV125-1 /seccion-dns-rapido] renderizado=${JSON.stringify(render)}`);
+          expect(render.estado).toBe("medido");
+          expect(punto(render)).toBe("rojo");
+        },
+        60_000
+      );
+
+      it(
+        "el DNS de la sección no contesta: `subrecurso-dns-sin-respuesta`, y el punto queda «no medido» —antes, VERDE—",
+        async () => {
+          const b = bitacora();
+          const render = await medirRenderizado("http://sitio.test/seccion-dns-mudo", conDnsReal(), OPCIONES_RENDER, b);
+          console.log(`[FV125-1 /seccion-dns-mudo] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+          expect(render).toEqual({
+            estado: "fallo",
+            codigo: "subrecurso-dns-sin-respuesta",
+            detalle: {
+              tipo: "script",
+              host: "mudo.dns.test",
+              ruta: "/seccion.js",
+              origen: "pagina",
+              motivo: "dns-sin-respuesta",
+              noLlegaron: 1,
+            },
+          });
+          expect(punto(render)).toBe("no-medido");
+        },
+        60_000
+      );
+
+      it(
+        "la AAAA de la sección no contesta y la A sí: se espera al DNS, el script llega y la página es ROJA —antes, VERDE—",
+        async () => {
+          const b = bitacora();
+          const render = await medirRenderizado("http://sitio.test/seccion-aaaa-muda", conDnsReal(), OPCIONES_RENDER, b);
+          console.log(`[FV125-1 /seccion-aaaa-muda] renderizado=${JSON.stringify(render)} pedidos=${JSON.stringify(b.pedidos.map((p) => p.url))}`);
+          expect(b.pedidos.map((p) => p.url)).toContain("http://aaaa-muda.dns.test/seccion.js");
+          expect(render.estado).toBe("medido");
+          expect(punto(render)).toBe("rojo");
+        },
+        60_000
+      );
+
+      it(
+        "el control del `fetch` con temporizador: con el DNS que contesta, el contenido llega y la página es ROJA",
+        async () => {
+          const render = await medirRenderizado("http://sitio.test/fetch-tarde-dns-rapido", conDnsReal());
+          console.log(`[FV125-1 /fetch-tarde-dns-rapido] renderizado=${JSON.stringify(render)}`);
+          expect(render.estado).toBe("medido");
+          expect(punto(render)).toBe("rojo");
+        },
+        60_000
+      );
+
+      it(
+        "un `fetch` con temporizador, después de la quietud de red, a un host con el DNS mudo: `subrecurso-dns-sin-respuesta` —antes, VERDE—",
+        async () => {
+          const b = bitacora();
+          const render = await medirRenderizado("http://sitio.test/fetch-tarde-dns-mudo", conDnsReal(), OPCIONES_RENDER, b);
+          console.log(`[FV125-1 /fetch-tarde-dns-mudo] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+          expect(render).toEqual({
+            estado: "fallo",
+            codigo: "subrecurso-dns-sin-respuesta",
+            detalle: {
+              tipo: "fetch",
+              host: "mudo.dns.test",
+              ruta: "/contenido-cors",
+              origen: "pagina",
+              motivo: "dns-sin-respuesta",
+              noLlegaron: 1,
+            },
+          });
+          expect(punto(render)).toBe("no-medido");
+        },
+        60_000
+      );
+    });
   });
 
   it(

@@ -503,7 +503,7 @@ describe("F6: un @type que schema.org no define, o un tipo que importa sin lo m�
     expect(erroresDeSchema(absurdo)).toEqual([
       'bloque 1: LocalBusiness con "telephone" que no es texto ({"x":1})',
       'bloque 1: LocalBusiness con "openingHours" que no es texto (true)',
-      'bloque 1: LocalBusiness con "address" que no es un PostalAddress o texto (42)',
+      'bloque 1: LocalBusiness con "address" que no es un PostalAddress con calle o localidad, o texto (42)',
     ]);
     expect(puntoSchema(absurdo)).toBe("rojo");
   });
@@ -527,7 +527,7 @@ describe("F6: un @type que schema.org no define, o un tipo que importa sin lo m�
       'bloque 1: FAQPage, la pregunta 1 sin "name"',
     ]);
     expect(erroresDeSchema(faq('{"@type":"Question","name":"¿Abren?","acceptedAnswer":{"@type":"Answer"}}'))).toEqual([
-      'bloque 1: FAQPage, la pregunta 1 sin "acceptedAnswer" con "text"',
+      'bloque 1: FAQPage, la pregunta 1 sin "acceptedAnswer" que sea un Answer con "text"',
     ]);
     expect(erroresDeSchema(faq('[{"@id":"#no-esta"}]'))).toEqual([
       "bloque 1: FAQPage, la pregunta 1 apunta a un @id que la página no declara",
@@ -637,6 +637,104 @@ describe("F6: un @type que schema.org no define, o un tipo que importa sin lo m�
     expect(erroresDeSchema(bien)).toEqual([]);
     expect(tiposDeSchema(bien)).toEqual(["FAQPage", "LocalBusiness", "Organization", "WebPage", "WebSite"]);
     expect(puntoSchema(bien)).toBe("verde");
+  });
+
+  /**
+   * FV125-2: el mínimo de F6 se cumplía con CUALQUIER objeto. Reproducido por
+   * la revisión con `erroresDeSchema`, `tiposDeSchema` y `puntosDeLaPuerta`:
+   * un `LocalBusiness` con `address: {}`, un `PostalAddress` con todos los
+   * campos vacíos —lo que emite un plugin de WordPress sin configurar—,
+   * `{"@value":""}`, `[{}]`, `{"x":1}` o `{"@type":"Bananaa"}` salía VERDE con
+   * `errores = []`, y lo mismo `geo: {}` y un `acceptedAnswer` que no es un
+   * `Answer`.
+   */
+  const local = (propiedades: string) =>
+    ld(`{"@context":"https://schema.org","@type":"LocalBusiness","name":"Ferretería",${propiedades}}`);
+
+  it("FV125-2 — un address vacío, sin tipo o de otro tipo no es una dirección: ROJO, con su error", () => {
+    const direcciones = [
+      "{}",
+      '{"@type":"PostalAddress","streetAddress":"","addressLocality":"","addressCountry":""}',
+      '{"@type":"PostalAddress","addressCountry":"ES","postalCode":"28001"}',
+      '{"@type":"Bananaa","x":1}',
+      '{"@type":"Bananaa","streetAddress":"Calle 1"}',
+      '{"@value":""}',
+      "[{}]",
+      '["Calle 1", {}]',
+      "[]",
+      '{"x":1}',
+      '{"streetAddress":"Calle 1"}',
+      '""',
+      '{"@id":"#no-esta"}',
+    ];
+    for (const direccion of direcciones) {
+      const html = local(`"address":${direccion}`);
+      const errores = erroresDeSchema(html);
+      expect(errores, direccion).toHaveLength(1);
+      expect(errores[0], direccion).toMatch(/^bloque 1: LocalBusiness con "address" que no es un PostalAddress con calle o localidad, o texto /);
+      expect(puntoSchema(html), direccion).toBe("rojo");
+    }
+  });
+
+  it("FV125-2 — un geo sin latitud y longitud, o que no es un GeoCoordinates, es un error: ROJO", () => {
+    const ubicaciones = [
+      "{}",
+      '{"@type":"GeoCoordinates"}',
+      '{"@type":"GeoCoordinates","latitude":"","longitude":2}',
+      '{"@type":"GeoCoordinates","latitude":"norte","longitude":2}',
+      '{"@type":"GeoCoordinates","latitude":40.4}',
+      '{"@type":"Bananaa","latitude":1,"longitude":2}',
+      '{"latitude":1,"longitude":2}',
+      '{"@type":"GeoShape"}',
+      "[{}]",
+    ];
+    for (const geo of ubicaciones) {
+      const html = local(`"address":"Calle 1","geo":${geo}`);
+      const errores = erroresDeSchema(html);
+      expect(errores, geo).toHaveLength(1);
+      expect(errores[0], geo).toMatch(/^bloque 1: LocalBusiness con "geo" que no es un GeoCoordinates con latitud y longitud, o un GeoShape /);
+      expect(puntoSchema(html), geo).toBe("rojo");
+    }
+  });
+
+  it("FV125-2 — un acceptedAnswer que no es un Answer no es una respuesta: ROJO", () => {
+    const faq = (respuesta: string) =>
+      ld(`{"@context":"https://schema.org","@type":"FAQPage","mainEntity":{"@type":"Question","name":"¿Abren?","acceptedAnswer":${respuesta}}}`);
+    for (const respuesta of ['{"@type":"Bananaa","text":"Sí."}', '{"text":"Sí."}', '{"@id":"#no-esta"}', '[{"@type":"Comment","text":"Sí."}]']) {
+      expect(erroresDeSchema(faq(respuesta)), respuesta).toEqual([
+        'bloque 1: FAQPage, la pregunta 1 sin "acceptedAnswer" que sea un Answer con "text"',
+      ]);
+      expect(puntoSchema(faq(respuesta)), respuesta).toBe("rojo");
+    }
+  });
+
+  it("FV125-2 — lo que sí es una dirección, una ubicación y una respuesta sigue VERDE, también por referencia @id", () => {
+    const bien = [
+      '"address":"Calle 1, Madrid"',
+      '"address":{"@value":"Calle 1, Madrid"}',
+      '"address":{"@type":"PostalAddress","streetAddress":"Calle 1"}',
+      '"address":{"@type":"PostalAddress","addressLocality":"Madrid","addressCountry":"ES"}',
+      '"address":{"@type":"schema:PostalAddress","streetAddress":["Calle 1"]}',
+      '"address":[{"@type":"PostalAddress","streetAddress":"Calle 1"},{"@type":"PostalAddress","addressLocality":"Getafe"}]',
+      '"address":"Calle 1","geo":{"@type":"GeoCoordinates","latitude":40.41,"longitude":-3.7}',
+      '"address":"Calle 1","geo":{"@type":"GeoCoordinates","latitude":"40.41","longitude":"-3.70"}',
+      '"address":"Calle 1","geo":{"@type":"GeoShape","box":"40.4 -3.7 40.5 -3.6"}',
+    ];
+    for (const propiedades of bien) {
+      const html = local(propiedades);
+      expect(erroresDeSchema(html), propiedades).toEqual([]);
+      expect(puntoSchema(html), propiedades).toBe("verde");
+    }
+    // La dirección, la ubicación y la respuesta como nodos aparte del @graph, por @id: como las escriben Yoast Local y RankMath.
+    const referencias = ld(`{"@context":"https://schema.org","@graph":[
+      {"@type":"LocalBusiness","@id":"#local","name":"Ferretería","address":{"@id":"#direccion"},"geo":{"@id":"#ubicacion"}},
+      {"@type":"PostalAddress","@id":"#direccion","streetAddress":"Calle 1","addressLocality":"Madrid"},
+      {"@type":"GeoCoordinates","@id":"#ubicacion","latitude":40.41,"longitude":-3.7},
+      {"@type":"FAQPage","mainEntity":{"@type":"Question","name":"¿Abren?","acceptedAnswer":{"@id":"#respuesta"}}},
+      {"@type":"Answer","@id":"#respuesta","text":"Sí."}
+    ]}`);
+    expect(erroresDeSchema(referencias)).toEqual([]);
+    expect(puntoSchema(referencias)).toBe("verde");
   });
 
   it("lo que NO valida, dicho: un nodo ANIDADO no pide lo mínimo (el publisher de un Article)", () => {

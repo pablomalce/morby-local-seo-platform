@@ -615,11 +615,68 @@ function esNodo(valor: unknown): boolean {
 }
 
 /**
+ * El nodo que es un valor: él mismo o, si es una referencia —`{"@id": …}`
+ * sin `@type`—, el nodo de la página con ese `@id`, como lo fusiona JSON-LD.
+ * `null` si no es un objeto. Una referencia que la página no declara queda
+ * como está: sin `@type`, no es nada.
+ */
+type ResolverNodo = (valor: unknown) => Record<string, unknown> | null;
+
+/** Un número de JSON-LD: un número finito, o un texto que lo es (`"40.41"`), también dentro de `{"@value": …}`. */
+function esNumero(valor: unknown): boolean {
+  const v = valor && typeof valor === "object" && !Array.isArray(valor) ? (valor as Record<string, unknown>)["@value"] : valor;
+  if (typeof v === "number") return Number.isFinite(v);
+  return typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v));
+}
+
+/** Uno, o una lista no vacía en la que TODOS lo son. */
+function cadaUno(valor: unknown, uno: (v: unknown) => boolean): boolean {
+  return Array.isArray(valor) ? valor.length > 0 && valor.every(uno) : uno(valor);
+}
+
+/**
+ * Una dirección (FV125-2): texto, o un `PostalAddress` con CALLE o LOCALIDAD
+ * —lo que la ubica—, por sí mismo o por referencia. Antes cualquier objeto lo
+ * era: `{}`, `{"x":1}`, `{"@type":"Bananaa"}`, y el `PostalAddress` con los
+ * campos vacíos que emite un plugin de WordPress sin configurar salían VERDES.
+ */
+function esDireccion(valor: unknown, resolver: ResolverNodo): boolean {
+  return cadaUno(valor, (v) => {
+    if (esTexto(v)) return true;
+    const nodo = resolver(v);
+    return (
+      nodo !== null &&
+      tiposDelNodo(nodo).includes("PostalAddress") &&
+      (esTexto(nodo["streetAddress"]) || esTexto(nodo["addressLocality"]))
+    );
+  });
+}
+
+/**
+ * Una ubicación (FV125-2): un `GeoCoordinates` con `latitude` y `longitude`
+ * numéricas, o un `GeoShape` (o `GeoCircle`) con su forma, por sí mismo o
+ * por referencia. Antes `geo: {}` salía VERDE.
+ */
+function esUbicacion(valor: unknown, resolver: ResolverNodo): boolean {
+  return cadaUno(valor, (v) => {
+    const nodo = resolver(v);
+    if (nodo === null) return false;
+    const tipos = tiposDelNodo(nodo);
+    if (tipos.includes("GeoCoordinates")) return esNumero(nodo["latitude"]) && esNumero(nodo["longitude"]);
+    if (tipos.includes("GeoShape") || tipos.includes("GeoCircle")) {
+      return ["box", "circle", "line", "polygon"].some((forma) => esTexto(nodo[forma])) || esNodo(nodo["geoMidpoint"]);
+    }
+    return false;
+  });
+}
+
+/**
  * Lo que tiene que traer cada propiedad de `Organization` y `LocalBusiness`
  * SI ESTÁ: el tipo de valor que schema.org le asigna, en la forma que admite
- * JSON-LD. `address` admite `PostalAddress` o texto; `geo`, sólo un nodo.
+ * JSON-LD. `address` admite texto o un `PostalAddress` que diga dónde; `geo`,
+ * un `GeoCoordinates` con latitud y longitud, o un `GeoShape` (FV125-2).
  */
-const FORMA_DE_PROPIEDAD: Record<string, { valida: (v: unknown) => boolean; que: string }> = {
+const FORMA_DE_PROPIEDAD: Record<string, { valida: (v: unknown, resolver: ResolverNodo) => boolean; que: string }> = {
   name: { valida: esTexto, que: "texto" },
   legalName: { valida: esTexto, que: "texto" },
   description: { valida: esTexto, que: "texto" },
@@ -632,8 +689,8 @@ const FORMA_DE_PROPIEDAD: Record<string, { valida: (v: unknown) => boolean; que:
   sameAs: { valida: esNodoOTexto, que: "una URL" },
   logo: { valida: esNodoOTexto, que: "una URL o un ImageObject" },
   image: { valida: esNodoOTexto, que: "una URL o un ImageObject" },
-  address: { valida: esNodoOTexto, que: "un PostalAddress o texto" },
-  geo: { valida: esNodo, que: "un GeoCoordinates" },
+  address: { valida: esDireccion, que: "un PostalAddress con calle o localidad, o texto" },
+  geo: { valida: esUbicacion, que: "un GeoCoordinates con latitud y longitud, o un GeoShape" },
   openingHoursSpecification: { valida: esNodo, que: "un OpeningHoursSpecification" },
 };
 
@@ -646,10 +703,14 @@ const FORMA_DE_PROPIEDAD: Record<string, { valida: (v: unknown) => boolean; que:
  *   - `Organization` y sus subtipos: `name`;
  *   - `LocalBusiness` y sus subtipos: además, `address` —sin ella no es un
  *     negocio LOCAL, y Google la pide—;
- *   - cada propiedad de `FORMA_DE_PROPIEDAD` que esté, con su forma;
+ *   - cada propiedad de `FORMA_DE_PROPIEDAD` que esté, con su forma: una
+ *     `address` tiene que decir DÓNDE y un `geo` tiene que traer
+ *     coordenadas, no ser un objeto cualquiera (FV125-2);
  *   - `FAQPage`: `mainEntity`, con cada `Question` con `name` y un
- *     `acceptedAnswer` con `text`. Una pregunta puede venir como referencia
- *     (`{"@id": …}`) a un nodo de la página, como la escribe Yoast.
+ *     `acceptedAnswer` que sea un `Answer` con `text` (FV125-2: antes valía
+ *     cualquier objeto con `text`). Una pregunta, una respuesta, una
+ *     dirección o una ubicación pueden venir como referencia (`{"@id": …}`)
+ *     a un nodo de la página, como las escriben Yoast y RankMath.
  */
 function erroresDeLosTiposQueImportan(nodos: Array<{ nodo: Record<string, unknown>; bloque: number }>): string[] {
   const errores: string[] = [];
@@ -668,6 +729,13 @@ function erroresDeLosTiposQueImportan(nodos: Array<{ nodo: Record<string, unknow
     if (id !== null) porId.set(id, entrada);
     fusionados.push(entrada);
   }
+  const resolver: ResolverNodo = (valor) => {
+    if (!valor || typeof valor !== "object" || Array.isArray(valor)) return null;
+    const nodo = valor as Record<string, unknown>;
+    if ("@type" in nodo || typeof nodo["@id"] !== "string") return nodo;
+    const apuntado = porId.get(nodo["@id"]);
+    return apuntado ? { ...nodo, ...apuntado.nodo } : nodo;
+  };
 
   for (const { nodo, bloque } of fusionados) {
     const tipos = tiposDelNodo(nodo);
@@ -678,14 +746,14 @@ function erroresDeLosTiposQueImportan(nodos: Array<{ nodo: Record<string, unknow
       if (!("name" in nodo)) errores.push(`bloque ${bloque}: ${quien} sin "name"`);
       if (local && !("address" in nodo)) errores.push(`bloque ${bloque}: ${local} sin "address"`);
       for (const [propiedad, forma] of Object.entries(FORMA_DE_PROPIEDAD)) {
-        if (propiedad in nodo && !forma.valida(nodo[propiedad])) {
+        if (propiedad in nodo && !forma.valida(nodo[propiedad], resolver)) {
           errores.push(
             `bloque ${bloque}: ${quien} con "${propiedad}" que no es ${forma.que} (${JSON.stringify(nodo[propiedad]).slice(0, 40)})`
           );
         }
       }
     }
-    if (tipos.includes("FAQPage")) errores.push(...erroresDeFaq(nodo, bloque, porId));
+    if (tipos.includes("FAQPage")) errores.push(...erroresDeFaq(nodo, bloque, porId, resolver));
   }
   return errores;
 }
@@ -693,7 +761,8 @@ function erroresDeLosTiposQueImportan(nodos: Array<{ nodo: Record<string, unknow
 function erroresDeFaq(
   faq: Record<string, unknown>,
   bloque: number,
-  porId: Map<string, { nodo: Record<string, unknown> }>
+  porId: Map<string, { nodo: Record<string, unknown> }>,
+  resolver: ResolverNodo
 ): string[] {
   const principal = faq["mainEntity"];
   const preguntas = Array.isArray(principal) ? principal : principal === undefined ? [] : [principal];
@@ -715,10 +784,13 @@ function erroresDeFaq(
     if (!esTexto(pregunta["name"])) errores.push(`bloque ${bloque}: FAQPage, la pregunta ${i + 1} sin "name"`);
     const respuestas = pregunta["acceptedAnswer"];
     const lista = Array.isArray(respuestas) ? respuestas : respuestas === undefined ? [] : [respuestas];
-    const conTexto = lista.some(
-      (r) => !!r && typeof r === "object" && esTexto((r as Record<string, unknown>)["text"])
-    );
-    if (!conTexto) errores.push(`bloque ${bloque}: FAQPage, la pregunta ${i + 1} sin "acceptedAnswer" con "text"`);
+    const conTexto = lista.some((r) => {
+      const respuesta = resolver(r);
+      return respuesta !== null && tiposDelNodo(respuesta).includes("Answer") && esTexto(respuesta["text"]);
+    });
+    if (!conTexto) {
+      errores.push(`bloque ${bloque}: FAQPage, la pregunta ${i + 1} sin "acceptedAnswer" que sea un Answer con "text"`);
+    }
   });
   return errores;
 }
