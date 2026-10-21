@@ -224,6 +224,20 @@ function seccionAlVerse(host: string): string {
 }
 
 /**
+ * FV125-1, la forma exacta de la revisión: un `fetch` de la página con un
+ * temporizador de 1,5 s, después de la quietud de red y mientras se lee. El
+ * temporizador sale al correr el script, antes del `load`, y la lectura
+ * termina como pronto 500 ms de red quieta más 2 s de DOM quieto después del
+ * `load`: el pedido entra al interceptor siempre ANTES de que termine la
+ * lectura, con cualquier binario.
+ */
+function fetchTarde(host: string): string {
+  return hibrida(
+    `<script>setTimeout(() => fetch("http://${host}/contenido-cors").then((r) => r.text()).then(${ESCRIBIR}).catch(() => {}), 1_500);</script>`
+  );
+}
+
+/**
  * RT-4: la forma de https://vulkan-studios.com que salía `subrecurso-sin-respuesta`.
  * La página trae su bundle y un reproductor de otro sitio (`player.vimeo.com`);
  * adentro del reproductor, el desafío de otro sitio más
@@ -781,6 +795,13 @@ beforeAll(async () => {
         return html(seccionAlVerse("aaaa-muda.dns.test"));
       case "/seccion-dns-rapido":
         return html(seccionAlVerse("rapido.dns.test"));
+      case "/fetch-tarde-dns-mudo":
+        return html(fetchTarde("mudo.dns.test"));
+      case "/fetch-tarde-dns-rapido":
+        return html(fetchTarde("rapido.dns.test"));
+      case "/contenido-cors":
+        res.writeHead(200, { "access-control-allow-origin": "*", "content-type": "text/plain; charset=utf-8" });
+        return res.end(CONTENIDO_DEL_BUNDLE);
       case "/seccion.js":
         return js(BUNDLE);
       case "/con-video":
@@ -2058,6 +2079,40 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
           expect(b.pedidos.map((p) => p.url)).toContain("http://aaaa-muda.dns.test/seccion.js");
           expect(render.estado).toBe("medido");
           expect(punto(render)).toBe("rojo");
+        },
+        60_000
+      );
+
+      it(
+        "el control del `fetch` con temporizador: con el DNS que contesta, el contenido llega y la página es ROJA",
+        async () => {
+          const render = await medirRenderizado("http://sitio.test/fetch-tarde-dns-rapido", conDnsReal());
+          console.log(`[FV125-1 /fetch-tarde-dns-rapido] renderizado=${JSON.stringify(render)}`);
+          expect(render.estado).toBe("medido");
+          expect(punto(render)).toBe("rojo");
+        },
+        60_000
+      );
+
+      it(
+        "un `fetch` con temporizador, después de la quietud de red, a un host con el DNS mudo: `subrecurso-dns-sin-respuesta` —antes, VERDE—",
+        async () => {
+          const b = bitacora();
+          const render = await medirRenderizado("http://sitio.test/fetch-tarde-dns-mudo", conDnsReal(), OPCIONES_RENDER, b);
+          console.log(`[FV125-1 /fetch-tarde-dns-mudo] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)}`);
+          expect(render).toEqual({
+            estado: "fallo",
+            codigo: "subrecurso-dns-sin-respuesta",
+            detalle: {
+              tipo: "fetch",
+              host: "mudo.dns.test",
+              ruta: "/contenido-cors",
+              origen: "pagina",
+              motivo: "dns-sin-respuesta",
+              noLlegaron: 1,
+            },
+          });
+          expect(punto(render)).toBe("no-medido");
         },
         60_000
       );
