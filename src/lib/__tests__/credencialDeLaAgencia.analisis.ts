@@ -541,8 +541,8 @@ function enContextoAmbiental(nodo: ts.Node): boolean {
 
 /**
  * Cómo se usa una expresión que vale un símbolo de otro módulo: `(n)` si se la
- * llama con `n` argumentos (`(...)` con un spread), `new(n)` si se la construye,
- * y nada si se la usa como VALOR —se guarda, se pasa, se le escribe una
+ * llama con `n` argumentos (un spread cuenta como uno), y nada si se la usa como
+ * VALOR —se guarda, se pasa, se construye con `new`, se le escribe una
  * propiedad, se reexporta—. Ver `Veredicto.usanDelArbol`: medido el 2026-10-21
  * en la revisión del #123, la puerta le colgaba el token al
  * `createSupabaseServerClient` que importa (un valor), o se lo pasaba como
@@ -550,13 +550,7 @@ function enContextoAmbiental(nodo: ts.Node): boolean {
  */
 function formaDelUso(uso: ts.Node): string {
   const e = envueltoHasta(uso);
-  const p = e.parent;
-  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === e) {
-    const argumentos = p.arguments ?? [];
-    const n = argumentos.some(ts.isSpreadElement) ? "..." : String(argumentos.length);
-    return `${ts.isNewExpression(p) ? "new" : ""}(${n})`;
-  }
-  return "";
+  return ts.isCallExpression(e.parent) && e.parent.expression === e ? `(${e.parent.arguments.length})` : "";
 }
 
 /** Los métodos de un cliente de Supabase que nombran algo de la base. */

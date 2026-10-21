@@ -653,8 +653,8 @@ const VIRTUALES: Record<string, string> = {
     export function consultarPorElCanalGlobal(deps: { accessToken: string }) { new BroadcastChannel("gsc").postMessage(deps.accessToken); }`,
   // Escribir en lo que ven otros módulos (revisión del #123): un valor del
   // lenguaje, un export propio, por cada forma de escribir —asignación,
-  // `Object.assign`, `Reflect.set`, destructuring, `for…of`, `++`, `delete`, y
-  // un `Object.assign` cuyo destino viene en un spread—.
+  // `Object.assign`, `Reflect.set`, destructuring, `for…of`, `++`, `delete`, un
+  // `Object.assign` cuyo destino viene en un spread, `+=` y `for…in`—.
   "receptorEscribeLoAjeno.ts": `
     export const registro: { t?: string } = {};
     export function consultarEscribiendo(deps: { accessToken: string }) {
@@ -669,6 +669,7 @@ const VIRTUALES: Record<string, string> = {
       ({ a: (Boolean as unknown as { t?: string }).t, ...(Error as unknown as { r: object }).r } = { a: deps.accessToken });
       [(String as unknown as { t?: string }).t = "", ...(RegExp as unknown as { r: string[] }).r] = [deps.accessToken];
       (Array as unknown as { t: string }).t += deps.accessToken;
+      for ((Symbol as unknown as { t?: string }).t in { [deps.accessToken]: 1 });
     }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
@@ -1442,7 +1443,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         [`${V}/receptorAlCanalGlobal.ts`]: { importa: [], globales: ["BroadcastChannel"] },
         [`${V}/receptorEscribeLoAjeno.ts`]: {
           importa: [],
-          globales: ["Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Reflect", "RegExp", "String", "fetch"],
+          globales: ["Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Reflect", "RegExp", "String", "Symbol", "fetch"],
         },
         // Los tenedores (EV-TOKENSTORE-EGRESS de la revisión del #123): el
         // productor, y el que deja el refresh token en el disco.
@@ -1491,6 +1492,7 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           `${V}/receptorEscribeLoAjeno.ts:13 escribe en String, que declara otro archivo: (String as unknown as { t?: string }).t = ""`,
           `${V}/receptorEscribeLoAjeno.ts:13 escribe en RegExp, que declara otro archivo: [(String as unknown as { t?: string }).t = "", ...(RegExp as unknown as { r: str`,
           `${V}/receptorEscribeLoAjeno.ts:14 escribe en Array, que declara otro archivo: (Array as unknown as { t: string }).t += deps.accessToken`,
+          `${V}/receptorEscribeLoAjeno.ts:15 escribe en Symbol, que declara otro archivo: (Symbol as unknown as { t?: string }).t`,
           // EV-TOKENSTORE-EGRESS: el productor, que también tiene el token.
           `${V}/tokenStore.ts:9 el objeto global: globalThis.cacheDelProductor`,
           `${V}/tokenStore.ts:10 escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token`,
