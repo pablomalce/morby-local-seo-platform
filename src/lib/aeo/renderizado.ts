@@ -156,9 +156,9 @@
  * `fetch` daban `medido 619/619` y el punto VERDE. Ahora es
  * `subrecurso-<motivo>`, y el punto queda «no medido». Vale para los pedidos
  * que DECIDEN según la regla de abajo (RT-4): los de la página, los de sus
- * marcos del mismo sitio o sin URL de red y los de un worker. Lo que la
- * política le rechaza a un marco de otro sitio no decide, como no decide lo
- * que no le llega.
+ * marcos del mismo sitio o sin URL de red y los de un worker que no es de
+ * otro sitio (W-1). Lo que la política le rechaza a un marco de otro sitio,
+ * o a su worker, no decide, como no decide lo que no le llega.
  *
  * Lo ÚNICO que no cuenta como «no llegó» es un nombre que NO EXISTE
  * (`no-resuelve`: NXDOMAIN, o sin registros): un navegador del público tampoco
@@ -178,12 +178,12 @@
  * por CDP (`salidasPropias`: lo dice el navegador, no la página), de la
  * pestaña y de cada worker, y un intento que decide deja el render sin número
  * (`subrecurso-websocket`). Decide con la misma regla que un pedido (RT-4):
- * el de un worker cuenta siempre; el de un marco, según el ORIGEN del
- * contexto que lo abrió, que también lo dice Chromium (`chromium.ts`), y si
- * no se sabe, cuenta. MEDIDO con el headless shell 153, que corre los marcos
- * de otro sitio en el mismo proceso: sin ese origen, el `WebSocket` de un
- * reproductor o de un chat en un `<iframe>` de otro sitio dejaba la página
- * «no medida». Es estricto a propósito: un chat que abre un `WebSocket` desde
+ * el de un marco, según el ORIGEN del contexto que lo abrió, que también lo
+ * dice Chromium (`chromium.ts`); el de un worker, según el origen de su
+ * script (W-1); y si no se sabe, cuenta. MEDIDO con el headless shell 153,
+ * que corre los marcos de otro sitio en el mismo proceso: sin ese origen, el
+ * `WebSocket` de un reproductor o de un chat en un `<iframe>` de otro sitio
+ * dejaba la página «no medida». Es estricto a propósito: un chat que abre un `WebSocket` desde
  * la página misma también la deja «no medida», y es el precio de no dar un
  * verde sin haber visto lo que el socket traía.
  *
@@ -200,18 +200,18 @@
  *
  * Lo que decide es DESDE DÓNDE sale el pedido, no sólo su tipo. Cuentan los
  * de la página, los de sus marcos del mismo sitio —su JavaScript puede
- * escribir en ella— y los que no salen de ningún marco: los de un worker
- * DEDICADO —sus `fetch`, `xhr` e `importScripts`—, que le puede pasar los
- * datos a la página. Chromium no dice de qué marco es un worker, así que
- * también cuentan los del worker de un marco de otro sitio: de más, no de
- * menos. Un `SharedWorker` no entra: ver «Lo que NO cubre». No cuentan los
- * que salen de un marco de OTRO sitio, ni la navegación de ese marco a otro
- * sitio: mientras su documento sea de otro sitio, la política del mismo
- * origen no le deja escribir en el DOM de la página, y su propio contenido no
- * está en la serialización (`chromium.ts`, PU-2). Ante la duda —un marco
- * `about:blank`, `about:srcdoc`, `blob:` o sin URL— cuenta. El sitio se
- * aproxima hacia arriba (los dos últimos rótulos del nombre): se cuenta de
- * más, nunca de menos.
+ * escribir en ella— y los de un worker DEDICADO de la página o de su sitio
+ * —sus `fetch`, `xhr` e `importScripts`—, que le puede pasar los datos a la
+ * página. Un `SharedWorker` no entra: ver «Lo que NO cubre». No cuentan los
+ * que salen de un marco de OTRO sitio, ni de un worker cuyo script es de
+ * otro sitio (W-1, abajo), ni la navegación de un marco a otro sitio:
+ * mientras su documento sea de otro sitio, la política del mismo origen no
+ * le deja escribir en el DOM de la página, y su propio contenido no está en
+ * la serialización (`chromium.ts`, PU-2). Ante la duda —un marco
+ * `about:blank`, `about:srcdoc`, `blob:` o sin URL, un worker `data:` o
+ * de origen opaco, un pedido sin marco que Chromium no atribuyó a ningún
+ * worker— cuenta. El sitio se aproxima hacia arriba (los dos últimos rótulos
+ * del nombre): se cuenta de más, nunca de menos.
  *
  * La página es el documento CONFIRMADO de la pestaña (`urlDeLaPagina`, que
  * `chromium.ts` lee de `page.mainFrame().url()`), y no el último PEDIDO de
@@ -240,6 +240,39 @@
  * eso sigue siendo `subrecurso-timeout`. Por lo mismo, los bytes de esos
  * marcos salen de un presupuesto aparte (`maxBytesDeOtrosSitios`): no le
  * quitan bytes a la página.
+ *
+ * NI LO QUE PIDE EL WORKER DE UN MARCO DE OTRO SITIO (W-1)
+ *
+ * MEDIDO en producción el 2026-10-21 a las 06:02 UTC, con el detalle de
+ * #124: https://vulkan-studios.com salía `subrecurso-sin-respuesta` por un
+ * `fetch` a `brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/…`
+ * con origen `worker`. Es el mismo `fetch` sólo-IPv6 de arriba, pero esta vez
+ * lo hacía un WORKER que crea el desafío de Cloudflare en su marco de
+ * `challenges.cloudflare.com`, dentro del de `player.vimeo.com`. Sus pedidos
+ * no traen marco, y «sin marco» decidía siempre: el desafío aparece en ~2 de
+ * cada 6 corridas, y la medición de la web real era intermitente.
+ *
+ * Ahora un pedido sin marco se juzga por el ORIGEN DEL SCRIPT DE SU WORKER,
+ * que Chromium da por pedido (`urlDelWorker`, ver `chromium.ts`), con la misma
+ * aproximación de sitio que los marcos y con el presupuesto de otros sitios.
+ * Un worker sólo se construye con un script de SU MISMO origen —o con un
+ * `blob:`, que lleva adentro el de quien lo creó (`blob:https://sitio/<uuid>`),
+ * o un `data:`, que queda opaco—, así que su origen es el del contexto que lo
+ * creó: el worker de un marco de otro sitio es tan ajeno como el marco, y una
+ * página no puede crear uno «de otro sitio» para no contar. Un worker de la
+ * página, de su sitio o `blob:` de la página decide (`worker`); uno `data:`,
+ * de origen opaco, o un pedido sin marco que no se pudo atribuir, decide por
+ * la duda, y el detalle lo dice (`sin-origen`). Lo mismo vale para el
+ * `WebSocket` que abre un worker (F3).
+ *
+ * Lo que NO se pudo medir, dicho: el desafío contra la web real. Desde la
+ * Mac, con Chrome 155, vulkan-studios.com midió 8 de 8 con esta regla y 8 de
+ * 8 con la anterior, y el desafío no apareció en ninguna; con el headless
+ * shell en AL2023, con un DNS que contesta AAAA y sin ruta IPv6 como en
+ * Vercel, 8 de 10 contra 7 de 10 —los no medidos, de los dos lados, por el
+ * plazo total—, y tampoco apareció el `fetch` a `brunhild`. Lo reproduce la
+ * integración: página → marco de otro sitio → marco de otro sitio → workers
+ * `blob:` y con script propio que piden a un nombre sólo-IPv6 sin ruta.
  *
  * Y CUANDO UN PEDIDO DEJA LA PÁGINA SIN NÚMERO, SE DICE CUÁL
  *
@@ -401,7 +434,12 @@ export type CodigoDeFallo =
  *   - `pagina`: del documento de la pestaña —su marco es el de la página—;
  *   - `mismo-sitio`: de un marco con URL `http(s)` del sitio de la página, o
  *     la navegación de un marco a ese sitio;
- *   - `worker`: sin marco, como lo que pide un worker dedicado;
+ *   - `worker`: sin marco, de un worker dedicado cuyo script es de la página
+ *     o de su sitio —o con la página todavía sin documento confirmado—;
+ *   - `sin-origen`: sin marco, y sin un worker con origen de red: un worker
+ *     `data:` o de origen opaco (`blob:null/…`), o un pedido que Chromium no
+ *     atribuyó a ningún worker. Cuenta por la duda (falla cerrado), y el
+ *     nombre dice que la atribución no se pudo hacer;
  *   - `marco-desconocido`: de un marco sin URL de red —`about:blank`,
  *     `about:srcdoc`, `blob:`—, o con la página todavía sin documento
  *     confirmado: cuenta por la duda, y no se sabe más que eso.
@@ -409,7 +447,7 @@ export type CodigoDeFallo =
  * Un `<iframe>` del mismo sitio con la MISMA URL que la página sale `pagina`:
  * la URL es lo único que el pedido trae para distinguirlos.
  */
-export type OrigenDelPedido = "pagina" | "mismo-sitio" | "worker" | "marco-desconocido";
+export type OrigenDelPedido = "pagina" | "mismo-sitio" | "worker" | "sin-origen" | "marco-desconocido";
 
 /** El largo máximo de `ruta` en el detalle: lo que se ve en la pantalla y en un log. */
 export const MAX_RUTA_DEL_DETALLE = 120;
@@ -526,6 +564,16 @@ export interface PedidoDelNavegador {
    */
   urlDelMarco: string | null;
   /**
+   * Para un pedido SIN marco: la URL del script del WORKER del que sale, como
+   * la dice Chromium —el `documentURL` del pedido en la sesión de CDP de ese
+   * worker (`chromium.ts`)—, y no la página. `null` si no sale de un worker o
+   * no se supo de cuál: entonces el pedido cuenta (falla cerrado). Con marco
+   * no se usa: manda el marco. De esta URL sale el ORIGEN del worker, que es
+   * el de quien lo creó: un worker sólo se construye con un script de su
+   * mismo origen, o con un `blob:` que lleva ese origen adentro.
+   */
+  urlDelWorker: string | null;
+  /**
    * La URL del documento CONFIRMADO de la pestaña cuando sale el pedido —el
    * que se lee—, no la del último PEDIDO de navegación (RT-4, FV-1). Una
    * navegación de la pestaña que no se confirma —un 204, una descarga
@@ -583,6 +631,12 @@ export interface SalidaPropiaVista {
   tipo: SalidaPropia;
   /** Lo abrió un worker: Chromium lo avisó en la sesión del worker. */
   deUnWorker: boolean;
+  /**
+   * Si lo abrió un worker, la URL de su script como la da Chromium para esa
+   * sesión (`worker.url()`), o `null` si no se supo: se juzga con la misma
+   * regla que los pedidos de un worker (`urlDelWorker` del pedido).
+   */
+  urlDelWorker: string | null;
   /**
    * El ORIGEN del contexto que lo abrió (`https://www.youtube.com`), como lo
    * da Chromium para ese contexto, o `null` si no se supo cuál fue. Ver
@@ -936,11 +990,46 @@ function urlDeRed(url: string | null): URL | null {
 }
 
 /**
- * Si el pedido sale de un marco de OTRO SITIO que la página, o es la
- * navegación de un marco a otro sitio (RT-4). Ante la duda, `false`: un
- * pedido sin marco (un worker de la página puede traer datos y pasárselos),
- * un marco `about:blank`, `blob:` o `srcdoc` —heredan el origen de quien lo
- * creó— y una página que todavía no se conoce cuentan como de la página.
+ * El ORIGEN de un worker, leído de la URL de su script, o `null` si no tiene
+ * uno de red (W-1). `http(s)` da el suyo; un `blob:` da el que lleva adentro
+ * (`blob:https://sitio/<uuid>` → `https://sitio`), que es el de quien lo
+ * creó. Un `data:`, un `blob:null/…` (lo creó un contexto de origen opaco),
+ * cualquier otro esquema o algo que no es una URL no dicen de quién es: `null`,
+ * y el worker cuenta como de la página.
+ *
+ * Que el script diga el origen de quien creó el worker no es una suposición:
+ * `new Worker(url)` exige una URL del MISMO origen que quien lo crea (o un
+ * `data:`, que queda opaco), y un `blob:` sólo lo arma su propio origen. Una
+ * página no puede crear un worker «de otro sitio» para que no cuente.
+ */
+function origenDelWorker(url: string | null): URL | null {
+  if (!url) return null;
+  try {
+    const origen = new URL(url).origin;
+    return origen === "null" ? null : urlDeRed(origen);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Desde dónde se juzga un pedido con la regla de RT-4: la URL a la que va,
+ * si es la navegación de un marco; la de su marco; y sin marco, el origen del
+ * worker del que sale (W-1). `null` si no se sabe.
+ */
+function desdeDonde(pedido: PedidoDelNavegador): URL | null {
+  if (pedido.tipo === "document") return urlDeRed(pedido.url);
+  if (pedido.urlDelMarco === null) return origenDelWorker(pedido.urlDelWorker);
+  return urlDeRed(pedido.urlDelMarco);
+}
+
+/**
+ * Si el pedido sale de un marco de OTRO SITIO que la página, de un WORKER
+ * cuyo script es de otro sitio, o es la navegación de un marco a otro sitio
+ * (RT-4, W-1). Ante la duda, `false`: un pedido sin marco y sin un worker con
+ * origen de red (`data:`, opaco, o que Chromium no atribuyó), un marco
+ * `about:blank`, `blob:` o `srcdoc` —heredan el origen de quien lo creó— y
+ * una página que todavía no se conoce cuentan como de la página.
  *
  * La página es `urlDeLaPagina`, el documento CONFIRMADO de la pestaña y no el
  * último pedido de navegación (FV-1, ver el encabezado). Se decide sólo con
@@ -949,7 +1038,7 @@ function urlDeRed(url: string | null): URL | null {
 function deOtroSitio(pedido: PedidoDelNavegador): boolean {
   if (pedido.esDocumentoPrincipal) return false;
   const pagina = urlDeRed(pedido.urlDeLaPagina);
-  const desde = urlDeRed(pedido.tipo === "document" ? pedido.url : pedido.urlDelMarco);
+  const desde = desdeDonde(pedido);
   if (pagina === null || desde === null) return false;
   return sitioAproximado(desde.hostname) !== sitioAproximado(pagina.hostname);
 }
@@ -977,27 +1066,32 @@ function origenDelPedido(pedido: PedidoDelNavegador): OrigenDelPedido {
   // La navegación de un marco se juzga por la URL a la que va: si cuenta, va
   // al sitio de la página.
   if (pedido.tipo === "document") return urlDeRed(pedido.urlDeLaPagina) === null ? "marco-desconocido" : "mismo-sitio";
-  if (pedido.urlDelMarco === null) return "worker";
+  // Sin marco: si cuenta, es de un worker de la página o de su sitio, o de
+  // uno que no se pudo atribuir (W-1).
+  if (pedido.urlDelMarco === null) return origenDelWorker(pedido.urlDelWorker) === null ? "sin-origen" : "worker";
   if (urlDeRed(pedido.urlDeLaPagina) === null || urlDeRed(pedido.urlDelMarco) === null) return "marco-desconocido";
   return pedido.urlDelMarco === pedido.urlDeLaPagina ? "pagina" : "mismo-sitio";
 }
 
 /**
  * Si un `WebSocket` o `WebTransport` que Chromium avisó DECIDE, con la regla
- * de RT-4, y de dónde salió; `null` si no decide (F3). Cuenta el de un worker,
- * el de un contexto que no se sabe cuál fue, y el de uno cuyo origen no es
- * `http(s)` (un marco con `sandbox` tiene origen `null`); no cuenta el de un
- * contexto de OTRO sitio que la página.
+ * de RT-4, y de dónde salió; `null` si no decide (F3). Cuenta el de un
+ * contexto que no se sabe cuál fue, y el de uno cuyo origen no es `http(s)`
+ * (un marco con `sandbox` tiene origen `null`, un worker `data:` también); no
+ * cuenta el de un contexto de OTRO sitio que la página. El de un worker se
+ * juzga por el origen de SU script, como sus pedidos (W-1): el de un worker
+ * de un marco de otro sitio no decide, y el de uno de la página sí.
  *
  * Con el origen y no con la URL del marco: un marco del mismo origen que la
  * página sale `pagina`. Es sólo el nombre del detalle, no decide nada.
  */
 function juzgarSalidaPropia(salida: SalidaPropiaVista): OrigenDelPedido | null {
-  if (salida.deUnWorker) return "worker";
-  const desde = urlDeRed(salida.origenDelMarco);
+  const desde = salida.deUnWorker ? origenDelWorker(salida.urlDelWorker) : urlDeRed(salida.origenDelMarco);
   const pagina = urlDeRed(salida.urlDeLaPagina);
-  if (desde === null || pagina === null) return "marco-desconocido";
+  if (desde === null) return salida.deUnWorker ? "sin-origen" : "marco-desconocido";
+  if (pagina === null) return salida.deUnWorker ? "worker" : "marco-desconocido";
   if (sitioAproximado(desde.hostname) !== sitioAproximado(pagina.hostname)) return null;
+  if (salida.deUnWorker) return "worker";
   return desde.origin === pagina.origin ? "pagina" : "mismo-sitio";
 }
 

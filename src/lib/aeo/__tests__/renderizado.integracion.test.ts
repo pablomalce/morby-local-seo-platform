@@ -441,6 +441,52 @@ const SOCKET_EN_MARCO = (url: string) => `<!doctype html><html><body><p>Chat</p>
   try { const s = new WebSocket(${JSON.stringify(url)}); s.onmessage = (e) => parent.postMessage({ texto: e.data }, "*"); } catch (e) {}
 </script></body></html>`;
 
+/**
+ * W-1: la forma de https://vulkan-studios.com en producción el 2026-10-21. La
+ * página trae su bundle y un reproductor de otro sitio (`video.test`, como
+ * `player.vimeo.com`); adentro, el desafío de OTRO sitio más (`reto.test`,
+ * como `challenges.cloudflare.com`) crea dos WORKERS —uno `blob:`, como el de
+ * Cloudflare, y uno con su propio script—, y cada uno pide a un nombre
+ * sólo-IPv6 sin ruta (`cdn-v6.test`, como `brunhild.challenges.cloudflare.com`),
+ * a una ruta que corta la conexión, y el de script, un `importScripts` que
+ * tampoco llega. Nada de eso llega, y nada de eso es de la página.
+ */
+const CON_WORKER_AJENO = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/marco-con-reto"></iframe>`);
+const MARCO_CON_RETO = `<!doctype html><html><body><p>Reproductor</p><iframe src="http://reto.test/reto-con-workers"></iframe></body></html>`;
+const RETO_CON_WORKERS = `<!doctype html><html><body><p>Desafío</p><script>
+  new Worker(URL.createObjectURL(new Blob([
+    "fetch('https://cdn-v6.test/sonda-blob').catch(() => {}); fetch('http://reto.test${CAIDO}del-blob').catch(() => {});"
+  ])));
+  new Worker("/w-reto.js");
+</script></body></html>`;
+const W_RETO = `fetch("https://cdn-v6.test/sonda-script").catch(() => {});
+fetch("${CAIDO}del-script").catch(() => {});
+try { importScripts("${CAIDO}imp.js"); } catch (e) {}`;
+
+/**
+ * W-1, los controles: un worker de la PÁGINA —con su script, `blob:` o
+ * `data:`— trae el contenido y se lo pasa a la página, y no le llega. El de
+ * script y el `blob:` son del sitio; el `data:` es de origen opaco, y cuenta
+ * por la duda.
+ */
+const PIDE_Y_PASA = (ruta: string) =>
+  `fetch(${JSON.stringify(`http://sitio.test${CAIDO}${ruta}`)}).then((r) => r.text()).then((t) => postMessage(t)).catch(() => {});`;
+function conWorkerDeLaPagina(cual: "script" | "blob" | "data"): string {
+  const crear =
+    cual === "script"
+      ? `new Worker("/w-propio.js")`
+      : cual === "blob"
+        ? `new Worker(URL.createObjectURL(new Blob([${JSON.stringify(PIDE_Y_PASA("del-blob-propio"))}])))`
+        : `new Worker("data:text/javascript," + encodeURIComponent(${JSON.stringify(PIDE_Y_PASA("del-data"))}))`;
+  return hibrida(`<script>const w = ${crear}; w.onmessage = (e) => (${ESCRIBIR})(e.data);</script>`);
+}
+
+/** W-1 con F3: el worker `blob:` de un marco de otro sitio abre un `WebSocket`. */
+const CON_WORKER_AJENO_Y_SOCKET = hibrida(`<script src="/app.js"></script><iframe src="http://video.test/marco-worker-socket"></iframe>`);
+const MARCO_WORKER_SOCKET = `<!doctype html><html><body><p>Chat</p><script>
+  new Worker(URL.createObjectURL(new Blob(["try { new WebSocket('wss://video.test/ws-del-worker'); } catch (e) {}"])));
+</script></body></html>`;
+
 /** F3: un `EventSource` cuyo stream no termina nunca. */
 const CON_STREAM = hibrida(`<script>const es = new EventSource("/eventos-sin-fin"); es.onmessage = (e) => (${ESCRIBIR})(e.data);</script>`);
 
@@ -634,6 +680,26 @@ beforeAll(async () => {
         return html(CON_SOCKET_AJENO);
       case "/socket-ajeno":
         return html(SOCKET_EN_MARCO("wss://video.test/chat"));
+      case "/con-worker-ajeno":
+        return html(CON_WORKER_AJENO);
+      case "/marco-con-reto":
+        return html(MARCO_CON_RETO);
+      case "/reto-con-workers":
+        return html(RETO_CON_WORKERS);
+      case "/w-reto.js":
+        return js(W_RETO);
+      case "/worker-propio-caido":
+        return html(conWorkerDeLaPagina("script"));
+      case "/w-propio.js":
+        return js(PIDE_Y_PASA("del-script-propio"));
+      case "/worker-blob-propio-caido":
+        return html(conWorkerDeLaPagina("blob"));
+      case "/worker-data-caido":
+        return html(conWorkerDeLaPagina("data"));
+      case "/worker-ajeno-socket":
+        return html(CON_WORKER_AJENO_Y_SOCKET);
+      case "/marco-worker-socket":
+        return html(MARCO_WORKER_SOCKET);
       case "/eventsource-sin-fin":
         return html(CON_STREAM);
       case "/eventos-sin-fin":
@@ -980,7 +1046,7 @@ function detalleDe(
  * SALIÓ de un marco de otro sitio, y no de la página.
  */
 function registrando(d: DependenciasRender) {
-  const vistos: Array<{ url: string; tipo: string; urlDelMarco: string | null }> = [];
+  const vistos: Array<{ url: string; tipo: string; urlDelMarco: string | null; urlDelWorker: string | null }> = [];
   const abrir = d.abrirNavegador;
   const conRegistro: DependenciasRender = {
     ...d,
@@ -993,7 +1059,7 @@ function registrando(d: DependenciasRender) {
             ...p,
             interceptar: (atender) =>
               p.interceptar((pedido) => {
-                vistos.push({ url: pedido.url, tipo: pedido.tipo, urlDelMarco: pedido.urlDelMarco });
+                vistos.push({ url: pedido.url, tipo: pedido.tipo, urlDelMarco: pedido.urlDelMarco, urlDelWorker: pedido.urlDelWorker });
                 return atender(pedido);
               }),
           };
@@ -1256,6 +1322,104 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
     );
   });
 
+  /**
+   * W-1. MEDIDO en producción el 2026-10-21 (POST /api/aeo/audit sobre
+   * https://vulkan-studios.com): `subrecurso-sin-respuesta`, `fetch
+   * brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/…` desde
+   * `worker`. Lo pedía el WORKER del desafío de Cloudflare, que vive en un
+   * marco de otro sitio dentro del reproductor de Vimeo, y «sin marco»
+   * decidía siempre. Ahora decide el origen del script del worker, que
+   * Chromium da por pedido, con los dos binarios.
+   */
+  describe("W-1 — lo que pide un WORKER se juzga por el origen de su script, con Chromium", () => {
+    const noLlego = (b: Bitacora, url: string) =>
+      b.bloqueados.some((x) => x.url === url && (x.motivo === "sin-respuesta" || x.motivo === "timeout"));
+
+    it(
+      "el caso de producción: los workers del desafío de otro sitio, dentro del reproductor, piden a un nombre sólo-IPv6 y no les llega —la página se MIDE, y con su bundle es ROJA—",
+      async () => {
+        const r = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/con-worker-ajeno", r.deps, undefined, b);
+        const deWorkers = r.vistos.filter((v) => v.urlDelMarco === null);
+        console.log(
+          `[W-1 /con-worker-ajeno] renderizado=${JSON.stringify(render)} noLlegaron=${JSON.stringify(b.noLlegaron)} deWorkers=${JSON.stringify(deWorkers)}`
+        );
+        // Anti-vacuidad: los dos workers PIDIERON, sin marco, y Chromium dijo
+        // de qué script era cada pedido —también el `importScripts`—.
+        const visto = (url: string) => r.vistos.find((v) => v.url === url);
+        const delBlob = { urlDelMarco: null, urlDelWorker: expect.stringMatching(/^blob:http:\/\/reto\.test\//) };
+        const delScript = { urlDelMarco: null, urlDelWorker: "http://reto.test/w-reto.js" };
+        expect(visto("https://cdn-v6.test/sonda-blob")).toMatchObject(delBlob);
+        expect(visto(`http://reto.test${CAIDO}del-blob`)).toMatchObject(delBlob);
+        expect(visto("https://cdn-v6.test/sonda-script")).toMatchObject(delScript);
+        expect(visto(`http://reto.test${CAIDO}del-script`)).toMatchObject(delScript);
+        expect(visto(`http://reto.test${CAIDO}imp.js`)).toMatchObject({ tipo: "other", ...delScript });
+        // No les llegó nada…
+        for (const url of [
+          "https://cdn-v6.test/sonda-blob",
+          `http://reto.test${CAIDO}del-blob`,
+          "https://cdn-v6.test/sonda-script",
+          `http://reto.test${CAIDO}del-script`,
+          `http://reto.test${CAIDO}imp.js`,
+        ]) {
+          expect(noLlego(b, url), url).toBe(true);
+        }
+        // …y no decidió: la página se midió, con su bundle.
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    // El cuarto valor es de dónde salió según el detalle.
+    it.each([
+      ["/worker-propio-caido", "del-script-propio", "un worker de la página, con su script", "worker"],
+      ["/worker-blob-propio-caido", "del-blob-propio", "un worker `blob:` que creó la página", "worker"],
+      ["/worker-data-caido", "del-data", "un worker `data:`, de origen opaco", "sin-origen"],
+    ] as const)(
+      "el control %s: lo que no le llega a %s (%s) deja la página SIN número",
+      async (ruta, perdido, _caso, origen) => {
+        const r = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, r.deps, undefined, b);
+        console.log(`[W-1 ${ruta}] renderizado=${JSON.stringify(render)} vistos=${JSON.stringify(r.vistos.filter((v) => v.urlDelMarco === null))}`);
+        const url = `http://sitio.test${CAIDO}${perdido}`;
+        // Salió sin marco, de un worker: lo que se ejerció es la rama del worker.
+        expect(r.vistos.find((v) => v.url === url)).toMatchObject({ tipo: "fetch", urlDelMarco: null });
+        expect(render).toEqual({
+          estado: "fallo",
+          codigo: "subrecurso-sin-respuesta",
+          detalle: { tipo: "fetch", host: "sitio.test", ruta: new URL(url).pathname, origen, motivo: "sin-respuesta", noLlegaron: 1 },
+        });
+        expect(b.noLlegaron.map((n) => n.url)).toEqual([url]);
+        expect(puntoHibrida(render)).toBe("no-medido");
+      },
+      60_000
+    );
+
+    it(
+      "el `WebSocket` que abre el worker `blob:` de un marco de otro sitio tampoco decide: la página se mide, ROJA",
+      async () => {
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/worker-ajeno-socket", deps(), undefined, b);
+        console.log(`[W-1 /worker-ajeno-socket] renderizado=${JSON.stringify(render)} salidasPropias=${JSON.stringify(b.salidasPropias)}`);
+        // Chromium lo avisó en la sesión del worker, con su script: si no, esto no prueba nada.
+        expect(b.salidasPropias).toEqual([
+          expect.objectContaining({
+            url: "wss://video.test/ws-del-worker",
+            deUnWorker: true,
+            urlDelWorker: expect.stringMatching(/^blob:http:\/\/video\.test\//),
+          }),
+        ]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
   describe("FV-1 — una navegación de la PESTAÑA que no se confirma no cambia de qué sitio es la página", () => {
     const punto = (render: Awaited<ReturnType<typeof medirRenderizado>>) =>
       contenidoSinJs({
@@ -1377,13 +1541,15 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         `[RED-121-3 /con-marco-hostil] render=${JSON.stringify(render)} pedidos=${JSON.stringify(b.pedidos)} canario=${JSON.stringify(visto)}`
       );
       // F2 con la regla de RT-4: lo que la política le rechazó al MARCO no
-      // decidió —nada suyo está en `noLlegaron`—. Lo que le rechazó a su
-      // WORKER sí: Chromium no dice de qué marco es un worker, y cuenta de
-      // más. Por eso el render queda sin número, y el detalle lo dice.
-      expect(render.estado).toBe("fallo");
-      expect(b.noLlegaron.length).toBeGreaterThan(0);
-      expect(b.noLlegaron.every((n) => n.origen === "worker")).toBe(true);
-      if (render.estado === "fallo") expect(render.detalle?.origen).toBe("worker");
+      // decidió —nada suyo está en `noLlegaron`—, y tampoco lo que le rechazó
+      // a SU WORKER: su script es `blob:http://video.test/…`, de otro sitio
+      // (W-1). Antes «sin marco» decidía siempre y el render quedaba sin número.
+      expect(b.noLlegaron).toEqual([]);
+      expect(render.estado).toBe("medido");
+      // Anti-vacuidad: el worker del marco pidió, y Chromium dijo de quién era.
+      const delWorker = r.vistos.filter((v) => v.urlDelMarco === null && v.urlDelWorker?.startsWith("blob:http://video.test/"));
+      expect(delWorker.map((v) => v.url)).toContain("http://169.254.169.254/w-ajeno");
+      expect(b.bloqueados).toContainEqual({ url: "http://169.254.169.254/w-ajeno", motivo: "red-no-publica" });
       // Y sus `WebSocket` tampoco decidieron (F3): con Chrome, el marco es otro
       // proceso y no se ven; con el headless shell se ven, con el origen del
       // marco, que es de otro sitio.
