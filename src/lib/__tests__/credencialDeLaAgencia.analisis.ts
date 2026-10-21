@@ -1303,10 +1303,8 @@ export function analizar(
         const padre = nodo.parent;
         const abreviado = padre && ts.isShorthandPropertyAssignment(padre) && padre.name === nodo;
         const s = abreviado ? checker.getShorthandAssignmentValueSymbol(padre) : checker.getSymbolAtLocation(nodo);
-        // `ns.x` vale lo que vale el acceso entero; `{ x }` y `export { x }`
-        // lo sacan como valor.
-        const nombreDeAcceso = padre && ts.isPropertyAccessExpression(padre) && padre.name === nodo;
-        usar(s, abreviado || ts.isExportSpecifier(padre) ? null : nombreDeAcceso ? padre : nodo);
+        // `ns.x` vale lo que vale el acceso entero: `ns.x()` es una llamada.
+        usar(s, ts.isPropertyAccessExpression(padre) && padre.name === nodo ? padre : nodo);
         // Y si ES un namespace del árbol, adónde va. Ver `usoDelNamespace`.
         if (s && !esNombreDeclarado(nodo)) {
           const { namespace } = delSimbolo(s);

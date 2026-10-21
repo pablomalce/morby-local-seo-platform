@@ -463,11 +463,11 @@ const VIRTUALES: Record<string, string> = {
   // función que importa de otro tenedor.
   "tokenStore.ts": `
     import { resolveAgencyOrgId } from "./agency";
-    import { admin } from "./admin";
+    import * as base from "./admin";
     import { refrescar } from "./oauth";
     export async function agencyAccessToken() {
       const org = resolveAgencyOrgId();
-      const { data } = await admin().rpc("integration_token_secret", { p_organization_id: org });
+      const { data } = await base.admin().rpc("integration_token_secret", { p_organization_id: org });
       const token = refrescar(String(data));
       globalThis.cacheDelProductor = token;
       (refrescar as unknown as { ultimo?: string }).ultimo = token;
@@ -476,7 +476,9 @@ const VIRTUALES: Record<string, string> = {
     // Otra pieza, inocua: le da a una aserción un nombre que existe y no es el token.
     export const proveedor = () => "google";`,
   // Otro tenedor, como oauth.ts: tiene el refresh token en claro, y lo deja en
-  // el disco. Y una ruta nueva que lee lo que el productor le colgó.
+  // el disco. Y una ruta nueva que lee lo que el productor le colgó. El
+  // cliente de la custodia llega por un namespace: `base.admin()` es una
+  // llamada, como `admin()`.
   "oauth.ts": `
     import { writeFileSync } from "node:fs";
     export function refrescar(secreto: string) {
@@ -664,6 +666,9 @@ const VIRTUALES: Record<string, string> = {
       (Number as unknown as { n: number }).n++;
       delete (consultarEscribiendo as unknown as { t?: string }).t;
       Object.assign(...([registro, { t: deps.accessToken }] as const));
+      ({ a: (Boolean as unknown as { t?: string }).t, ...(Error as unknown as { r: object }).r } = { a: deps.accessToken });
+      [(String as unknown as { t?: string }).t = "", ...(RegExp as unknown as { r: string[] }).r] = [deps.accessToken];
+      (Array as unknown as { t: string }).t += deps.accessToken;
     }`,
   "datosLegitimos.ts": `
     import { servir } from "./servicioCompartido";
@@ -1435,7 +1440,10 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
         // Por `require()` y por `import()` literales.
         [`${V}/receptorAlDisco.js`]: { importa: ["node:fs", "node:fs/promises"], globales: ["require"] },
         [`${V}/receptorAlCanalGlobal.ts`]: { importa: [], globales: ["BroadcastChannel"] },
-        [`${V}/receptorEscribeLoAjeno.ts`]: { importa: [], globales: ["Date", "JSON", "Math", "Number", "Object", "Reflect", "fetch"] },
+        [`${V}/receptorEscribeLoAjeno.ts`]: {
+          importa: [],
+          globales: ["Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Reflect", "RegExp", "String", "fetch"],
+        },
         // Los tenedores (EV-TOKENSTORE-EGRESS de la revisión del #123): el
         // productor, y el que deja el refresh token en el disco.
         [`${V}/tokenStore.ts`]: { importa: [], globales: ["String"] },
@@ -1474,6 +1482,15 @@ describe("el detector ve cada forma conocida de saltarse la pared, y nada más",
           `${V}/receptorEscribeLoAjeno.ts:10 escribe en consultarEscribiendo, que este módulo exporta: delete (consultarEscribiendo as unknown as { t?: string }).t`,
           // Con el destino en un spread no se sabe a quién: el mundo es cerrado.
           `${V}/receptorEscribeLoAjeno.ts:11 le escribe propiedades a lo que trae un spread, que no se lee: Object.assign(...([registro, { t: deps.accessToken }] as const))`,
+          // Cada destino de un destructuring: una propiedad y un resto de un
+          // objeto, un elemento con su valor por defecto (que es también una
+          // asignación) y un resto de un arreglo. Y una asignación compuesta.
+          `${V}/receptorEscribeLoAjeno.ts:12 escribe en Boolean, que declara otro archivo: { a: (Boolean as unknown as { t?: string }).t, ...(Error as unknown as { r: obje`,
+          `${V}/receptorEscribeLoAjeno.ts:12 escribe en Error, que declara otro archivo: { a: (Boolean as unknown as { t?: string }).t, ...(Error as unknown as { r: obje`,
+          `${V}/receptorEscribeLoAjeno.ts:13 escribe en String, que declara otro archivo: [(String as unknown as { t?: string }).t = "", ...(RegExp as unknown as { r: str`,
+          `${V}/receptorEscribeLoAjeno.ts:13 escribe en String, que declara otro archivo: (String as unknown as { t?: string }).t = ""`,
+          `${V}/receptorEscribeLoAjeno.ts:13 escribe en RegExp, que declara otro archivo: [(String as unknown as { t?: string }).t = "", ...(RegExp as unknown as { r: str`,
+          `${V}/receptorEscribeLoAjeno.ts:14 escribe en Array, que declara otro archivo: (Array as unknown as { t: string }).t += deps.accessToken`,
           // EV-TOKENSTORE-EGRESS: el productor, que también tiene el token.
           `${V}/tokenStore.ts:9 el objeto global: globalThis.cacheDelProductor`,
           `${V}/tokenStore.ts:10 escribe en refrescar, que es un import: (refrescar as unknown as { ultimo?: string }).ultimo = token`,
