@@ -59,6 +59,16 @@ const DNS = {
   "www.mudado.test": [PUBLICA],
   // FV-1: el otro sitio al que la página manda la pestaña, sin confirmarse.
   "otro.test": [OTRA_PUBLICA],
+  // SEC-A2: un subdominio del sitio, y dos sitios hermanos bajo el mismo nombre.
+  "api.sitio.test": [PUBLICA],
+  "mio.app.test": [PUBLICA],
+  "otro.app.test": [OTRA_PUBLICA],
+  // R7-SEC-A2: un nombre que TERMINA como el sitio sin ser un subdominio, y
+  // el sitio con su `www.`.
+  "xsitio.test": [OTRA_PUBLICA],
+  "www.sitio.test": [PUBLICA],
+  // CSP-SIN-TEXTO-MUERTO: el tercero al que la página manda sus reportes.
+  "tercero.test": [OTRA_PUBLICA],
 };
 
 function bitacoraVacia(): Bitacora {
@@ -437,12 +447,99 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     expect(red.pedidos[0]).toMatchObject({ ip: PUBLICA, alternativas: [OTRA_PUBLICA, "2606:4700:4700::1111"] });
   });
 
-  it("lo que la POLÍTICA rechaza no es «no llegó»: un script a una red privada deja medir", async () => {
-    const html = `<html><body>${MENU}<script src="http://interno.test/interno.js"></script><img src="/foto.jpg"></body></html>`;
-    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html }, "http://interno.test/interno.js": { cuerpo: "x" } });
+  /**
+   * F2: lo que la POLÍTICA no deja salir y decide es contenido que la
+   * auditoría no vio. MEDIDO por la revisión con Chrome 155: un menú de 619 y
+   * `fetch("https://sitio.test:8443/api/contenido")`, que escribía 4 499, daban
+   * `bloqueados=[puerto]`, `noLlegaron=[]`, `medido 619/619` y VERDE. Y la
+   * mutación que sumaba `puerto` a la lista sobrevivía a los 292 tests: ninguno
+   * fijaba el caso.
+   */
+  it.each([
+    ["puerto", `<main data-fetch="https://sitio.test:8443/api/contenido"></main>`, "https://sitio.test:8443/api/contenido", "fetch"],
+    ["puerto", `<script src="https://cdn.test:8443/app.js"></script>`, "https://cdn.test:8443/app.js", "script"],
+    ["esquema", `<script src="ftp://cdn.test/app.js"></script>`, "ftp://cdn.test/app.js", "script"],
+    ["credenciales", `<script src="http://u:p@cdn.test/app.js"></script>`, "http://u:p@cdn.test/app.js", "script"],
+    ["red-no-publica", `<script src="http://interno.test/interno.js"></script>`, "http://interno.test/interno.js", "script"],
+  ] as const)(
+    "F2 — lo que escribe texto y la política rechaza (%s) NO LLEGÓ: `subrecurso-<motivo>`, y el punto queda «no medido»",
+    async (motivo, etiqueta, url, tipo) => {
+      const html = `<html><body>${MENU}${etiqueta}<img src="http://10.1.2.3/foto.jpg"></body></html>`;
+      const { deps, bitacora, red } = armar({ "http://sitio.test/": { cuerpo: html }, [url]: { cuerpo: CONTENIDO } });
+      const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+      const destino = new URL(url);
+      expect(render).toEqual(falloPor(motivo, { tipo, host: destino.hostname, ruta: destino.pathname, origen: "pagina" }));
+      expect(bitacora.noLlegaron).toEqual([{ url, tipo, motivo, origen: "pagina" }]);
+      // Y la política sigue siendo la política: no salió.
+      expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+      // Las credenciales de la URL no llegan al detalle.
+      expect(JSON.stringify(render)).not.toMatch(/u:p/);
+      expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe(
+        "no-medido"
+      );
+    }
+  );
+
+  it("F2 — un método que escribe (PUT) en un pedido de datos tampoco llegó: `subrecurso-metodo`", async () => {
+    const { deps, bitacora, red } = armar(
+      { "http://sitio.test/": { cuerpo: `<html><body>${MENU}</body></html>` }, "http://sitio.test/api": { cuerpo: CONTENIDO } },
+      { enSegundoPlano: [{ url: "/api", tipo: "fetch", metodo: "PUT" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora)).toEqual(
+      falloPor("metodo", { tipo: "fetch", host: "sitio.test", ruta: "/api", origen: "pagina" })
+    );
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+  });
+
+  it("F2 — lo que NO cuenta: una imagen a una red privada (no escribe texto) y un nombre que NO EXISTE", async () => {
+    const html = `<html><body>${MENU}<img src="http://10.1.2.3/foto.jpg"><script src="http://nadie.test/app.js"></script></body></html>`;
+    const { deps, bitacora } = armar({ "http://sitio.test/": { cuerpo: html } });
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
     expect(render.estado).toBe("medido");
     expect(bitacora.noLlegaron).toEqual([]);
+    expect(bitacora.bloqueados).toEqual(
+      expect.arrayContaining([
+        { url: "http://10.1.2.3/foto.jpg", motivo: "sin-texto" },
+        { url: "http://nadie.test/app.js", motivo: "no-resuelve" },
+      ])
+    );
+  });
+
+  /**
+   * F2 con la regla de RT-4: lo que la política le rechaza a un marco de OTRO
+   * sitio no decide, como no decide lo que no le llega. Lo mismo desde un
+   * worker —Chromium no dice de qué marco es— o desde un marco del mismo
+   * sitio, sí.
+   */
+  it.each([
+    ["un marco de OTRO sitio: no decide", "http://video.test/embed", null],
+    ["un worker: decide", null, "worker"],
+    ["un marco del MISMO sitio: decide", "http://widgets.sitio.test/w", "mismo-sitio"],
+  ] as const)("F2 — lo que la política le rechaza a %s", async (_caso, marco, origen) => {
+    const { deps, bitacora, red } = armar(
+      { "http://sitio.test/": { cuerpo: `<html><body>${MENU}</body></html>` } },
+      {
+        enSegundoPlano: [
+          { url: "https://cdn.test:8443/datos", tipo: "fetch", marco },
+          { url: "http://interno.test/datos", tipo: "fetch", marco },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    // Los dos salieron del interceptor rechazados por la política, siempre.
+    expect(bitacora.bloqueados).toEqual(
+      expect.arrayContaining([
+        { url: "https://cdn.test:8443/datos", motivo: "puerto" },
+        { url: "http://interno.test/datos", motivo: "red-no-publica" },
+      ])
+    );
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+    if (origen === null) {
+      expect(render.estado).toBe("medido");
+      expect(bitacora.noLlegaron).toEqual([]);
+    } else {
+      expect(render).toEqual(falloPor("puerto", { tipo: "fetch", host: "cdn.test", ruta: "/datos", origen, noLlegaron: 2 }));
+    }
   });
 
   it("un chunk que todavía está EN VUELO al leer se espera, y lo que trae se cuenta: el punto sale ROJO, no verde", async () => {
@@ -797,6 +894,106 @@ describe("RT-4: lo que pide un marco de OTRO SITIO no decide si la página se mi
 });
 
 /**
+ * F3: lo que la página abre por fuera del interceptor. MEDIDO por la revisión
+ * con Chrome 155: un menú de 619 y un `WebSocket` que escribía 4 499 daban
+ * `medido 619/619`, `bloqueados=[]`, `noLlegaron=[]` y VERDE. Y con la regla
+ * de RT-4: MEDIDO con el headless shell 153, el `WebSocket` de un marco de
+ * otro sitio sale en la misma sesión que el de la página, y no puede decidir.
+ */
+describe("F3: un WebSocket o un WebTransport que la página abrió por fuera del interceptor", () => {
+  const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+  const CONTENIDO = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+  const HIBRIDA = `<html><body>${MENU}<main id="app"></main><script src="/app.js"></script></body></html>`;
+  const SITIO: Sitio = { "http://sitio.test/": { cuerpo: HIBRIDA }, "http://sitio.test/app.js": { cuerpo: CONTENIDO } };
+
+  it("un WebSocket de la página deja el render sin número: `subrecurso-websocket`, con su detalle sin la query", async () => {
+    const { deps, bitacora, navegador } = armar(SITIO, {
+      salidasPropias: [{ url: "ws://sitio.test/ws?token=SECRETO", tipo: "websocket" }],
+    });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render).toEqual(falloPor("websocket", { tipo: "websocket", host: "sitio.test", ruta: "/ws", origen: "pagina" }));
+    expect(JSON.stringify(render)).not.toMatch(/SECRETO/);
+    expect(bitacora.salidasPropias).toEqual([
+      {
+        url: "ws://sitio.test/ws?token=SECRETO",
+        tipo: "websocket",
+        deUnWorker: false,
+        origenDelMarco: "http://sitio.test",
+        urlDeLaPagina: "http://sitio.test/",
+      },
+    ]);
+    expect(navegador.registro.cierres).toBe(1);
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(HIBRIDA), caracteresRenderizados: render }).estado).toBe(
+      "no-medido"
+    );
+  });
+
+  // El tercer valor es de dónde salió según el detalle.
+  it.each([
+    ["un worker (Chromium lo avisa en su sesión)", { worker: true }, "worker"],
+    ["un contexto que no avisó cuál era (esquivó el envoltorio)", { origen: null }, "marco-desconocido"],
+    ["un marco con `sandbox`, de origen opaco", { origen: "null" }, "marco-desconocido"],
+    ["un marco de un subdominio del sitio", { origen: "https://chat.sitio.test" }, "mismo-sitio"],
+  ] as const)("el de %s también decide", async (_caso, de, origen) => {
+    const { deps } = armar(SITIO, { salidasPropias: [{ url: "wss://chat.test/socket", tipo: "websocket", ...de }] });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("websocket", { tipo: "websocket", host: "chat.test", ruta: "/socket", origen })
+    );
+  });
+
+  it("un WebTransport es lo mismo: `subrecurso-webtransport`", async () => {
+    const { deps } = armar(SITIO, { salidasPropias: [{ url: "https://sitio.test/wt", tipo: "webtransport" }] });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("webtransport", { tipo: "webtransport", host: "sitio.test", ruta: "/wt", origen: "pagina" })
+    );
+  });
+
+  it("el de un marco de OTRO sitio no decide (RT-4): la página se mide, y con el bundle es ROJA", async () => {
+    const { deps, bitacora } = armar(SITIO, {
+      salidasPropias: [{ url: "wss://video.test/chat", tipo: "websocket", origen: "https://video.test" }],
+    });
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    // Chromium lo avisó —si no, esto no prueba nada—, y no decidió.
+    expect(bitacora.salidasPropias.map((s) => s.url)).toEqual(["wss://video.test/chat"]);
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(HIBRIDA), caracteresRenderizados: render }).estado).toBe("rojo");
+  });
+
+  it("el detalle es el PRIMERO que decide, y cuenta los que deciden: el de otro sitio no", async () => {
+    const { deps } = armar(SITIO, {
+      salidasPropias: [
+        { url: "wss://video.test/chat", tipo: "websocket", origen: "https://video.test" },
+        { url: "ws://sitio.test/vivo", tipo: "websocket" },
+        { url: "ws://sitio.test/del-worker", tipo: "websocket", worker: true },
+      ],
+    });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("websocket", { tipo: "websocket", host: "sitio.test", ruta: "/vivo", origen: "pagina", noLlegaron: 2 })
+    );
+  });
+
+  it("un pedido que no llegó manda sobre un socket: el código es el del pedido", async () => {
+    const { deps } = armar(
+      { ...SITIO, "http://sitio.test/app.js": { error: "timeout" } },
+      { salidasPropias: [{ url: "ws://sitio.test/vivo", tipo: "websocket" }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual(
+      falloPor("timeout", { tipo: "script", host: "sitio.test", ruta: "/app.js", origen: "pagina" })
+    );
+  });
+
+  it("y un EventSource que LLEGA escribe y se cuenta: no es un socket, pasa por el interceptor", async () => {
+    const pagina = { "http://sitio.test/": { cuerpo: `<html><body>${MENU}<main id="app"></main></body></html>` } };
+    const llega = armar(
+      { ...pagina, "http://sitio.test/eventos": { cuerpo: CONTENIDO } },
+      { enSegundoPlano: [{ url: "/eventos", tipo: "eventsource" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", llega.deps);
+    expect(render.estado === "medido" && render.caracteres).toBeGreaterThan(contarCaracteres(CONTENIDO));
+  });
+});
+
+/**
  * El detalle de un `subrecurso-<motivo>`. Con el #121 en producción,
  * https://vulkan-studios.com seguía saliendo `subrecurso-sin-respuesta` desde
  * la red de Vercel, y ni la respuesta ni los logs decían qué pedido faltaba:
@@ -962,7 +1159,15 @@ describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también pa
       const urls = Array.from({ length: 30 }, (_, i) => `http://video.test/seg${i}`);
       const { deps, red } = enParalelo(urls, "v".repeat(450), porPartes);
       const bitacora = bitacoraVacia();
-      const opciones = { ...OPCIONES_RENDER, maxBytesPorRespuesta: 500, maxBytesDeOtrosSitios: 1_000, maxBytesTotales: 1_000_000 };
+      // Los 30 a la vez: los turnos de SEC-A2 son otra garantía (abajo), y acá
+      // lo que se prueba es el presupuesto de bytes con todos en vuelo.
+      const opciones = {
+        ...OPCIONES_RENDER,
+        maxBytesPorRespuesta: 500,
+        maxBytesDeOtrosSitios: 1_000,
+        maxBytesTotales: 1_000_000,
+        maxConcurrencia: 30,
+      };
       const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
       const desenlaces: Record<string, number | "abortado"> = {};
       await Promise.all(urls.map((u) => atender(pedidoA(u, "xhr", "http://video.test/embed", desenlaces))));
@@ -985,7 +1190,13 @@ describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también pa
     const urls = Array.from({ length: 30 }, (_, i) => `http://sitio.test/chunk${i}.js`);
     const { deps, red } = enParalelo(urls, "c".repeat(450), porPartes);
     const bitacora = bitacoraVacia();
-    const opciones = { ...OPCIONES_RENDER, maxBytesPorRespuesta: 500, maxBytesTotales: 1_000, maxBytesDeOtrosSitios: 1_000_000 };
+    const opciones = {
+      ...OPCIONES_RENDER,
+      maxBytesPorRespuesta: 500,
+      maxBytesTotales: 1_000,
+      maxBytesDeOtrosSitios: 1_000_000,
+      maxConcurrencia: 30,
+    };
     const atender = crearInterceptor(deps, opciones, bitacora, () => 5_000, new AbortController().signal);
     const desenlaces: Record<string, number | "abortado"> = {};
     await Promise.all(urls.map((u) => atender(pedidoA(u, "script", "http://sitio.test/", desenlaces))));
@@ -1052,6 +1263,461 @@ describe("RED-121-2 y RED-121-3: los presupuestos y los plazos valen también pa
     expect(bitacora.pedidos).toEqual([]);
     for (const url of hostiles) expect(desenlaces[url]).toBe("abortado");
     expect(new Set(bitacora.bloqueados.map((b) => b.motivo))).toEqual(new Set(["red-no-publica"]));
+  });
+});
+
+/**
+ * SEC-A2: el render no es un relé. MEDIDO por la revisión con Chrome 155 y las
+ * banderas de producción: una página con 3 000 `fetch` no-cors a un tercero y
+ * un `POST` simple le hizo `pedidosAlTercero=3000 picoConcurrente=580` y el
+ * `POST` con `body=datos-de-la-pagina`, y el render salió «medido». Con 10
+ * auditorías por minuto e instancia, unos 30 000 pedidos por minuto desde las
+ * IP de la plataforma. Y con la regla de RT-4, cada presupuesto tiene sus
+ * topes: lo que piden los marcos de otro sitio no le gasta a la página ni los
+ * pedidos, ni los `POST`, ni los turnos.
+ */
+describe("SEC-A2: el render no es un relé: tope de pedidos, de concurrencia y de POST a otros sitios", () => {
+  const PAGINA = { "http://sitio.test/": { cuerpo: "<html><body><p>hola</p></body></html>" } };
+
+  it("los topes de producción: 200 pedidos y 16 a la vez por presupuesto, 20 POST ajenos de hasta 64 KB", () => {
+    expect(OPCIONES_RENDER.maxPedidos).toBe(200);
+    expect(OPCIONES_RENDER.maxConcurrencia).toBe(16);
+    expect(OPCIONES_RENDER.maxPostsAjenos).toBe(20);
+    expect(OPCIONES_RENDER.maxCuerpoAjeno).toBe(64 * 1024);
+  });
+
+  it("3 000 pedidos de la página a un tercero: salen `maxPedidos` (el documento incluido), y el resto no llegó", async () => {
+    // Cuerpos vacíos: lo que se mide es cuántos salen, no el texto (con texto,
+    // el DOM del doble crece mientras llegan y la lectura no ve quietud).
+    const urls = Array.from({ length: 3_000 }, (_, i) => `http://cdn.test/p${i}`);
+    const { deps, red, bitacora } = armar(
+      { ...PAGINA, ...Object.fromEntries(urls.map((u) => [u, { cuerpo: "" }])) },
+      { enSegundoPlano: urls.map((url) => ({ url, tipo: "fetch" })) }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(red.pedidos).toHaveLength(OPCIONES_RENDER.maxPedidos);
+    expect(bitacora.noLlegaron).toHaveLength(3_000 - (OPCIONES_RENDER.maxPedidos - 1));
+    expect(render).toEqual(
+      falloPor("presupuesto", { tipo: "fetch", host: "cdn.test", ruta: "/p199", origen: "pagina", noLlegaron: 2_801 })
+    );
+  });
+
+  it("como mucho `maxConcurrencia` pedidos a la vez: el resto ESPERA su turno, no se pierde, y la página se mide", async () => {
+    const urls = Array.from({ length: 100 }, (_, i) => `http://cdn.test/c${i}`);
+    const { deps, bitacora } = armar(
+      (reloj) => ({ ...PAGINA, ...Object.fromEntries(urls.map((u) => [u, { cuerpo: "", llegaCuando: () => reloj.alcanzar(500) }])) }),
+      { enSegundoPlano: urls.map((url) => ({ url, tipo: "fetch" })) }
+    );
+    let enCurso = 0;
+    let pico = 0;
+    const transporte = deps.transporte;
+    deps.transporte = async (pedido) => {
+      enCurso += 1;
+      pico = Math.max(pico, enCurso);
+      try {
+        return await transporte(pedido);
+      } finally {
+        enCurso -= 1;
+      }
+    };
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    expect(render.estado).toBe("medido");
+    expect(pico).toBe(OPCIONES_RENDER.maxConcurrencia);
+    expect(bitacora.picoConcurrente).toEqual({ pagina: OPCIONES_RENDER.maxConcurrencia, deOtrosSitios: 0 });
+    expect(bitacora.pedidos).toHaveLength(101);
+  });
+
+  it("un pedido que ESPERA turno está en vuelo: la lectura lo espera, y lo que trae se cuenta —ROJO—", async () => {
+    // Un turno solo, ocupado 5 s por una hoja de estilos —que no escribe
+    // texto ni cuenta en `enVuelo`—, y el bundle detrás, esperando. Si la
+    // espera no contara, la lectura terminaba a los 2 s con el menú solo: VERDE.
+    const MENU = `<nav>${Array.from({ length: 60 }, (_, i) => `<a href="/s${i}">Sección ${i} del sitio</a>`).join(" ")}</nav>`;
+    const CONTENIDO = "Contenido del negocio que dibuja el bundle de la página. ".repeat(70);
+    const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
+    const { deps, red } = armar(
+      (reloj) => ({
+        "http://sitio.test/": { cuerpo: html },
+        "http://sitio.test/estilo.css": { cuerpo: "p{}", llegaCuando: () => reloj.alcanzar(5_000) },
+        "http://sitio.test/chunk.js": { cuerpo: CONTENIDO },
+      }),
+      {
+        enSegundoPlano: [
+          { url: "/estilo.css", tipo: "stylesheet" },
+          { url: "/chunk.js", tipo: "script" },
+        ],
+      }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, { ...OPCIONES_RENDER, maxConcurrencia: 1 });
+    expect(red.pedidos.map((p) => p.url)).toContain("http://sitio.test/chunk.js");
+    expect(render.estado).toBe("medido");
+    if (render.estado !== "medido") return;
+    expect(render.caracteres).toBeGreaterThan(contarCaracteres(CONTENIDO));
+    expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe("rojo");
+  });
+
+  it("si el presupuesto de tiempo vence, lo que esperaba turno se aborta como `presupuesto`: no queda colgado", async () => {
+    const { deps } = armar({});
+    deps.transporte = () => new Promise(() => {});
+    const bitacora = bitacoraVacia();
+    const corte = new AbortController();
+    const atender = crearInterceptor(deps, { ...OPCIONES_RENDER, maxConcurrencia: 1 }, bitacora, () => 5_000, corte.signal);
+    const desenlaces: Record<string, string> = {};
+    const pedido = (url: string): PedidoDelNavegador => ({
+      url,
+      metodo: "GET",
+      encabezados: {},
+      tipo: "script",
+      esDocumentoPrincipal: false,
+      urlDelMarco: "http://sitio.test/",
+      urlDeLaPagina: "http://sitio.test/",
+      continuar: async () => {},
+      abortar: async () => void (desenlaces[url] = "abortado"),
+      responder: async () => void (desenlaces[url] = "respondido"),
+    });
+    void atender(pedido("http://sitio.test/ocupa.js"));
+    const espera = atender(pedido("http://sitio.test/espera.js"));
+    await new Promise((listo) => setImmediate(listo));
+    // Esperando turno, y en vuelo: si no, esto no prueba nada.
+    expect(bitacora.enVuelo).toBe(2);
+    corte.abort();
+    const listo = await Promise.race([espera.then(() => "listo"), new Promise((r) => setTimeout(() => r("colgado"), 1_000))]);
+    expect(listo).toBe("listo");
+    expect(desenlaces["http://sitio.test/espera.js"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/espera.js", tipo: "script", motivo: "presupuesto", origen: "pagina" },
+    ]);
+  });
+
+  it("POST a OTRO sitio: como mucho `maxPostsAjenos`, con cuerpo acotado; un `ping` no sale nunca", async () => {
+    const posts = Array.from({ length: 25 }, () => ({ url: "http://cdn.test/collect", tipo: "fetch", metodo: "POST", cuerpo: "datos-de-la-pagina" }));
+    const { deps, red, bitacora } = armar(
+      { ...PAGINA, "http://cdn.test/collect": { cuerpo: "ok" } },
+      { enSegundoPlano: [...posts, { url: "http://cdn.test/beacon", tipo: "ping", metodo: "POST", cuerpo: "x" }] }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+    const alTercero = red.pedidos.filter((p) => p.url.startsWith("http://cdn.test/"));
+    expect(alTercero).toHaveLength(OPCIONES_RENDER.maxPostsAjenos);
+    expect(alTercero.every((p) => p.metodo === "POST" && p.cuerpo === "datos-de-la-pagina")).toBe(true);
+    expect(render).toEqual(falloPor("presupuesto", { tipo: "fetch", host: "cdn.test", ruta: "/collect", origen: "pagina", noLlegaron: 5 }));
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://cdn.test/beacon", motivo: "sin-texto" });
+
+    // Un cuerpo de más de `maxCuerpoAjeno` no sale, aunque sea el primero.
+    const grande = armar(
+      { ...PAGINA, "http://cdn.test/collect": { cuerpo: "ok" } },
+      { enSegundoPlano: [{ url: "http://cdn.test/collect", tipo: "xhr", metodo: "POST", cuerpo: "x".repeat(OPCIONES_RENDER.maxCuerpoAjeno + 1) }] }
+    );
+    expect(await medirRenderizado("http://sitio.test/", grande.deps)).toEqual(
+      falloPor("presupuesto", { tipo: "xhr", host: "cdn.test", ruta: "/collect", origen: "pagina" })
+    );
+    expect(grande.red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
+    // Y uno de `maxCuerpoAjeno` justos, sí.
+    const justo = armar(
+      { ...PAGINA, "http://cdn.test/collect": { cuerpo: "ok" } },
+      { enSegundoPlano: [{ url: "http://cdn.test/collect", tipo: "xhr", metodo: "POST", cuerpo: "x".repeat(OPCIONES_RENDER.maxCuerpoAjeno) }] }
+    );
+    expect((await medirRenderizado("http://sitio.test/", justo.deps)).estado).toBe("medido");
+  });
+
+  it("POST al MISMO sitio —el nombre del documento o un subdominio suyo— no tiene ese tope: GraphQL lee con POST", async () => {
+    const posts = Array.from({ length: 25 }, (_, i) => ({
+      url: i % 2 === 0 ? "http://api.sitio.test/graphql" : "/graphql",
+      tipo: "fetch",
+      metodo: "POST",
+      cuerpo: `{"query":"{ pagina(id: ${i}) { texto } }"}`,
+    }));
+    const { deps, red } = armar(
+      { ...PAGINA, "http://api.sitio.test/graphql": { cuerpo: "texto" }, "http://sitio.test/graphql": { cuerpo: "texto" } },
+      { enSegundoPlano: posts }
+    );
+    const render = await medirRenderizado("http://sitio.test/", deps);
+    expect(render.estado).toBe("medido");
+    expect(red.pedidos.filter((p) => p.metodo === "POST")).toHaveLength(25);
+  });
+
+  it("«el mismo sitio» nunca SUBE de nivel: `otro.app.test` no es del sitio de `mio.app.test`", async () => {
+    const opciones = { ...OPCIONES_RENDER, maxPostsAjenos: 0 };
+    const { deps, red } = armar(
+      {
+        "http://mio.app.test/": { cuerpo: "<p>hola</p>" },
+        "http://mio.app.test/api": { cuerpo: "propio" },
+        "http://otro.app.test/api": { cuerpo: "ajeno" },
+      },
+      {
+        enSegundoPlano: [
+          { url: "http://mio.app.test/api", tipo: "xhr", metodo: "POST", cuerpo: "a" },
+          { url: "http://otro.app.test/api", tipo: "ping", metodo: "GET" },
+          { url: "http://otro.app.test/api", tipo: "xhr", metodo: "POST", cuerpo: "b" },
+        ],
+      }
+    );
+    expect(await medirRenderizado("http://mio.app.test/", deps, opciones)).toEqual(
+      falloPor("presupuesto", { tipo: "xhr", host: "otro.app.test", ruta: "/api", origen: "pagina" })
+    );
+    expect(red.pedidos.map((p) => `${p.metodo} ${p.url}`)).toEqual(["GET http://mio.app.test/", "POST http://mio.app.test/api"]);
+  });
+
+  /** Un pedido al interceptor, uno por vez, con su desenlace anotado. */
+  function pedidor(atender: (p: PedidoDelNavegador) => Promise<void>, desenlaces: Record<string, string>) {
+    return (
+      url: string,
+      urlDelMarco: string | null,
+      opciones: {
+        tipo?: string;
+        metodo?: string;
+        cuerpo?: string;
+        principal?: boolean;
+        urlDeLaPagina?: string | null;
+        encabezados?: Record<string, string>;
+      } = {}
+    ) =>
+      atender({
+        url,
+        metodo: opciones.metodo ?? "GET",
+        encabezados: opciones.encabezados ?? {},
+        ...(opciones.cuerpo !== undefined ? { cuerpo: opciones.cuerpo } : {}),
+        tipo: opciones.tipo ?? (opciones.principal ? "document" : "xhr"),
+        esDocumentoPrincipal: opciones.principal === true,
+        urlDelMarco,
+        urlDeLaPagina: opciones.urlDeLaPagina !== undefined ? opciones.urlDeLaPagina : opciones.principal ? null : "http://sitio.test/",
+        continuar: async () => void (desenlaces[url] = "continuado"),
+        abortar: async () => void (desenlaces[url] = "abortado"),
+        responder: async () => void (desenlaces[url] = "respondido"),
+      });
+  }
+
+  it("sin documento confirmado todavía, todo POST es ajeno: no hay sitio contra el cual eximirlo", async () => {
+    const { deps } = armar({ "http://sitio.test/api": { cuerpo: "ok" }, "http://sitio.test/api?2": { cuerpo: "ok" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/api", "about:blank", { metodo: "POST", cuerpo: "x", urlDeLaPagina: "about:blank" });
+    expect(desenlaces["http://sitio.test/api"]).toBe("abortado");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://sitio.test/api", motivo: "presupuesto" });
+    // Con la página confirmada, el mismo POST es del sitio, y sale.
+    await pedir("http://sitio.test/api?2", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://sitio.test/api?2"]).toBe("respondido");
+  });
+
+  it("los pedidos de un marco de otro sitio salen de SU tope: los del reproductor no le quitan ninguno a la página", async () => {
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://video.test/seg1": { cuerpo: "v" },
+      "http://video.test/seg2": { cuerpo: "v" },
+      "http://video.test/seg3": { cuerpo: "v" },
+      "http://sitio.test/chunk.js": { cuerpo: "c" },
+      "http://sitio.test/chunk2.js": { cuerpo: "d" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPedidos: 2 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    for (const n of [1, 2, 3]) await pedir(`http://video.test/seg${n}`, "http://video.test/embed");
+    // El reproductor gastó los SUYOS: dos, y el tercero no sale y no decide.
+    expect(desenlaces["http://video.test/seg2"]).toBe("respondido");
+    expect(desenlaces["http://video.test/seg3"]).toBe("abortado");
+    expect(bitacora.bloqueados).toContainEqual({ url: "http://video.test/seg3", motivo: "presupuesto" });
+    expect(bitacora.noLlegaron).toEqual([]);
+    // La página tiene los suyos enteros: el documento y un chunk. Con un solo
+    // tope, el chunk era `presupuesto` y la página quedaba sin número.
+    await pedir("http://sitio.test/chunk.js", "http://sitio.test/", { tipo: "script" });
+    expect(desenlaces["http://sitio.test/chunk.js"]).toBe("respondido");
+    await pedir("http://sitio.test/chunk2.js", "http://sitio.test/", { tipo: "script" });
+    expect(desenlaces["http://sitio.test/chunk2.js"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://sitio.test/chunk2.js", tipo: "script", motivo: "presupuesto", origen: "pagina" },
+    ]);
+  });
+
+  it("y sus POST a otros sitios también: la analítica de un reproductor no le gasta el tope a la de la página", async () => {
+    // Los `?2` ESTÁN en el sitio del doble (R7-SEC-A2): sin ellos, el doble
+    // contestaba `sin-respuesta` y se abortaban con tope o sin él. Medido por
+    // la revisión: sin el tope de los marcos de otro sitio, sin el tope para
+    // lo que no escribe, o juzgando el POST contra el marco y no contra el
+    // documento, este test seguía verde.
+    const { deps } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://video.test/log": { cuerpo: "ok" },
+      "http://video.test/log?2": { cuerpo: "ok" },
+      "http://cdn.test/collect": { cuerpo: "ok" },
+      "http://cdn.test/collect?2": { cuerpo: "ok" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 1 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    await pedir("http://video.test/log", "http://video.test/embed", { metodo: "POST", cuerpo: "1" });
+    expect(desenlaces["http://video.test/log"]).toBe("respondido");
+    await pedir("http://video.test/log?2", "http://video.test/embed", { metodo: "POST", cuerpo: "2" });
+    expect(desenlaces["http://video.test/log?2"]).toBe("abortado");
+    // El de la página sale: con un solo tope, era `presupuesto`.
+    await pedir("http://cdn.test/collect", "http://sitio.test/", { metodo: "POST", cuerpo: "3" });
+    expect(desenlaces["http://cdn.test/collect"]).toBe("respondido");
+    await pedir("http://cdn.test/collect?2", "http://sitio.test/", { metodo: "POST", cuerpo: "4" });
+    expect(desenlaces["http://cdn.test/collect?2"]).toBe("abortado");
+    // Los dos, por el TOPE: no porque el doble no los tuviera.
+    expect(bitacora.bloqueados).toEqual([
+      { url: "http://video.test/log?2", motivo: "presupuesto" },
+      { url: "http://cdn.test/collect?2", motivo: "presupuesto" },
+    ]);
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://cdn.test/collect?2", tipo: "xhr", motivo: "presupuesto", origen: "pagina" },
+    ]);
+  });
+
+  it("R7-SEC-A2 — «el mismo sitio» es por rótulos, no por sufijo: `xsitio.test` NO es del sitio de `sitio.test`", async () => {
+    // Medido por la revisión con Chrome 155: con `h.endsWith(base)` sin el
+    // punto, de 25 POST de sitio.test a xsitio.test llegaban los 25, un relé
+    // sin tope hacia cualquier dominio que termine igual.
+    const { deps, red } = armar({ "http://xsitio.test/api": { cuerpo: "ajeno" }, "http://api.sitio.test/api": { cuerpo: "propio" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://xsitio.test/api", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://xsitio.test/api"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual([{ url: "http://xsitio.test/api", motivo: "presupuesto" }]);
+    // Anti-vacuidad: un subdominio de verdad sí es del sitio, con el mismo tope en cero.
+    await pedir("http://api.sitio.test/api", "http://sitio.test/", { metodo: "POST", cuerpo: "x" });
+    expect(desenlaces["http://api.sitio.test/api"]).toBe("respondido");
+    expect(red.pedidos.map((p) => `${p.metodo} ${p.url}`)).toEqual(["POST http://api.sitio.test/api"]);
+  });
+
+  it("R7-SEC-A2 — con el documento en `www.sitio.test`, `api.sitio.test` y `sitio.test` son del sitio: se le saca el `www.`", async () => {
+    const { deps, red } = armar({
+      "http://api.sitio.test/graphql": { cuerpo: "texto" },
+      "http://sitio.test/graphql": { cuerpo: "texto" },
+      "http://xsitio.test/graphql": { cuerpo: "ajeno" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 0 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    const enWww = { metodo: "POST", cuerpo: "{}", tipo: "fetch", urlDeLaPagina: "http://www.sitio.test/" };
+    await pedir("http://api.sitio.test/graphql", "http://www.sitio.test/", enWww);
+    await pedir("http://sitio.test/graphql", "http://www.sitio.test/", enWww);
+    expect(desenlaces["http://api.sitio.test/graphql"]).toBe("respondido");
+    expect(desenlaces["http://sitio.test/graphql"]).toBe("respondido");
+    // Sacarle el `www.` no abre los nombres que sólo TERMINAN igual.
+    await pedir("http://xsitio.test/graphql", "http://www.sitio.test/", enWww);
+    expect(desenlaces["http://xsitio.test/graphql"]).toBe("abortado");
+    expect(bitacora.noLlegaron).toEqual([
+      { url: "http://xsitio.test/graphql", tipo: "fetch", motivo: "presupuesto", origen: "pagina" },
+    ]);
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://api.sitio.test/graphql", "http://sitio.test/graphql"]);
+  });
+
+  it("R7-SEC-A2 — un POST cuenta para `maxPedidos`, del sitio o ajeno: no es un pedido gratis", async () => {
+    const { deps, red } = armar({
+      "http://sitio.test/": { cuerpo: "<p>hola</p>" },
+      "http://sitio.test/graphql": { cuerpo: "texto" },
+      "http://sitio.test/graphql?2": { cuerpo: "texto" },
+      "http://sitio.test/chunk.js": { cuerpo: "c" },
+      "http://sitio.test/chunk2.js": { cuerpo: "d" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPedidos: 3 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    await pedir("http://sitio.test/graphql", "http://sitio.test/", { metodo: "POST", cuerpo: "{}", tipo: "fetch" });
+    await pedir("http://sitio.test/chunk.js", "http://sitio.test/", { tipo: "script" });
+    // Tres: el documento, el POST y el chunk. Lo que sigue, POST o GET, ya no sale.
+    await pedir("http://sitio.test/graphql?2", "http://sitio.test/", { metodo: "POST", cuerpo: "{}", tipo: "fetch" });
+    await pedir("http://sitio.test/chunk2.js", "http://sitio.test/", { tipo: "script" });
+    expect(desenlaces).toMatchObject({
+      "http://sitio.test/graphql": "respondido",
+      "http://sitio.test/chunk.js": "respondido",
+      "http://sitio.test/graphql?2": "abortado",
+      "http://sitio.test/chunk2.js": "abortado",
+    });
+    expect(red.pedidos).toHaveLength(3);
+    expect(bitacora.noLlegaron.map((n) => `${n.url} ${n.motivo}`)).toEqual([
+      "http://sitio.test/graphql?2 presupuesto",
+      "http://sitio.test/chunk2.js presupuesto",
+    ]);
+  });
+
+  /**
+   * CSP-SIN-TEXTO-MUERTO: `SIN_TEXTO` nombraba `csp_violation_report`, que
+   * ningún Chromium dice. MEDIDO por la revisión con Chrome 155: un reporte
+   * de `report-uri` llega al interceptor como `other POST`, salía al tercero
+   * y le gastaba a la página sus 20 `POST` ajenos; el `fetch` con el
+   * contenido que venía después quedaba `subrecurso-presupuesto`.
+   */
+  it("CSP — un reporte del navegador no sale ni gasta: `other POST` con `application/csp-report` o `reports+json` es `sin-texto`", async () => {
+    const { deps, red } = armar({ "http://tercero.test/csp-report": { cuerpo: "ok" }, "http://cdn.test/graphql": { cuerpo: "contenido" } });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 1 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    const reportes = [
+      ["http://tercero.test/csp-report", { "content-type": "application/csp-report" }],
+      ["http://tercero.test/csp-report?2", { "Content-Type": "application/csp-report; charset=utf-8" }],
+      ["http://tercero.test/csp-report?3", { "content-type": "Application/Reports+JSON" }],
+    ] as const;
+    for (const [url, encabezados] of reportes) {
+      await pedir(url, "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: '{"csp-report":{}}', encabezados });
+      expect(desenlaces[url], url).toBe("abortado");
+    }
+    // El tipo de CDP, como lo da puppeteer, también; sin `content-type`.
+    await pedir("http://tercero.test/csp-report?4", "http://sitio.test/", { tipo: "cspviolationreport", metodo: "POST", cuerpo: "{}" });
+    expect(desenlaces["http://tercero.test/csp-report?4"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual(
+      ["", "?2", "?3", "?4"].map((q) => ({ url: `http://tercero.test/csp-report${q}`, motivo: "sin-texto" }))
+    );
+    // Ninguno salió, y el único `POST` ajeno sigue libre para lo que la página escribe.
+    await pedir("http://cdn.test/graphql", "http://sitio.test/", { tipo: "fetch", metodo: "POST", cuerpo: "{}" });
+    expect(desenlaces["http://cdn.test/graphql"]).toBe("respondido");
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://cdn.test/graphql"]);
+    expect(bitacora.noLlegaron).toEqual([]);
+  });
+
+  it("CSP — lo que NO es un reporte sigue su camino: un `other POST` sin ese `content-type`, y un `fetch` de la página que lo trae", async () => {
+    const { deps, red } = armar({
+      "http://tercero.test/log": { cuerpo: "ok" },
+      "http://tercero.test/log?2": { cuerpo: "ok" },
+      "http://cdn.test/datos": { cuerpo: "contenido" },
+    });
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxPostsAjenos: 1 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    // Un `other POST` con otro cuerpo gasta el tope como cualquier POST ajeno.
+    await pedir("http://tercero.test/log", "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: "x", encabezados: { "content-type": "text/plain" } });
+    expect(desenlaces["http://tercero.test/log"]).toBe("respondido");
+    await pedir("http://tercero.test/log?2", "http://sitio.test/", { tipo: "other", metodo: "POST", cuerpo: "x", encabezados: { "content-type": "text/plain" } });
+    expect(desenlaces["http://tercero.test/log?2"]).toBe("abortado");
+    // Un `fetch` lo arma la página y lee la respuesta: con `application/csp-report`
+    // no se vuelve un reporte. Si decide y no sale, NO LLEGÓ (F2), no `sin-texto`.
+    await pedir("http://cdn.test/datos", "http://sitio.test/", {
+      tipo: "fetch",
+      metodo: "POST",
+      cuerpo: "{}",
+      encabezados: { "content-type": "application/csp-report" },
+    });
+    expect(desenlaces["http://cdn.test/datos"]).toBe("abortado");
+    expect(bitacora.bloqueados).toEqual([
+      { url: "http://tercero.test/log?2", motivo: "presupuesto" },
+      { url: "http://cdn.test/datos", motivo: "presupuesto" },
+    ]);
+    expect(bitacora.noLlegaron).toEqual([{ url: "http://cdn.test/datos", tipo: "fetch", motivo: "presupuesto", origen: "pagina" }]);
+    expect(red.pedidos.map((p) => p.url)).toEqual(["http://tercero.test/log"]);
+  });
+
+  it("y sus turnos: un reproductor con todos los suyos ocupados no deja esperando a la página", async () => {
+    const { deps } = armar({ "http://sitio.test/": { cuerpo: "<p>hola</p>" }, "http://sitio.test/chunk.js": { cuerpo: "c" } });
+    const transporte = deps.transporte;
+    // Los segmentos del reproductor no terminan nunca.
+    deps.transporte = (p) => (p.url.startsWith("http://video.test/") ? new Promise(() => {}) : transporte(p));
+    const bitacora = bitacoraVacia();
+    const desenlaces: Record<string, string> = {};
+    const pedir = pedidor(crearInterceptor(deps, { ...OPCIONES_RENDER, maxConcurrencia: 2 }, bitacora, () => 5_000, new AbortController().signal), desenlaces);
+    await pedir("http://sitio.test/", null, { principal: true });
+    for (const n of [1, 2, 3]) void pedir(`http://video.test/seg${n}`, "http://video.test/embed");
+    await new Promise((listo) => setImmediate(listo));
+    // Dos en el transporte y el tercero esperando: si no, esto no prueba nada.
+    expect(bitacora.picoConcurrente.deOtrosSitios).toBe(2);
+    expect(bitacora.pedidos.map((p) => p.url)).not.toContain("http://video.test/seg3");
+    const chunk = pedir("http://sitio.test/chunk.js", "http://sitio.test/", { tipo: "script" });
+    const listo = await Promise.race([chunk.then(() => "listo"), new Promise((r) => setTimeout(() => r("esperando"), 1_000))]);
+    expect(listo).toBe("listo");
+    expect(desenlaces["http://sitio.test/chunk.js"]).toBe("respondido");
+    expect(bitacora.picoConcurrente.pagina).toBe(1);
   });
 });
 
@@ -1148,6 +1814,28 @@ describe("un fallo es un fallo: con código, sin número, y con el navegador cer
     expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "http_403" });
   });
 
+  // M11 (F10): el borde es 400, no 401. Un 400 con una página de error larga
+  // se medía como el sitio.
+  it("el borde: un documento que contesta 400 es `http_400`, y uno que contesta 399 se mide", async () => {
+    const error = `<h1>Bad Request</h1><p>${"Página de error del servidor. ".repeat(40)}</p>`;
+    const { deps } = armar({ "http://sitio.test/": { status: 400, cuerpo: error } });
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "http_400" });
+    const otro = armar({ "http://sitio.test/": { status: 399, cuerpo: error } });
+    expect((await medirRenderizado("http://sitio.test/", otro.deps)).estado).toBe("medido");
+  });
+
+  // M12 (F10): sin status del documento no hay documento medido. Si Chromium
+  // lo sirvió por su cuenta, lo que se lee no pasó por el examen ni por el
+  // transporte, y su texto no es el del sitio.
+  it("un documento que la medición no vio llegar —sin status— es `navegacion`, no un número", async () => {
+    const { deps, navegador } = armar(
+      { "http://sitio.test/": { cuerpo: "<p>x</p>" } },
+      { documentoPorFuera: `<main><p>${"Texto que nadie examinó. ".repeat(40)}</p></main>` }
+    );
+    expect(await medirRenderizado("http://sitio.test/", deps)).toEqual({ estado: "fallo", codigo: "navegacion" });
+    expect(navegador.registro.cierres).toBe(1);
+  });
+
   it("un documento que se declara descarga no se entrega: `descarga`", async () => {
     const { deps, navegador } = armar({
       "http://sitio.test/": { cuerpo: "PK...", encabezados: { "content-disposition": "attachment; filename=x.zip" } },
@@ -1192,7 +1880,7 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     expect(red.pedidos.map((p) => p.url)).toEqual(["http://sitio.test/"]);
   });
 
-  it("los SUBRECURSOS a 127.0.0.1, 169.254.169.254 y 10.x se abortan, y la página se mide igual", async () => {
+  it("los SUBRECURSOS a 127.0.0.1, 169.254.169.254 y 10.x se abortan, y el render queda sin número: no se vio lo que traían (F2)", async () => {
     const html = `<html><body><p>${"Texto real del sitio. ".repeat(40)}</p>
       <script src="http://127.0.0.1/loopback.js"></script>
       <script src="http://169.254.169.254/latest/meta-data/iam.js"></script>
@@ -1214,7 +1902,15 @@ describe("SSRF: el navegador no llega a ninguna red que no sea pública", () => 
     });
 
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
-    expect(render.estado).toBe("medido");
+    // Antes «medido»: lo que esos scripts escribían no estaba, y el número se
+    // daba igual. Ahora, contenido que no se vio es «no medido» (F2), y el
+    // detalle es el primero que la política rechazó. Cinco y no seis: el
+    // marco a `localhost` es de OTRO sitio que la página, y lo que la
+    // política le rechaza no decide (RT-4), igual que lo que no le llega.
+    expect(render).toEqual(
+      falloPor("red-no-publica", { tipo: "script", host: "127.0.0.1", ruta: "/loopback.js", origen: "pagina", noLlegaron: 5 })
+    );
+    expect(bitacora.noLlegaron.map((n) => n.url)).not.toContain("http://localhost/");
 
     // Ninguna dirección que no sea pública llegó al transporte.
     expect(red.pedidos.map((p) => p.url).sort()).toEqual(["http://cdn.test/legitimo.js", "http://sitio.test/"]);
