@@ -32,6 +32,7 @@ import {
   type CacheDeRespuestas,
   type DependenciasRender,
   type DetalleDelSubrecurso,
+  type MotivoDeNoLlegada,
   type MotivoDeSubrecurso,
   type PedidoDelNavegador,
   type PedidoHttp,
@@ -526,6 +527,7 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
       tipo,
       esDocumentoPrincipal: false,
       urlDelMarco: "http://sitio.test/",
+      urlDelWorker: null,
       urlDeLaPagina: "http://sitio.test/",
       continuar: async () => {},
       abortar: async () => {},
@@ -596,14 +598,19 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
    * Ningún test lo fijaba. Con `descarga` fuera de `esNoLlegada`, la revisión
    * midió con el navegador doble `medido 1249/1249`: el contenido detrás del
    * `fetch` no se vio, y había número (y el punto salía VERDE). Con la regla de
-   * RT-4: el mismo pedido desde un marco de OTRO sitio no decide.
+   * RT-4: el mismo pedido desde un marco de OTRO sitio no decide. Y con la de
+   * W-1 (#127): sin marco, se juzga por el script del worker. MEDIDO al
+   * integrar #127: el caso del worker iba sin `urlDelWorker` y salía
+   * `sin-origen`, no `worker`; el test no decía de QUÉ worker era.
    */
   it.each([
-    ["la página: decide", undefined, "pagina"],
-    ["un worker: decide", null, "worker"],
-    ["un marco del MISMO sitio: decide", "http://widgets.sitio.test/w", "mismo-sitio"],
-    ["un marco de OTRO sitio: no decide", "http://video.test/embed", null],
-  ] as const)("F2 — un fetch que vuelve como descarga (attachment), desde %s", async (_caso, marco, origen) => {
+    ["la página: decide", {}, "pagina"],
+    ["un worker de la página: decide", { marco: null, worker: "blob:http://sitio.test/5e1f0c2a" }, "worker"],
+    ["un worker de OTRO sitio (W-1): no decide", { marco: null, worker: "blob:http://video.test/0b6c9a4e" }, null],
+    ["un pedido sin marco que no es de ningún worker conocido: decide", { marco: null }, "sin-origen"],
+    ["un marco del MISMO sitio: decide", { marco: "http://widgets.sitio.test/w" }, "mismo-sitio"],
+    ["un marco de OTRO sitio: no decide", { marco: "http://video.test/embed" }, null],
+  ] as const)("F2 — un fetch que vuelve como descarga (attachment), desde %s", async (_caso, donde, origen) => {
     const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
     const url = "http://sitio.test/api/contenido";
     const { deps, bitacora, red, navegador } = armar(
@@ -611,7 +618,7 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
         "http://sitio.test/": { cuerpo: html },
         [url]: { cuerpo: CONTENIDO, encabezados: { "content-disposition": 'attachment; filename="contenido.json"' } },
       },
-      { enSegundoPlano: [{ url, tipo: "fetch", ...(marco === undefined ? {} : { marco }) }] }
+      { enSegundoPlano: [{ url, tipo: "fetch", ...donde }] }
     );
     const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
     // El pedido salió y volvió: lo que lo frenó es la respuesta, no la política.
@@ -683,6 +690,119 @@ describe("RT-1: un render al que no le llegó lo que escribe el texto NO es una 
     } else {
       expect(render).toEqual(falloPor("puerto", { tipo: "fetch", host: "cdn.test", ruta: "/datos", origen, noLlegaron: 2 }));
     }
+  });
+
+  /**
+   * LA REGLA, NO EL CASO (integración de #126 con #127, W-1). Cada forma de
+   * NO LLEGAR —lo que la política no deja salir y lo que no deja pedir (F2),
+   * la respuesta que vuelve como descarga (R7-F2-DESCARGA), el transporte que
+   * no contesta (PU-3) y el DNS que no contesta MIENTRAS se lee (FV125-1)— y
+   * el estar EN VUELO desde que el pedido entra al interceptor (FV125-1)
+   * deciden con UNA sola regla de desde dónde sale el pedido: RT-4 para los
+   * marcos y W-1 para lo que sale sin marco. MEDIDO al integrar #127: el caso
+   * del worker de la descarga se había escrito sin decir de QUÉ worker era, y
+   * W-1 lo pasó de `worker` a `sin-origen` sin que ningún test de #126 lo
+   * pidiera; el merge, además, no compilaba. Acá cada forma se cruza con cada
+   * origen: una forma nueva entra a `FORMAS_DE_NO_LLEGAR` y se prueba contra
+   * todos, y un origen nuevo entra a `DESDE_DONDE` y se prueba contra todas.
+   */
+  const DESDE_DONDE = [
+    ["la página", {}, "pagina"],
+    ["un marco del MISMO sitio", { marco: "http://widgets.sitio.test/w" }, "mismo-sitio"],
+    ["un marco de OTRO sitio", { marco: "http://video.test/embed" }, null],
+    ["un worker `blob:` de la página", { marco: null, worker: "blob:http://sitio.test/5e1f0c2a" }, "worker"],
+    ["un worker con script de la página", { marco: null, worker: "http://sitio.test/worker.js" }, "worker"],
+    ["un worker con script de un subdominio del sitio", { marco: null, worker: "http://static.sitio.test/w.js" }, "worker"],
+    ["un worker `blob:` de OTRO sitio", { marco: null, worker: "blob:http://video.test/0b6c9a4e" }, null],
+    ["un worker con script de OTRO sitio", { marco: null, worker: "https://video.test/w.js" }, null],
+    ["un worker `data:`", { marco: null, worker: "data:text/javascript,fetch('/datos')" }, "sin-origen"],
+    ["un worker de origen opaco (`blob:null`)", { marco: null, worker: "blob:null/7d3e9b10" }, "sin-origen"],
+    ["un pedido sin marco que Chromium no atribuyó a ningún worker", { marco: null }, "sin-origen"],
+  ] as const;
+
+  const DATOS = "http://cdn.test/datos";
+  const FORMAS_DE_NO_LLEGAR: ReadonlyArray<{
+    motivo: MotivoDeNoLlegada;
+    url: string;
+    metodo?: string;
+    sitio: Sitio;
+    /** Lo que el caso le cambia al armado: el DNS que contesta tarde. */
+    preparar?: (armado: ReturnType<typeof armar>) => void;
+  }> = [
+    { motivo: "puerto", url: "https://cdn.test:8443/datos", sitio: {} },
+    { motivo: "red-no-publica", url: "http://interno.test/datos", sitio: {} },
+    { motivo: "metodo", url: DATOS, metodo: "PUT", sitio: { [DATOS]: { cuerpo: CONTENIDO } } },
+    {
+      motivo: "descarga",
+      url: DATOS,
+      sitio: { [DATOS]: { cuerpo: CONTENIDO, encabezados: { "content-disposition": 'attachment; filename="datos.json"' } } },
+    },
+    { motivo: "sin-respuesta", url: DATOS, sitio: {} },
+    {
+      motivo: "dns-sin-respuesta",
+      url: DATOS,
+      sitio: { [DATOS]: { cuerpo: CONTENIDO } },
+      preparar: (armado) => {
+        const resolver = armado.deps.resolver;
+        armado.deps.resolver = async (host, senal) => {
+          if (host !== "cdn.test") return resolver(host, senal);
+          await armado.reloj.alcanzar(5_000);
+          return { ok: false, transitorio: true };
+        };
+      },
+    },
+  ];
+
+  describe.each(FORMAS_DE_NO_LLEGAR.map((f) => [f.motivo, f] as const))(
+    "#126 × W-1 — `%s`: decide con la regla de desde dónde sale el pedido",
+    (motivo, forma) => {
+      it.each(DESDE_DONDE)("desde %s", async (_caso, donde, origen) => {
+        const html = `<html><body>${MENU}<main id="app"></main></body></html>`;
+        const armado = armar(
+          { "http://sitio.test/": { cuerpo: html }, ...forma.sitio },
+          { enSegundoPlano: [{ url: forma.url, tipo: "fetch", ...(forma.metodo ? { metodo: forma.metodo } : {}), ...donde }] }
+        );
+        forma.preparar?.(armado);
+        const { deps, bitacora } = armado;
+        const render = await medirRenderizado("http://sitio.test/", deps, OPCIONES_RENDER, bitacora);
+        // Lo que no decide no se espera: su DNS contesta después de medir. Se
+        // deja que termine, para ver que salió por esta forma igual.
+        await armado.reloj.esperar(5_000);
+        for (let i = 0; i < 5; i += 1) await new Promise((listo) => setImmediate(listo));
+        // El pedido salió del interceptor por esta forma, siempre: lo que
+        // cambia según de dónde sale es si decide.
+        expect(bitacora.bloqueados).toContainEqual({ url: forma.url, motivo });
+        if (origen === null) {
+          expect(bitacora.noLlegaron).toEqual([]);
+          expect(render.estado).toBe("medido");
+          return;
+        }
+        const { hostname: host, pathname: ruta } = new URL(forma.url);
+        expect(render).toEqual(falloPor(motivo, { tipo: "fetch", host, ruta, origen }));
+        expect(bitacora.noLlegaron).toEqual([{ url: forma.url, tipo: "fetch", motivo, origen }]);
+        expect(contenidoSinJs({ ...SANO_PUNTO, caracteresSinJs: textoSinJavaScript(html), caracteresRenderizados: render }).estado).toBe(
+          "no-medido"
+        );
+      });
+    }
+  );
+
+  it.each(DESDE_DONDE)("#126 × W-1 — EN VUELO desde que entra al interceptor (FV125-1), desde %s", async (_caso, donde, origen) => {
+    const { deps } = armar({});
+    deps.resolver = () => new Promise(() => {});
+    const bitacora = bitacoraVacia();
+    const atender = crearInterceptor(deps, OPCIONES_RENDER, bitacora, () => 5_000, new AbortController().signal);
+    const desde: { marco?: string | null; worker?: string } = donde;
+    const urlDelMarco = desde.marco === undefined ? "http://sitio.test/" : desde.marco;
+    void pedidor(atender, {})(DATOS, urlDelMarco, { tipo: "fetch", urlDelWorker: urlDelMarco === null ? (desde.worker ?? null) : null });
+    await new Promise((listo) => setImmediate(listo));
+    if (origen === null) {
+      expect(bitacora.enVuelo).toBe(0);
+      expect([...bitacora.enCamino]).toEqual([]);
+      return;
+    }
+    expect(bitacora.enVuelo).toBe(1);
+    expect([...bitacora.enCamino]).toEqual([{ url: DATOS, tipo: "fetch", origen }]);
   });
 
   it("un chunk que todavía está EN VUELO al leer se espera, y lo que trae se cuenta: el punto sale ROJO, no verde", async () => {

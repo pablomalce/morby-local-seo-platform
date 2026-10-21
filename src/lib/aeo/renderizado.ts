@@ -219,6 +219,15 @@
  * worker— cuenta. El sitio se aproxima hacia arriba (los dos últimos rótulos
  * del nombre): se cuenta de más, nunca de menos.
  *
+ * Es UNA sola regla, y se juzga una vez, al entrar (`escribeTexto`,
+ * `deOtroSitio`, `origenDelPedido`): la misma para estar EN VUELO (FV125-1)
+ * y para cada forma de no llegar —la política (F2), la descarga, el
+ * transporte, el DNS que no contesta—. Ninguna forma vuelve a mirar desde
+ * dónde salió el pedido por su cuenta. MEDIDO al integrar #126 con W-1: el
+ * merge no tenía conflicto de texto y dejaba el typecheck y un test en rojo,
+ * porque un test de la descarga desde un worker no decía de qué worker era.
+ * `renderizado.test.ts` («#126 × W-1») cruza cada forma con cada origen.
+ *
  * La página es el documento CONFIRMADO de la pestaña (`urlDeLaPagina`, que
  * `chromium.ts` lee de `page.mainFrame().url()`), y no el último PEDIDO de
  * navegación. Reproducido por la revisión con Chrome 155 y el headless shell
