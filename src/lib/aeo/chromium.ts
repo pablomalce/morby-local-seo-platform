@@ -187,21 +187,77 @@ const sinWebRtc = `(() => {
  * antes de que corra su primera línea (ver `vigilarSalidasPropias`)— y se
  * anota, por pedido, la URL de su script. Un pedido sin marco que no está
  * anotado queda sin worker, y cuenta (falla cerrado).
+ *
+ * Y se anota también la SESIÓN de cada worker, para contestarle a cada
+ * pedido por la sesión que lo pausó (`contestarPorQuienLoPauso`).
  */
-function scriptsDeLosWorkers(page: Page): Map<string, string> {
-  const porPedido = new Map<string, string>();
+interface WorkersDeLaPestana {
+  /** Por `requestId` de CDP, la URL del script del worker que lo pidió (W-1). */
+  scripts: Map<string, string>;
+  /** Las sesiones de CDP de los workers de la pestaña (PRE-SESION-EQUIVOCADA). */
+  sesiones: WeakSet<CDPSession>;
+}
+
+function vigilarWorkers(page: Page): WorkersDeLaPestana {
+  const workers: WorkersDeLaPestana = { scripts: new Map(), sesiones: new WeakSet() };
   page.on("workercreated", (worker) => {
     const script = worker.url();
+    workers.sesiones.add(worker.client);
     worker.client.on("Network.requestWillBeSent", (e) => {
-      porPedido.set(e.requestId, e.documentURL || script);
+      workers.scripts.set(e.requestId, e.documentURL || script);
     });
   });
-  return porPedido;
+  return workers;
+}
+
+/**
+ * A QUIÉN SE LE CONTESTA UN PEDIDO DE UN WORKER (PRE-SESION-EQUIVOCADA).
+ *
+ * Chromium pausa el pedido de un worker en la sesión del MARCO que lo creó
+ * —la de la pestaña, o la de un marco de otro sitio que corre en otro
+ * proceso—: el worker no tiene el dominio `Fetch`. Pero puppeteer 25.11.0 le
+ * asigna al pedido la sesión del ÚLTIMO de los dos avisos que empareja, y si
+ * el `Network.requestWillBeSent` de la sesión del worker llega DESPUÉS del
+ * `Fetch.requestPaused`, el pedido queda con la sesión del worker. Entonces
+ * `respond`, `continue` y `abort` fallan con «'Fetch.fulfillRequest' wasn't
+ * found», puppeteer se traga el error, y el pedido queda pausado para
+ * siempre: lo que el worker trae no llega a la página, nada lo anota, y el
+ * render salía `medido` y VERDE. REPRODUCIDO por la revisión y MEDIDO con
+ * Chrome 155 y con el headless shell 153 en AL2023, con los datos en un CDN
+ * de otro origen: un worker `blob:` que hace `importScripts` y después
+ * `fetch` —todo llega— dejaba la página vacía 3 de 3 y 4 de 4; uno con
+ * script propio, 2 de 3 con Chrome. Al mismo origen no se reprodujo.
+ *
+ * La sesión que lo pausó es la primera que NO es de un worker subiendo por
+ * `parentSession()` —la de auto-attach de CDP—: MEDIDO con los dos binarios,
+ * 4 corridas por caso, en cada pedido de un worker `blob:`, de uno con
+ * script, de uno `module`, del worker de un marco de otro sitio y de los de
+ * un marco de otro sitio dentro de otro; con esa sesión, todos llegaron.
+ * Subir más de un nivel (un worker creado por otro) lo prueba sólo el doble
+ * (`chromiumWorkers.test.ts`). Se cambia ANTES de contestar. `client` y
+ * `parentSession()` son `@internal` en puppeteer, fijado exacto como el
+ * `requestId`. Si subiendo no hay una sesión que no sea de un worker —o un
+ * día falta `parentSession`—, no hay a quién contestarle: `false`, y lo que
+ * se le responda no llegó —falla cerrado, nunca un pedido colgado que no
+ * cuenta—.
+ */
+function contestarPorQuienLoPauso(req: HTTPRequest, sesiones: WeakSet<CDPSession>): boolean {
+  const pedido = req as unknown as { client?: CDPSession };
+  let sesion = pedido.client;
+  if (sesion === undefined || !sesiones.has(sesion)) return true;
+  while (sesion !== undefined && sesiones.has(sesion)) {
+    const padre: CDPSession | undefined = (sesion as unknown as { parentSession?: () => CDPSession | undefined }).parentSession?.();
+    // Sin padre, puppeteer devuelve la misma sesión: no hay más arriba.
+    sesion = padre === sesion ? undefined : padre;
+  }
+  if (sesion === undefined) return false;
+  pedido.client = sesion;
+  return true;
 }
 
 /**
  * El `requestId` de CDP del pedido: el mismo del `Network.requestWillBeSent`
- * que anota `scriptsDeLosWorkers`. puppeteer lo tiene (`CdpHTTPRequest.id`)
+ * que anota `vigilarWorkers`. puppeteer lo tiene (`CdpHTTPRequest.id`)
  * pero lo marca `@internal` y su tipo público no lo trae; la versión está
  * fijada exacta (ver «QUÉ CHROMIUM»). Emparejar por URL no sirve: dos workers
  * que piden la misma URL a la vez se confunden, y el de la página podía pasar
@@ -213,13 +269,18 @@ function idDelPedido(req: HTTPRequest): string | null {
   return typeof id === "string" && id !== "" ? id : null;
 }
 
-async function adaptar(req: HTTPRequest, page: Page, scripts: Map<string, string>): Promise<PedidoDelNavegador> {
+async function adaptar(req: HTTPRequest, page: Page, workers: WorkersDeLaPestana): Promise<PedidoDelNavegador> {
+  const { scripts } = workers;
   // Lo que decide de dónde sale el pedido se lee AL ENTRAR (FV-1), antes de
   // cualquier espera.
   const marco = req.frame();
   const urlDeLaPagina = page.mainFrame().url();
+  // El cuerpo, por la sesión con la que llegó: es la que avisó el pedido.
   let cuerpo = req.postData();
   if (cuerpo === undefined && req.hasPostData()) cuerpo = await req.fetchPostData();
+  // Y desde acá, todo lo que se le contesta va a la sesión que lo pausó.
+  const entregable = contestarPorQuienLoPauso(req, workers.sesiones);
+  const sinSesion = () => Promise.reject(new Error("el pedido de un worker no tiene una sesión que lo haya pausado"));
   let urlDelWorker: string | null = null;
   if (marco === null) {
     // El aviso del worker puede llegar en el MISMO mensaje de CDP que suelta
@@ -256,9 +317,11 @@ async function adaptar(req: HTTPRequest, page: Page, scripts: Map<string, string
     // cambian. Antes `renderizado.ts` tomaba el último PEDIDO de navegación,
     // y con un 204 a otro sitio los `fetch` de la página pasaban por ajenos.
     urlDeLaPagina,
-    continuar: () => req.continue(),
-    abortar: () => req.abort("blockedbyclient"),
-    responder: (r) => req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }),
+    // Sin sesión que lo pausó, contestar no llega a ninguna parte: se dice,
+    // y `renderizado.ts` lo anota como un pedido que no llegó (PU-3).
+    continuar: () => (entregable ? req.continue() : sinSesion()),
+    abortar: () => (entregable ? req.abort("blockedbyclient") : sinSesion()),
+    responder: (r) => (entregable ? req.respond({ status: r.status, headers: r.encabezados, body: r.cuerpo }) : sinSesion()),
   };
 }
 
@@ -411,13 +474,13 @@ function envolverPagina(page: Page, vigilada?: { sesion: CDPSession; salidas: ()
       return vigilada?.salidas() ?? [];
     },
     async interceptar(atender) {
-      const scripts = scriptsDeLosWorkers(page);
+      const workers = vigilarWorkers(page);
       await page.setBypassServiceWorker(true);
       await page.setRequestInterception(true);
       page.on("request", (req) => {
         // Si adaptar o atender fallan, el pedido se aborta: un pedido colgado
         // frena el `load`, y uno liberado sin examen es una salida.
-        void adaptar(req, page, scripts)
+        void adaptar(req, page, workers)
           .then(atender)
           .catch(() => req.abort("blockedbyclient").catch(() => {}));
       });

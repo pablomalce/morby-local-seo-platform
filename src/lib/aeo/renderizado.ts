@@ -274,6 +274,18 @@
  * integración: página → marco de otro sitio → marco de otro sitio → workers
  * `blob:` y con script propio que piden a un nombre sólo-IPv6 sin ruta.
  *
+ * El costo, dicho: el worker de un marco de otro sitio que le trae los datos
+ * a la página por `postMessage` tampoco decide («LO QUE NO CUBRE», 2).
+ *
+ * Y LO QUE TRAE UN WORKER DE LA PÁGINA LLEGA (PRE-SESION-EQUIVOCADA). Un
+ * `fetch` de un worker que sí llegaba al interceptor podía no llegarle
+ * nunca a la página: puppeteer le contestaba por la sesión del worker, que no
+ * lo había pausado, y se tragaba el error. REPRODUCIDO por la revisión con
+ * los dos binarios, también en main: un worker `blob:` que hace
+ * `importScripts` y después `fetch` daba `medido 1249/1249` y VERDE en todas
+ * las corridas. `chromium.ts` le contesta por la sesión que lo pausó, y si no
+ * la encuentra, la respuesta no llegó y cuenta.
+ *
  * Y CUANDO UN PEDIDO DEJA LA PÁGINA SIN NÚMERO, SE DICE CUÁL
  *
  * Un `subrecurso-<motivo>` solo no se puede diagnosticar. Con el #121 en
@@ -305,14 +317,16 @@
  *
  * LO QUE NO CUBRE, DICHO
  *
- * Reproducido por la revisión de este cambio con Chrome 155 y el headless
- * shell 153 (FV-2, FV-3, FV-4, FV-5, RED-121-4, F4). Las dos primeras formas
- * salen `medido` y VERDE donde main decía `subrecurso-sin-respuesta`: son el
- * costo de no contar lo que pide un marco de otro sitio, porque al momento
- * del pedido un reproductor caído y un marco de autenticación caído no se
- * distinguen. Las otras tres ya estaban en main. La integración
- * (`renderizado.integracion.test.ts`, «LO QUE NO CUBRE») fija hoy las tres
- * primeras: si una cambia, ese test se pone rojo y esta lista se corrige.
+ * Reproducido por las revisiones con Chrome 155 y el headless shell 153: la
+ * de RT-4 (FV-2, FV-3, FV-4, FV-5, RED-121-4, F4) y la de W-1
+ * (W1-FV3-WORKER). Las tres primeras formas salen `medido` y VERDE donde
+ * antes de RT-4 —la 2, antes de W-1— se decía `subrecurso-sin-respuesta`:
+ * son el costo de no contar lo que pide un marco de otro sitio o su worker,
+ * porque al momento del pedido un reproductor caído y un marco de
+ * autenticación caído no se distinguen. Las otras tres ya estaban antes. La
+ * integración (`renderizado.integracion.test.ts`, «LO QUE NO CUBRE») fija hoy
+ * las cuatro primeras: si una cambia, ese test se pone rojo y esta lista se
+ * corrige.
  *
  *   1. Un marco de otro sitio que le pasa datos a la página con `postMessage`
  *      y la página escribe texto con ellos (FV-3). Si a ese marco no le llegó
@@ -320,23 +334,35 @@
  *      o se queda en «Cargando…», y no se ve. Es la autenticación silenciosa
  *      de muchas SPA: Auth0 con `response_mode=web_message`, el iframe oculto
  *      de MSAL. La página espera el mensaje del marco para pedir lo suyo.
- *   2. Un marco cuyo PRIMER salto es de otro sitio y redirige al origen de la
+ *   2. Lo mismo, cuando los datos los trae un WORKER de ese marco
+ *      (W1-FV3-WORKER): el marco de otro sitio crea un worker —un `blob:`
+ *      suyo—, el worker hace el `fetch` y el marco le pasa el texto a la
+ *      página. Si no llega, la página escribe menos y sale `medido` y VERDE;
+ *      antes de W-1, «sin marco» decidía siempre y era
+ *      `subrecurso-sin-respuesta`. También cuando el worker le pide los datos
+ *      al SITIO de la página: se juzga desde dónde sale el pedido, no adónde
+ *      va, como el `fetch` del marco en el punto 1. REPRODUCIDO por la
+ *      revisión con Chrome 155 (5 de 5) y el headless shell 153 (4 de 4), con
+ *      el oráculo ROJO. Es el precio de que el worker del desafío de
+ *      Cloudflare no deje sin número a la web real: al momento del pedido, los
+ *      dos son el `fetch` de un worker de otro sitio que no llegó.
+ *   3. Un marco cuyo PRIMER salto es de otro sitio y redirige al origen de la
  *      página (FV-2): el documento del mismo origen sí puede escribir en
  *      `parent`, pero si el primer salto no llega, ese documento nunca carga.
  *      Es el silent-auth de OIDC: iframe → `/authorize?prompt=none` del IdP →
  *      302 → el callback del propio sitio, que escribe o avisa al padre.
- *   3. Un `SharedWorker`: lo que pide no pasa por la intercepción de
+ *   4. Un `SharedWorker`: lo que pide no pasa por la intercepción de
  *      puppeteer (FV-4), y muere en la red apagada de Chromium sin que nadie
  *      lo anote. Si la página escribe con eso, escribe menos y no se ve. La
  *      red sigue cerrada: el canario de la integración lo afirma.
- *   4. Un marco de otro sitio que SE NAVEGA a sí mismo al origen de la
+ *   5. Un marco de otro sitio que SE NAVEGA a sí mismo al origen de la
  *      página (FV-5): la navegación se intercepta y cuenta —se juzga por la
  *      URL del pedido—, pero con Chrome 155 los subrecursos del documento al
  *      que llega NO pasan por la intercepción: MEDIDO, ni su `script` ni su
  *      `fetch` llegan al interceptor, 3 de 3. No llegan y no se anotan. Con
  *      el headless shell 153, el de producción, sí se interceptan y cuentan,
  *      y con una redirección HTTP en vez de `location.href`, con los dos.
- *   5. `falloDocumento` y `statusDocumento` se miran UNA vez, después de la
+ *   6. `falloDocumento` y `statusDocumento` se miran UNA vez, después de la
  *      quietud de red. Si la página manda la pestaña a otra parte durante el
  *      recorrido o la lectura, y ese salto se rechaza o contesta 4xx/5xx, el
  *      fallo no se ve, y lo que se lee puede ser la página de error de

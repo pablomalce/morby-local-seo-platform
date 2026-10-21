@@ -487,6 +487,42 @@ const MARCO_WORKER_SOCKET = `<!doctype html><html><body><p>Chat</p><script>
   new Worker(URL.createObjectURL(new Blob(["try { new WebSocket('wss://video.test/ws-del-worker'); } catch (e) {}"])));
 </script></body></html>`;
 
+/**
+ * PRE-SESION-EQUIVOCADA: un worker de la PÁGINA trae el contenido de un CDN
+ * —otro origen, con CORS— y se lo pasa, y TODO LLEGA. Reproducido por la
+ * revisión con Chrome 155 y el headless shell 153: puppeteer emparejaba el
+ * `fetch` del worker con la sesión del worker, la respuesta no llegaba a
+ * ninguna parte, y la página salía `medido 1249/1249`, VERDE. El `blob:` que
+ * hace `importScripts` y después `fetch` lo dejaba vacío siempre; el de
+ * script y el `module`, a veces. Al MISMO origen no se reprodujo: por eso el
+ * CDN.
+ */
+const TRAE_Y_PASA = `fetch("http://cdn.test/datos-cors").then((r) => r.text()).then((t) => postMessage(t)).catch(() => {});`;
+function conWorkerQueTrae(cual: "blob" | "script" | "modulo"): string {
+  const crear =
+    cual === "blob"
+      ? `new Worker(URL.createObjectURL(new Blob([${JSON.stringify(`importScripts("http://cdn.test/lib.js"); ${TRAE_Y_PASA}`)}])))`
+      : cual === "script"
+        ? `new Worker("/w-trae.js")`
+        : `new Worker("/w-trae-modulo.js", { type: "module" })`;
+  return hibrida(`<script>const w = ${crear}; w.onmessage = (e) => (${ESCRIBIR})(e.data);</script>`);
+}
+
+/**
+ * LO QUE NO CUBRE, W1-FV3-WORKER: FV-3 en un worker. Un widget de OTRO sitio
+ * crea un worker `blob:`, el worker trae los datos —de su sitio, o del de la
+ * página— y el widget se los pasa a la página con `postMessage`. Si no le
+ * llegan, la página escribe menos, y lo que pidió el worker de otro sitio no
+ * decide (W-1).
+ */
+const WIDGET_WORKER = (datos: string) => `<!doctype html><html><body><p>Widget</p><script>
+  const w = new Worker(URL.createObjectURL(new Blob([
+    ${JSON.stringify(`fetch(${JSON.stringify(datos)}).then((r) => r.text()).then((t) => postMessage(t)).catch(() => {});`)}
+  ])));
+  w.onmessage = (e) => parent.postMessage({ texto: e.data }, "*");
+</script></body></html>`;
+const CON_WIDGET_WORKER = (marco: string) => hibrida(`${ESCUCHA}<iframe src="http://widget.test/${marco}"></iframe>`);
+
 /** F3: un `EventSource` cuyo stream no termina nunca. */
 const CON_STREAM = hibrida(`<script>const es = new EventSource("/eventos-sin-fin"); es.onmessage = (e) => (${ESCRIBIR})(e.data);</script>`);
 
@@ -700,6 +736,40 @@ beforeAll(async () => {
         return html(CON_WORKER_AJENO_Y_SOCKET);
       case "/marco-worker-socket":
         return html(MARCO_WORKER_SOCKET);
+      case "/worker-blob-trae":
+        return html(conWorkerQueTrae("blob"));
+      case "/worker-script-trae":
+        return html(conWorkerQueTrae("script"));
+      case "/worker-modulo-trae":
+        return html(conWorkerQueTrae("modulo"));
+      case "/w-trae.js":
+        return js(TRAE_Y_PASA);
+      case "/w-trae-modulo.js":
+        return js(`import { TEXTO } from "http://cdn.test/modulo-texto.js"; postMessage(TEXTO);`);
+      case "/modulo-texto.js":
+        // Un módulo de otro origen sólo se importa con CORS.
+        res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "access-control-allow-origin": "*" });
+        return res.end(`export const TEXTO = ${JSON.stringify(CONTENIDO_DEL_BUNDLE)};`);
+      case "/widget-worker-ok":
+        return html(CON_WIDGET_WORKER("ww-ok"));
+      case "/widget-worker-caido":
+        return html(CON_WIDGET_WORKER("ww-caido"));
+      case "/widget-worker-al-sitio-ok":
+        return html(CON_WIDGET_WORKER("ww-al-sitio-ok"));
+      case "/widget-worker-al-sitio-caido":
+        return html(CON_WIDGET_WORKER("ww-al-sitio-caido"));
+      case "/ww-ok":
+        return html(WIDGET_WORKER("http://widget.test/datos"));
+      case "/ww-caido":
+        return html(WIDGET_WORKER(`http://widget.test${CAIDO}datos`));
+      case "/ww-al-sitio-ok":
+        return html(WIDGET_WORKER("http://sitio.test/datos-cors"));
+      case "/ww-al-sitio-caido":
+        return html(WIDGET_WORKER(`http://sitio.test${CAIDO}datos-cors`));
+      case "/datos-cors":
+        // Los datos, legibles desde un worker de otro origen.
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" });
+        return res.end(CONTENIDO_DEL_BUNDLE);
       case "/eventsource-sin-fin":
         return html(CON_STREAM);
       case "/eventos-sin-fin":
@@ -1009,6 +1079,8 @@ function deps(
       "reto.test": [PUBLICA_DE_TERCEROS],
       "otro.test": [PUBLICA_DE_TERCEROS],
       "widget.test": [PUBLICA_DE_TERCEROS],
+      // PRE-SESION-EQUIVOCADA: el CDN del que el worker de la página trae el contenido.
+      "cdn.test": [PUBLICA_DE_TERCEROS],
       "idp.test": [PUBLICA_DE_TERCEROS],
       "rebind.test": () => (consultasRebind++ === 0 ? [PUBLICA_DE_TERCEROS] : ["127.0.0.1"]),
       "sitio.test": [PUBLICA],
@@ -1413,6 +1485,51 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
             urlDelWorker: expect.stringMatching(/^blob:http:\/\/video\.test\//),
           }),
         ]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+  });
+
+  /**
+   * PRE-SESION-EQUIVOCADA. Lo que trae un worker de la página LLEGA: a cada
+   * pedido se le contesta por la sesión que lo pausó (`chromium.ts`). Antes,
+   * con la del worker, la respuesta se perdía y la página salía VERDE.
+   */
+  describe("PRE-SESION-EQUIVOCADA — lo que trae un worker de la página LLEGA, con Chromium", () => {
+    it.each([
+      ["/worker-blob-trae", "un worker `blob:` que hace `importScripts` del CDN y después `fetch`", /^blob:http:\/\/sitio\.test\//],
+      ["/worker-script-trae", "un worker con su script, que hace `fetch` al CDN", /^http:\/\/sitio\.test\/w-trae\.js$/],
+    ] as const)(
+      "%s (%s): lo pide el worker, le llega, y la página es ROJA",
+      async (ruta, _caso, script) => {
+        const r = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado(`http://sitio.test${ruta}`, r.deps, undefined, b);
+        console.log(`[PRE-SESION ${ruta}] renderizado=${JSON.stringify(render)} vistos=${JSON.stringify(r.vistos.filter((v) => v.urlDelMarco === null))}`);
+        // Anti-vacuidad: los datos los pidió el worker, sin marco.
+        expect(r.vistos.find((v) => v.url === "http://cdn.test/datos-cors")).toMatchObject({
+          tipo: "fetch",
+          urlDelMarco: null,
+          urlDelWorker: expect.stringMatching(script),
+        });
+        expect(b.noLlegaron).toEqual([]);
+        expect(render.estado).toBe("medido");
+        expect(puntoHibrida(render)).toBe("rojo");
+      },
+      60_000
+    );
+
+    it(
+      "un worker `module` que importa el contenido del CDN: le llega, y la página es ROJA",
+      async () => {
+        const r = registrando(deps());
+        const b = bitacora();
+        const render = await medirRenderizado("http://sitio.test/worker-modulo-trae", r.deps, undefined, b);
+        console.log(`[PRE-SESION /worker-modulo-trae] renderizado=${JSON.stringify(render)} vistos=${JSON.stringify(r.vistos.filter((v) => v.urlDelMarco === null))}`);
+        expect(r.vistos.find((v) => v.url === "http://cdn.test/modulo-texto.js")).toMatchObject({ urlDelMarco: null });
+        expect(b.noLlegaron).toEqual([]);
         expect(render.estado).toBe("medido");
         expect(puntoHibrida(render)).toBe("rojo");
       },
@@ -1934,6 +2051,35 @@ describe.skipIf(!HAY_CHROME)(`el renderizado con un Chromium de verdad (${MOTIVO
         expect(puntoHibrida(ok)).toBe("rojo");
         // Lo que no llegó, no llegó —está en la bitácora—, y no decidió.
         expect(b.bloqueados.some((x) => x.url.includes(CAIDO) && x.motivo === "sin-respuesta")).toBe(true);
+        expect(caido.estado).toBe("medido");
+        expect(puntoHibrida(caido)).toBe("verde");
+      },
+      90_000
+    );
+
+    // W1-FV3-WORKER: el costo de W-1, y una regresión contra main, que con
+    // «sin marco decide» lo dejaba «no medido». Lo pide el worker `blob:` del
+    // widget, sin marco, y Chromium dice que el script es de otro sitio.
+    it.each([
+      ["/widget-worker", `http://widget.test${CAIDO}datos`, "el worker `blob:` de un widget de otro sitio no recibe su `fetch`, y el widget le pasa los datos a la página"],
+      ["/widget-worker-al-sitio", `http://sitio.test${CAIDO}datos-cors`, "lo mismo, con el worker de otro sitio pidiéndole los datos al SITIO de la página"],
+    ])(
+      "%s (FV-3 en un worker, W1-FV3-WORKER: %s → %s)",
+      async (base, perdido) => {
+        const ok = await medirRenderizado(`http://sitio.test${base}-ok`, deps());
+        const r = registrando(deps());
+        const b = bitacora();
+        const caido = await medirRenderizado(`http://sitio.test${base}-caido`, r.deps, undefined, b);
+        console.log(`[NO CUBRE ${base}] ok=${JSON.stringify(ok)} caido=${JSON.stringify(caido)} bloqueados=${JSON.stringify(b.bloqueados)}`);
+        expect(ok.estado).toBe("medido");
+        expect(puntoHibrida(ok)).toBe("rojo");
+        expect(r.vistos.find((v) => v.url === perdido)).toMatchObject({
+          urlDelMarco: null,
+          urlDelWorker: expect.stringMatching(/^blob:http:\/\/widget\.test\//),
+        });
+        // No llegó —está en la bitácora—, y no decidió.
+        expect(b.bloqueados).toContainEqual({ url: perdido, motivo: "sin-respuesta" });
+        expect(b.noLlegaron).toEqual([]);
         expect(caido.estado).toBe("medido");
         expect(puntoHibrida(caido)).toBe("verde");
       },
