@@ -109,7 +109,10 @@ export function readRunReport(body: unknown, fetchedAt: string): Ga4Result {
   const leer = (metrica: string): number | null => {
     const i = nombres.indexOf(metrica);
     if (i < 0 || i >= valores.length) return null;
-    const celda = valores[i];
+    // `.at(i)` y no `valores[i]`: en un módulo con el token, una clave que no
+    // está escrita puede ser `constructor`, y la pared la marca
+    // (credencialDeLaAgencia.analisis.ts, `REFLEXIVOS`). `.at` sólo lee índices.
+    const celda = valores.at(i);
     return numero(
       typeof celda === "object" && celda !== null ? (celda as { value?: unknown }).value : celda
     );
