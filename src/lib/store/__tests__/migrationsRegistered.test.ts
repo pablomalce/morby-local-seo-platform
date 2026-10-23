@@ -56,7 +56,14 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * Hoy no hay ninguna. Las dos últimas se cruzaron: la `0031` de H4.1 (PR
+ * Hoy no hay ninguna. La última fue la `0034_search_console_coverage`, de
+ * `fix/sin-token-propio-no-se-usa-el-de-la-agencia` (PR #118), reservada
+ * mientras la `0035_account_deletion_in_one_transaction` (la baja de cuenta en
+ * una transacción, PR #120) se escribía con el número siguiente. Se borró el
+ * 2026-10-23, al integrar `main` en la rama de la baja con la `0034` ya
+ * presente.
+ *
+ * Las dos de antes se cruzaron: la `0031` de H4.1 (PR
  * #114), reservada mientras la `0032_geo_grid` (H2-GO-3,
  * `feat/la-grilla-mide-geografia`, PR #115) se escribía con el número
  * siguiente; y la `0032`, reservada por la rama del sello

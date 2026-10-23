@@ -54,28 +54,70 @@ export async function exportMyData(): Promise<{ ok: boolean; data?: string; mess
 export interface BajaFallida {
   ok: false;
   motivo: MotivoDeBaja;
-  /** Lo que ya no está. Todo en cero cuando no se borró nada. */
-  yaBorrado: YaBorrado;
+  /**
+   * Lo que ya no está. Todo en cero cuando no se borró nada; `null` cuando no
+   * se sabe si se borró (la base no contestó).
+   */
+  yaBorrado: YaBorrado | null;
   /** La frase de `explicarBaja`: por qué, qué ya no está, qué hacer. Sin detalle de la base. */
   message: string;
 }
 
-type PasoDeBaja = "sesion" | "verificar" | "salir" | "propias" | "acceso";
+type PasoDeBaja = "sesion" | "verificar" | "organizaciones" | "acceso";
 
 /** Un paso que lanza en vez de devolver `error` falla con el motivo de ese paso. */
 const MOTIVO_SI_LANZA: Record<PasoDeBaja, MotivoDeBaja> = {
   sesion: "sin-sesion",
   verificar: "no-se-pudo-verificar",
-  salir: "no-se-pudo-salir",
-  propias: "no-se-pudieron-borrar-las-propias",
+  // La llamada salió y no volvió: la transacción pudo confirmarse o no.
+  organizaciones: "no-se-sabe-que-se-borro",
   acceso: "no-se-pudo-borrar-el-acceso",
 };
 
-/** `foreign_key_violation`: lo que contesta la base cuando una firma traba la salida. */
-const FK_RECHAZA = "23503";
+/** La función de la 0035: clasifica y borra en una transacción. */
+const BAJA_EN_LA_BASE = "delete_account_organizations";
 
-/** Para el log cuando PostgREST no dio error ni filas: no es cero, es nada. */
-const SIN_FILAS = { message: "sin error y sin filas" };
+/**
+ * Los códigos con nombre de `delete_account_organizations` (ver el encabezado
+ * de la 0035). Cualquier otro error que contestó la base es
+ * `no-se-pudieron-borrar-las-organizaciones`: la base lo deshizo igual.
+ */
+const MOTIVO_DE_LA_BASE: Record<string, MotivoDeBaja> = {
+  "45008": "sello-en-otra-organizacion",
+  // `foreign_key_violation`: una firma traba la salida de una ajena.
+  "23503": "firma-en-otra-organizacion",
+  "45009": "no-se-pudo-verificar",
+  "40001": "no-se-pudo-verificar",
+  "40P01": "no-se-pudo-verificar",
+  "55P03": "no-se-pudo-verificar",
+};
+
+/**
+ * ¿El error lo contestó la base? Sólo entonces se sabe que la transacción se
+ * deshizo. postgrest-js también devuelve `error` cuando el `fetch` se corta o el
+ * cuerpo no se puede leer (con `status` 0 y el `code` del error de red, que
+ * puede ser `EPIPE`: cinco mayúsculas), y cuando un proxy contesta HTML sin
+ * código. En esos casos el pedido pudo llegar, confirmarse y perder la
+ * respuesta: «no se borró nada» sería una suposición.
+ */
+function laBaseContesto(r: { status: number; error: { code?: unknown } }): boolean {
+  return r.status >= 400 && typeof r.error.code === "string" && /^([0-9A-Z]{5}|PGRST\d{3})$/.test(r.error.code);
+}
+
+/** Lo que devolvió la función, si tiene la forma que promete; si no, `null`. */
+function leerResultado(data: unknown): YaBorrado | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, unknown>;
+  const n = (v: unknown) => (Array.isArray(v) && v.every((x) => typeof x === "string") ? v.length : null);
+  const propias = n(d.deleted_organizations);
+  const ajenas = n(d.left_organizations);
+  const sellos = n(d.released_seals);
+  if (propias === null || ajenas === null || sellos === null) return null;
+  return { ajenas, propias, sellos };
+}
+
+/** Para el log cuando la base contestó sin error y con otra forma. */
+const SIN_FORMA = { message: "sin error y sin la forma prometida" };
 
 function describir(causa: unknown): string {
   if (causa && typeof causa === "object") {
@@ -87,9 +129,9 @@ function describir(causa: unknown): string {
 
 // El detalle de la base va al log y no a la pantalla: el DETAIL de un 23503
 // nombra el uuid de otra organización. Ver `porQueNoSeBorro.ts`.
-function fallo(motivo: MotivoDeBaja, paso: string, causa: unknown, ya: YaBorrado): BajaFallida {
+function fallo(motivo: MotivoDeBaja, paso: string, causa: unknown, ya: YaBorrado | null): BajaFallida {
   console.error(`[deleteMyAccount] ${paso} -> ${motivo}${causa ? `: ${describir(causa)}` : ""}`);
-  const yaBorrado = { ...ya };
+  const yaBorrado = ya === null ? null : { ...ya };
   return { ok: false, motivo, yaBorrado, message: explicarBaja(motivo, yaBorrado) };
 }
 
@@ -97,84 +139,53 @@ function fallo(motivo: MotivoDeBaja, paso: string, causa: unknown, ya: YaBorrado
  * GDPR right to erasure ("right to be forgotten").
  *
  * QUÉ IMPIDE: que la baja le conteste «listo» a quien no se le borró nada, que
- * deje la cuenta A MEDIAS cuando se podía evitar, y que se lleve una
- * organización que NO era sólo de quien se va.
+ * deje la cuenta A MEDIAS, que se lleve una organización que NO era sólo de
+ * quien se va, y que diga «no se borró nada» cuando no lo sabe.
  *
- * DE QUIÉN ES CADA ORGANIZACIÓN. «Propia» —la que se borra con todo— es una
- * en la que la persona es owner ACTIVA y no hay otro owner activo. Todas las
- * demás membresías se QUITAN y la organización queda:
+ * DE QUIÉN ES CADA ORGANIZACIÓN —«propia» es una donde la persona es owner
+ * ACTIVA y no hay otro owner activo— lo decide la base, no este archivo:
+ * `delete_account_organizations` (0035) clasifica y borra en UNA transacción,
+ * con locks sobre las organizaciones y las membresías que la clasificación lee,
+ * y con la pregunta «¿hay otro owner activo?» adentro del mismo DELETE.
  *
- *   * owner con otro owner activo. El esquema deja varios owners por
- *     organización (sólo UNIQUE(organization_id, user_id)), y la RLS deja llegar
- *     ahí: un owner suma un admin y el admin se sube a owner. Medido en la
- *     réplica el 2026-10-11: con «propias = role owner», la baja de beto se
- *     llevaba la organización de alicia con sus negocios, y a alicia le quedaba
- *     el login y nada más. En hosted ese día había una organización con dos
- *     owners activos (SELECT de agregados);
- *   * owner ARCHIVADA (0013): ya la sacaron de esa organización, no la manda.
- *     Medido igual: con el filtro sólo por rol, también se la llevaba. Hosted:
- *     dos membresías owner archivadas;
- *   * cualquier otro rol (admin, manager, editor, viewer, client).
+ * HASTA LA 0035 (#117, `faade08`) esto eran cuatro pedidos de PostgREST —leer
+ * membresías, leer otros owners, verificar sellos, borrar— y entre pedido y
+ * pedido la base no prometía nada. Medido en la réplica el 2026-10-11:
  *
- * LO QUE SE MIDIÓ ANTES (réplica `supabase/postgres:17.4.1.075`, 2026-10-11,
- * cada paso en su propia transacción como un pedido de PostgREST). La persona es
- * dueña de A y manager en B, que es de otra. Con el orden anterior —borrar las
- * propias, después salir de las ajenas, después `auth.users`—:
+ *   * dos co-owners que se dan de baja a la vez dejaban su organización sin
+ *     ningún miembro (bloque 402 de `defects_test.sql`), y una owner sumada a
+ *     una propia entre la lectura y el DELETE se borraba con ella;
+ *   * «no hay otro owner» salía de una lectura VACÍA, y PostgREST corta en
+ *     `max_rows` sin error: con 1001 compartidas, una se leía propia (403);
+ *   * un sello en una organización sin nadie que apruebe la trababa para
+ *     siempre, con una frase que mandaba a pedirle a nadie.
  *
- *   * publicó una versión de la ficha en B → la salida muere con 23503 en
- *     `company_profiles_published_by_member_fkey` (0026, decisión 4), DESPUÉS de
- *     que A ya se borró: queda sin A, miembro de B, con login;
- *   * aprobó una tarjeta en B → lo mismo, 23503 en
- *     `board_cards_approver_member_fkey` (0029, decisión 3);
- *   * selló contenido en B → todo pasa y `auth.users` muere con 23514 en
- *     `content_assets_approval_check`: el `ON DELETE SET NULL` de `approved_by`
- *     (0015) choca con el CHECK de la misma 0015, que no acepta un sello sin
- *     firmante. Queda sin organizaciones, sin membresías y con login.
- *
- * Las tres son rechazos que no se arreglan reintentando: los decide otra
- * organización. Y en las tres el paso irreversible ya había pasado.
- *
- * EL ORDEN, Y POR QUÉ
+ * LA SECUENCIA, Y LO QUE CADA RESPUESTA QUIERE DECIR
  *
  *   0. la sesión (adentro del `try`: un `getUser` que lanza también vuelve con
- *      nombre);
- *   1. leer TODAS sus membresías, con rol y estado;
- *   2. de las que es owner activa, leer si hay otro owner activo: esas no son
- *      propias;
- *   3. verificar que no haya sellos suyos fuera de las propias (sólo lee);
- *   4. quitar TODAS las membresías que no son de una propia: UNA sentencia, así
- *      que el 23503 de una firma la deshace entera y no se borró nada;
- *   5. borrar las propias (la cascada se lleva todo; la 0026 decisión 18 y la
- *      0029 decisión 4 hacen que pase con ficha publicada y tablero aprobado:
- *      bloques 118 y 131);
- *   6. borrar el acceso.
+ *      nombre). La identidad la valida GoTrue; la base confía en el id que
+ *      recibe porque sólo `service_role` puede llamarla.
+ *   1. `delete_account_organizations(user.id)`, una sola llamada:
+ *        - contestó un error de la base → la transacción se deshizo: NO se
+ *          borró nada, y el código dice por qué (`MOTIVO_DE_LA_BASE`);
+ *        - no contestó, o contestó algo ilegible → NO SE SABE: pudo
+ *          confirmarse. `yaBorrado` va en `null` y el login no se toca;
+ *        - contestó la forma prometida → lo que borró, contado.
+ *   2. el acceso (`auth.admin.deleteUser`). Si falla, la frase dice lo que el
+ *      paso 1 ya hizo y que queda el login.
  *
- * Los rechazos de negocio caen en 3 y 4, antes de que se borre nada. El 3 es el
- * único que copia una regla de la base, porque es el único rechazo que llega
- * recién en `auth.users`; el bloque 400 de `defects_test.sql` mira por catálogo
- * que las FK hacia `auth.users` sigan siendo las que este paso conoce, y el 401
- * mide el rechazo que copia. Los pasos 3 y 4 usan el MISMO conjunto de propias
- * que el 5: un sello o una firma en una organización compartida trabaría el 6,
- * porque esa organización no se borra.
+ * Reintentar retoma: la función sobre una persona sin membresías es un no-op y
+ * devuelve todo vacío.
  *
- * LO QUE NO SE PUEDE EVITAR, Y SE DICE. PostgREST no da una transacción entre
- * pedidos y GoTrue borra el acceso en la suya. Si 5 falla después de 4, ya salió
- * de las demás; si 6 falla después de 5, sólo queda el login. La respuesta trae
- * `yaBorrado` y la pantalla lo muestra. Reintentar retoma: cada paso sobre lo
- * que ya no está es un no-op.
+ * LO QUE NO SE PUEDE EVITAR, Y SE DICE. GoTrue borra el login en su propia
+ * transacción, así que entre el paso 1 y el 2 queda la ventana de un pedido: una
+ * membresía o un sello nuevos de la persona en ese instante los encuentra la
+ * cascada de `auth.users`.
  *
- * Y una carrera que sólo cerraría una función en la base: entre el paso 2 y el 5
- * pasan pedidos. Si los dos owners de una organización compartida se dan de
- * baja a la vez, cada una lee a la otra como owner, las dos salen y la
- * organización queda sin owner; si en ese intervalo alguien se suma como owner a
- * una propia, la propia se borra igual.
- *
- * Un paso que LANZA en vez de devolver `error` es el mismo paso fallando, y
- * vuelve con el motivo de ese paso y con lo que ya se borró. El `redirect` va
- * fuera del `try`: lanza a propósito.
+ * El `redirect` va fuera del `try`: lanza a propósito.
  */
 export async function deleteMyAccount(): Promise<BajaFallida> {
-  const yaBorrado: YaBorrado = { ...NADA_BORRADO };
+  let yaBorrado: YaBorrado | null = { ...NADA_BORRADO };
   let paso: PasoDeBaja = "sesion";
 
   try {
@@ -188,93 +199,28 @@ export async function deleteMyAccount(): Promise<BajaFallida> {
     paso = "verificar";
     const admin = createSupabaseAdminClient();
 
-    // 1. Todas sus membresías. Sin poder leerlas no se sigue: con `data` en null
-    //    el paso 5 se salteaba y el 6 dejaba las organizaciones sin dueño (la
-    //    cascada de `auth.users` se lleva la membresía owner). Ausencia no es cero.
-    const { data: membresias, error: membresiasErr } = await admin
-      .from("org_members")
-      .select("organization_id, role, state")
-      .eq("user_id", user.id);
-    if (membresiasErr || !Array.isArray(membresias)) {
-      return fallo("no-se-pudo-verificar", paso, membresiasErr ?? SIN_FILAS, yaBorrado);
-    }
-    const comoOwnerActiva = membresias
-      .filter((m) => m.role === "owner" && m.state === "active")
-      .map((m) => m.organization_id);
-
-    // 2. Las que tienen OTRO owner activo no son propias: se sale de ellas y
-    //    quedan con lo suyo. Un owner archivado no cuenta: ya no la manda.
-    let compartidas: string[] = [];
-    if (comoOwnerActiva.length > 0) {
-      const { data: otros, error: otrosErr } = await admin
-        .from("org_members")
-        .select("organization_id")
-        .in("organization_id", comoOwnerActiva)
-        .eq("role", "owner")
-        .eq("state", "active")
-        .neq("user_id", user.id);
-      if (otrosErr || !Array.isArray(otros)) {
-        return fallo("no-se-pudo-verificar", paso, otrosErr ?? SIN_FILAS, yaBorrado);
+    // 1. Las organizaciones, en una transacción de la base.
+    paso = "organizaciones";
+    const respuesta = await admin.rpc(BAJA_EN_LA_BASE, { p_user_id: user.id });
+    if (respuesta.error) {
+      if (!laBaseContesto(respuesta)) {
+        return fallo("no-se-sabe-que-se-borro", paso, respuesta.error, null);
       }
-      compartidas = otros.map((o) => o.organization_id);
+      const motivo = MOTIVO_DE_LA_BASE[String(respuesta.error.code)] ?? "no-se-pudieron-borrar-las-organizaciones";
+      return fallo(motivo, paso, respuesta.error, yaBorrado);
     }
-    const propias = comoOwnerActiva.filter((id) => !compartidas.includes(id));
-    const lasPropias = `(${propias.join(",")})`;
+    const hecho = leerResultado(respuesta.data);
+    // Sin error y sin la forma prometida: la base confirmó ALGO. No se cuenta
+    // como cero, y el login no se borra sobre una suposición.
+    if (!hecho) return fallo("no-se-sabe-que-se-borro", paso, SIN_FORMA, null);
+    yaBorrado = hecho;
 
-    // 3. Sellos suyos FUERA de las propias. Los de adentro se van con la
-    //    cascada del paso 5; los de afuera hacen morir el paso 6 (23514). Basta
-    //    con uno: `limit(1)`.
-    let sellos = admin.from("content_assets").select("id").eq("approved_by", user.id);
-    if (propias.length > 0) sellos = sellos.not("organization_id", "in", lasPropias);
-    const { data: ajenos, error: sellosErr } = await sellos.limit(1);
-    if (sellosErr || !Array.isArray(ajenos)) {
-      return fallo("no-se-pudo-verificar", paso, sellosErr ?? SIN_FILAS, yaBorrado);
-    }
-    if (ajenos.length > 0) {
-      return fallo("sello-en-otra-organizacion", paso, null, yaBorrado);
-    }
-
-    // 4. Salir de TODAS las demás —por rol, por estado o por compartida—, en una
-    //    sentencia. Filtrar por rol acá dejaba afuera alguna membresía, y la
-    //    cascada de `auth.users` la encontraba en el paso 6, después de borrar
-    //    las propias.
-    paso = "salir";
-    let salir = admin.from("org_members").delete({ count: "exact" }).eq("user_id", user.id);
-    if (propias.length > 0) salir = salir.not("organization_id", "in", lasPropias);
-    const { error: salirErr, count: salioDe } = await salir;
-    if (salirErr) {
-      const motivo = salirErr.code === FK_RECHAZA ? "firma-en-otra-organizacion" : "no-se-pudo-salir";
-      return fallo(motivo, paso, salirErr, yaBorrado);
-    }
-    yaBorrado.ajenas = salioDe ?? null;
-
-    // 5. Las propias, con todo lo que tienen. Que borre MENOS de las que se
-    //    leyeron —o no diga cuántas— no es un éxito: el paso 6 dejaría las que
-    //    quedaron sin dueño.
-    paso = "propias";
-    if (propias.length > 0) {
-      const { error: orgsErr, count: borradas } = await admin
-        .from("organizations")
-        .delete({ count: "exact" })
-        .in("id", propias);
-      if (orgsErr) return fallo("no-se-pudieron-borrar-las-propias", paso, orgsErr, yaBorrado);
-      yaBorrado.propias = borradas ?? null;
-      if (borradas !== propias.length) {
-        return fallo(
-          "no-se-pudieron-borrar-las-propias",
-          paso,
-          { message: `borró ${borradas ?? "?"} de ${propias.length}` },
-          yaBorrado,
-        );
-      }
-    }
-
-    // 6. El acceso.
+    // 2. El acceso.
     paso = "acceso";
     const { error: userErr } = await admin.auth.admin.deleteUser(user.id);
     if (userErr) return fallo("no-se-pudo-borrar-el-acceso", paso, userErr, yaBorrado);
   } catch (lanzado) {
-    return fallo(MOTIVO_SI_LANZA[paso], paso, lanzado, yaBorrado);
+    return fallo(MOTIVO_SI_LANZA[paso], paso, lanzado, paso === "organizaciones" ? null : yaBorrado);
   }
 
   redirect("/");

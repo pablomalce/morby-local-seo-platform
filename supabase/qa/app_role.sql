@@ -231,6 +231,23 @@ END
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Y NO la baja de cuenta en la base, que el GRANT de arriba le acaba de dar.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- `delete_account_organizations` (0035) es `SECURITY DEFINER`, sólo de
+-- `service_role`, y borra organizaciones enteras de la persona que recibe. En
+-- hosted `growthos_app` no la ejecuta —medido por catálogo el 2026-10-11: sin
+-- default privileges a su nombre y sin EXECUTE sobre `ingest_lead_won`, que es
+-- del mismo tipo—; acá la recibiría del GRANT de arriba, y la suite mediría un
+-- rol de aplicación más ancho que el de producción. El bloque 405 lo mide.
+DO $$
+BEGIN
+    IF to_regprocedure('public.delete_account_organizations(uuid)') IS NOT NULL THEN
+        REVOKE ALL ON FUNCTION public.delete_account_organizations(uuid) FROM growthos_app;
+    END IF;
+END
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Y NO las tres funciones de la custodia de tokens, que el GRANT de arriba le
 -- acaba de dar.
 -- ─────────────────────────────────────────────────────────────────────────────
