@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { Badge, Card, HudLabel } from "@/components/ui";
-import type { Gravedad, Hallazgo } from "@/lib/aeo/hallazgos";
+import type { EstadoDelPunto, Gravedad, Hallazgo, PuntosDeLaPuerta } from "@/lib/aeo/hallazgos";
+import type { DetalleDelSubrecurso, ResultadoRenderizado } from "@/lib/aeo/renderizado";
 
 /**
  * QUÉ IMPIDE ESTA PANTALLA
@@ -13,25 +14,208 @@ import type { Gravedad, Hallazgo } from "@/lib/aeo/hallazgos";
  * Y que un hallazgo se muestre sin decir dónde se arregla: un bloqueo de
  * rastreadores lo toca quien maneja el `robots.txt` o el CDN, y un sitio sin
  * texto sin JavaScript lo toca quien hace el sitio. Son dos personas distintas.
+ *
+ * Y que el texto servido se muestre sin el renderizado al lado. La puerta
+ * H2-GO-1 pide los DOS números crudos, uno frente al otro: con uno solo no se
+ * distingue una página corta de una que se dibuja en el cliente. Si el
+ * renderizado no se pudo medir, el lugar del número dice «no medido» y por qué
+ * —nunca un cero, que se leería como «la página no tiene texto»—, y si lo
+ * decidió un pedido que no llegó, cuál (`detalle`).
  */
 
-const TONO: Record<Gravedad, "critical" | "orange" | "hud"> = {
+const TONO: Record<Gravedad, "critical" | "orange" | "hud" | "outline"> = {
   bloqueante: "critical",
   importante: "orange",
   informativo: "hud",
+  "no-medido": "outline",
 };
 
 const ETIQUETA: Record<Gravedad, string> = {
   bloqueante: "BLOQUEANTE",
   importante: "IMPORTANTE",
   informativo: "INFORMATIVO",
+  "no-medido": "NO MEDIDO",
 };
 
 interface Resultado {
   url: string;
   robotsLeido: boolean;
+  /** RFC 9309: leído, «no hay» (4xx, deja entrar a todos) o sin medir (5xx, timeout, red). */
+  estadoRobots?: "leido" | "ausente" | "no-medido";
   motivoRobots: string | null;
   hallazgos: Hallazgo[];
+  /**
+   * `true` sólo sin bloqueantes y con los tres ejes medidos; `null` es «no se
+   * sabe». Es lo único que habilita la frase de «sin hallazgos» (P3): una
+   * lista vacía sola no la habilita.
+   */
+  legible?: boolean | null;
+  /** Si la corrida quedó en `aeo_audits`. Hoy, contra la base real, no (ver `DatosCrudos`). */
+  guardada?: boolean;
+  /** El color de cada punto de la puerta. Opcional: una respuesta vieja no lo trae, y no se inventa. */
+  puntos?: PuntosDeLaPuerta;
+  /** Opcional: una respuesta sin lectura no rompe la pantalla, y no muestra números. */
+  lectura?: {
+    caracteresSinJs: number;
+    caracteresRenderizados?: ResultadoRenderizado;
+    /** Lo que el robots declara por agente; `null` es «no se pudo leer». */
+    acceso?: Record<string, boolean | null>;
+    /** El código HTTP de la petición con el user-agent de cada agente; `null` es «no contestó». */
+    statusPorAgente?: Record<string, number | null>;
+    schema?: string[];
+    erroresDeSchema?: string[];
+  };
+}
+
+/**
+ * Los datos CRUDOS que la puerta H2-GO-1 pide para la web real: el código por
+ * agente, los tipos de schema y los errores del validador. Antes sólo
+ * aparecían dentro del texto de un hallazgo cuando había un problema, así que
+ * un sitio sano no mostraba ninguno, y comparar dos URLs pedía abrir devtools
+ * (P6). Tampoco quedan guardados: `aeo_audits` no acepta la escritura de una
+ * sesión (0025), y la pantalla lo dice en vez de callarlo.
+ */
+function DatosCrudos({ lectura, guardada }: { lectura: NonNullable<Resultado["lectura"]>; guardada?: boolean }) {
+  const agentes = Object.keys({ ...(lectura.acceso ?? {}), ...(lectura.statusPorAgente ?? {}) });
+  const robots = (v: boolean | null | undefined) => (v === true ? "permite" : v === false ? "bloquea" : "sin medir");
+  return (
+    <div className="mt-3 rounded-vulkan border border-metal-800 bg-metal-950 p-3" data-testid="datos-crudos">
+      <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">Datos crudos</p>
+      {agentes.length > 0 && (
+        <table className="mt-2 w-full text-left text-[12px] text-metal-300">
+          <thead>
+            <tr className="text-metal-500">
+              <th className="font-normal">Agente</th>
+              <th className="font-normal">robots.txt</th>
+              <th className="font-normal">HTTP con su user-agent</th>
+            </tr>
+          </thead>
+          <tbody>
+            {agentes.map((a) => {
+              const status = lectura.statusPorAgente?.[a];
+              return (
+                <tr key={a} data-testid="dato-agente" data-agente={a}>
+                  <td className="font-mono">{a}</td>
+                  <td>{robots(lectura.acceso?.[a])}</td>
+                  <td data-testid="dato-http">{typeof status === "number" ? status : "sin respuesta"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      <p className="mt-2 text-[12px] text-metal-300" data-testid="dato-schema">
+        Schema: {lectura.schema && lectura.schema.length > 0 ? lectura.schema.join(", ") : "ninguno"}
+      </p>
+      <p className="mt-1 text-[12px] text-metal-300" data-testid="dato-errores-schema">
+        Errores del JSON-LD:{" "}
+        {lectura.erroresDeSchema && lectura.erroresDeSchema.length > 0 ? lectura.erroresDeSchema.join("; ") : "ninguno"}
+      </p>
+      {guardada === false && (
+        <p className="mt-2 text-[11px] text-metal-500" data-testid="no-guardada">
+          Esta corrida no quedó guardada: lo que ves acá es lo único que hay de ella.
+        </p>
+      )}
+    </div>
+  );
+}
+
+const NOMBRE_DEL_PUNTO: Record<keyof PuntosDeLaPuerta, string> = {
+  acceso: "Acceso por rastreador",
+  contenidoSinJs: "Contenido sin JavaScript",
+  schema: "Schema verificable",
+};
+
+const TONO_DEL_PUNTO: Record<EstadoDelPunto, "critical" | "success" | "outline"> = {
+  rojo: "critical",
+  verde: "success",
+  "no-medido": "outline",
+};
+
+/**
+ * Los tres puntos de la puerta H2-GO-1, cada uno con su color: lo que la
+ * puerta cuenta («rojo 3 de 3», «verde 3 de 3») se lee acá, no de la prosa de
+ * los hallazgos (GATE-7).
+ */
+function Puntos({ puntos }: { puntos: PuntosDeLaPuerta }) {
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-2" data-testid="puntos">
+      {(Object.keys(NOMBRE_DEL_PUNTO) as Array<keyof PuntosDeLaPuerta>).map((p) => (
+        <div
+          key={p}
+          className="rounded-vulkan border border-metal-800 bg-metal-950 p-3"
+          data-testid="punto"
+          data-punto={p}
+          data-estado={puntos[p]}
+        >
+          <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">{NOMBRE_DEL_PUNTO[p]}</p>
+          <Badge variant={TONO_DEL_PUNTO[puntos[p]]}>{puntos[p] === "no-medido" ? "NO MEDIDO" : puntos[p].toUpperCase()}</Badge>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TextoComparado({ lectura }: { lectura: NonNullable<Resultado["lectura"]> }) {
+  const render = lectura.caracteresRenderizados;
+  // El número que la puerta nombra: los caracteres de texto del HTML sin
+  // ejecutar JavaScript. Si el render lo midió, el del MISMO documento que se
+  // renderizó; si no, el del HTML que trajo la ruta. Ninguno aplica CSS: un
+  // rastreador sin JavaScript tampoco lo aplica (GATE-1).
+  const servido = render?.estado === "medido" && render.servidos !== undefined ? render.servidos : lectura.caracteresSinJs;
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2" data-testid="texto-comparado">
+      <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
+        <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+          Sin JavaScript · texto del HTML
+        </p>
+        <p className="mt-1 text-[13px] text-metal-200" data-testid="texto-servido">
+          {servido.toLocaleString("es")} caracteres
+        </p>
+      </div>
+      <div className="rounded-vulkan border border-metal-800 bg-metal-950 p-3">
+        <p className="font-mono text-[10px] uppercase tracking-hud text-metal-500">
+          Renderizado · texto del DOM en Chromium
+        </p>
+        {render?.estado === "medido" ? (
+          <p className="mt-1 text-[13px] text-metal-200" data-testid="texto-renderizado" data-estado="medido">
+            {render.caracteres.toLocaleString("es")} caracteres
+          </p>
+        ) : (
+          <>
+            <p className="mt-1 text-[13px] text-metal-400" data-testid="texto-renderizado" data-estado="no-medido">
+              no medido ({render?.estado === "fallo" ? render.codigo : "sin dato"})
+            </p>
+            {render?.estado === "fallo" && render.detalle && <PedidoQueNoLlego detalle={render.detalle} />}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const DE_DONDE: Record<DetalleDelSubrecurso["origen"], string> = {
+  pagina: "la página",
+  "mismo-sitio": "un marco del mismo sitio",
+  worker: "un worker",
+  "sin-origen": "un worker sin origen de red, o un pedido sin marco que no se pudo atribuir",
+  "marco-desconocido": "un marco sin URL de red",
+};
+
+/**
+ * CUÁL pedido dejó el render sin número, al lado del «no medido»: sin esto,
+ * `subrecurso-sin-respuesta` no dice qué falta ni a quién preguntarle. La ruta
+ * llega sin query: es lo que manda el servidor (`renderizado.ts`).
+ */
+function PedidoQueNoLlego({ detalle }: { detalle: DetalleDelSubrecurso }) {
+  const n = detalle.noLlegaron;
+  return (
+    <p className="mt-1 break-all font-mono text-[11px] text-metal-500" data-testid="render-detalle" data-origen={detalle.origen}>
+      No llegó: {detalle.tipo} {detalle.host}
+      {detalle.ruta} · desde {DE_DONDE[detalle.origen]} · {detalle.motivo} · {n} {n === 1 ? "pedido" : "pedidos"} sin
+      llegar en total
+    </p>
+  );
 }
 
 export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
@@ -66,7 +250,9 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
             ? `El sitio no respondió (${cuerpo.detalle ?? "sin detalle"}). Eso NO significa que esté bien ni mal: no se pudo mirar.`
             : cuerpo.motivo === "sitio-ilegible"
               ? "La dirección cargada no es una URL válida."
-              : `No se pudo auditar (${res.status}).`;
+              : cuerpo.motivo === "destino-rechazado"
+                ? `La dirección del sitio no se audita (${cuerpo.detalle ?? "sin detalle"}): sólo se piden sitios públicos, por http o https, en los puertos 80 y 443. Si redirige, cada salto tiene que cumplirlo.`
+                : `No se pudo auditar (${res.status}).`;
       setError(dicho);
       return;
     }
@@ -79,8 +265,8 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
       <HudLabel>AI READABILITY</HudLabel>
       <p className="mt-3 text-[12px] text-metal-400">
         Mide lo que decide si un motor de IA puede leer el sitio: si los rastreadores pueden entrar,
-        y si el contenido existe sin ejecutar JavaScript. Las dos cosas son binarias y son la mitad
-        del resultado.
+        y cuánto del texto existe sin ejecutar JavaScript frente al que dibuja un navegador. Las dos
+        cosas son la mitad del resultado.
       </p>
 
       <button
@@ -114,18 +300,33 @@ export function AuditoriaAeo({ businessId }: { businessId: string | null }) {
             {resultado.url}
           </p>
 
-          {!resultado.robotsLeido && (
-            <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido">
-              No se pudo leer el <code>robots.txt</code> ({resultado.motivoRobots}). El acceso de
-              abajo se calculó como si no hubiera reglas — que es lo que el estándar dice, pero no
-              es lo mismo que haberlo comprobado.
-            </p>
-          )}
+          {resultado.puntos && <Puntos puntos={resultado.puntos} />}
+          {resultado.lectura && <TextoComparado lectura={resultado.lectura} />}
+          {resultado.lectura && <DatosCrudos lectura={resultado.lectura} guardada={resultado.guardada} />}
 
-          {resultado.hallazgos.length === 0 ? (
+          {!resultado.robotsLeido &&
+            (resultado.estadoRobots === "ausente" ? (
+              <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido" data-estado="ausente">
+                No hay <code>robots.txt</code> ({resultado.motivoRobots}). Según el estándar, eso deja
+                entrar a todos los rastreadores, y así se calculó el acceso.
+              </p>
+            ) : (
+              <p className="mt-2 text-[12px] text-metal-400" data-testid="robots-no-leido" data-estado="no-medido">
+                No se pudo leer el <code>robots.txt</code> ({resultado.motivoRobots}). El acceso por
+                robots quedó SIN MEDIR: no es «permite», y un 5xx que se repite hace que los
+                rastreadores asuman que no pueden entrar a nada.
+              </p>
+            ))}
+
+          {resultado.hallazgos.length === 0 && resultado.legible === true ? (
             <p className="mt-3 text-[13px] text-metal-300" data-testid="sin-hallazgos">
               Los rastreadores entran, el contenido existe sin JavaScript y el schema que importa
               está declarado.
+            </p>
+          ) : resultado.hallazgos.length === 0 ? (
+            <p className="mt-3 text-[13px] text-metal-400" data-testid="sin-veredicto">
+              La auditoría no trae un veredicto: sin hallazgos y sin la confirmación de que los tres
+              ejes se midieron, no se puede decir que el sitio esté bien.
             </p>
           ) : (
             <div className="mt-3 space-y-2">

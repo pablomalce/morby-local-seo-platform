@@ -12,6 +12,9 @@
  *
  *   `sources.ts`    si hay credenciales de plataforma y si ESTE cliente tiene
  *                   property. Decide sin preguntarle nada a Google;
+ *   `servicioCompartido.ts`  si el token de la agencia se le presta a ESTA
+ *                   organización: sin ningún mapeo vivo, o con el mapeo
+ *                   ilegible, no se le pide;
  *   `tokenStore.ts` si hay un access token usable, y si no, cuál de las seis
  *                   maneras de no tenerlo es;
  *   `status.ts`     qué significa lo que Google contestó.
@@ -36,11 +39,17 @@
  * puede estar vivo y lo que falló es nuestra manera de mirarlo.
  */
 
-import type { DataSourceStatus } from "@/lib/reports/types";
-import type { AccessTokenResult, TokenUnavailable } from "./tokenStore";
+import type { DataSourceStatus, FuenteDeGoogle, MotivoDeFuente } from "@/lib/reports/types";
+import type { TokenUnavailable } from "./tokenStore";
+import type { Negativa, TokenDelServicio } from "./servicioCompartido";
 import type { Ga4Result, Ga4Totals } from "./ga4";
 import type { SearchConsoleResult, SearchConsoleTotals } from "./searchConsole";
-import { type GoogleSurface, type PropertyMapping, resolveGoogleSource } from "./sources";
+import {
+  type GoogleSourceResolution,
+  type GoogleSurface,
+  type PropertyMapping,
+  resolveGoogleSource,
+} from "./sources";
 import { type FetchOutcome, statusForOutcome } from "./status";
 import { type Sonda, sondaDeOutcome } from "./probe";
 
@@ -49,6 +58,11 @@ export interface GoogleHydration {
   searchConsole: DataSourceStatus;
   ga4: DataSourceStatus;
   gbp: DataSourceStatus;
+  /**
+   * Por qué cada superficie NO se consultó. Sólo las que no se consultaron: lo
+   * que Google contestó no es un motivo de esta lista. Ver `MotivoDeFuente`.
+   */
+  motivos: Partial<Record<FuenteDeGoogle, MotivoDeFuente>>;
   /** Los números, cuando la consulta salió bien. */
   searchConsoleTotals: SearchConsoleTotals | null;
   ga4Totals: Ga4Totals | null;
@@ -60,6 +74,10 @@ export interface GoogleHydration {
  * Dos de los seis motivos no dicen nada del token —dicen que no se pudo
  * averiguar— así que son `error`. Los otros cuatro son «no hay nada que mandar»,
  * que es lo único que `status.ts` deja llamar `missing`.
+ *
+ * La negativa del servicio compartido (`not-mapped`, `mapping-unreadable`) no
+ * pasa por acá: no es un estado del token, y se decide antes, para todas las
+ * superficies a la vez. Ver `hydrateGoogle`.
  */
 export function statusForTokenFailure(reason: TokenUnavailable): DataSourceStatus {
   switch (reason) {
@@ -115,12 +133,41 @@ export function describirFallo(outcome: FetchOutcome, propertyRef: string): stri
   }
 }
 
+/** Una superficie que no se consulta, con el motivo que el reporte muestra. */
+type NoConsultada = { ready: false; status: DataSourceStatus; reason: MotivoDeFuente };
+
+/** Lo que el servicio compartido niega, como estado de la fuente. */
+function statusForNegativa(negativa: Negativa): DataSourceStatus {
+  switch (negativa) {
+    // Sin ningún mapeo no hay nada que mandar, ni a quién.
+    case "not-mapped":
+      return "missing";
+    // No se sabe si hay mapeo: es un fallo nuestro, no una integración sin
+    // configurar. Decir «sin conectar» mandaría a mapear lo que puede estar
+    // mapeado.
+    case "mapping-unreadable":
+      return "error";
+  }
+}
+
+const esNegativa = (reason: TokenUnavailable | Negativa): reason is Negativa =>
+  reason === "not-mapped" || reason === "mapping-unreadable";
+
 export interface HydrateDeps {
   mappings: readonly PropertyMapping[];
-  /** El access token de la agencia, ya resuelto. Se pide UNA vez. */
-  token: AccessTokenResult;
-  fetchSearchConsole: (accessToken: string, propertyRef: string) => Promise<SearchConsoleResult>;
-  fetchGa4: (accessToken: string, propertyRef: string) => Promise<Ga4Result>;
+  /**
+   * Si hay token de la agencia —o por qué el servicio compartido no lo
+   * prestó—. SIN el token: lo da `servirConLaAgencia()` junto con `mappings`, y
+   * el token mismo no sale de allá (cuarta revisión del #118).
+   */
+  token: TokenDelServicio;
+  /**
+   * Las consultas, sin token: las arma el servicio compartido, que usa el suyo
+   * adentro y sólo sobre sus mapeos. Una property que no es un mapeo vivo de la
+   * organización contesta `no-credentials` sin salir a la red.
+   */
+  fetchSearchConsole: (propertyRef: string) => Promise<SearchConsoleResult>;
+  fetchGa4: (propertyRef: string) => Promise<Ga4Result>;
   env?: NodeJS.ProcessEnv;
   /**
    * Dónde se anota el motivo de un fallo. Inyectable para poder MEDIR que se
@@ -151,13 +198,32 @@ export interface HydrateDeps {
  */
 export async function hydrateGoogle(deps: HydrateDeps): Promise<GoogleHydration> {
   const env = deps.env ?? process.env;
+  const negativa = !deps.token.ok && esNegativa(deps.token.reason) ? deps.token.reason : null;
 
-  const resolucion = (superficie: GoogleSurface) =>
-    resolveGoogleSource(superficie, deps.mappings, env);
+  // El orden es el de siempre, la causa de más arriba gana, con un escalón
+  // nuevo en el medio:
+  //
+  //   1. sin credenciales de plataforma no hay petición para NADIE;
+  //   2. la negativa del servicio compartido es de la ORGANIZACIÓN entera —sin
+  //      ningún mapeo, o sin poder leerlo— y dice eso, no «a esta superficie le
+  //      falta su property»;
+  //   3. el mapeo de cada superficie;
+  //   4. el token.
+  const resolucion = (superficie: GoogleSurface): GoogleSourceResolution | NoConsultada => {
+    const r = resolveGoogleSource(superficie, deps.mappings, env);
+    if (!r.ready && r.reason === "platform-not-connected") return r;
+    if (negativa) return { ready: false, status: statusForNegativa(negativa), reason: negativa };
+    return r;
+  };
 
   const sc = resolucion("search_console");
   const ga = resolucion("ga4");
   const gbp = resolucion("google_business_profile");
+
+  const motivos: GoogleHydration["motivos"] = {};
+  if (!sc.ready) motivos.searchConsole = sc.reason;
+  if (!ga.ready) motivos.ga4 = ga.reason;
+  if (!gbp.ready) motivos.gbp = gbp.reason;
 
   const salida: GoogleHydration = {
     // `ready` sin consulta sigue siendo `error`, igual que antes de este archivo:
@@ -166,28 +232,39 @@ export async function hydrateGoogle(deps: HydrateDeps): Promise<GoogleHydration>
     searchConsole: sc.ready ? "error" : sc.status,
     ga4: ga.ready ? "error" : ga.status,
     gbp: gbp.ready ? "error" : gbp.status,
+    motivos,
     searchConsoleTotals: null,
     ga4Totals: null,
   };
 
   // Sin token no se llama a nadie, y las fuentes que ya tenían un motivo propio
-  // —sin credenciales, sin mapear— conservan el suyo: ésa es la causa que se
-  // arregla primero.
+  // —sin credenciales, sin mapear, la negativa— conservan el suyo: ésa es la
+  // causa que se arregla primero. Con una negativa ninguna fuente está lista.
   if (!deps.token.ok) {
-    const porToken = statusForTokenFailure(deps.token.reason);
-    if (sc.ready) salida.searchConsole = porToken;
-    if (ga.ready) salida.ga4 = porToken;
-    if (gbp.ready) salida.gbp = porToken;
+    const reason = deps.token.reason;
+    if (!esNegativa(reason)) {
+      const porToken = statusForTokenFailure(reason);
+      if (sc.ready) {
+        salida.searchConsole = porToken;
+        motivos.searchConsole = "agency-token";
+      }
+      if (ga.ready) {
+        salida.ga4 = porToken;
+        motivos.ga4 = "agency-token";
+      }
+      if (gbp.ready) {
+        salida.gbp = porToken;
+        motivos.gbp = "agency-token";
+      }
+    }
     return salida;
   }
-
-  const accessToken = deps.token.accessToken;
 
   // Las dos en paralelo: son APIs distintas y ninguna necesita el resultado de la
   // otra. En serie, el reporte espera la suma de las dos latencias.
   const [scResultado, gaResultado] = await Promise.all([
-    sc.ready ? deps.fetchSearchConsole(accessToken, sc.propertyRef) : null,
-    ga.ready ? deps.fetchGa4(accessToken, ga.propertyRef) : null,
+    sc.ready ? deps.fetchSearchConsole(sc.propertyRef) : null,
+    ga.ready ? deps.fetchGa4(ga.propertyRef) : null,
   ]);
 
   // Por defecto va a los logs del servidor, que en Vercel es donde alguien puede

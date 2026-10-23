@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Página de control AEO — híbrida a propósito</title>
+  <!--
+    ESTA PÁGINA TIENE QUE SALIR VERDE, ROJO, VERDE. Es el TERCER control de la
+    puerta H2-GO-1 de la espina de Vulkan, y el único que mide la COMPARACIÓN
+    entre el HTML servido y el DOM renderizado (F5).
+
+    La rota (/aeo-control) sirve 0 caracteres: sale roja en contenido por el
+    mínimo de 500, con o sin navegador. La sana (/aeo-sana) no tiene un solo
+    script: sale verde aunque el render no midiera nada. Con las dos, la puerta
+    se contestaba SÍ con la proporción servido/renderizado anulada. Ésta sirve
+    un menú, una cabecera y un pie de MÁS de 500 caracteres, y el contenido del
+    negocio lo dibuja el JavaScript: más del doble de lo servido.
+
+      1. Acceso: el robots.txt deja entrar a todos, y el servidor les contesta
+         200 a todos. VERDE.
+      2. Contenido sin JavaScript: lo servido pasa el mínimo, y es menos de la
+         mitad de lo renderizado. ROJO, y SÓLO por la proporción: si la regla
+         dejara de comparar, saldría verde.
+      3. Schema verificable: un JSON-LD válido, con Organization,
+         LocalBusiness y FAQPage. VERDE.
+
+    El negocio es FICTICIO. No la "mejores": si cambia, tiene que seguir
+    saliendo verde, rojo, verde (src/lib/aeo/__tests__/control.test.ts la
+    audita por la ruta, y renderizado.integracion.test.ts con Chromium).
+  -->
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Organization",
+          "@id": "#organizacion",
+          "name": "Ferretería de Control (ficticia)"
+        },
+        {
+          "@type": "LocalBusiness",
+          "@id": "#local",
+          "name": "Ferretería de Control (ficticia)",
+          "parentOrganization": { "@id": "#organizacion" },
+          "address": {
+            "@type": "PostalAddress",
+            "streetAddress": "Avenida del Control 3",
+            "addressLocality": "Ciudad de Prueba",
+            "addressCountry": "ES"
+          },
+          "telephone": "+34 900 000 000",
+          "openingHours": "Mo-Fr 09:00-19:00"
+        },
+        {
+          "@type": "FAQPage",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "¿Qué es esta página?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "El control híbrido de la auditoría AEO: tiene que salir roja en contenido, y sólo por la proporción."
+              }
+            }
+          ]
+        }
+      ]
+    }
+  </script>
+</head>
+<body>
+  <header>
+    <p>Ferretería de Control (ficticia) · control híbrido de la auditoría AEO</p>
+    <nav>
+      <a href="/aeo-hibrida#herramientas">Herramientas manuales</a> ·
+      <a href="/aeo-hibrida#electricas">Herramientas eléctricas</a> ·
+      <a href="/aeo-hibrida#tornilleria">Tornillería y fijaciones</a> ·
+      <a href="/aeo-hibrida#pintura">Pintura y acabados</a> ·
+      <a href="/aeo-hibrida#jardin">Jardín y exterior</a> ·
+      <a href="/aeo-hibrida#fontaneria">Fontanería</a> ·
+      <a href="/aeo-hibrida#electricidad">Material eléctrico</a> ·
+      <a href="/aeo-hibrida#cerrajeria">Cerrajería y copias de llaves</a> ·
+      <a href="/aeo-hibrida#alquiler">Alquiler de maquinaria</a> ·
+      <a href="/aeo-hibrida#contacto">Contacto y cómo llegar</a>
+    </nav>
+  </header>
+  <main id="contenido"></main>
+  <footer>
+    <p>
+      Avenida del Control 3, Ciudad de Prueba. Abierto de lunes a viernes, de
+      nueve de la mañana a siete de la tarde. Teléfono +34 900 000 000. Página
+      de control de Growth OS: datos ficticios, ningún negocio real.
+    </p>
+    <p>
+      Aviso legal · Política de privacidad · Política de cookies · Condiciones
+      de venta · Devoluciones y garantías · Trabaja con nosotros · Mapa del
+      sitio · Preguntas frecuentes · Blog de bricolaje · Atención al cliente
+    </p>
+  </footer>
+  <script>
+    // Lo que un rastreador sin JavaScript NO lee: el contenido del negocio.
+    var secciones = [
+      ["Herramientas para cada trabajo", "Tenemos herramientas manuales y eléctricas para el trabajo de cada día, desde un martillo de carpintero hasta un taladro percutor con su juego de brocas, y te ayudamos a elegir la que conviene para lo que tienes que hacer en casa o en la obra."],
+      ["Tornillería a granel", "Vendemos tornillos, tacos, clavos, arandelas y tuercas sueltos, por unidad o por peso, para que no tengas que comprar una caja entera cuando sólo necesitas tres piezas para colgar una estantería o arreglar una bisagra."],
+      ["Pintura a medida", "Mezclamos pintura plástica y esmaltes al color que traigas, con la carta o con una muestra, y te prestamos los rodillos y las bandejas si los devuelves limpios. Te explicamos cuántas manos hacen falta según la pared."],
+      ["Copias de llaves en el momento", "Hacemos copias de llaves planas, de seguridad y de buzón mientras esperas, y te decimos si tu cerradura admite un cilindro de seguridad antibumping antes de que la cambies."],
+      ["Alquiler de maquinaria", "Alquilamos hormigoneras, rozadoras, martillos demoledores y escaleras de tijera por días o por fin de semana, con la fianza devuelta en el momento si la máquina vuelve en buen estado y sin piezas rotas."],
+      ["Asesoramiento sin prisa", "Si no sabes por dónde empezar, cuéntanos el problema: una fuga bajo el fregadero, un enchufe que no funciona o una puerta que roza. Te decimos qué material llevar y cómo hacerlo, o a quién llamar si no conviene que lo hagas tú."],
+      ["Jardín y exterior", "En primavera traemos sustratos, semillas de huerta, mangueras, aspersores y herramientas de poda, y afilamos tijeras y cuchillas de cortacésped en dos días, para que el jardín no espere a que llegue el verano."],
+      ["Fontanería y electricidad", "Grifos, latiguillos, sifones, cinta de teflón, mecanismos, cables y regletas: lo que se rompe un domingo por la tarde lo tenemos el lunes a primera hora, y si no está en la tienda lo pedimos al proveedor para el día siguiente."],
+      ["Entrega a domicilio", "Llevamos a casa los pedidos grandes, como sacos de cemento, tableros o una escalera, dentro del barrio y sin coste a partir de un importe mínimo, y te avisamos por teléfono media hora antes de llegar para que estés."]
+    ];
+    var html = "<h1>La ferretería del barrio, con todo lo que hace falta</h1>";
+    for (var i = 0; i < secciones.length; i++) {
+      html += "<h2>" + secciones[i][0] + "</h2><p>" + secciones[i][1] + "</p>";
+    }
+    document.getElementById("contenido").innerHTML = html;
+  </script>
+</body>
+</html>

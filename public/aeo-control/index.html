@@ -10,7 +10,10 @@
 
       1. Contenido sólo tras ejecutar JavaScript: el HTML servido no tiene texto.
       2. JSON-LD inválido: un bloque que no parsea y otro sin @context ni @type.
-      3. Bloqueada en robots.txt para GPTBot y ClaudeBot (ver /robots.txt).
+      3. Bloqueada en robots.txt para GPTBot y ClaudeBot (ver /robots.txt), y
+         rechazada con 403 a PerplexityBot por el servidor, que el robots deja
+         entrar (src/lib/aeo/paginaDeControl.ts): el rojo de acceso depende
+         también de la petición real con cada user-agent.
 
     No la arregles. Está alojada en el mismo despliegue de Growth OS para que
     exista en una URL pública sin acto humano aparte.

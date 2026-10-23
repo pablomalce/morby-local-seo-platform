@@ -2045,6 +2045,13 @@ describe("la precondición global se mide llamando, no leyendo", () => {
         "src/lib/profile/nodeTransport.ts":
           "node:http/https (request, instrumentados) y node:dns (Resolver, instrumentado); node:net sólo isIP",
         "src/lib/profile/evidenceCheck.ts": "node:net sólo BlockList e isIP: no abre sockets",
+        // El render de la auditoría AEO. Chromium (puppeteer-core) NO sale a la
+        // red: arranca contra un proxy inexistente y sin resolvedor
+        // (`src/lib/aeo/chromium.ts`), y todo byte que dibuja lo pide este
+        // archivo en Node. Que Chromium solo no abre ni un socket lo mide
+        // `renderizado.integracion.test.ts` con un canario que cuenta conexiones.
+        "src/lib/aeo/transporteRender.ts":
+          "node:http/https (request, instrumentados; el DNS va por el Resolver de nodeTransport.ts, instrumentado); node:net sólo isIP",
       };
       // `from "…"`, `import "…"`, `import("…")` y `require("…")`, con o sin `node:`.
       const DE_RED =

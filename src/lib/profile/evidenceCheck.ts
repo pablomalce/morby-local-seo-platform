@@ -211,7 +211,12 @@ export type RespuestaHttp =
   | { tipo: "respuesta"; status: number; location: string | null }
   | { tipo: "error"; motivo: "timeout" | "sin-respuesta" | "tls" };
 
-export type Resolucion = { ok: true; direcciones: string[] } | { ok: false };
+/**
+ * `transitorio` dice que el DNS NO CONTESTÓ (timeout, SERVFAIL, cancelado),
+ * que no es lo mismo que un nombre que no existe: la auditoría AEO cuenta un
+ * subrecurso así como «no llegó» (PU-3). Quien no lo mira lo lee como antes.
+ */
+export type Resolucion = { ok: true; direcciones: string[] } | { ok: false; transitorio?: true };
 
 export interface Dependencias {
   /**

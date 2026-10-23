@@ -74,8 +74,9 @@ export interface OpcionesDns {
 }
 
 /**
- * Un resolvedor: TODAS las direcciones del nombre, A primero y AAAA después,
- * y cualquier fallo es «no resuelve». La señal corta la consulta de verdad.
+ * Un resolvedor: TODAS las direcciones del nombre, A primero y AAAA después.
+ * Sin ninguna, «no resuelve», con `transitorio` si fue el DNS el que no
+ * contestó. La señal corta la consulta de verdad.
  *
  * Una familia que falla mientras la otra contesta no tumba la fuente: es lo que
  * hace `getaddrinfo` con A y AAAA en paralelo, y no abre nada, porque el
@@ -99,12 +100,23 @@ export function crearResolvedorDns(opciones: OpcionesDns = {}): Dependencias["re
         ...(v4.status === "fulfilled" ? v4.value : []),
         ...(v6.status === "fulfilled" ? v6.value : []),
       ];
-      return direcciones.length > 0 ? { ok: true, direcciones } : { ok: false };
+      if (direcciones.length > 0) return { ok: true, direcciones };
+      // Sin direcciones: o el nombre no existe —las dos familias contestaron
+      // NXDOMAIN o «sin registros»—, o alguna NO CONTESTÓ, y entonces no se
+      // sabe (PU-3). Una familia con NOERROR vacío y la otra en timeout es
+      // «no se sabe»: la AAAA que faltó podía estar.
+      const definitivo = [v4, v6].every(
+        (r) => r.status === "rejected" && DNS_DEFINITIVOS.has((r.reason as NodeJS.ErrnoException)?.code ?? "")
+      );
+      return definitivo ? { ok: false } : { ok: false, transitorio: true };
     } finally {
       senal.removeEventListener("abort", cancelar);
     }
   };
 }
+
+/** Las respuestas de c-ares que dicen que el nombre NO TIENE direcciones, no que el DNS falló. */
+const DNS_DEFINITIVOS = new Set(["ENOTFOUND", "ENODATA", "EBADNAME"]);
 
 /** El resolvedor de producción, con los servidores del sistema. */
 export const resolverDns = crearResolvedorDns();

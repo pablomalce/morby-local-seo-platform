@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Página de control AEO — sana a propósito</title>
+  <!--
+    ESTA PÁGINA TIENE QUE SALIR EN VERDE. Es la página de control SANA de la
+    puerta H2-GO-1 de la espina de Vulkan (la corregida: «dos páginas de
+    control alojadas, no una»). La rota, /aeo-control, tiene que dar ROJO en
+    los tres puntos; ésta, VERDE en los tres, en la misma corrida. Un auditor
+    que diera rojo siempre pasaría la rota: ésta es la que no puede pasar.
+
+      1. Acceso: el robots.txt deja entrar a todos los agentes a esta ruta, y
+         el servidor les contesta 200 a todos.
+      2. Contenido sin JavaScript: todo el texto viene en el HTML servido; no
+         hay ni un script que lo dibuje.
+      3. Schema verificable: un JSON-LD válido, con @context de schema.org y
+         Organization, LocalBusiness y FAQPage.
+
+    El negocio es FICTICIO: la página no describe a ninguno real. No la
+    "mejores": si cambia, tiene que seguir saliendo verde en los tres puntos
+    (src/lib/aeo/__tests__/control.test.ts la audita por la ruta).
+  -->
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Organization",
+          "@id": "#organizacion",
+          "name": "Panadería de Control (ficticia)",
+          "description": "Negocio ficticio de la página de control sana de la auditoría AEO de Growth OS."
+        },
+        {
+          "@type": "LocalBusiness",
+          "@id": "#local",
+          "name": "Panadería de Control (ficticia)",
+          "parentOrganization": { "@id": "#organizacion" },
+          "address": {
+            "@type": "PostalAddress",
+            "streetAddress": "Calle del Control 1",
+            "addressLocality": "Ciudad de Prueba",
+            "addressCountry": "ES"
+          },
+          "openingHours": "Mo-Sa 08:00-20:00"
+        },
+        {
+          "@type": "FAQPage",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "¿Qué es esta página?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "La página de control sana de la auditoría AEO: tiene que salir en verde en los tres puntos."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "¿El negocio existe?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "No. Los datos son ficticios y sólo sirven para que la auditoría tenga un caso sano conocido."
+              }
+            }
+          ]
+        }
+      ]
+    }
+  </script>
+</head>
+<body>
+  <header>
+    <p>Panadería de Control (ficticia) · página de control sana de la auditoría AEO</p>
+  </header>
+  <main>
+    <h1>Pan de masa madre, horneado cada mañana</h1>
+    <p>
+      Somos una panadería de barrio ficticia, creada para que la auditoría de
+      legibilidad por inteligencia artificial tenga un caso sano conocido. Todo
+      lo que se lee en esta página viene en el HTML que entrega el servidor: un
+      rastreador que no ejecuta JavaScript lee exactamente lo mismo que una
+      persona con un navegador.
+    </p>
+    <h2>Qué hacemos</h2>
+    <p>
+      Horneamos pan de masa madre, hogazas de centeno y bollería de mantequilla
+      todos los días, de lunes a sábado, desde las ocho de la mañana hasta las
+      ocho de la tarde. La masa fermenta durante la noche y el horno se enciende
+      antes del amanecer, para que el primer pan salga caliente a la hora de
+      abrir.
+    </p>
+    <h2>Dónde estamos</h2>
+    <p>
+      En la Calle del Control 1, en la Ciudad de Prueba. La dirección es tan
+      ficticia como el negocio: está escrita para que el schema de esta página
+      tenga una dirección postal completa y válida.
+    </p>
+    <h2>Preguntas frecuentes</h2>
+    <h3>¿Qué es esta página?</h3>
+    <p>
+      La página de control sana de la auditoría AEO: tiene que salir en verde
+      en los tres puntos. Su pareja rota, en /aeo-control, tiene que salir en
+      rojo en los tres.
+    </p>
+    <h3>¿El negocio existe?</h3>
+    <p>
+      No. Los datos son ficticios y sólo sirven para que la auditoría tenga un
+      caso sano conocido contra el cual medirse.
+    </p>
+  </main>
+  <footer>
+    <p>Página de control de Growth OS. Datos ficticios.</p>
+  </footer>
+</body>
+</html>

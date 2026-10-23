@@ -71,8 +71,95 @@ jobs:
       # variables de entorno. Si algún día las necesita, va a fallar acá y no
       # en el deploy a producción.
       - name: build
+        id: build
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: npm run build
+
+      # RV-B: el binario de Chromium viaja en la función de la auditoría AEO
+      # porque `outputFileTracingIncludes` lo mete en su nft; el trazador de
+      # Next no lo ve solo. Sin esa línea el build termina en 0 y en
+      # producción cada render es «sin-navegador». El job `render` no lo ve:
+      # corre con node_modules entero. Esto lee el nft que deja el build de
+      # arriba, que es lo que Vercel empaqueta.
+      - name: el nft de la auditoría lleva Chromium, y ningún otro
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/verificar-nft-chromium.mjs
+
+  # La defensa SSRF del render de la auditoría AEO —el proxy que no existe, el
+  # resolvedor apagado, las banderas de WebRTC, el popup, las descargas— y la
+  # extracción de los dos lados del punto «contenido sin JavaScript» sólo se
+  # pueden probar con un Chromium de verdad: los tests de `verify` usan dobles
+  # del navegador y no ven una bandera borrada de `src/lib/aeo/chromium.ts`
+  # (SEC-1, GATE-5). Hasta este job, la integración se salteaba en el CI y un
+  # PR que sacara una capa mergeaba en verde.
+  #
+  # Corre con los DOS binarios: el Chrome del runner y el headless shell de
+  # `@sparticuz/chromium`, que es el que corre en Vercel y no escucha las mismas
+  # banderas (RV-1). Con AEO_INTEGRACION_OBLIGATORIA, un Chrome que falta es un
+  # rojo, no un salteo.
+  render:
+    name: render integration (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      AEO_INTEGRACION_OBLIGATORIA: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install
+        id: install
+        run: npm ci
+
+      - name: integración con el Chrome del runner
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          # Ubuntu 24.04 restringe los namespaces sin privilegios que usa el
+          # sandbox de Chrome; en el runner, que es efímero, se levanta.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable)"
+          "$CHROME" --version
+          AEO_CHROME_PATH="$CHROME" npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
+
+      - name: integración con el headless shell de producción
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          AEO_CHROMIUM_DE_PRODUCCION: "1"
+        run: npx vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
+
+      # RTV-3: el paso de arriba corre el binario de producción con las
+      # bibliotecas de UBUNTU. `@sparticuz/chromium` sólo descomprime las suyas
+      # (`al2023.tar.br`) y fija `LD_LIBRARY_PATH` cuando ve `VERCEL` o
+      # `AWS_EXECUTION_ENV`, y acá no estaban: un cambio que rompiera ese camino
+      # salía verde, y en producción cada render daba `sin-navegador`.
+      # REPRODUCIDO en esta misma imagen sin esas variables: «libnspr4.so:
+      # cannot open shared object file», Code 127.
+      #
+      # Este paso corre la integración en AL2023, que es lo que corre la
+      # función de Vercel, con las variables que Vercel pone. Usa el
+      # node_modules del `npm ci` de arriba: Ubuntu y AL2023 son x64 con glibc.
+      # `AEO_EN_AL2023` hace que el test afirme el entorno —el sistema, el
+      # binario y las bibliotecas que cargó—, para que este paso no pueda
+      # quedar verde midiendo otra cosa.
+      - name: integración con el headless shell de producción, en AL2023 como Vercel
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/app" -w /app \
+            -e CI \
+            -e AEO_INTEGRACION_OBLIGATORIA=1 \
+            -e AEO_CHROMIUM_DE_PRODUCCION=1 \
+            -e AEO_EN_AL2023=1 \
+            -e VERCEL=1 \
+            -e AWS_EXECUTION_ENV=AWS_Lambda_nodejs24.x \
+            --entrypoint npx \
+            public.ecr.aws/lambda/nodejs:24 \
+            vitest run src/lib/aeo/__tests__/renderizado.integracion.test.ts
 
   # El esquema es la otra mitad del repo y hasta ahora nada lo verificaba: los
   # tests de arriba corren contra dobles, así que probaban la LÓGICA y nunca
@@ -166,3 +253,13 @@ jobs:
       - name: canonical shape agreement
         if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
         run: $PSQL -f supabase/qa/forma_canonica.sql
+
+      # La 0034 tiene garantías que `defects_test.sql` no puede medir porque
+      # corre en UNA transacción: dos onboardings concurrentes que se solapan
+      # (el candado), el rechazo fuera de READ COMMITTED, y la propia migración
+      # aplicada con un onboarding solapado abierto (su guarda tiene que verlo).
+      # Necesitan varias sesiones y su propio aislamiento, y por eso van en un
+      # script aparte. Revierte y vuelve a aplicar la 0034: va último.
+      - name: search console overlap under concurrency
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: PSQL="psql -h localhost -U postgres -d growthos" bash supabase/qa/solape_concurrente.sh

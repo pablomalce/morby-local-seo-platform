@@ -1,5 +1,6 @@
 import type { AgenteIA } from "./lectura";
 import { AGENTES_IA } from "./lectura";
+import { PLAZO_POR_PEDIDO_DE_LA_RUTA_MS, traerExaminado, type RedExaminada } from "./red";
 
 /**
  * La petición REAL con el user-agent del rastreador, y el código que volvió.
@@ -14,7 +15,11 @@ import { AGENTES_IA } from "./lectura";
  * pasar: hay un código HTTP por agente, registrado.
  *
  * `null` es «no contestó» —timeout, DNS, red— y se distingue de un 5xx porque
- * un sitio caído para todos no es un sitio que bloquea a las IA.
+ * un sitio caído para todos no es un sitio que bloquea a las IA. También es
+ * `null` el agente al que el sitio REDIRIGE a una dirección que no es pública:
+ * cada salto pasa por el examen de `red.ts`, y el pedido no sale. Que ese
+ * agente quede sin código, y no con el de la dirección interna, es lo que
+ * impide que este número sea un escáner de puertos.
  */
 export const USER_AGENTS: Record<AgenteIA, string> = {
   gptbot: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)",
@@ -28,26 +33,19 @@ export type StatusPorAgente = Record<AgenteIA, number | null>;
 
 export async function statusPorAgente(
   url: string,
-  traer: (url: string, init: RequestInit) => Promise<Response> = fetch,
-  timeoutMs = 8_000
+  red: RedExaminada,
+  timeoutMs = PLAZO_POR_PEDIDO_DE_LA_RUTA_MS
 ): Promise<StatusPorAgente> {
   const salida = {} as StatusPorAgente;
   await Promise.all(
     AGENTES_IA.map(async (agente) => {
-      const reloj = new AbortController();
-      const alarma = setTimeout(() => reloj.abort(), timeoutMs);
-      try {
-        const res = await traer(url, {
-          headers: { "user-agent": USER_AGENTS[agente] },
-          redirect: "follow",
-          signal: reloj.signal,
-        });
-        salida[agente] = res.status;
-      } catch {
-        salida[agente] = null;
-      } finally {
-        clearTimeout(alarma);
-      }
+      const traida = await traerExaminado(red, url, {
+        userAgent: USER_AGENTS[agente],
+        timeoutMs,
+        maxBytes: 0,
+        sinCuerpo: true,
+      });
+      salida[agente] = traida.ok ? traida.status : null;
     })
   );
   return salida;

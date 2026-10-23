@@ -4,18 +4,42 @@ import { apiError } from "@/lib/api/error";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { quienLlama } from "@/lib/api/sesion";
 import {
-  accesoDeLasIA,
+  AGENTES_IA,
   erroresDeSchema,
+  leerAcceso,
   textoSinJavaScript,
   tiposDeSchema,
 } from "@/lib/aeo/lectura";
 import { statusPorAgente } from "@/lib/aeo/peticion";
-import { hallazgos, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { contenidoSinJs, esLegiblePorIA, hallazgos, puntosDeLaPuerta, type LecturaDelSitio } from "@/lib/aeo/hallazgos";
+import { dependenciasDeProduccion } from "@/lib/aeo/chromium";
+import { medirRenderizado } from "@/lib/aeo/renderizado";
+import {
+  crearRedExaminada,
+  MOTIVOS_DE_BLOQUEO,
+  PLAZO_POR_PEDIDO_DE_LA_RUTA_MS,
+  traerExaminado,
+  type RedExaminada,
+} from "@/lib/aeo/red";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-/** Tres peticiones a un sitio ajeno, que puede ser lento. */
-export const maxDuration = 30;
+/**
+ * La portada (8 s, redirecciones incluidas), y después, en paralelo, el
+ * `robots.txt` y el `llms.txt` del origen al que llevó la portada (8 s), las
+ * cinco por agente (8 s) y el render en Chromium (`renderizado.ts`: 40 s de
+ * tope total, más 5 s para cerrar el navegador). Peor caso, unos 53 s: la
+ * cuenta la suma `renderizado.test.ts` (RT-2).
+ *
+ * 59 y no 60, A PROPÓSITO: el builder de Vercel junta en UNA función las rutas
+ * con la misma configuración. MEDIDO con `vercel inspect` sobre la preview de
+ * este PR (RV-3): con 60, esta ruta compartía función con `geo/grid`,
+ * `profile/evidence-check` y `reports/generate` —las tres con 60—, y las tres
+ * pasaron de 2,0 MB a 72,8 MB y a compartir instancia con un Chromium. Un
+ * valor que ninguna otra ruta tiene la deja sola; `funcionPropia.test.ts` lo
+ * sostiene.
+ */
+export const maxDuration = 59;
 
 /**
  * QUÉ IMPIDE ESTA RUTA
@@ -34,39 +58,58 @@ export const maxDuration = 30;
  * la IP de la plataforma. Se lee de `businesses` COMO EL USUARIO, así que la RLS
  * contesta la membresía y sólo se puede auditar el sitio de un cliente propio.
  *
+ * Y QUE VENGA DEL NEGOCIO NO LO HACE SEGURO: lo escribe cualquier miembro de
+ * la organización. Por eso TODO pedido de esta ruta —el `robots.txt`, la
+ * portada, el `llms.txt`, uno por agente y el render— examina la dirección de
+ * cada salto antes de conectarse, y sigue las redirecciones a mano, volviendo
+ * a examinar el destino (`red.ts`). Un sitio cargado como `http://10.0.0.7/`,
+ * o uno público que redirige a la metadata, se contesta `destino-rechazado`
+ * sin un solo pedido a esa dirección.
+ *
  * UN FALLO DE RED NO ES UN HALLAZGO
  *
  * Si el `robots.txt` no se pudo traer, eso NO es «permite a todos»: es que no se
  * sabe. Se informa con su motivo, como `integration_probe`, en vez de rellenarlo
- * con un optimismo que después alguien lee como un hecho.
+ * con un optimismo que después alguien lee como un hecho. RFC 9309 separa los
+ * dos casos y acá se separan igual: un 4xx es «no hay robots» y deja entrar a
+ * todos; un 5xx, un timeout o una red que no contesta dejan el acceso SIN
+ * MEDIR, y así sale —`no-medido`, nunca verde—. Lo mismo un agente cuyo pedido
+ * no volvió.
  */
 
 const schema = z.object({ businessId: z.string().uuid() });
 
 /** Un sitio ajeno no tiene por qué contestar rápido, ni nosotros que esperarlo. */
-const TIMEOUT_MS = 8_000;
+const TIMEOUT_MS = PLAZO_POR_PEDIDO_DE_LA_RUTA_MS;
 
-async function traer(
-  url: string
-): Promise<{ ok: true; texto: string } | { ok: false; motivo: string }> {
-  const corte = new AbortController();
-  const reloj = setTimeout(() => corte.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      signal: corte.signal,
-      redirect: "follow",
-      headers: { "user-agent": "VulkanGrowthOS/1.0 (auditoria AEO)" },
-      cache: "no-store",
-    });
-    // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
-    // significa que el archivo no está, que es exactamente lo que se pregunta.
-    if (!res.ok) return { ok: false, motivo: `http ${res.status}` };
-    return { ok: true, texto: await res.text() };
-  } catch (e) {
-    return { ok: false, motivo: (e as Error).name === "AbortError" ? "timeout" : "sin-respuesta" };
-  } finally {
-    clearTimeout(reloj);
+/** Lo que se lee de un sitio ajeno, como mucho: lo mismo que el render. */
+const MAX_BYTES = 5 * 1024 * 1024;
+
+const AGENTE = "VulkanGrowthOS/1.0 (auditoria AEO)";
+
+type Traido =
+  | { ok: true; texto: string; /** La URL del último salto. */ url: string; status: number }
+  | { ok: false; motivo: string; bloqueado: boolean; /** El status, si hubo respuesta. */ status: number | null };
+
+async function traer(red: RedExaminada, url: string): Promise<Traido> {
+  const t = await traerExaminado(red, url, { userAgent: AGENTE, timeoutMs: TIMEOUT_MS, maxBytes: MAX_BYTES });
+  if (!t.ok) return { ok: false, motivo: t.motivo, bloqueado: MOTIVOS_DE_BLOQUEO.has(t.motivo), status: null };
+  // Un 404 en `robots.txt` o en `llms.txt` es una respuesta y no un fallo:
+  // significa que el archivo no está, que es exactamente lo que se pregunta.
+  if (t.status < 200 || t.status >= 300) {
+    return { ok: false, motivo: `http ${t.status}`, bloqueado: false, status: t.status };
   }
+  return { ok: true, texto: t.cuerpo.toString("utf8"), url: t.url, status: t.status };
+}
+
+/**
+ * Qué dice el robots, según RFC 9309: 2xx se lee; 4xx es «no está» y deja
+ * entrar a todos; todo lo demás —5xx, timeout, red, una redirección que no se
+ * pudo seguir— no dice nada, y el acceso por robots queda sin medir.
+ */
+function estadoDelRobots(robots: Traido): "leido" | "ausente" | "no-medido" {
+  if (robots.ok) return "leido";
+  return robots.status !== null && robots.status >= 400 && robots.status < 500 ? "ausente" : "no-medido";
 }
 
 export async function POST(req: Request) {
@@ -108,39 +151,114 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, motivo: "sitio-ilegible" }, { status: 409 });
     }
 
-    const [robots, portada, llms] = await Promise.all([
-      traer(new URL("/robots.txt", base).toString()),
-      traer(base.toString()),
-      traer(new URL("/llms.txt", base).toString()),
-    ]);
+    // Las dependencias de red se arman una vez: el mismo resolvedor y el
+    // mismo transporte para los pedidos de la ruta y para el render.
+    const deps = dependenciasDeProduccion();
+    const red = crearRedExaminada(deps);
+
+    const portada = await traer(red, base.toString());
 
     // La portada es la única imprescindible: sin ella no hay ni schema ni texto
     // que medir, y devolver ceros sería inventar dos hallazgos.
     if (!portada.ok) {
+      // Un destino que el examen rechaza no es un sitio caído: es una
+      // dirección que esta ruta no pide —red interna, puerto raro, esquema
+      // que no es web—, y se dice distinto porque se arregla distinto.
+      if (portada.bloqueado) {
+        return NextResponse.json(
+          { ok: false, motivo: "destino-rechazado", detalle: portada.motivo },
+          { status: 422 }
+        );
+      }
       return NextResponse.json(
         { ok: false, motivo: "sitio-inalcanzable", detalle: portada.motivo },
         { status: 502 }
       );
     }
 
-    // Un `robots.txt` que no se pudo traer se trata como AUSENTE, que es lo que
-    // el estándar dice: sin robots, se permite. Y se informa que no se leyó, para
-    // que nadie confunda «permite» con «no se pudo mirar».
-    const textoRobots = robots.ok ? robots.texto : "";
+    // La página que se audita es la del ÚLTIMO salto de la portada, y el
+    // `robots.txt` que la gobierna es el de SU origen, preguntado por SU ruta.
+    // Leerlo en "/" del sitio cargado dejaba en verde a toda página que no
+    // fuera la raíz: la de control de la puerta H2-GO-1 —bloqueada en el
+    // robots para GPTBot y ClaudeBot— salía con todos los agentes adentro,
+    // porque "/" no cae bajo `Disallow: /aeo-control` y además el despliegue
+    // redirige `/aeo-control/` a `/aeo-control`.
+    const final = new URL(portada.url);
+    const rutaFinal = `${final.pathname}${final.search}`;
 
     // La petición REAL con cada user-agent. No reemplaza la lectura del
     // robots: la complementa con lo que el servidor hace de verdad, que es lo
     // que la puerta H2-GO-1 exige y lo único que un CDN no puede fingir.
-    const statusAgentes = await statusPorAgente(base.toString());
+    //
+    // Y en paralelo, el DOM RENDERIZADO: la otra mitad del punto «contenido
+    // sin JavaScript». Va después de la portada a propósito —si el sitio no
+    // contesta no se arranca un navegador— y nunca rechaza: un render que
+    // falla vuelve como `{ estado: "fallo", codigo }`, y el hallazgo lo dice
+    // como «no medido», no como un cero.
+    const [robots, llms, statusAgentes, caracteresRenderizados] = await Promise.all([
+      traer(red, new URL("/robots.txt", final).toString()),
+      traer(red, new URL("/llms.txt", final).toString()),
+      statusPorAgente(base.toString(), red),
+      medirRenderizado(base.toString(), deps),
+    ]);
+
+    // Un render sin número se dice también en el log de la función, con el
+    // pedido que lo decidió si fue uno (`detalle`): la respuesta traía sólo el
+    // código y los logs de Vercel nada, y `subrecurso-sin-respuesta` no dice
+    // qué pedido faltó. El detalle sale de `renderizado.ts` sin query ni
+    // fragmento, y acá no se le agrega ninguna URL: un token no llega al log.
+    if (caracteresRenderizados.estado === "fallo") {
+      console.warn(
+        "[aeo/audit] render no medido:",
+        JSON.stringify({ codigo: caracteresRenderizados.codigo, detalle: caracteresRenderizados.detalle ?? null })
+      );
+    }
+
+    // Un `robots.txt` que NO ESTÁ (4xx) se lee como vacío, que es lo que el
+    // estándar dice: sin robots, se permite. Uno que no se pudo traer deja el
+    // acceso en `null` por agente —«no se sabe»—, y el hallazgo lo dice como
+    // no medido. Antes los dos se leían «permite a todos» (P3).
+    //
+    // Y uno que se leyó pero pasa los topes (`MAX_LARGO_DE_PATRON`,
+    // `MAX_REGLAS_POR_GRUPO` en `lectura.ts`) deja en `null` a los agentes
+    // que ese grupo gobierna, con el motivo: lo escribe un tercero, y sin
+    // topes decide cuánto trabaja esta función (REDOS).
+    const estadoRobots = estadoDelRobots(robots);
+    const leido =
+      estadoRobots === "no-medido"
+        ? {
+            acceso: Object.fromEntries(AGENTES_IA.map((a) => [a, null])) as LecturaDelSitio["acceso"],
+            fueraDeTope: null,
+          }
+        : leerAcceso(robots.ok ? robots.texto : "", rutaFinal);
+    const acceso = leido.acceso;
+    const robotsNoMedido = !robots.ok
+      ? estadoRobots === "no-medido"
+        ? robots.motivo
+        : null
+      : leido.fueraDeTope && `robots.txt fuera de tope: ${leido.fueraDeTope}`;
+
     const lectura: LecturaDelSitio = {
-      acceso: accesoDeLasIA(textoRobots),
+      acceso,
+      ...(robotsNoMedido ? { robotsNoMedido } : {}),
       statusPorAgente: statusAgentes,
+      // La línea de base de cada agente: la MISMA URL, pedida con el
+      // user-agent de la auditoría. Llegar acá ya exige que sea 2xx, así que
+      // un agente que no termina en 2xx es uno al que el sitio trata distinto
+      // (PU-1: un 503 de Wordfence a GPTBot salía verde).
+      statusPortada: portada.status,
       caracteresSinJs: textoSinJavaScript(portada.texto),
+      caracteresRenderizados,
       schema: tiposDeSchema(portada.texto),
       erroresDeSchema: erroresDeSchema(portada.texto),
       tieneLlmsTxt: llms.ok,
     };
 
+    // `caracteresRenderizados` NO se guarda: la 0025 no tiene columna para
+    // él, y ni `acceso` ni `schema_encontrado` son su lugar —meterlo en un
+    // jsonb ajeno sería escribir en la base un dato con otro nombre—. Viaja en
+    // la respuesta; guardarlo pide una migración que este cambio no escribe.
+    //
     // Una fila por corrida: la historia es el producto (encabezado de la 0025).
     // Hasta hoy la tabla existía y nadie la escribía — la forma «módulo sin
     // llamadores» del #95, en versión tabla. Si la escritura falla, la
@@ -152,20 +270,33 @@ export async function POST(req: Request) {
       url: base.toString(),
       robots_leido: robots.ok,
       acceso: { robots: lectura.acceso, http: statusAgentes },
-      caracteres_sin_js: lectura.caracteresSinJs,
+      // El número servido que DECIDIÓ el punto: el del mismo documento que
+      // se renderizó (`servidos`) si el render midió, y si no, el del HTML de
+      // la ruta. Antes se guardaba siempre el de la ruta, y el dato crudo no
+      // era el que pintó el color (PU-5).
+      caracteres_sin_js: contenidoSinJs(lectura).servido,
       schema_encontrado: { tipos: lectura.schema, errores: lectura.erroresDeSchema },
       llms_txt: llms.ok,
     });
 
+    const lista = hallazgos(lectura);
     return NextResponse.json(
       {
         ok: true,
         url: base.toString(),
+        urlFinal: final.toString(),
         robotsLeido: robots.ok,
+        estadoRobots,
         motivoRobots: robots.ok ? null : robots.motivo,
         guardada: !errorGuardado,
         lectura,
-        hallazgos: hallazgos(lectura),
+        hallazgos: lista,
+        // El color de cada punto de la puerta H2-GO-1, para que «rojo 3 de 3»
+        // y «verde 3 de 3» se lean de un dato y no de la prosa (GATE-7).
+        puntos: puntosDeLaPuerta(lectura),
+        // `true` sólo sin bloqueantes Y con todo medido; `null` es «no se
+        // sabe». La pantalla dice «sin hallazgos» sólo con `true`.
+        legible: esLegiblePorIA(lista),
       },
       { status: 200 }
     );

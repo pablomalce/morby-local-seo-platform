@@ -83,10 +83,20 @@ export type PropertyActionError =
   | "agency-unresolved"
   /** La superficie no es una de las tres. */
   | "unknown-surface"
-  /** El identificador no tiene la forma que la 0017 exige. */
+  /**
+   * El identificador no tiene la forma que la 0017 exige, o —Search Console— no
+   * tiene forma canónica para la 0034: un host que no es un nombre en ASCII (un
+   * dominio internacional sin punycode, una dirección IP).
+   */
   | "bad-shape"
   /** Otra organización ya tiene esa property viva. Es la fuga, rechazada. */
   | "property-taken"
+  /**
+   * Es otra property de Search Console, pero cubre URLs de la que otra
+   * organización tiene viva —un dominio y sus prefijos, o un prefijo dentro de
+   * otro—. La misma fuga por otro camino: la 0034 la rechaza con 23P01.
+   */
+  | "property-overlaps"
   /** Cualquier otro fallo de la base. */
   | "write-failed";
 
@@ -124,13 +134,22 @@ async function organizacionDelUsuario(organizationId: string): Promise<PropertyA
 /**
  * Mapear una superficie de una organización a una property de Google.
  *
- * Si la organización ya tenía un mapeo vivo de esa superficie, se desmapea
- * primero. El orden importa y no es intercambiable: el índice
+ * Si la organización ya tenía un mapeo vivo de esa superficie, se desmapea y
+ * se inserta el nuevo EN UNA TRANSACCIÓN: `remap_integration_property()` de la
+ * `0034`. El orden adentro es desmapear y después insertar —el índice
  * `integration_properties_one_live_per_provider` rechaza el INSERT mientras el
- * anterior siga vivo, así que al revés esto no funciona nunca. Y como los dos
- * pasos no son una transacción, la caída entre uno y otro deja al cliente SIN
- * mapear — que no muestra nada de nadie. Al revés dejaría dos mapeos vivos, que
- * es la mitad de los reportes con los números del sitio equivocado.
+ * anterior siga vivo—, y si el INSERT choca (23505 de la 0017, 23P01 o 23514 de
+ * la 0034, 45007), la base revierte también el desmapeo.
+ *
+ * Hasta la segunda revisión del #118 eran dos llamadas, y la segunda podía
+ * fallar con la primera hecha. Medido el 2026-10-11: con un 23P01 en el INSERT,
+ * la organización se quedaba SIN su mapeo vivo anterior, que era válido, y el
+ * mensaje no lo decía. Con la 0034 eso pasaba en cada remapeo que se solapara
+ * con otra organización.
+ *
+ * Y si la base todavía no tiene la `0034` (la función no existe), no se toca
+ * nada: falla cerrado con `write-failed` y lo dice. No hay un camino de dos
+ * pasos «por las dudas»: sería el mismo defecto con otro nombre.
  */
 export async function mapProperty(input: {
   organizationId: string;
@@ -160,29 +179,35 @@ export async function mapProperty(input: {
 
   const admin = createSupabaseAdminClient();
 
-  const { error: errorDesmapeo } = await admin
-    .from("integration_properties")
-    .update({ unmapped_at: new Date().toISOString() })
-    .eq("organization_id", input.organizationId)
-    .eq("provider", input.surface)
-    .is("unmapped_at", null);
-  if (errorDesmapeo) {
-    return { ok: false, code: "write-failed", message: mensaje("write-failed") };
-  }
-
-  const { error } = await admin.from("integration_properties").insert({
-    organization_id: input.organizationId,
-    provider: input.surface,
-    property_ref: validacion.propertyRef,
+  const { error } = await admin.rpc("remap_integration_property", {
+    p_organization_id: input.organizationId,
+    p_provider: input.surface,
+    p_property_ref: validacion.propertyRef,
   });
 
   if (error) {
     // 23505 es la unicidad, y acá sólo puede ser la GLOBAL: la de
-    // `(organization_id, provider)` la acabamos de despejar. O sea que es
-    // exactamente la fuga que la `0017` existe para impedir, y el operador tiene
-    // que leer eso y no «error al guardar».
+    // `(organization_id, provider)` la despejó la misma transacción. O sea que
+    // es exactamente la fuga que la `0017` existe para impedir, y el operador
+    // tiene que leer eso y no «error al guardar».
     if (error.code === "23505") {
       return { ok: false, code: "property-taken", message: mensaje("property-taken") };
+    }
+    // 23P01 es la 0034: no es el mismo texto, es la misma cuenta de tráfico.
+    // «Error al guardar» dejaría al operador reintentando; «ya está mapeada»
+    // lo mandaría a buscar un texto idéntico que no existe.
+    if (error.code === "23P01") {
+      return { ok: false, code: "property-overlaps", message: mensaje("property-overlaps") };
+    }
+    // 23514: la forma. `validarPropertyRef` ya miró la de la 0017, así que en
+    // la práctica es la forma canónica de Search Console de la 0034.
+    if (error.code === "23514") {
+      return { ok: false, code: "bad-shape", message: MENSAJE_SIN_FORMA_CANONICA };
+    }
+    // La función no existe: la base no tiene la 0034. PGRST202 es como lo dice
+    // PostgREST; 42883, como lo diría PostgreSQL.
+    if (error.code === "PGRST202" || error.code === "42883") {
+      return { ok: false, code: "write-failed", message: MENSAJE_SIN_0034 };
     }
     return { ok: false, code: "write-failed", message: mensaje("write-failed") };
   }
@@ -221,6 +246,18 @@ export async function unmapProperty(input: {
   return { ok: true };
 }
 
+/** El mapeo anterior sigue: el remapeo es una transacción. Ver `mapProperty`. */
+const SIGUE_EL_ANTERIOR = "El mapeo anterior de esta organización sigue como estaba.";
+
+const MENSAJE_SIN_FORMA_CANONICA =
+  "Ese identificador no tiene una forma que la base acepte para Search Console: https://sitio/ (con la barra final) " +
+  "o sc-domain:host, con el host como nombre en ASCII —un dominio internacional va en punycode, xn--…— y sin " +
+  `dirección IP. ${SIGUE_EL_ANTERIOR}`;
+
+const MENSAJE_SIN_0034 =
+  "No se pudo guardar el mapeo: la base todavía no tiene la migración 0034 (el remapeo en una transacción). " +
+  "No se tocó ningún mapeo.";
+
 function mensaje(code: PropertyActionError): string {
   switch (code) {
     case "not-authenticated":
@@ -238,7 +275,9 @@ function mensaje(code: PropertyActionError): string {
     case "bad-shape":
       return "Ese identificador no tiene la forma que Google devuelve.";
     case "property-taken":
-      return "Esa property ya está mapeada a otra organización. Desmapeala allá primero.";
+      return `Esa property ya está mapeada a otra organización. Desmapeala allá primero. ${SIGUE_EL_ANTERIOR}`;
+    case "property-overlaps":
+      return `Esa property de Search Console se solapa con la de otra organización (un dominio cubre sus subdominios y sus prefijos de URL). Desmapeá la otra primero, o elegí una que no se solape. ${SIGUE_EL_ANTERIOR}`;
     case "write-failed":
       return "No se pudo guardar el mapeo.";
   }
