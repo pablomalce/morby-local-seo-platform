@@ -1,4 +1,4 @@
--- A hundred and ninety-four isolation checks against the Growth OS schema — executable.
+-- Two hundred and one isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -10398,6 +10398,417 @@ SELECT 241, 'the remap function runs as its owner, or a browser role can execute
  RIGHT JOIN (SELECT 1) uno ON true;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 250 a 256. El rol de owner lo da y lo quita un owner (0036)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: que un admin activo se suba a owner, sume owners o le saque el rol
+-- a un owner. `members_owner_write` (0013) le deja escribir cualquier membresía
+-- de su organización, y medido el 2026-10-23 como `authenticated` la admin de A
+-- se subía a owner (`UPDATE 2`) y sumaba otro (`INSERT 0 1`). La 0036 pone tres
+-- restrictivas: una fila owner, antes o después de la escritura, la escribe sólo
+-- un owner activo de esa organización.
+--
+-- Todo entra como PostgREST v16 —el uid en `request.jwt.claims`, el GUC viejo
+-- vacío— y se deshace al volver, como `s33_como()`. La diferencia es el error:
+-- una restrictiva que rechaza la fila nueva NOMBRA la policy en el mensaje
+-- («new row violates row-level security policy "org_members_owner_update"»), y
+-- estos bloques la exigen. Sin eso, un 42501 de la 0031 o de la permisiva de la
+-- 0013 se leería igual que el de la 0036, y el bloque pasaría por otra cosa.
+--
+-- La fixture, toda por `handle_new_user()` como el resto del archivo, y con las
+-- membresías de A sembradas como `postgres` (BYPASSRLS):
+--
+--   olga    owner de A (A es su organización propia)
+--   otto    owner de A, y de la suya
+--   ada     admin de A, y owner de la suya: la que ataca
+--   mara    manager de A
+--   ofelia  owner ARCHIVADA de A
+--   nico    sin membresía en A: a quien se da de alta
+RESET ROLE;
+
+CREATE OR REPLACE FUNCTION pg_temp.o36(p_quien text) RETURNS uuid
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT ('d0360000-0036-4036-8036-0000000000' ||
+            CASE p_quien WHEN 'olga' THEN 'a1' WHEN 'otto' THEN 'a2' WHEN 'ada' THEN 'a3'
+                         WHEN 'mara' THEN 'a4' WHEN 'ofelia' THEN 'a5' WHEN 'nico' THEN 'a6'
+                         WHEN 'lea' THEN 'a7' END)::uuid;
+$$;
+
+INSERT INTO auth.users (id, email)
+SELECT pg_temp.o36(q), q || '36@example.test'
+  FROM unnest(ARRAY['olga', 'otto', 'ada', 'mara', 'ofelia', 'nico']) q;
+
+CREATE TEMP TABLE o36_org AS
+SELECT (SELECT organization_id FROM org_members WHERE user_id = pg_temp.o36('olga') AND role = 'owner') AS a,
+       (SELECT organization_id FROM org_members WHERE user_id = pg_temp.o36('otto') AND role = 'owner') AS de_otto,
+       (SELECT organization_id FROM org_members WHERE user_id = pg_temp.o36('ada')  AND role = 'owner') AS de_ada;
+
+INSERT INTO org_members (organization_id, user_id, role, state)
+SELECT a, pg_temp.o36('otto'),   'owner',   'active'   FROM o36_org UNION ALL
+SELECT a, pg_temp.o36('ada'),    'admin',   'active'   FROM o36_org UNION ALL
+SELECT a, pg_temp.o36('mara'),   'manager', 'active'   FROM o36_org UNION ALL
+SELECT a, pg_temp.o36('ofelia'), 'owner',   'archived' FROM o36_org;
+
+-- Anti-vacuidad: A con sus cinco membresías y nico afuera. Si la fixture no
+-- sembrara a la admin, el 250 daría verde porque no hay nadie que ataque.
+DO $$
+DECLARE
+    medido text;
+BEGIN
+    SELECT string_agg(m.role || '/' || m.state, ' ' ORDER BY m.user_id)
+      INTO medido
+      FROM org_members m, o36_org o
+     WHERE m.organization_id = o.a;
+    IF medido IS DISTINCT FROM 'owner/active owner/active admin/active manager/active owner/archived'
+       OR (SELECT de_otto IS NULL OR de_ada IS NULL OR de_otto = a OR de_ada = a FROM o36_org) THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 250 a 256 no quedó como se sembró: A = [%]', medido;
+    END IF;
+END
+$$;
+
+-- `s33_como()` con el error entero: si el mensaje nombra una policy, va su
+-- nombre. Ver el encabezado de estos bloques.
+CREATE OR REPLACE FUNCTION pg_temp.o36_como(p_uid uuid, p_sql text, p_prep text DEFAULT NULL,
+                                           p_rol text DEFAULT 'authenticated')
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    salida text;
+BEGIN
+    BEGIN
+        IF p_prep IS NOT NULL THEN
+            EXECUTE p_prep;
+        END IF;
+        PERFORM set_config('request.jwt.claim.sub', '', true);
+        PERFORM set_config('request.jwt.claims',
+                           jsonb_strip_nulls(jsonb_build_object('sub', p_uid, 'role', p_rol))::text, true);
+        EXECUTE format('SET LOCAL ROLE %I', p_rol);
+        EXECUTE p_sql INTO salida;
+        RESET ROLE;
+        RAISE EXCEPTION 'qa: deshacer la medición' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN coalesce(salida, '(nada)');
+    END;
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'ERR ' || SQLSTATE || ' ' ||
+           CASE WHEN SQLERRM ~ '^new row violates row-level security policy "'
+                    THEN 'rls:' || substring(SQLERRM FROM 'policy "([^"]+)"')
+                WHEN SQLERRM LIKE 'new row violates row-level security policy%' THEN 'rls'
+                WHEN SQLERRM LIKE 'permission denied for table%'                 THEN 'priv'
+                ELSE left(SQLERRM, 160) END;
+END
+$$;
+
+-- Una escritura, contada.
+CREATE OR REPLACE FUNCTION pg_temp.o36_n(p_dml text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT format('WITH u AS (%s RETURNING 1) SELECT ''n='' || count(*) FROM u', p_dml);
+$$;
+
+-- Las escrituras, con nombre, para que el 250 y su contraprueba del 252 corran
+-- EXACTAMENTE la misma sentencia y sólo cambie quién la manda.
+CREATE TEMP TABLE o36_sql AS
+SELECT x.caso, pg_temp.o36_n(x.dml) AS sentencia, x.prep
+  FROM o36_org o
+ CROSS JOIN LATERAL (VALUES
+    ('a ada a owner', format(
+        'UPDATE public.org_members SET role = ''owner'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('ada')), NULL),
+    ('alta de nico como owner', format(
+        'INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''owner'')',
+        o.a, pg_temp.o36('nico')), NULL),
+    -- Propone `admin` y el ON CONFLICT sube a owner: así llega al camino de
+    -- UPDATE del upsert. Uno que propone owner directamente —lo que manda
+    -- PostgREST con merge-duplicates— muere antes, en el WITH CHECK del INSERT
+    -- sobre la fila propuesta (medido: `org_members_owner_insert`), que es el
+    -- caso de la alta.
+    ('upsert de ada como owner', format(
+        'INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''admin'') '
+        'ON CONFLICT (organization_id, user_id) DO UPDATE SET role = ''owner''',
+        o.a, pg_temp.o36('ada')), NULL),
+    ('mudar a A un owner de la propia (ada)', format(
+        'UPDATE public.org_members SET organization_id = %L WHERE organization_id = %L AND user_id = %L',
+        o.a, o.de_ada, pg_temp.o36('nico')),
+     format('INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''owner'')',
+            o.de_ada, pg_temp.o36('nico'))),
+    ('mudar a A un owner de la propia (otto)', format(
+        'UPDATE public.org_members SET organization_id = %L WHERE organization_id = %L AND user_id = %L',
+        o.a, o.de_otto, pg_temp.o36('nico')),
+     format('INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''owner'')',
+            o.de_otto, pg_temp.o36('nico'))),
+    ('degradar a olga', format(
+        'UPDATE public.org_members SET role = ''admin'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('olga')), NULL),
+    ('archivar a olga', format(
+        'UPDATE public.org_members SET state = ''archived'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('olga')), NULL),
+    ('desarchivar a ofelia', format(
+        'UPDATE public.org_members SET state = ''active'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('ofelia')), NULL),
+    -- `authenticated` no tiene DELETE desde la 0013: se lo devuelve la
+    -- preparación, como `postgres` y adentro de la medición, que lo deshace.
+    -- Sin eso el 42501 de privilegio taparía a la policy.
+    ('borrar a olga', format(
+        'DELETE FROM public.org_members WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('olga')),
+     'GRANT DELETE ON public.org_members TO authenticated'),
+    ('alta de nico como editor', format(
+        'INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''editor'')',
+        o.a, pg_temp.o36('nico')), NULL),
+    ('mara a admin', format(
+        'UPDATE public.org_members SET role = ''admin'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('mara')), NULL),
+    ('archivar a mara', format(
+        'UPDATE public.org_members SET state = ''archived'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('mara')), NULL),
+    ('borrar a mara', format(
+        'DELETE FROM public.org_members WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('mara')),
+     'GRANT DELETE ON public.org_members TO authenticated')
+ ) x(caso, dml, prep);
+
+-- Quién manda cada una, y qué tiene que pasar.
+CREATE TEMP TABLE o36_medido AS
+SELECT e.bloque, e.orden, e.caso, e.quien, e.esperado,
+       pg_temp.o36_como(pg_temp.o36(e.quien), s.sentencia, s.prep) AS medido
+  FROM (VALUES
+    (250, 1, 'a ada a owner',                          'ada',  'ERR 42501 rls:org_members_owner_update'),
+    (250, 2, 'alta de nico como owner',                'ada',  'ERR 42501 rls:org_members_owner_insert'),
+    (250, 3, 'upsert de ada como owner',               'ada',  'ERR 42501 rls:org_members_owner_update'),
+    (250, 4, 'mudar a A un owner de la propia (ada)',  'ada',  'ERR 42501 rls:org_members_owner_update'),
+    (251, 1, 'degradar a olga',                        'ada',  'n=0'),
+    (251, 2, 'archivar a olga',                        'ada',  'n=0'),
+    (251, 3, 'desarchivar a ofelia',                   'ada',  'n=0'),
+    (251, 4, 'borrar a olga',                          'ada',  'n=0'),
+    (252, 1, 'a ada a owner',                          'olga', 'n=1'),
+    (252, 2, 'alta de nico como owner',                'olga', 'n=1'),
+    (252, 3, 'upsert de ada como owner',               'olga', 'n=1'),
+    (252, 4, 'mudar a A un owner de la propia (otto)', 'otto', 'n=1'),
+    (252, 5, 'degradar a olga',                        'otto', 'n=1'),
+    (252, 6, 'archivar a olga',                        'otto', 'n=1'),
+    (252, 7, 'desarchivar a ofelia',                   'olga', 'n=1'),
+    (252, 8, 'borrar a olga',                          'otto', 'n=1'),
+    (253, 1, 'alta de nico como editor',               'ada',  'n=1'),
+    (253, 2, 'mara a admin',                           'ada',  'n=1'),
+    (253, 3, 'archivar a mara',                        'ada',  'n=1'),
+    (253, 4, 'borrar a mara',                          'ada',  'n=1')
+  ) e(bloque, orden, caso, quien, esperado)
+  JOIN o36_sql s ON s.caso = e.caso;
+
+-- Anti-vacuidad de la tabla de casos: un caso mal escrito no encuentra su
+-- sentencia, el JOIN lo pierde, y el bloque pasaría sobre menos casos.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM o36_medido) <> 20 THEN
+        RAISE EXCEPTION 'Vacuous run: los bloques 250 a 253 midieron % de 20 casos.',
+            (SELECT count(*) FROM o36_medido);
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION pg_temp.o36_informe(p_bloque int) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) = 0
+                THEN string_agg(quien || ', ' || caso || ': ' || medido, '; ' ORDER BY orden)
+                ELSE 'medido (esperado): ' ||
+                     string_agg(quien || ', ' || caso || ': ' || medido || ' (' || esperado || ')', '; '
+                                ORDER BY orden) FILTER (WHERE medido IS DISTINCT FROM esperado)
+                END
+      FROM o36_medido WHERE bloque = p_bloque;
+$$;
+
+-- ── 250 ──────────────────────────────────────────────────────────────────────
+-- EL ATAQUE MEDIDO. ada, admin activa de A, como PostgREST: subirse a owner,
+-- sumar a nico como owner, subirse por el ON CONFLICT de un upsert y mudar a A
+-- una fila owner de SU organización —donde es owner y la puede escribir—. Cada uno muere con 42501
+-- y el mensaje nombra la restrictiva de la 0036: la permisiva de la 0013 y el
+-- eje de la 0031 la dejan pasar, porque es admin y escribe.
+INSERT INTO defect_report
+SELECT 250, 'an active admin can make someone an owner of the organization, herself included',
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       pg_temp.o36_informe(250)
+  FROM o36_medido WHERE bloque = 250;
+
+-- ── 251 ──────────────────────────────────────────────────────────────────────
+-- LA OTRA MITAD: quitar el rol. ada degrada a olga, la archiva, desarchiva a
+-- ofelia y, con DELETE devuelto adentro de la medición, borra la fila de olga.
+-- Cada uno, 0 filas: el USING de la restrictiva le esconde la fila owner al
+-- verbo. Que esas filas existen y se pueden escribir lo dice el 252, con las
+-- mismas sentencias.
+INSERT INTO defect_report
+SELECT 251, 'an active admin can demote, archive, unarchive or delete an owner',
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       pg_temp.o36_informe(251)
+  FROM o36_medido WHERE bloque = 251;
+
+-- ── 252 ──────────────────────────────────────────────────────────────────────
+-- LA CONTRAPRUEBA. Las mismas sentencias, mandadas por un owner activo de A,
+-- cambian una fila cada una. Sin esto el 250 y el 251 se ponen verdes con una
+-- regla que no deja escribir owners a NADIE —o con filas que no existen—, y la
+-- negativa no diría nada de quién llama. La mudanza la hace otto desde la suya:
+-- es owner de las dos organizaciones.
+INSERT INTO defect_report
+SELECT 252, 'an active owner cannot grant, move, demote, archive, unarchive or delete an owner',
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 8,
+       pg_temp.o36_informe(252)
+  FROM o36_medido WHERE bloque = 252;
+
+-- ── 253 ──────────────────────────────────────────────────────────────────────
+-- LO QUE NO SE LE SACA AL ADMIN. ada suma a nico como editor, asciende a mara a
+-- admin, la archiva y la borra: una fila cada uno. Sin este bloque, una regla
+-- que pidiera ser owner para escribir CUALQUIER membresía pondría verdes el 250
+-- y el 251 y dejaría a los admins sin poder administrar.
+INSERT INTO defect_report
+SELECT 253, 'an active admin can no longer manage the memberships that are not owner',
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       pg_temp.o36_informe(253)
+  FROM o36_medido WHERE bloque = 253;
+
+-- ── 254 ──────────────────────────────────────────────────────────────────────
+-- `current_user_owner_org_ids()`, persona por persona, sobre A. Es lo único que
+-- ve el `state = 'active'` de la función: ofelia, owner archivada, no llega a
+-- la policy de la 0036 porque la permisiva de la 0013 ya la frena (bloque 16),
+-- así que sacarle el estado a la función no cambia ninguna escritura de hoy.
+-- Cambia la próxima permisiva que no lo mire.
+CREATE TEMP TABLE o36_funcion AS
+SELECT string_agg(CASE pg_temp.o36_como(pg_temp.o36(q.quien), format(
+                           'SELECT count(*)::text FROM public.current_user_owner_org_ids() f WHERE f = %L',
+                           (SELECT a FROM o36_org)))
+                      WHEN '1' THEN '1' WHEN '0' THEN '0' ELSE '?' END, '' ORDER BY q.orden) AS medido,
+       string_agg(q.quien, ' ' ORDER BY q.orden) AS quienes
+  FROM (VALUES (1, 'olga'), (2, 'otto'), (3, 'ada'), (4, 'mara'), (5, 'ofelia'), (6, 'nico')) q(orden, quien);
+
+INSERT INTO defect_report
+SELECT 254, 'current_user_owner_org_ids() answers for someone who is not an active owner, or not for an owner',
+       medido IS DISTINCT FROM '110000',
+       quienes || ': ' || coalesce(medido, '?') || ' (se espera 110000: sólo los owners activos)'
+  FROM o36_funcion;
+
+-- ── 255 ──────────────────────────────────────────────────────────────────────
+-- QUIEN DA OWNERS SIN SER OWNER DE ESA ORGANIZACIÓN, Y TIENE QUE PODER:
+--
+--   a. `handle_new_user()`: la alta de lea crea su organización y la hace owner.
+--      GoTrue inserta como `supabase_auth_admin`, que el stub no tiene con
+--      INSERT; acá inserta `postgres`, con el uid de ada puesto en la sesión
+--      para que «no hay uid» no sea lo que la exime. Lo que la exime es que la
+--      función es SECURITY DEFINER de `postgres`, con BYPASSRLS;
+--   b. `create_client_organization()`, como `authenticated` con el uid de ada:
+--      ada queda owner de la organización nueva, de la que antes no era nada;
+--   c. el servidor, `service_role` sin uid, da de alta a nico como owner de A;
+--   d. `postgres` con el uid de ada puesto, lo mismo: es como siembran owners
+--      las fixtures de este archivo, y sin esto media suite moriría antes;
+--   e. `ingest_lead_won()`, como `service_role`: crea la organización y NO le da
+--      ningún miembro. El día que empiece a dar un owner, este bloque se pone
+--      rojo: sería un owner que no dio un owner, y alguien tiene que decidirlo.
+--
+-- Las tres funciones de abajo existen porque la lectura tiene que ver lo que la
+-- escritura acaba de hacer: en una misma sentencia no lo vería —es la misma
+-- foto—, en la sentencia siguiente de una función plpgsql sí.
+CREATE OR REPLACE FUNCTION pg_temp.o36_alta() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    r text;
+BEGIN
+    INSERT INTO auth.users (id, email) VALUES (pg_temp.o36('lea'), 'lea36@example.test');
+    SELECT string_agg(role || '/' || state, ',') INTO r
+      FROM public.org_members WHERE user_id = pg_temp.o36('lea');
+    RETURN coalesce(r, 'sin membresía');
+END
+$$;
+
+CREATE OR REPLACE FUNCTION pg_temp.o36_cliente() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_org uuid;
+    r     text;
+BEGIN
+    v_org := public.create_client_organization('Cliente 0036');
+    SELECT string_agg(role || '/' || state, ',') INTO r
+      FROM public.org_members WHERE organization_id = v_org AND user_id = auth.uid();
+    RETURN coalesce(r, 'sin membresía');
+END
+$$;
+
+CREATE OR REPLACE FUNCTION pg_temp.o36_ingesta() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    r jsonb;
+BEGIN
+    r := public.ingest_lead_won('lead-engine', 'qa-0036', NULL, 'Lead 0036', 'lead-0036', 'en',
+                                'Negocio 0036', 'negocio-0036', '', 'other', '{}'::jsonb, '{}'::jsonb);
+    RETURN format('duplicado=%s organización=%s miembros=%s', r ->> 'duplicate',
+                  (SELECT count(*) FROM public.organizations WHERE id = (r ->> 'organization_id')::uuid),
+                  (SELECT count(*) FROM public.org_members WHERE organization_id = (r ->> 'organization_id')::uuid));
+END
+$$;
+
+CREATE TEMP TABLE o36_servidor AS
+SELECT x.orden, x.caso, x.esperado, x.medido
+  FROM (VALUES
+    (1, 'alta de usuario', 'owner/active',
+        pg_temp.o36_como(pg_temp.o36('ada'), 'SELECT pg_temp.o36_alta()', NULL, 'postgres')),
+    (2, 'alta de cliente', 'owner/active',
+        pg_temp.o36_como(pg_temp.o36('ada'), 'SELECT pg_temp.o36_cliente()')),
+    (3, 'service_role', 'n=1',
+        pg_temp.o36_como(NULL, (SELECT sentencia FROM o36_sql WHERE caso = 'alta de nico como owner'),
+                         NULL, 'service_role')),
+    (4, 'postgres', 'n=1',
+        pg_temp.o36_como(pg_temp.o36('ada'), (SELECT sentencia FROM o36_sql WHERE caso = 'alta de nico como owner'),
+                         NULL, 'postgres')),
+    (5, 'ingesta', 'duplicado=false organización=1 miembros=0',
+        pg_temp.o36_como(NULL, 'SELECT pg_temp.o36_ingesta()', NULL, 'service_role'))
+  ) x(orden, caso, esperado, medido);
+
+INSERT INTO defect_report
+SELECT 255, 'a path that legitimately grants owner without being an owner of that organization stopped working',
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 5,
+       CASE WHEN count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) = 0
+            THEN string_agg(caso || ': ' || medido, '; ' ORDER BY orden)
+            ELSE 'medido (esperado): ' ||
+                 string_agg(caso || ': ' || medido || ' (' || esperado || ')', '; ' ORDER BY orden)
+                     FILTER (WHERE medido IS DISTINCT FROM esperado)
+            END
+  FROM o36_servidor;
+
+-- ── 256 ──────────────────────────────────────────────────────────────────────
+-- POR CATÁLOGO, lo que la conducta no ve:
+--   * la función es SECURITY DEFINER con `search_path` fijo. Ninguna de las dos
+--     se ve por conducta hoy: como INVOKER contesta lo mismo, porque las
+--     restrictivas son de escritura y no recursan (mutación O08 de la 0036,
+--     sólo rojo acá), y sin `search_path` también (O13; ése lo ve además el
+--     214). Por qué es DEFINER igual: ver «LA FUNCIÓN» en la 0036;
+--   * EXECUTE sólo para `authenticated`: ni PUBLIC, ni `anon`, ni
+--     `service_role`. Ninguna escritura de hoy lo distingue;
+--   * las tres restrictivas son de PUBLIC. Una puesta sólo para `authenticated`
+--     sería la misma conducta hoy y dejaría afuera al próximo rol.
+INSERT INTO defect_report
+SELECT 256, 'the owner axis is not DEFINER with a fixed search_path, runs for more than authenticated, or is not restrictive for everyone',
+       NOT coalesce(definer AND con_search_path AND sesion AND NOT otros AND restrictivas = 'a d w', false),
+       format('SECURITY DEFINER: %s; search_path fijo: %s; authenticated ejecuta: %s; PUBLIC, anon o service_role ejecutan: %s; restrictivas de PUBLIC: [%s]',
+              definer, con_search_path, sesion, otros, restrictivas)
+  FROM (
+    SELECT p.prosecdef AS definer,
+           coalesce(array_to_string(p.proconfig, ',') LIKE '%search_path=public%', false) AS con_search_path,
+           has_function_privilege('authenticated', p.oid, 'EXECUTE') AS sesion,
+           has_function_privilege('anon', p.oid, 'EXECUTE')
+             OR has_function_privilege('service_role', p.oid, 'EXECUTE')
+             OR EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                         WHERE a.grantee = 0) AS otros
+      FROM pg_proc p
+     WHERE p.oid = to_regprocedure('public.current_user_owner_org_ids()')
+  ) q
+ RIGHT JOIN (
+    SELECT coalesce(string_agg(pol.polcmd::text, ' ' ORDER BY pol.polcmd), '') AS restrictivas
+      FROM pg_policy pol
+     WHERE pol.polrelid = 'public.org_members'::regclass
+       AND pol.polname IN ('org_members_owner_insert', 'org_members_owner_update', 'org_members_owner_delete')
+       AND NOT pol.polpermissive
+       AND pol.polroles = '{0}'::oid[]
+       AND pol.polcmd = CASE pol.polname WHEN 'org_members_owner_insert' THEN 'a'
+                                         WHEN 'org_members_owner_update' THEN 'w'
+                                         ELSE 'd' END
+  ) r ON true;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 400 y 401. La baja de cuenta no borra a medias lo que la base va a rechazar
 -- ─────────────────────────────────────────────────────────────────────────────
 -- QUÉ CUIDAN: la premisa de la verificación previa de `deleteMyAccount`
@@ -10559,8 +10970,8 @@ SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and ninety-four checks were written, so a hundred
--- and ninety-four rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: two hundred and one checks were written, so two hundred and
+-- one rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
@@ -10569,10 +10980,12 @@ SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante
 -- mergearse. Y del 216 al 300 por lo mismo: los de la 0032 (H2-GO-3) se
 -- escribieron con la 0031 en un PR abierto. Los de la 0033 siguen la misma
 -- regla desde el 220, escritos con la 0032 en un PR abierto. Los de la 0034
--- (230 a 241) siguen después de los de la 0033. Los 400 y 401 (la baja de
--- cuenta) no son de una migración: arrancan en 400 para no chocar con ningún
--- rango de migración abierto. El conteo de abajo es de FILAS, no el número más
--- alto: 143 + 17 + 12 + 8 + 12 + 2.
+-- (230 a 241) siguen después de los de la 0033, y los de la 0036 (250 a 256)
+-- después de ésos, escritos con la 0035 en un PR abierto (#120, que usa del 402
+-- en adelante). Los 400 y 401 (la baja de cuenta) no son de una migración:
+-- arrancan en 400 para no chocar con ningún rango de migración abierto. El
+-- conteo de abajo es de FILAS, no el número más alto: 143 + 17 + 12 + 8 + 12 +
+-- 7 + 2.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -10587,8 +11000,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 194 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 194 checks recorded a result.', checks;
+    IF checks <> 201 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 201 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -10599,11 +11012,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 194 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 201 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 194 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 201 checks green: the schema prevents every one of them.';
 END
 $$;
 
