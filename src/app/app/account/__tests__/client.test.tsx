@@ -66,7 +66,7 @@ describe("la baja de cuenta en pantalla", () => {
     accion.mockResolvedValue({
       ok: false,
       motivo: "no-se-pudo-borrar-el-acceso",
-      yaBorrado: { ajenas: 1, propias: 1 },
+      yaBorrado: { ajenas: 1, propias: 1, sellos: 0 },
       message: frase,
     });
     confirmar();
@@ -83,6 +83,14 @@ describe("la baja de cuenta en pantalla", () => {
     expect(aviso.getAttribute("data-motivo")).toBe("sin-respuesta");
     expect(aviso.textContent).toBe(FRASE_SIN_RESPUESTA);
     expect(aviso.textContent).not.toContain("fetch failed");
+  });
+
+  it("ANTES de confirmar dice que lo que aprobó donde nadie más aprueba vuelve a borrador (0035)", () => {
+    // La baja suelta esos sellos sin preguntar: es la única forma de que se
+    // pueda borrar la cuenta. Que la persona lo sepa antes es lo que hace que no
+    // sea una sorpresa.
+    render(<DeleteAccountButton />);
+    expect(screen.getByText(/approved where no one else can approve\s+goes back to draft/)).toBeTruthy();
   });
 
   it("CONTROL: la acción resuelve sin respuesta: no inventa un error", async () => {
@@ -112,7 +120,7 @@ describe("pedirLaBaja — lo que vuelve de la acción, a la pantalla", () => {
     const r = await pedirLaBaja(async () => ({
       ok: false,
       motivo: "firma-en-otra-organizacion",
-      yaBorrado: { ajenas: 0, propias: 0 },
+      yaBorrado: { ajenas: 0, propias: 0, sellos: 0 },
       message: "frase",
     }));
     expect(r).toEqual({ motivo: "firma-en-otra-organizacion", message: "frase" });

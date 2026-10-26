@@ -19,16 +19,18 @@ const MOTIVOS: MotivoDeBaja[] = [
   "no-se-pudo-verificar",
   "sello-en-otra-organizacion",
   "firma-en-otra-organizacion",
-  "no-se-pudo-salir",
-  "no-se-pudieron-borrar-las-propias",
+  "sello-publicado-sin-quien-decida",
+  "no-se-pudieron-borrar-las-organizaciones",
+  "no-se-sabe-que-se-borro",
   "no-se-pudo-borrar-el-acceso",
+  "no-se-sabe-si-se-borro-el-acceso",
 ];
 
 describe("explicarBaja", () => {
   it.each(MOTIVOS)("«%s» tiene frase propia, con por qué y qué hacer", (motivo) => {
     const frase = explicarBaja(motivo, NADA_BORRADO);
     expect(frase).not.toMatch(/undefined/);
-    expect(frase).toMatch(/^Your account was not (fully )?deleted: /);
+    expect(frase).toMatch(/^Your account (was not|was not fully|may not be fully) deleted: /);
     // Ninguna frase es la de otro motivo: si dos coincidieran, la pantalla no
     // distinguiría casos que se arreglan en lugares distintos.
     const otras = MOTIVOS.filter((m) => m !== motivo).map((m) => explicarBaja(m, NADA_BORRADO));
@@ -39,6 +41,32 @@ describe("explicarBaja", () => {
     expect(explicarBaja("firma-en-otra-organizacion", NADA_BORRADO)).toMatch(/That organization has to decide/);
     expect(explicarBaja("sello-en-otra-organizacion", NADA_BORRADO)).toMatch(/Ask that organization/);
   });
+
+  it("el sello ya publicado donde nadie más aprueba manda a soporte: nadie de la organización puede soltarlo", () => {
+    const f = explicarBaja("sello-publicado-sin-quien-decida", NADA_BORRADO);
+    expect(f).toMatch(/publication record/);
+    expect(f).toMatch(/Contact support/);
+    expect(f).not.toMatch(/Ask that organization/);
+    expect(f).toMatch(/Nothing was deleted/);
+  });
+
+  it("GoTrue sin respuesta: no afirma que el login sigue, ni con algo hecho ni sin nada", () => {
+    const conAlgo = explicarBaja("no-se-sabe-si-se-borro-el-acceso", { ajenas: 1, propias: 1, sellos: 0 });
+    expect(conAlgo).toMatch(/could not confirm whether your login was deleted/);
+    expect(conAlgo).toMatch(/Already done: you were removed from 1 organization/);
+    expect(conAlgo).toMatch(/We cannot tell whether your login is still there\./);
+    expect(conAlgo).not.toMatch(/Your login is still there/);
+    const sinNada = explicarBaja("no-se-sabe-si-se-borro-el-acceso", NADA_BORRADO);
+    expect(sinNada).not.toMatch(/Nothing was deleted|Your login is still there/);
+    expect(sinNada).toMatch(/Nothing else had to be deleted\. We cannot tell whether your login is still there\./);
+    // No infiere nada de un login fallido: con GoTrue caído, entrar también falla.
+    expect(conAlgo).not.toMatch(/if you cannot|your account is gone/);
+    expect(conAlgo).toMatch(/contact support to confirm whether your login is gone/);
+    // Y el login que GoTrue SÍ dijo que no borró sigue diciéndose.
+    expect(explicarBaja("no-se-pudo-borrar-el-acceso", { ajenas: 1, propias: 0, sellos: 0 })).toMatch(
+      /Your login is still there/,
+    );
+  });
 });
 
 describe("loQueYaNoEsta", () => {
@@ -47,7 +75,7 @@ describe("loQueYaNoEsta", () => {
   });
 
   it("con algo borrado NO dice «nothing», y nombra cada cosa con su número", () => {
-    const f = loQueYaNoEsta({ ajenas: 2, propias: 1 });
+    const f = loQueYaNoEsta({ ajenas: 2, propias: 1, sellos: 0 });
     expect(f).not.toMatch(/Nothing/);
     expect(f).toMatch(/removed from 2 organizations that are not only yours/);
     expect(f).toMatch(/1 organization that was only yours was deleted/);
@@ -55,18 +83,34 @@ describe("loQueYaNoEsta", () => {
   });
 
   it("sólo ajenas, o sólo propias", () => {
-    expect(loQueYaNoEsta({ ajenas: 1, propias: 0 })).toMatch(/removed from 1 organization that is not only yours\. /);
-    expect(loQueYaNoEsta({ ajenas: 0, propias: 3 })).toMatch(
+    expect(loQueYaNoEsta({ ajenas: 1, propias: 0, sellos: 0 })).toMatch(/removed from 1 organization that is not only yours\. /);
+    expect(loQueYaNoEsta({ ajenas: 0, propias: 3, sellos: 0 })).toMatch(
       /^Already done: 3 organizations that were only yours were deleted/,
     );
   });
 
   it("«no se sabe cuántas» (null) no es cero, y no inventa un número", () => {
-    const f = loQueYaNoEsta({ ajenas: null, propias: null });
+    const f = loQueYaNoEsta({ ajenas: null, propias: null, sellos: null });
     expect(f).not.toMatch(/Nothing/);
     expect(f).not.toMatch(/\d/);
     expect(f).toMatch(/removed from organizations that are not only yours/);
     expect(f).toMatch(/may have been deleted/);
+    expect(f).toMatch(/approvals of yours were withdrawn/);
+  });
+
+  it("los sellos soltados (0035) se nombran con su número, y solos no son «nothing»", () => {
+    const f = loQueYaNoEsta({ ajenas: 0, propias: 0, sellos: 2 });
+    expect(f).toBe("Already done: 2 approvals of yours were withdrawn, back to draft, where no one else could approve. Your login is still there.");
+    expect(loQueYaNoEsta({ ajenas: 1, propias: 0, sellos: 1 })).toMatch(/; 1 approval of yours was withdrawn/);
+  });
+
+  it("«no se sabe SI pasó» (null) no dice «nothing» ni «already done», ni inventa un número; sí que el login sigue", () => {
+    // Es la respuesta perdida de la 0035: la transacción pudo confirmarse.
+    const f = loQueYaNoEsta(null);
+    expect(f).not.toMatch(/Nothing|Already done/);
+    expect(f).not.toMatch(/\d/);
+    expect(f).toMatch(/cannot tell whether/);
+    expect(f).toMatch(/login is still there/);
   });
 });
 
@@ -88,8 +132,9 @@ describe("las frases nombran de quién es cada organización", () => {
     // Con varios owners, «you do not own» era falso para la compartida de la que
     // sale, y «you owned» para la que queda entera con la otra owner.
     const todas = [
-      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: 2, propias: 1 })),
-      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: null, propias: null })),
+      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: 2, propias: 1, sellos: 1 })),
+      ...MOTIVOS.map((m) => explicarBaja(m, { ajenas: null, propias: null, sellos: null })),
+      ...MOTIVOS.map((m) => explicarBaja(m, null)),
     ];
     for (const f of todas) expect(f).not.toMatch(/you do not own|you owned/);
   });

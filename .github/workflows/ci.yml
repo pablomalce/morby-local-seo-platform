@@ -233,6 +233,15 @@ jobs:
         if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
         run: $PSQL -f supabase/qa/defects_test.sql
 
+      # La baja de cuenta con DOS sesiones de verdad (0035). defects_test.sql es
+      # una sola transacción y no puede medir locks: esto pone a otra sesión a
+      # cambiar membresías a mitad de la baja y exige verla esperar. Va después
+      # de las aserciones porque confirma filas (y las borra al terminar). Usa
+      # el $PSQL del job.
+      - name: account deletion under concurrency
+        if: ${{ !cancelled() && steps.stub.outcome == 'success' }}
+        run: bash supabase/qa/baja_concurrente.sh
+
       # La forma canónica del `property_ref` vive en dos lugares: el CHECK de la
       # 0017 y `src/lib/integrations/google/mapping.ts`, que la repite en
       # JavaScript para poder rechazar un identificador mal escrito ANTES de

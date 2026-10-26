@@ -1,4 +1,4 @@
--- A hundred and ninety-four isolation checks against the Growth OS schema — executable.
+-- Two hundred and one isolation checks against the Growth OS schema — executable.
 --
 --   ./supabase/qa/replica.sh
 --   docker exec growthos-replica psql -U postgres -d growthos \
@@ -9810,6 +9810,14 @@ SELECT 225, 'un client, un viewer o un editor sella por PostgREST firmando como 
 --      su cuerpo. Una función así corre como `postgres`, que está exento: sería
 --      código del servidor declarando firmas, y tiene que mirarse.
 --
+--      Mirada, y la única exceptuada: `delete_account_organizations` (0035, la
+--      baja de cuenta), que SUELTA los sellos de quien se va donde nadie más
+--      aprueba. No declara una firma: la borra. La excepción es por nombre Y por
+--      lo que escribe: todo `approved_by =` de su cuerpo tiene que ser `NULL`
+--      (el SET que suelta) o `p_user_id` (los WHERE que buscan los sellos de
+--      quien se va). Una versión que asignara otro valor vuelve a contar acá. Lo
+--      que efectivamente hace con el sello lo mide el bloque 406.
+--
 -- `to_regprocedure` y no un cast: si la función no está, esto tiene que dar
 -- rojo con su evidencia, no tirar la corrida.
 CREATE TEMP TABLE s33_tablas AS
@@ -9833,7 +9841,8 @@ SELECT 226, 'una tabla con approved_by que una sesión escribe no tiene firmante
             THEN 'el firmante es BEFORE INSERT OR UPDATE, por fila, ENABLE ALWAYS e INVOKER; de las ' ||
                  con_approved_by || ' tablas de public con approved_by, ' || escribibles ||
                  ' escribible por sesión (content_assets) y las ' || escribibles || ' llevan firmante; ' ||
-                 'ninguna función SECURITY DEFINER de public nombra content_assets'
+                 'ninguna función SECURITY DEFINER de public nombra content_assets, salvo la baja de ' ||
+                 'cuenta (0035), que sólo escribe NULL en approved_by'
             ELSE 'firmante con la forma de la 0033: ' || forma || ' de 1 / escribibles por sesión: ' ||
                  escribibles || ' (content_assets entre ellas: ' || con_content_assets || ') / sin firmante: ' ||
                  coalesce(sin_firmante, '-') || ' / funciones DEFINER que nombran content_assets: ' || definer
@@ -9854,7 +9863,13 @@ SELECT 226, 'una tabla con approved_by que una sesión escribe no tiene firmante
               AS sin_firmante,
           (SELECT count(*) FROM pg_proc p
              JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
-            WHERE p.prosecdef AND p.prosrc ILIKE '%content\_assets%') AS definer
+            WHERE p.prosecdef AND p.prosrc ILIKE '%content\_assets%'
+              AND NOT coalesce(
+                    p.oid = to_regprocedure('public.delete_account_organizations(uuid)')
+                    AND (SELECT coalesce(array_agg(DISTINCT m[1]), '{}')
+                           FROM regexp_matches(p.prosrc, 'approved_by\s*=\s*([A-Za-z_]+)', 'gi') m)
+                        <@ ARRAY['NULL', 'p_user_id'],
+                    false)) AS definer
        ) x;
 
 -- ── 227 ──────────────────────────────────────────────────────────────────────
@@ -10557,10 +10572,649 @@ SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante
                current_setting('qa.b401c') AS c, current_setting('qa.b401d') AS d) x;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 402 a 408. La baja de cuenta decide y borra en UNA transacción (0035)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- QUÉ CUIDAN: `delete_account_organizations`, la función de la 0035 a la que
+-- `deleteMyAccount` le delega todo lo que no es el login. Un bloque por
+-- garantía, y cada uno con su premisa: la secuencia de #117 (`faade08`) sobre el
+-- MISMO armado tiene que reproducir el defecto, o el bloque no mide nada.
+--
+--   402  dos co-owners: con la secuencia vieja intercalada la organización
+--        queda sin nadie; con la función, en serie (lo que los locks fuerzan
+--        cuando las dos bajas llegan juntas, `baja_concurrente.sh`), la
+--        primera sale y la segunda —ya única owner— se la lleva.
+--   403  truncado: 1001 compartidas. Con la lectura de otros owners cortada en
+--        1000 (el `max_rows` de PostgREST, simulado como LIMIT), una compartida
+--        se lee propia. La función no lee por PostgREST, y devuelve UNA fila.
+--   404  vocabulario: `state` y `role` son los que la función sabe leer, por
+--        catálogo; y si dejaran de serlo, la función se niega (45009).
+--   405  quién la llama: sólo `service_role`; y sus atributos.
+--   406  el sello: se suelta donde nadie más aprueba (y la baja entera pasa,
+--        `auth.users` incluido), se niega donde alguien aprueba (45008), los
+--        dos remedios que nombra la pantalla destraban, y uno que ya cita una
+--        publicación se niega con 45010 en vez de morir con la FK del ledger.
+--   407  la postcondición: una membresía o un sello que aparecen a mitad de la
+--        baja la hacen negarse (40001) en vez de dejarlos para la cascada.
+--   408  una firma diferida (0026) muere ADENTRO de la función, no en el COMMIT.
+--
+-- Lo que esto NO mide: la carrera con dos sesiones de verdad. Este archivo es
+-- una sola transacción; los locks se miden en `supabase/qa/baja_concurrente.sh`.
+--
+-- FIXTURE PROPIA, `d0350000-…`. Toda usuaria nace con su organización personal
+-- de owner (`handle_new_user()`), y el armado se apoya en eso:
+--   alicia (a01) y beto (a02)   owners activas de X, la personal de alicia;
+--   carla (a03) y dora (a04)    owners activas de 1001 organizaciones;
+--   ulises (a05)                owner de la suya, para el vocabulario;
+--   sara (a06)                  owner ARCHIVADA de Z, la suya; eli (a09) editora
+--                               activa de Z; sara selló c01 en Z;
+--   tomas (a07)                 manager en W, la de mario (a08); selló c02 en W;
+--   lucia (a10)                 owner de la suya y viewer en W.
+RESET ROLE;
+
+INSERT INTO auth.users (id, email) VALUES
+    ('d0350000-0035-4035-8035-000000000a01', 'alicia35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a02', 'beto35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a03', 'carla35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a04', 'dora35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a05', 'ulises35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a06', 'sara35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a07', 'tomas35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a08', 'mario35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a09', 'eli35@example.test'),
+    ('d0350000-0035-4035-8035-000000000a10', 'lucia35@example.test');
+
+CREATE TEMP TABLE b35 AS
+SELECT (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a01' AND role = 'owner') AS org_x,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a03' AND role = 'owner') AS org_carla,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a05' AND role = 'owner') AS org_ulises,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a06' AND role = 'owner') AS org_z,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a08' AND role = 'owner') AS org_w,
+       (SELECT organization_id FROM org_members
+         WHERE user_id = 'd0350000-0035-4035-8035-000000000a10' AND role = 'owner') AS org_lucia;
+
+INSERT INTO org_members (organization_id, user_id, role)
+SELECT org_x, 'd0350000-0035-4035-8035-000000000a02'::uuid, 'owner' FROM b35
+UNION ALL
+SELECT org_z, 'd0350000-0035-4035-8035-000000000a09'::uuid, 'editor' FROM b35
+UNION ALL
+SELECT org_w, 'd0350000-0035-4035-8035-000000000a07'::uuid, 'manager' FROM b35
+UNION ALL
+SELECT org_w, 'd0350000-0035-4035-8035-000000000a10'::uuid, 'viewer' FROM b35;
+
+UPDATE org_members SET state = 'archived'
+ WHERE user_id = 'd0350000-0035-4035-8035-000000000a06'
+   AND organization_id = (SELECT org_z FROM b35);
+
+INSERT INTO organizations (id, name, slug)
+SELECT ('d0350000-0035-4035-9035-' || lpad(to_hex(i), 12, '0'))::uuid,
+       'Compartida 0035 ' || i, 'b35-compartida-' || i
+  FROM generate_series(1, 1001) i;
+
+INSERT INTO org_members (organization_id, user_id, role)
+SELECT o.id, u.id, 'owner'
+  FROM organizations o
+ CROSS JOIN (VALUES ('d0350000-0035-4035-8035-000000000a03'::uuid),
+                    ('d0350000-0035-4035-8035-000000000a04'::uuid)) u(id)
+ WHERE o.slug LIKE 'b35-compartida-%';
+
+INSERT INTO businesses (id, organization_id, name)
+SELECT 'd0350000-0035-4035-8035-000000000b01'::uuid, org_z, 'Negocio de Z' FROM b35
+UNION ALL
+SELECT 'd0350000-0035-4035-8035-000000000b02'::uuid, org_w, 'Negocio de W' FROM b35;
+
+INSERT INTO content_assets (id, organization_id, business_id, locale, kind, title, body, status)
+SELECT 'd0350000-0035-4035-8035-000000000c01'::uuid, org_z, 'd0350000-0035-4035-8035-000000000b01'::uuid,
+       'en', 'post', 'Sellado por sara en Z', 'cuerpo', 'draft' FROM b35
+UNION ALL
+SELECT 'd0350000-0035-4035-8035-000000000c02'::uuid, org_w, 'd0350000-0035-4035-8035-000000000b02'::uuid,
+       'en', 'post', 'Sellado por tomas en W', 'cuerpo', 'draft' FROM b35
+UNION ALL
+SELECT 'd0350000-0035-4035-8035-000000000c03'::uuid, org_w, 'd0350000-0035-4035-8035-000000000b02'::uuid,
+       'en', 'post', 'Borrador en W', 'cuerpo', 'draft' FROM b35;
+
+-- Los sellos los pone `postgres`, como en el 401: la 0033 lo exime de firmar
+-- como sí mismo, y es la fila que deja una aprobación hecha cuando sara todavía
+-- era owner activa.
+UPDATE content_assets
+   SET status = 'approved', approved_hash = payload_hash, approved_at = now(),
+       approved_by = CASE id WHEN 'd0350000-0035-4035-8035-000000000c01'
+                             THEN 'd0350000-0035-4035-8035-000000000a06'::uuid
+                             ELSE 'd0350000-0035-4035-8035-000000000a07'::uuid END
+ WHERE id IN ('d0350000-0035-4035-8035-000000000c01', 'd0350000-0035-4035-8035-000000000c02');
+
+-- Anti-vacuidad: cada pieza del armado está donde se dice. Sin las dos owners
+-- de X el 402 no tiene carrera; sin las 1001 el 403 no tiene qué truncar; sin
+-- el sello de sara en una Z sin quien apruebe, el 406 no tiene a quién soltar.
+DO $$
+DECLARE
+    faltan text;
+BEGIN
+    SELECT string_agg(pieza, ', ') INTO faltan
+      FROM (VALUES
+        ('X con dos owners activas',
+         (SELECT count(*) FROM org_members m, b35 WHERE m.organization_id = org_x
+             AND m.role = 'owner' AND m.state = 'active') = 2),
+        ('1001 compartidas con dos owners activas',
+         (SELECT count(*) FROM org_members m JOIN organizations o ON o.id = m.organization_id
+           WHERE o.slug LIKE 'b35-compartida-%' AND m.role = 'owner' AND m.state = 'active') = 2002),
+        ('sara owner archivada de Z',
+         EXISTS (SELECT 1 FROM org_members m, b35 WHERE m.organization_id = org_z
+                    AND m.user_id = 'd0350000-0035-4035-8035-000000000a06'
+                    AND m.role = 'owner' AND m.state = 'archived')),
+        ('eli editora activa de Z',
+         EXISTS (SELECT 1 FROM org_members m, b35 WHERE m.organization_id = org_z
+                    AND m.user_id = 'd0350000-0035-4035-8035-000000000a09'
+                    AND m.role = 'editor' AND m.state = 'active')),
+        ('c01 sellado por sara en Z',
+         EXISTS (SELECT 1 FROM content_assets c, b35 WHERE c.id = 'd0350000-0035-4035-8035-000000000c01'
+                    AND c.organization_id = org_z AND c.status = 'approved'
+                    AND c.approved_by = 'd0350000-0035-4035-8035-000000000a06')),
+        ('c02 sellado por tomas en W',
+         EXISTS (SELECT 1 FROM content_assets c, b35 WHERE c.id = 'd0350000-0035-4035-8035-000000000c02'
+                    AND c.organization_id = org_w AND c.status = 'approved'
+                    AND c.approved_by = 'd0350000-0035-4035-8035-000000000a07')),
+        ('tomas manager y lucia viewer en W, mario su owner activo',
+         (SELECT count(*) FROM org_members m, b35 WHERE m.organization_id = org_w AND m.state = 'active'
+             AND (m.user_id, m.role) IN (('d0350000-0035-4035-8035-000000000a07'::uuid, 'manager'),
+                                         ('d0350000-0035-4035-8035-000000000a10'::uuid, 'viewer'),
+                                         ('d0350000-0035-4035-8035-000000000a08'::uuid, 'owner'))) = 3)
+      ) AS f(pieza, ok)
+     WHERE NOT ok;
+    IF faltan IS NOT NULL THEN
+        RAISE EXCEPTION 'Vacuous run: la fixture de los bloques 402 a 408 no pobló: %', faltan;
+    END IF;
+END
+$$;
+
+-- Una baja con la función, como `service_role`, que se DESHACE siempre.
+-- `p_antes` corre antes como `postgres`; `p_mira` es una consulta escalar que se
+-- evalúa después: con la baja hecha si pasó, o con todo deshecho si murió.
+-- Sin `SET CONSTRAINTS ALL IMMEDIATE` a propósito: lo que la función no haga
+-- morir adentro no tiene que morir acá (bloque 408).
+CREATE TEMP TABLE b35r (bloque int, caso text, estado text, resultado jsonb, mira text);
+
+CREATE OR REPLACE FUNCTION pg_temp.b35_llamar(p_user uuid, p_antes text DEFAULT '', p_mira text DEFAULT NULL,
+                                              OUT estado text, OUT resultado jsonb, OUT mira text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    BEGIN
+        IF p_antes <> '' THEN
+            EXECUTE p_antes;
+        END IF;
+        SET LOCAL ROLE service_role;
+        resultado := public.delete_account_organizations(p_user);
+        RESET ROLE;
+        IF p_mira IS NOT NULL THEN
+            EXECUTE p_mira INTO mira;
+        END IF;
+        estado := 'ok';
+        RAISE EXCEPTION 'qa: deshacer la baja' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN;
+    END;
+EXCEPTION WHEN OTHERS THEN
+    estado := SQLSTATE || ' | ' || SQLERRM;
+    resultado := NULL;
+    IF p_mira IS NOT NULL THEN
+        mira := pg_temp.escalar(p_mira);
+    END IF;
+END
+$$;
+
+-- Lo que queda de una organización.
+CREATE OR REPLACE FUNCTION pg_temp.b35_org(p_org uuid) RETURNS text
+LANGUAGE sql AS $$
+    SELECT format('existe=%s owners_activos=%s miembros=%s',
+                  EXISTS (SELECT 1 FROM public.organizations WHERE id = p_org),
+                  (SELECT count(*) FROM public.org_members
+                    WHERE organization_id = p_org AND role = 'owner' AND state = 'active'),
+                  (SELECT count(*) FROM public.org_members WHERE organization_id = p_org));
+$$;
+
+-- ── 402 ──────────────────────────────────────────────────────────────────────
+-- a. La secuencia de #117 intercalada: las dos lecturas antes que cualquier
+--    borrado —lo que pasa cuando las dos bajas llegan juntas—, y después cada
+--    una hace lo que leyó. X queda en pie y sin nadie.
+CREATE OR REPLACE FUNCTION pg_temp.b402_vieja() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    x       uuid := (SELECT org_x FROM b35);
+    alicia  uuid := 'd0350000-0035-4035-8035-000000000a01';
+    beto    uuid := 'd0350000-0035-4035-8035-000000000a02';
+    a_comparte boolean;
+    b_comparte boolean;
+    salida  text;
+BEGIN
+    BEGIN
+        a_comparte := EXISTS (SELECT 1 FROM org_members WHERE organization_id = x AND role = 'owner'
+                                 AND state = 'active' AND user_id <> alicia);
+        b_comparte := EXISTS (SELECT 1 FROM org_members WHERE organization_id = x AND role = 'owner'
+                                 AND state = 'active' AND user_id <> beto);
+        IF a_comparte THEN
+            DELETE FROM org_members WHERE organization_id = x AND user_id = alicia;
+        ELSE
+            DELETE FROM organizations WHERE id = x;
+        END IF;
+        IF b_comparte THEN
+            DELETE FROM org_members WHERE organization_id = x AND user_id = beto;
+        ELSE
+            DELETE FROM organizations WHERE id = x;
+        END IF;
+        salida := pg_temp.b35_org(x);
+        RAISE EXCEPTION 'qa: deshacer' USING ERRCODE = 'QA000';
+    EXCEPTION WHEN SQLSTATE 'QA000' THEN
+        RETURN salida;
+    END;
+END
+$$;
+
+INSERT INTO b35r (bloque, caso, estado) VALUES (402, 'a', pg_temp.b402_vieja());
+
+-- b. La función para alicia: sale de X, que queda con beto.
+-- c. La función para beto DESPUÉS de la de alicia, que es el orden que los
+--    locks imponen cuando llegan juntas: beto ya es la única owner y X se va.
+INSERT INTO b35r
+SELECT 402, 'b', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a01', '',
+           format('SELECT pg_temp.b35_org(%L)', (SELECT org_x FROM b35))) l;
+INSERT INTO b35r
+SELECT 402, 'c', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a02',
+           'SELECT public.delete_account_organizations(''d0350000-0035-4035-8035-000000000a01'')',
+           format('SELECT pg_temp.b35_org(%L)', (SELECT org_x FROM b35))) l;
+
+INSERT INTO defect_report
+SELECT 402, 'dos co-owners que se dan de baja dejan su organización sin nadie',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'con la secuencia de #117 intercalada X queda ' || a.estado ||
+                 '; con la función, alicia sale (X ' || b.mira || ') y beto, ya única owner, ' ||
+                 'se la lleva (' || c.mira || ')'
+            ELSE 'secuencia vieja: ' || a.estado || ' / alicia: ' || coalesce(b.estado, '?') || ' ' ||
+                 coalesce(b.resultado::text, '') || ' ' || coalesce(b.mira, '') ||
+                 ' / beto después: ' || coalesce(c.estado, '?') || ' ' ||
+                 coalesce(c.resultado::text, '') || ' ' || coalesce(c.mira, '') END
+  FROM (SELECT * FROM b35r WHERE bloque = 402 AND caso = 'a') a,
+       (SELECT * FROM b35r WHERE bloque = 402 AND caso = 'b') b,
+       (SELECT * FROM b35r WHERE bloque = 402 AND caso = 'c') c,
+       b35,
+       LATERAL (SELECT
+           a.estado = 'existe=t owners_activos=0 miembros=0'
+           AND b.estado = 'ok'
+           AND b.resultado->'left_organizations' ? org_x::text
+           AND NOT b.resultado->'deleted_organizations' ? org_x::text
+           AND b.mira = 'existe=t owners_activos=1 miembros=1'
+           AND c.estado = 'ok'
+           AND c.resultado->'deleted_organizations' ? org_x::text
+           AND c.mira = 'existe=f owners_activos=0 miembros=0' AS ok) v;
+
+-- ── 403 ──────────────────────────────────────────────────────────────────────
+-- a. La lectura de #117 («otros owners activos de las que soy owner»), cortada
+--    en 1000 filas como la corta PostgREST, sin error. Lo que no vuelve se lee
+--    «no hay otro owner» y va a «propias».
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 403, 'a', format('leidas_propias=%s verdad=%s',
+    (SELECT count(*) FROM org_members m
+      WHERE m.user_id = 'd0350000-0035-4035-8035-000000000a03' AND m.role = 'owner' AND m.state = 'active'
+        AND m.organization_id NOT IN (
+            SELECT o.organization_id FROM org_members o
+             WHERE o.organization_id IN (SELECT organization_id FROM org_members
+                                          WHERE user_id = 'd0350000-0035-4035-8035-000000000a03'
+                                            AND role = 'owner' AND state = 'active')
+               AND o.role = 'owner' AND o.state = 'active'
+               AND o.user_id <> 'd0350000-0035-4035-8035-000000000a03'
+             LIMIT 1000)),
+    (SELECT count(*) FROM org_members m
+      WHERE m.user_id = 'd0350000-0035-4035-8035-000000000a03' AND m.role = 'owner' AND m.state = 'active'
+        AND NOT EXISTS (SELECT 1 FROM org_members o
+                         WHERE o.organization_id = m.organization_id AND o.role = 'owner'
+                           AND o.state = 'active' AND o.user_id <> m.user_id)));
+
+-- b. La función: borra sólo la personal de carla y sale de las 1001.
+INSERT INTO b35r
+SELECT 403, 'b', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a03', '',
+    'SELECT ''compartidas_en_pie='' || count(*) FROM organizations o
+      WHERE o.slug LIKE ''b35-compartida-%''
+        AND EXISTS (SELECT 1 FROM org_members m WHERE m.organization_id = o.id
+                       AND m.user_id = ''d0350000-0035-4035-8035-000000000a04'' AND m.role = ''owner'')') l;
+
+-- c. Y lo que devuelve es UNA fila: `max_rows` corta filas, no un escalar.
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 403, 'c', format('setof=%s tipo=%s', p.proretset, p.prorettype::regtype)
+  FROM pg_proc p
+ WHERE p.oid = 'public.delete_account_organizations(uuid)'::regprocedure;
+
+INSERT INTO defect_report
+SELECT 403, '«no hay otro owner» sale de una lectura que max_rows puede cortar',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'cortada en 1000, la lectura de #117 da ' || a.estado || '; la función borra 1 ' ||
+                 '(la personal de carla), sale de ' || jsonb_array_length(b.resultado->'left_organizations') ||
+                 ' y deja ' || b.mira || '; devuelve ' || c.estado
+            ELSE 'lectura cortada: ' || a.estado || ' / función: ' || coalesce(b.estado, '?') || ' borradas=' ||
+                 coalesce(jsonb_array_length(b.resultado->'deleted_organizations')::text, '?') || ' salidas=' ||
+                 coalesce(jsonb_array_length(b.resultado->'left_organizations')::text, '?') || ' ' ||
+                 coalesce(b.mira, '') || ' / ' || c.estado END
+  FROM (SELECT * FROM b35r WHERE bloque = 403 AND caso = 'a') a,
+       (SELECT * FROM b35r WHERE bloque = 403 AND caso = 'b') b,
+       (SELECT * FROM b35r WHERE bloque = 403 AND caso = 'c') c,
+       b35,
+       LATERAL (SELECT
+           a.estado = 'leidas_propias=2 verdad=1'
+           AND b.estado = 'ok'
+           AND b.resultado->'deleted_organizations' = jsonb_build_array(org_carla::text)
+           AND jsonb_array_length(b.resultado->'left_organizations') = 1001
+           AND b.mira = 'compartidas_en_pie=1001'
+           AND c.estado = 'setof=f tipo=jsonb' AS ok) v;
+
+-- ── 404 ──────────────────────────────────────────────────────────────────────
+-- a. Hoy un estado o un rol desconocidos no pueden existir: NOT NULL y los CHECK
+--    de la 0013 y la 0031. Son el vocabulario que la función conoce; si cambian,
+--    esto se pone rojo y obliga a enseñárselo a la función.
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 404, 'a', string_agg(format('%s:%s', d.nombre, d.v), ' / ' ORDER BY d.nombre)
+  FROM (SELECT c.conname AS nombre, pg_get_constraintdef(c.oid) AS v
+          FROM pg_constraint c
+         WHERE c.conrelid = 'public.org_members'::regclass
+           AND c.conname IN ('org_members_state_check', 'org_members_role_check')
+        UNION ALL
+        SELECT 'notnull_' || a.attname, a.attnotnull::text
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.org_members'::regclass AND a.attname IN ('state', 'role')) d;
+
+-- b. Si el CHECK de estado cayera y la membresía owner de ulises dijera
+--    'suspended', #117 la leía «no owner», salía y dejaba la suya sin owner.
+-- c. Lo mismo con un rol que nadie conoce.
+-- d. Y con un estado desconocido en OTRA membresía de una candidata.
+-- e. CONTROL: sin nada raro, la suya se borra.
+INSERT INTO b35r
+SELECT 404, 'b', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a05',
+    'ALTER TABLE public.org_members DROP CONSTRAINT org_members_state_check; ' ||
+    'UPDATE public.org_members SET state = ''suspended'' ' ||
+    'WHERE user_id = ''d0350000-0035-4035-8035-000000000a05'' AND role = ''owner''',
+    format('SELECT pg_temp.b35_org(%L)', (SELECT org_ulises FROM b35))) l;
+INSERT INTO b35r
+SELECT 404, 'c', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a05',
+    'ALTER TABLE public.org_members DROP CONSTRAINT org_members_role_check; ' ||
+    'UPDATE public.org_members SET role = ''superowner'' ' ||
+    'WHERE user_id = ''d0350000-0035-4035-8035-000000000a05'' AND role = ''owner''') l;
+INSERT INTO b35r
+SELECT 404, 'd', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a05',
+    format('ALTER TABLE public.org_members DROP CONSTRAINT org_members_state_check; ' ||
+           'INSERT INTO public.org_members (organization_id, user_id, role, state) ' ||
+           'VALUES (%L, ''d0350000-0035-4035-8035-000000000a04'', ''viewer'', ''pending'')',
+           (SELECT org_ulises FROM b35))) l;
+INSERT INTO b35r
+SELECT 404, 'e', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a05') l;
+-- f. Y al revés: un miembro de CADA rol del CHECK (leído del catálogo, no de
+--    una lista) en la suya —el owner, archivado, para que ulises siga siendo la
+--    única owner activa— no la hace negarse. Una función que conociera MENOS
+--    roles que el esquema se negaría a dar de baja a cualquiera con un client
+--    en su organización.
+INSERT INTO b35r
+SELECT 404, 'f', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a05',
+    format('INSERT INTO public.org_members (organization_id, user_id, role, state) '
+           'SELECT %L, u.id, r.rol, CASE r.rol WHEN ''owner'' THEN ''archived'' ELSE ''active'' END '
+           'FROM (SELECT rol, row_number() OVER (ORDER BY rol) AS n FROM ('
+           '  SELECT (regexp_matches(pg_get_constraintdef(c.oid), $r$''([a-z_]+)''::text$r$, ''g''))[1] AS rol '
+           '    FROM pg_constraint c WHERE c.conrelid = ''public.org_members''::regclass '
+           '     AND c.conname = ''org_members_role_check'') x) r '
+           'JOIN (SELECT id, row_number() OVER (ORDER BY id) AS n FROM unnest(%L::uuid[]) id) u USING (n)',
+           (SELECT org_ulises FROM b35),
+           ARRAY['d0350000-0035-4035-8035-000000000a01', 'd0350000-0035-4035-8035-000000000a02',
+                 'd0350000-0035-4035-8035-000000000a03', 'd0350000-0035-4035-8035-000000000a04',
+                 'd0350000-0035-4035-8035-000000000a06', 'd0350000-0035-4035-8035-000000000a07',
+                 'd0350000-0035-4035-8035-000000000a08', 'd0350000-0035-4035-8035-000000000a09',
+                 'd0350000-0035-4035-8035-000000000a10']),
+    format('SELECT count(*)::text FROM org_members WHERE organization_id = %L', (SELECT org_ulises FROM b35))) l;
+
+INSERT INTO defect_report
+SELECT 404, 'una membresía con un estado o un rol que la baja no conoce se clasifica igual',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'state y role son NOT NULL con los CHECK de siempre; sin ellos, un owner ''suspended'', ' ||
+                 'un rol ''superowner'' o un miembro ''pending'' hacen negarse a la función (45009 x3); ' ||
+                 'sin nada raro la suya se borra, también con un miembro de cada rol del CHECK'
+            ELSE 'catálogo: ' || a.estado || ' / suspended: ' || b.estado || ' ' || coalesce(b.mira, '') ||
+                 ' / superowner: ' || c.estado || ' / pending: ' || d.estado ||
+                 ' / control: ' || e.estado || ' ' || coalesce(e.resultado::text, '') ||
+                 ' / un miembro de cada rol: ' || f.estado || ' ' || coalesce(f.resultado::text, '') ||
+                 ' quedan=' || coalesce(f.mira, '?') END
+  FROM (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'a') a,
+       (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'b') b,
+       (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'c') c,
+       (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'd') d,
+       (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'e') e,
+       (SELECT * FROM b35r WHERE bloque = 404 AND caso = 'f') f,
+       b35,
+       LATERAL (SELECT
+           a.estado = 'notnull_role:true / notnull_state:true / '
+                      'org_members_role_check:CHECK ((role = ANY (ARRAY[''owner''::text, ''admin''::text, '
+                      '''manager''::text, ''editor''::text, ''viewer''::text, ''client''::text]))) / '
+                      'org_members_state_check:CHECK ((state = ANY (ARRAY[''active''::text, ''archived''::text])))'
+           AND b.estado LIKE '45009 |%suspended%'
+           AND c.estado LIKE '45009 |%superowner%'
+           AND d.estado LIKE '45009 |%pending%'
+           AND e.estado = 'ok'
+           AND e.resultado->'deleted_organizations' = jsonb_build_array(org_ulises::text)
+           AND f.estado = 'ok'
+           AND f.resultado->'deleted_organizations' = jsonb_build_array(org_ulises::text)
+           AND f.mira = '0' AS ok) v;
+
+-- ── 405 ──────────────────────────────────────────────────────────────────────
+-- Sólo `service_role` la ejecuta (ver «QUIÉN LA LLAMA» en la 0035): la llama el
+-- servidor después de `getUser()`, nunca el navegador. Por catálogo y llamándola
+-- con cada rol; `al_commit()` deshace lo que pase.
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 405, 'a', format('ejecutan=%s secdef=%s volatil=%s config=%s',
+    (SELECT string_agg(CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END, ','
+                       ORDER BY CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END)
+       FROM aclexplode(p.proacl) x WHERE x.privilege_type = 'EXECUTE'),
+    p.prosecdef, p.provolatile, array_to_string(p.proconfig, ','))
+  FROM pg_proc p
+ WHERE p.oid = 'public.delete_account_organizations(uuid)'::regprocedure;
+
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 405, r.rol, pg_temp.al_commit(
+           'SELECT public.delete_account_organizations(''d0350000-0035-4035-8035-000000000a05'')', r.rol)
+  FROM (VALUES ('anon'), ('authenticated'), ('growthos_app'), ('service_role')) r(rol);
+
+INSERT INTO defect_report
+SELECT 405, 'la baja en la base la puede ejecutar otro rol que service_role, o perdió sus atributos',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'sólo postgres (dueña) y service_role la ejecutan; anon, authenticated y growthos_app ' ||
+                 'mueren con 42501 en la función; SECURITY DEFINER, volátil, search_path vacío y lock_timeout 5s'
+            ELSE 'catálogo: ' || a || ' / anon: ' || an || ' / authenticated: ' || au ||
+                 ' / growthos_app: ' || ga || ' / service_role: ' || sr END
+  FROM (SELECT max(estado) FILTER (WHERE caso = 'a') AS a,
+               max(estado) FILTER (WHERE caso = 'anon') AS an,
+               max(estado) FILTER (WHERE caso = 'authenticated') AS au,
+               max(estado) FILTER (WHERE caso = 'growthos_app') AS ga,
+               max(estado) FILTER (WHERE caso = 'service_role') AS sr
+          FROM b35r WHERE bloque = 405) x,
+       LATERAL (SELECT
+           a = 'ejecutan=postgres,service_role secdef=t volatil=v config=search_path="",lock_timeout=5s'
+           AND an = '42501 | permission denied for function delete_account_organizations'
+           AND au = '42501 | permission denied for function delete_account_organizations'
+           AND ga = '42501 | permission denied for function delete_account_organizations'
+           AND sr = 'paso' AS ok) v;
+
+-- ── 406 ──────────────────────────────────────────────────────────────────────
+-- a. La premisa: en Z nadie más aprueba. sara está archivada y eli es editora
+--    (activa, pero no aprueba: 0031, D4; podría volverlo a borrador, no
+--    re-firmarlo). Con #117 la baja de sara se negaba con «pedile a esa
+--    organización», y en Z nadie puede re-firmar.
+INSERT INTO b35r (bloque, caso, estado)
+SELECT 406, 'a', format('aprueban_activos=%s activos=%s',
+    (SELECT count(*) FROM org_members m WHERE m.organization_id = org_z AND m.state = 'active'
+        AND m.role IN ('owner', 'admin', 'manager')
+        AND m.user_id <> 'd0350000-0035-4035-8035-000000000a06'),
+    (SELECT count(*) FROM org_members m WHERE m.organization_id = org_z AND m.state = 'active'))
+  FROM b35;
+
+-- b. La función suelta el sello, sara sale de Z (que queda), y después el
+--    borrado de `auth.users` —lo que hace GoTrue— PASA: la baja entera termina.
+INSERT INTO b35r
+SELECT 406, 'b', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a06', '',
+    format('WITH d AS (DELETE FROM auth.users WHERE id = ''d0350000-0035-4035-8035-000000000a06'' RETURNING 1) '
+           'SELECT format(''c01=%%s/%%s z=%%s login_borrado=%%s'', c.status, c.approved_by IS NULL, '
+           'pg_temp.b35_org(%L), (SELECT count(*) FROM d)) '
+           'FROM content_assets c WHERE c.id = ''d0350000-0035-4035-8035-000000000c01''',
+           (SELECT org_z FROM b35))) l;
+
+-- c. En W aprueba mario: la baja de tomas se niega (45008) y no toca nada.
+INSERT INTO b35r
+SELECT 406, 'c', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a07', '',
+    'SELECT format(''c02=%s membresias_de_tomas=%s'', c.approved_by = ''d0350000-0035-4035-8035-000000000a07'', '
+    '(SELECT count(*) FROM org_members WHERE user_id = ''d0350000-0035-4035-8035-000000000a07'')) '
+    'FROM content_assets c WHERE c.id = ''d0350000-0035-4035-8035-000000000c02''') l;
+
+-- d. y e. Los dos remedios que nombra la pantalla: mario lo re-firma, o lo
+--    vuelve a borrador. Los dos destraban, y la función no suelta nada.
+INSERT INTO b35r
+SELECT 406, 'd', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a07',
+    'UPDATE public.content_assets SET approved_by = ''d0350000-0035-4035-8035-000000000a08'' '
+    'WHERE id = ''d0350000-0035-4035-8035-000000000c02''') l;
+INSERT INTO b35r
+SELECT 406, 'e', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a07',
+    'UPDATE public.content_assets SET status = ''draft'', approved_hash = NULL, approved_by = NULL, '
+    'approved_at = NULL WHERE id = ''d0350000-0035-4035-8035-000000000c02''') l;
+
+-- f. Y si el sello de sara en Z YA CITA UNA PUBLICACIÓN (acá, una pendiente):
+--    soltarlo no se puede, porque la FK del ledger (0016) ata la fila al hash
+--    aprobado. La baja se niega con 45010 —no con el 23503 en
+--    `publications_asset_fkey` que la pantalla leía como una firma— y no toca
+--    nada. Encontrado por la revisión del 2026-10-26: la fixture de (b) no
+--    tenía publicación, y en hosted dos de los tres sellos la tienen.
+INSERT INTO b35r
+SELECT 406, 'f', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a06',
+    'INSERT INTO public.publications (organization_id, asset_id, approved_hash, destination, status) '
+    'SELECT organization_id, id, approved_hash, ''google_business_profile'', ''pending'' '
+    'FROM public.content_assets WHERE id = ''d0350000-0035-4035-8035-000000000c01''',
+    'SELECT format(''c01=%s/%s membresias_de_sara=%s'', c.status, '
+    'c.approved_by = ''d0350000-0035-4035-8035-000000000a06'', '
+    '(SELECT count(*) FROM org_members WHERE user_id = ''d0350000-0035-4035-8035-000000000a06'')) '
+    'FROM content_assets c WHERE c.id = ''d0350000-0035-4035-8035-000000000c01''') l;
+
+INSERT INTO defect_report
+SELECT 406, 'un sello donde nadie más aprueba traba la baja para siempre, uno donde alguien aprueba se suelta solo, o uno publicado muere como firma',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'en Z (' || a.estado || ') el sello de sara se suelta y la baja termina: ' || b.mira ||
+                 '; en W, donde aprueba mario, la de tomas se niega con 45008 sin tocar nada (' || c.mira ||
+                 '), y re-firmar o volver a borrador la destraban; un sello que ya cita una publicación ' ||
+                 'no se suelta: 45010, sin tocar nada (' || f.mira || ')'
+            ELSE 'premisa: ' || a.estado || ' / sara: ' || coalesce(b.estado, '?') || ' ' ||
+                 coalesce(b.resultado::text, '') || ' ' || coalesce(b.mira, '') ||
+                 ' / tomas: ' || coalesce(c.estado, '?') || ' ' || coalesce(c.mira, '') ||
+                 ' / re-firmado: ' || coalesce(d.estado, '?') || ' ' || coalesce(d.resultado::text, '') ||
+                 ' / a borrador: ' || coalesce(e.estado, '?') ||
+                 ' / sello con publicación: ' || coalesce(f.estado, '?') || ' ' || coalesce(f.mira, '') END
+  FROM (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'a') a,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'b') b,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'c') c,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'd') d,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'e') e,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'f') f,
+       b35,
+       LATERAL (SELECT
+           a.estado = 'aprueban_activos=0 activos=1'
+           AND b.estado = 'ok'
+           AND b.resultado->'released_seals' = '["d0350000-0035-4035-8035-000000000c01"]'::jsonb
+           AND b.resultado->'left_organizations' ? org_z::text
+           AND b.resultado->'deleted_organizations' = '[]'::jsonb
+           AND b.mira = 'c01=draft/t z=existe=t owners_activos=0 miembros=1 login_borrado=1'
+           AND c.estado LIKE '45008 |%'
+           AND c.mira = 'c02=t membresias_de_tomas=2'
+           AND d.estado = 'ok' AND d.resultado->'released_seals' = '[]'::jsonb
+           AND d.resultado->'left_organizations' ? org_w::text
+           AND e.estado = 'ok' AND e.resultado->'released_seals' = '[]'::jsonb
+           AND f.estado LIKE '45010 |%'
+           AND f.mira = 'c01=approved/t membresias_de_sara=1' AS ok) v;
+
+-- ── 407 ──────────────────────────────────────────────────────────────────────
+-- La postcondición. Una membresía o un sello de la persona que aparecen
+-- DESPUÉS de los locks —otra pestaña que crea una organización, o que
+-- aprueba— no se borran a ciegas ni se dejan para la cascada de `auth.users`:
+-- la función se niega (40001) y el reintento los clasifica. Este archivo es una
+-- sola sesión, así que el «después» lo pone un trigger temporal que corre a
+-- mitad de la función:
+--   a. al borrar la personal de lucia, una membresía suya aparece en X;
+--   b. al sacarla de W, un sello suyo aparece en c03;
+--   c. CONTROL: sin triggers, pasa.
+INSERT INTO b35r
+SELECT 407, 'a', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a10',
+    format('CREATE FUNCTION public.b35_aparece_membresia() RETURNS trigger LANGUAGE plpgsql AS '
+           '$t$ BEGIN INSERT INTO public.org_members (organization_id, user_id, role) '
+           'VALUES (%L, ''d0350000-0035-4035-8035-000000000a10'', ''viewer''); RETURN NULL; END $t$; '
+           'CREATE TRIGGER b35_aparece AFTER DELETE ON public.organizations FOR EACH ROW '
+           'WHEN (OLD.id = %L) EXECUTE FUNCTION public.b35_aparece_membresia()',
+           (SELECT org_x FROM b35), (SELECT org_lucia FROM b35))) l;
+INSERT INTO b35r
+SELECT 407, 'b', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a10',
+    format('CREATE FUNCTION public.b35_aparece_sello() RETURNS trigger LANGUAGE plpgsql AS '
+           '$t$ BEGIN UPDATE public.content_assets SET status = ''approved'', approved_hash = payload_hash, '
+           'approved_at = now(), approved_by = ''d0350000-0035-4035-8035-000000000a10'' '
+           'WHERE id = ''d0350000-0035-4035-8035-000000000c03''; RETURN NULL; END $t$; '
+           'CREATE TRIGGER b35_aparece AFTER DELETE ON public.org_members FOR EACH ROW '
+           'WHEN (OLD.organization_id = %L AND OLD.user_id = ''d0350000-0035-4035-8035-000000000a10'') '
+           'EXECUTE FUNCTION public.b35_aparece_sello()',
+           (SELECT org_w FROM b35))) l;
+INSERT INTO b35r
+SELECT 407, 'c', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a10') l;
+
+INSERT INTO defect_report
+SELECT 407, 'una membresía o un sello que aparecen a mitad de la baja quedan para la cascada de auth.users',
+       NOT ok,
+       CASE WHEN ok
+            THEN 'una membresía nueva en X y un sello nuevo en W, aparecidos a mitad de la baja de lucia, ' ||
+                 'la hacen negarse con 40001; sin ellos pasa'
+            ELSE 'membresía: ' || coalesce(a.estado, '?') || ' ' || coalesce(a.resultado::text, '') ||
+                 ' / sello: ' || coalesce(b.estado, '?') || ' ' || coalesce(b.resultado::text, '') ||
+                 ' / control: ' || coalesce(c.estado, '?') END
+  FROM (SELECT * FROM b35r WHERE bloque = 407 AND caso = 'a') a,
+       (SELECT * FROM b35r WHERE bloque = 407 AND caso = 'b') b,
+       (SELECT * FROM b35r WHERE bloque = 407 AND caso = 'c') c,
+       LATERAL (SELECT
+           a.estado LIKE '40001 |%membresia%'
+           AND b.estado LIKE '40001 |%sello%'
+           AND c.estado = 'ok' AS ok) v;
+
+-- ── 408 ──────────────────────────────────────────────────────────────────────
+-- víctor (fixture de los 118 a 120) verificó evidencia en la organización de
+-- olga. Esa FK (0026) es DEFERRABLE INITIALLY DEFERRED: sin el
+-- `SET CONSTRAINTS ALL IMMEDIATE` de la función, la salida «pasaba», la función
+-- devolvía lo que había borrado, y el rechazo llegaba recién en el COMMIT.
+-- `b35_llamar()` no pone las constraints en inmediato: si muere, murió adentro.
+INSERT INTO b35r
+SELECT 408, 'a', l.* FROM pg_temp.b35_llamar('d0260000-0026-4026-8026-000000000a02', '',
+    format('SELECT format(''en_la_de_olga=%%s membresias=%%s'', '
+           'EXISTS (SELECT 1 FROM org_members WHERE organization_id = %L '
+           'AND user_id = ''d0260000-0026-4026-8026-000000000a02''), '
+           '(SELECT count(*) FROM org_members WHERE user_id = ''d0260000-0026-4026-8026-000000000a02''))',
+           (SELECT org FROM baja))) l;
+
+INSERT INTO defect_report
+SELECT 408, 'la baja en la base devuelve lo que borró y la firma diferida la rechaza recién en el COMMIT',
+       NOT (a.estado LIKE '23503 |%"profile_evidence_verified_by_member_fkey"%'
+            AND a.mira = 'en_la_de_olga=t membresias=2'),
+       CASE WHEN a.estado LIKE '23503 |%"profile_evidence_verified_by_member_fkey"%'
+                 AND a.mira = 'en_la_de_olga=t membresias=2'
+            THEN 'la baja de víctor muere ADENTRO de la función con 23503 en profile_evidence_verified_by_member_fkey, ' ||
+                 'y no se borró nada (' || a.mira || ')'
+            ELSE 'víctor: ' || coalesce(a.estado, '?') || ' ' || coalesce(a.resultado::text, '') ||
+                 ' ' || coalesce(a.mira, '') END
+  FROM (SELECT * FROM b35r WHERE bloque = 408 AND caso = 'a') a;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Report
 -- ─────────────────────────────────────────────────────────────────────────────
--- Anti-vacuity: a hundred and ninety-four checks were written, so a hundred
--- and ninety-four rows must be present. Fewer means a check silently failed to record and the report is lying
+-- Anti-vacuity: two hundred and one checks were written, so two hundred
+-- and one rows must be present. Fewer means a check silently failed to record and the report is lying
 -- by omission.
 --
 -- La numeración salta del 143 al 200 a propósito: los bloques de la 0031 (H4.1)
@@ -10571,8 +11225,10 @@ SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante
 -- regla desde el 220, escritos con la 0032 en un PR abierto. Los de la 0034
 -- (230 a 241) siguen después de los de la 0033. Los 400 y 401 (la baja de
 -- cuenta) no son de una migración: arrancan en 400 para no chocar con ningún
--- rango de migración abierto. El conteo de abajo es de FILAS, no el número más
--- alto: 143 + 17 + 12 + 8 + 12 + 2.
+-- rango de migración abierto. Los 402 a 408 son de la 0035, la baja en una
+-- transacción: siguen en el rango de la baja, escritos con la 0034 en un PR
+-- abierto. El conteo de abajo es de FILAS, no el número más alto:
+-- 143 + 17 + 12 + 8 + 12 + 2 + 7.
 --
 -- El número de esta prosa estuvo DESFASADO del código —decía «sixty-eight»
 -- mientras el código exigía 76— en el archivo cuyo trabajo es que los números no
@@ -10587,8 +11243,8 @@ DECLARE
     detail    text;
 BEGIN
     SELECT count(*) INTO checks FROM defect_report;
-    IF checks <> 194 THEN
-        RAISE EXCEPTION 'Vacuous run: % of 194 checks recorded a result.', checks;
+    IF checks <> 201 THEN
+        RAISE EXCEPTION 'Vacuous run: % of 201 checks recorded a result.', checks;
     END IF;
 
     SELECT count(*) INTO n_present FROM defect_report d WHERE d.present;
@@ -10599,11 +11255,11 @@ BEGIN
       FROM defect_report d WHERE d.present;
 
     IF n_present > 0 THEN
-        RAISE EXCEPTION E'% of 194 isolation defects are live in this schema:\n%',
+        RAISE EXCEPTION E'% of 201 isolation defects are live in this schema:\n%',
             n_present, detail;
     END IF;
 
-    RAISE NOTICE 'All 194 checks green: the schema prevents every one of them.';
+    RAISE NOTICE 'All 201 checks green: the schema prevents every one of them.';
 END
 $$;
 

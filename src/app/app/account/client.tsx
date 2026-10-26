@@ -125,7 +125,8 @@ export function DeleteAccountButton() {
           <p className="mt-1 text-[12px] text-red-300/80">
             Right to erasure — permanently removes your account. Organizations that are only
             yours are deleted with all their data; organizations you share with another owner,
-            or do not own, stay without you. Cannot be undone.
+            or do not own, stay without you. Content you approved where no one else can approve
+            goes back to draft. Cannot be undone.
           </p>
         </div>
       </div>
