@@ -10590,8 +10590,9 @@ SELECT 401, 'un sello en una organización ajena no traba la baja de su firmante
 --        catálogo; y si dejaran de serlo, la función se niega (45009).
 --   405  quién la llama: sólo `service_role`; y sus atributos.
 --   406  el sello: se suelta donde nadie más aprueba (y la baja entera pasa,
---        `auth.users` incluido), se niega donde alguien aprueba (45008), y los
---        dos remedios que nombra la pantalla destraban.
+--        `auth.users` incluido), se niega donde alguien aprueba (45008), los
+--        dos remedios que nombra la pantalla destraban, y uno que ya cita una
+--        publicación se niega con 45010 en vez de morir con la FK del ledger.
 --   407  la postcondición: una membresía o un sello que aparecen a mitad de la
 --        baja la hacen negarse (40001) en vez de dejarlos para la cascada.
 --   408  una firma diferida (0026) muere ADENTRO de la función, no en el COMMIT.
@@ -11044,8 +11045,9 @@ SELECT 405, 'la baja en la base la puede ejecutar otro rol que service_role, o p
 
 -- ── 406 ──────────────────────────────────────────────────────────────────────
 -- a. La premisa: en Z nadie más aprueba. sara está archivada y eli es editora
---    (activa, pero no aprueba: 0031, D4). Con #117 la baja de sara se negaba
---    con «pedile a esa organización», y en Z no hay a quién.
+--    (activa, pero no aprueba: 0031, D4; podría volverlo a borrador, no
+--    re-firmarlo). Con #117 la baja de sara se negaba con «pedile a esa
+--    organización», y en Z nadie puede re-firmar.
 INSERT INTO b35r (bloque, caso, estado)
 SELECT 406, 'a', format('aprueban_activos=%s activos=%s',
     (SELECT count(*) FROM org_members m WHERE m.organization_id = org_z AND m.state = 'active'
@@ -11082,23 +11084,42 @@ SELECT 406, 'e', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a
     'UPDATE public.content_assets SET status = ''draft'', approved_hash = NULL, approved_by = NULL, '
     'approved_at = NULL WHERE id = ''d0350000-0035-4035-8035-000000000c02''') l;
 
+-- f. Y si el sello de sara en Z YA CITA UNA PUBLICACIÓN (acá, una pendiente):
+--    soltarlo no se puede, porque la FK del ledger (0016) ata la fila al hash
+--    aprobado. La baja se niega con 45010 —no con el 23503 en
+--    `publications_asset_fkey` que la pantalla leía como una firma— y no toca
+--    nada. Encontrado por la revisión del 2026-10-26: la fixture de (b) no
+--    tenía publicación, y en hosted dos de los tres sellos la tienen.
+INSERT INTO b35r
+SELECT 406, 'f', l.* FROM pg_temp.b35_llamar('d0350000-0035-4035-8035-000000000a06',
+    'INSERT INTO public.publications (organization_id, asset_id, approved_hash, destination, status) '
+    'SELECT organization_id, id, approved_hash, ''google_business_profile'', ''pending'' '
+    'FROM public.content_assets WHERE id = ''d0350000-0035-4035-8035-000000000c01''',
+    'SELECT format(''c01=%s/%s membresias_de_sara=%s'', c.status, '
+    'c.approved_by = ''d0350000-0035-4035-8035-000000000a06'', '
+    '(SELECT count(*) FROM org_members WHERE user_id = ''d0350000-0035-4035-8035-000000000a06'')) '
+    'FROM content_assets c WHERE c.id = ''d0350000-0035-4035-8035-000000000c01''') l;
+
 INSERT INTO defect_report
-SELECT 406, 'un sello donde nadie más aprueba traba la baja para siempre, o uno donde alguien aprueba se suelta solo',
+SELECT 406, 'un sello donde nadie más aprueba traba la baja para siempre, uno donde alguien aprueba se suelta solo, o uno publicado muere como firma',
        NOT ok,
        CASE WHEN ok
             THEN 'en Z (' || a.estado || ') el sello de sara se suelta y la baja termina: ' || b.mira ||
                  '; en W, donde aprueba mario, la de tomas se niega con 45008 sin tocar nada (' || c.mira ||
-                 '), y re-firmar o volver a borrador la destraban'
+                 '), y re-firmar o volver a borrador la destraban; un sello que ya cita una publicación ' ||
+                 'no se suelta: 45010, sin tocar nada (' || f.mira || ')'
             ELSE 'premisa: ' || a.estado || ' / sara: ' || coalesce(b.estado, '?') || ' ' ||
                  coalesce(b.resultado::text, '') || ' ' || coalesce(b.mira, '') ||
                  ' / tomas: ' || coalesce(c.estado, '?') || ' ' || coalesce(c.mira, '') ||
                  ' / re-firmado: ' || coalesce(d.estado, '?') || ' ' || coalesce(d.resultado::text, '') ||
-                 ' / a borrador: ' || coalesce(e.estado, '?') END
+                 ' / a borrador: ' || coalesce(e.estado, '?') ||
+                 ' / sello con publicación: ' || coalesce(f.estado, '?') || ' ' || coalesce(f.mira, '') END
   FROM (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'a') a,
        (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'b') b,
        (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'c') c,
        (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'd') d,
        (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'e') e,
+       (SELECT * FROM b35r WHERE bloque = 406 AND caso = 'f') f,
        b35,
        LATERAL (SELECT
            a.estado = 'aprueban_activos=0 activos=1'
@@ -11111,7 +11132,9 @@ SELECT 406, 'un sello donde nadie más aprueba traba la baja para siempre, o uno
            AND c.mira = 'c02=t membresias_de_tomas=2'
            AND d.estado = 'ok' AND d.resultado->'released_seals' = '[]'::jsonb
            AND d.resultado->'left_organizations' ? org_w::text
-           AND e.estado = 'ok' AND e.resultado->'released_seals' = '[]'::jsonb AS ok) v;
+           AND e.estado = 'ok' AND e.resultado->'released_seals' = '[]'::jsonb
+           AND f.estado LIKE '45010 |%'
+           AND f.mira = 'c01=approved/t membresias_de_sara=1' AS ok) v;
 
 -- ── 407 ──────────────────────────────────────────────────────────────────────
 -- La postcondición. Una membresía o un sello de la persona que aparecen
