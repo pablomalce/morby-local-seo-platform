@@ -42,7 +42,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NADA_BORRADO } from "../porQueNoSeBorro";
 
 const redirect = vi.fn();
-vi.mock("next/navigation", () => ({ redirect: (url: string) => redirect(url) }));
+// Como el de Next: `redirect` LANZA (NEXT_REDIRECT). Con un mock que devuelve,
+// mover el `redirect` adentro del `try` pasaba todos los tests, y en producción
+// el `catch` se tragaba la baja ya terminada y contestaba «no se pudo borrar el
+// acceso» sobre una cuenta borrada (revisión del 2026-10-26).
+vi.mock("next/navigation", () => ({
+  redirect: (url: string) => {
+    redirect(url);
+    throw Object.assign(new Error("NEXT_REDIRECT"), { digest: `NEXT_REDIRECT;replace;${url};307;` });
+  },
+}));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
 const UMA = "11111111-1111-4111-8111-111111111111"; // la que se va
@@ -90,7 +99,10 @@ let respuesta: Respuesta;
 /** Si la base confirmó la transacción. Con la respuesta perdida, puede ser `true` igual. */
 let confirmo: boolean;
 let login: boolean;
-let falloDelLogin: { message: string } | null;
+/** Lo que contesta auth-js: `AuthApiError` si GoTrue contestó, `AuthRetryableFetchError`/`AuthUnknownError` si no. */
+let falloDelLogin: { message: string; name?: string; status?: number } | null;
+/** Si GoTrue borró el login antes de que se perdiera la respuesta. */
+let borroYPerdio: boolean;
 let lanza: Record<string, Error>;
 let pedidas: string[];
 let argumentos: unknown[];
@@ -120,6 +132,7 @@ vi.mock("@/lib/supabase/admin", () => ({
           deleteUser: async (id: string) => {
             pedidas.push("auth.deleteUser");
             if (lanza["auth.deleteUser"]) throw lanza["auth.deleteUser"];
+            if (borroYPerdio && id === UMA) login = false;
             if (falloDelLogin) return { data: null, error: falloDelLogin };
             if (id === UMA) login = false;
             return { data: {}, error: null };
@@ -141,6 +154,7 @@ beforeEach(() => {
   confirmo = false;
   login = true;
   falloDelLogin = null;
+  borroYPerdio = false;
   lanza = {};
   pedidas = [];
   argumentos = [];
@@ -148,6 +162,16 @@ beforeEach(() => {
   consola = vi.spyOn(console, "error").mockImplementation(() => {});
 });
 afterEach(() => consola.mockRestore());
+
+/** Una baja que TERMINÓ: no vuelve, lanza el NEXT_REDIRECT de `redirect("/")`. */
+async function terminada() {
+  const e = await deleteMyAccount().then(
+    (r) => ({ volvio: r }),
+    (e: unknown) => e,
+  );
+  expect(e).toMatchObject({ digest: expect.stringMatching(/^NEXT_REDIRECT;replace;\/;/) });
+  expect(redirect).toHaveBeenCalledWith("/");
+}
 
 /** Nada de la base en la frase que ve la persona. */
 function sinDetalleDeLaBase(mensaje: string) {
@@ -161,25 +185,31 @@ describe("deleteMyAccount — una llamada a la base y después el login", () => 
     // Sin este caso, una acción que nunca borrara —o nunca redirigiera—
     // pasaría todos los de abajo.
     expect(login).toBe(true); // anti-vacuidad
-    await deleteMyAccount();
+    await terminada();
     expect(pedidas).toEqual(SECUENCIA);
     expect(argumentos).toEqual([{ p_user_id: UMA }]);
     expect(login).toBe(false);
-    expect(redirect).toHaveBeenCalledWith("/");
+  });
+
+  it("el redirect queda FUERA del try: la baja terminada no se convierte en un fallo con motivo", async () => {
+    // Si el catch atajara el NEXT_REDIRECT, la acción devolvería un BajaFallida
+    // (con el login ya borrado) en vez de lanzar, y la pantalla mostraría un
+    // error sobre una cuenta que ya no existe.
+    await terminada();
+    expect(consola).not.toHaveBeenCalled();
   });
 
   it("no lee ni borra ninguna tabla por su cuenta: la clasificación es de la base (bloques 402 y 403)", async () => {
-    await deleteMyAccount();
+    await terminada();
     expect(pedidas.filter((p) => p.startsWith("from:"))).toEqual([]);
     expect(pedidas.filter((p) => p.startsWith("rpc:"))).toEqual(["rpc:delete_account_organizations"]);
   });
 
   it("sin organizaciones ni sellos (la función devuelve todo vacío) también borra el login: reintentar retoma", async () => {
     respuesta = { data: resultado([], [], []), error: null, status: 200 };
-    await deleteMyAccount();
+    await terminada();
     expect(pedidas).toEqual(SECUENCIA);
     expect(login).toBe(false);
-    expect(redirect).toHaveBeenCalledWith("/");
   });
 
   it("sin sesión no llama a la base y lo dice con nombre", async () => {
@@ -194,17 +224,25 @@ describe("deleteMyAccount — una llamada a la base y después el login", () => 
 
 describe("deleteMyAccount — la base CONTESTÓ un error: se deshizo todo, y el código dice por qué", () => {
   it.each([
-    ["45008", "sello-en-otra-organizacion", /Ask that organization/],
-    ["23503", "firma-en-otra-organizacion", /That organization has to decide/],
-    ["45009", "no-se-pudo-verificar", /could not check what deleting it involves/],
-    ["40001", "no-se-pudo-verificar", /could not check what deleting it involves/],
-    ["40P01", "no-se-pudo-verificar", /could not check what deleting it involves/],
-    ["55P03", "no-se-pudo-verificar", /could not check what deleting it involves/],
-    ["57014", "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
-    ["42501", "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
-    ["PGRST202", "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
-  ])("%s → «%s», «Nothing was deleted», y el login no se toca", async (code, motivo, frase) => {
-    respuesta = contesto(code, code === "PGRST202" ? 404 : 400, "texto de postgres",
+    // [código, status con el que lo manda PostgREST, motivo, frase]
+    ["45008", 400, "sello-en-otra-organizacion", /Ask that organization/],
+    ["45010", 400, "sello-publicado-sin-quien-decida", /Contact support/],
+    ["23503", 409, "firma-en-otra-organizacion", /That organization has to decide/],
+    ["45009", 400, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["40001", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["40P01", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["55P03", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["22023", 400, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // Una sentencia cancelada por statement_timeout: se deshizo, aunque venga con 500.
+    ["57014", 500, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    ["42501", 403, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // La función no existe (la 0035 sin aplicar): PostgREST no abrió la transacción.
+    ["PGRST202", 404, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // Sin conexión del pool, o sin conectar: tampoco.
+    ["PGRST003", 504, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    ["PGRST000", 503, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+  ])("%s (%s) → «%s», «Nothing was deleted», y el login no se toca", async (code, status, motivo, frase) => {
+    respuesta = contesto(code, status, "texto de postgres",
       `Key (organization_id, user_id)=(${AJENA}, ${UMA}) is still referenced`);
     const r = await deleteMyAccount();
     expect(confirmo).toBe(false); // anti-vacuidad: el doble deshizo
@@ -237,6 +275,21 @@ describe("deleteMyAccount — la base NO contestó: no se sabe, y no lo disfraza
       { data: null, error: { message: "<html>Bad Gateway</html>" }, status: 502, confirmo: true }],
     ["un 504 de la puerta, con un código que no es de la base",
       { data: null, error: { message: "timeout", code: "GATEWAY" }, status: 504, confirmo: true }],
+    // PostgREST perdió la conexión con Postgres mientras mandaba el COMMIT o leía
+    // su respuesta (revisión del 2026-10-26): pudo confirmarse.
+    ["PGRST001: PostgREST perdió la conexión con la base (503)",
+      { data: null, error: { message: "Database client error. Retrying the connection.", code: "PGRST001" }, status: 503, confirmo: true }],
+    ["08006: la conexión se cayó (503)",
+      { data: null, error: { message: "connection failure", code: "08006" }, status: 503, confirmo: true }],
+    // Con réplica sincrónica, el apagado llega con el COMMIT ya escrito.
+    ["57P01: el servidor se apagó (503)",
+      { data: null, error: { message: "terminating connection due to administrator command", code: "57P01" }, status: 503, confirmo: true }],
+    ["XX000: error interno (500)",
+      { data: null, error: { message: "internal error", code: "XX000" }, status: 500, confirmo: true }],
+    ["53100: sin disco (503)",
+      { data: null, error: { message: "could not extend file", code: "53100" }, status: 503, confirmo: true }],
+    ["un PGRST que no se conoce",
+      { data: null, error: { message: "algo nuevo", code: "PGRST999" }, status: 500, confirmo: true }],
   ])("%s → «no-se-sabe-que-se-borro», yaBorrado null, y el login no se toca", async (_caso, r0) => {
     respuesta = r0 as Respuesta;
     const r = await deleteMyAccount();
@@ -294,10 +347,40 @@ describe("deleteMyAccount — el login, después: lo que ya se hizo se dice", ()
     falloDelLogin = null;
     respuesta = { data: resultado([], [], []), error: null, status: 200 };
     pedidas = [];
-    await deleteMyAccount();
+    await terminada();
     expect(pedidas).toEqual(SECUENCIA);
     expect(login).toBe(false);
-    expect(redirect).toHaveBeenCalledWith("/");
+  });
+
+  it.each([
+    ["el fetch se cortó (status 0)", { name: "AuthRetryableFetchError", status: 0, message: "fetch failed" }],
+    ["la puerta contestó 504", { name: "AuthRetryableFetchError", status: 504, message: "Gateway Timeout" }],
+    ["el cuerpo no se pudo leer", { name: "AuthUnknownError", message: "Unexpected token <" }],
+  ])("GoTrue no contestó (%s): NO dice que el login sigue, dice que no se sabe", async (_caso, err) => {
+    // GoTrue pudo borrar `auth.users` y perder la respuesta (revisión del
+    // 2026-10-26). Decir «Your login is still there» sería afirmar lo que no se sabe.
+    borroYPerdio = true;
+    falloDelLogin = err;
+    const r = await deleteMyAccount();
+    expect(login).toBe(false); // anti-vacuidad: el doble lo borró y perdió la respuesta
+    expect(r).toMatchObject({
+      ok: false,
+      motivo: "no-se-sabe-si-se-borro-el-acceso",
+      yaBorrado: { ajenas: 2, propias: 1, sellos: 1 },
+    });
+    expect(r.message).toMatch(/could not confirm whether your login was deleted/);
+    expect(r.message).toMatch(/We cannot tell whether your login is still there/);
+    expect(r.message).not.toMatch(/Your login is still there/);
+    expect(r.message).toMatch(/Already done: you were removed from 2 organizations/);
+    expect(redirect).not.toHaveBeenCalled();
+  });
+
+  it("GoTrue CONTESTÓ un error (AuthApiError 500): ahí sí se sabe que el login sigue", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 500, message: "Database error deleting user" };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso" });
+    expect(r.message).toMatch(/Your login is still there/);
+    expect(login).toBe(true);
   });
 });
 
@@ -309,7 +392,8 @@ describe("deleteMyAccount — un paso que LANZA vuelve con el motivo de ese paso
     ["admin", "no-se-pudo-verificar", NADA_BORRADO],
     // La llamada salió y no volvió: pudo confirmarse.
     ["rpc", "no-se-sabe-que-se-borro", null],
-    ["auth.deleteUser", "no-se-pudo-borrar-el-acceso", HECHO],
+    // Lanzó adentro de auth-js: no se sabe si GoTrue llegó a borrarlo.
+    ["auth.deleteUser", "no-se-sabe-si-se-borro-el-acceso", HECHO],
   ])("%s → «%s», con lo que ya se sabe que se borró", async (paso, motivo, yaBorrado) => {
     lanza[paso] = new Error("fetch failed");
     const r = await deleteMyAccount();

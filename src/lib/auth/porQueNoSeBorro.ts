@@ -62,6 +62,13 @@ export type MotivoDeBaja =
    * organización (0026 decisión 4, 0029 decisión 3). No se borró nada.
    */
   | "firma-en-otra-organizacion"
+  /**
+   * Aprobó contenido que ya tiene una publicación (pendiente, publicada o
+   * fallida) en una organización donde nadie más aprueba. La fila del ledger
+   * está atada a su aprobación (0016) y nadie de la organización puede
+   * soltarla (0035, 45010). No se borró nada; la salida es soporte.
+   */
+  | "sello-publicado-sin-quien-decida"
   /** La base contestó otro error al borrar o dejar sus organizaciones, y deshizo todo. No se borró nada. */
   | "no-se-pudieron-borrar-las-organizaciones"
   /**
@@ -69,8 +76,13 @@ export type MotivoDeBaja =
    * pudo confirmarse o no. No se sabe qué ya no está; el login sigue.
    */
   | "no-se-sabe-que-se-borro"
-  /** Sus organizaciones ya quedaron resueltas; el acceso no se borró. A medias. */
-  | "no-se-pudo-borrar-el-acceso";
+  /** Sus organizaciones ya quedaron resueltas; GoTrue contestó que el acceso no se borró. A medias. */
+  | "no-se-pudo-borrar-el-acceso"
+  /**
+   * Sus organizaciones ya quedaron resueltas; GoTrue no contestó (fetch cortado,
+   * 502/503/504, cuerpo ilegible). El login pudo borrarse o no.
+   */
+  | "no-se-sabe-si-se-borro-el-acceso";
 
 /**
  * Lo que ya no está cuando la cadena se corta. `null` en un campo es «pasó, pero
@@ -104,23 +116,31 @@ const CABECERA: Record<MotivoDeBaja, string> = {
     "Your account was not deleted: you approved content in an organization that is not only yours, and that approval is signed with your name.",
   "firma-en-otra-organizacion":
     "Your account was not deleted: you published a company profile version, verified evidence or approved a task in an organization that is not only yours, and that record is signed with your name.",
+  "sello-publicado-sin-quien-decida":
+    "Your account was not deleted: content you approved already has a publication record in an organization where no one else can approve, and that record is tied to your approval.",
   "no-se-pudieron-borrar-las-organizaciones":
     "Your account was not deleted: we could not delete the organizations that are only yours or remove you from the others.",
   "no-se-sabe-que-se-borro":
     "Your account was not deleted: we could not confirm whether your organizations were deleted.",
   "no-se-pudo-borrar-el-acceso": "Your account was not fully deleted: we could not delete your login.",
+  "no-se-sabe-si-se-borro-el-acceso":
+    "Your account may not be fully deleted: we could not confirm whether your login was deleted.",
 };
 
 const QUE_HACER: Record<MotivoDeBaja, string> = {
   "sin-sesion": "Sign in again and retry.",
   "no-se-pudo-verificar": "Try again in a moment.",
   "sello-en-otra-organizacion":
-    "Ask that organization to re-approve that content under another name or return it to draft, then try again.",
+    "Ask that organization to re-approve that content under another name (or return it to draft, if it was never sent for publishing), then try again.",
+  "sello-publicado-sin-quien-decida":
+    "Contact support: that record has to be resolved before your account can be deleted.",
   "firma-en-otra-organizacion":
     "That organization has to decide first what happens with that record; then try again.",
   "no-se-pudieron-borrar-las-organizaciones": "Try again in a moment.",
   "no-se-sabe-que-se-borro": "Try again: the deletion resumes where it stopped.",
   "no-se-pudo-borrar-el-acceso": "Try again: the deletion resumes where it stopped.",
+  "no-se-sabe-si-se-borro-el-acceso":
+    "Try to sign in: if you can, retry the deletion and it resumes where it stopped; if you cannot, your account is gone.",
 };
 
 function cuantas(n: number | null, una: string, varias: string): string {
@@ -128,8 +148,11 @@ function cuantas(n: number | null, una: string, varias: string): string {
   return n === 1 ? `1 ${una}` : `${n} ${varias}`;
 }
 
-/** Qué ya no está, en una frase. Lo decide el estado, no el motivo. */
-export function loQueYaNoEsta(ya: YaBorrado | null): string {
+/**
+ * Qué ya no está, en una frase. Lo decide el estado, no el motivo; el login, si
+ * se sabe que sigue (`"sigue"`) o no se sabe (`"no-se-sabe"`: GoTrue no contestó).
+ */
+export function loQueYaNoEsta(ya: YaBorrado | null, login: "sigue" | "no-se-sabe" = "sigue"): string {
   // No se sabe SI pasó: ni «nothing» ni un número. Lo único seguro es que el
   // login no se tocó, porque se borra después.
   if (ya === null) {
@@ -153,13 +176,18 @@ export function loQueYaNoEsta(ya: YaBorrado | null): string {
       `${cuantas(ya.sellos, "approval of yours", "approvals of yours")} ${ya.sellos === 1 ? "was" : "were"} withdrawn, back to draft, where no one else could approve`,
     );
   }
+  if (login === "no-se-sabe") {
+    const hecho = partes.length === 0 ? "Nothing else had to be deleted." : `Already done: ${partes.join("; ")}.`;
+    return `${hecho} We cannot tell whether your login is still there.`;
+  }
   if (partes.length === 0) return "Nothing was deleted.";
   return `Already done: ${partes.join("; ")}. Your login is still there.`;
 }
 
 /** La frase entera que ve la persona: por qué, qué ya no está, qué hacer. */
 export function explicarBaja(motivo: MotivoDeBaja, ya: YaBorrado | null): string {
-  return `${CABECERA[motivo]} ${loQueYaNoEsta(ya)} ${QUE_HACER[motivo]}`;
+  const login = motivo === "no-se-sabe-si-se-borro-el-acceso" ? "no-se-sabe" : "sigue";
+  return `${CABECERA[motivo]} ${loQueYaNoEsta(ya, login)} ${QUE_HACER[motivo]}`;
 }
 
 /**

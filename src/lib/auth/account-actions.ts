@@ -71,7 +71,8 @@ const MOTIVO_SI_LANZA: Record<PasoDeBaja, MotivoDeBaja> = {
   verificar: "no-se-pudo-verificar",
   // La llamada salió y no volvió: la transacción pudo confirmarse o no.
   organizaciones: "no-se-sabe-que-se-borro",
-  acceso: "no-se-pudo-borrar-el-acceso",
+  // Lo mismo con GoTrue: el login pudo borrarse antes de que se cortara.
+  acceso: "no-se-sabe-si-se-borro-el-acceso",
 };
 
 /** La función de la 0035: clasifica y borra en una transacción. */
@@ -84,6 +85,7 @@ const BAJA_EN_LA_BASE = "delete_account_organizations";
  */
 const MOTIVO_DE_LA_BASE: Record<string, MotivoDeBaja> = {
   "45008": "sello-en-otra-organizacion",
+  "45010": "sello-publicado-sin-quien-decida",
   // `foreign_key_violation`: una firma traba la salida de una ajena.
   "23503": "firma-en-otra-organizacion",
   "45009": "no-se-pudo-verificar",
@@ -92,16 +94,54 @@ const MOTIVO_DE_LA_BASE: Record<string, MotivoDeBaja> = {
   "55P03": "no-se-pudo-verificar",
 };
 
+/** Los que levanta la función misma: la transacción murió adentro, y se deshizo. */
+const DE_LA_FUNCION = new Set([...Object.keys(MOTIVO_DE_LA_BASE), "22023"]);
+
 /**
- * ¿El error lo contestó la base? Sólo entonces se sabe que la transacción se
- * deshizo. postgrest-js también devuelve `error` cuando el `fetch` se corta o el
- * cuerpo no se puede leer (con `status` 0 y el `code` del error de red, que
- * puede ser `EPIPE`: cinco mayúsculas), y cuando un proxy contesta HTML sin
- * código. En esos casos el pedido pudo llegar, confirmarse y perder la
- * respuesta: «no se borró nada» sería una suposición.
+ * Lo que PostgREST rechaza ANTES de abrir la transacción: no conectó (000), no
+ * armó la caché del esquema (002), no consiguió conexión del pool (003), el
+ * pedido (1xx), el esquema —la función no existe: PGRST202— (2xx) o el JWT
+ * (3xx). No corrió nada.
+ */
+const PGRST_ANTES = /^PGRST(00[023]|[123]\d\d)$/;
+
+/**
+ * SQLSTATE que no dicen que se deshizo: la conexión se cortó (clase 08), el
+ * servidor se apagó o no acepta (57P01-57P03, que puede llegar con el COMMIT ya
+ * escrito si espera la réplica sincrónica), faltan recursos (53), falla de
+ * sistema (58) o error interno (XX).
+ */
+const SQLSTATE_SIN_CERTEZA = /^(08|53|58|XX)[0-9A-Z]{3}$|^57P0[123]$/;
+
+/**
+ * ¿El error lo contestó la base, CON la transacción deshecha? Sólo entonces se
+ * puede decir «no se borró nada». Es una lista de lo que se sabe, no de lo que
+ * no: todo lo demás es «no se sabe».
+ *
+ * postgrest-js también devuelve `error` cuando el `fetch` se corta o el cuerpo
+ * no se puede leer (`status` 0, con el `code` del error de red, que puede ser
+ * `EPIPE`: cinco mayúsculas), cuando un proxy contesta HTML sin código, y
+ * PostgREST contesta PGRST001 (503) cuando pierde la conexión con Postgres
+ * mientras manda el COMMIT o lee su respuesta: ahí la transacción pudo
+ * confirmarse (revisión del 2026-10-26).
  */
 function laBaseContesto(r: { status: number; error: { code?: unknown } }): boolean {
-  return r.status >= 400 && typeof r.error.code === "string" && /^([0-9A-Z]{5}|PGRST\d{3})$/.test(r.error.code);
+  if (r.status < 400 || typeof r.error.code !== "string") return false;
+  const code = r.error.code;
+  if (DE_LA_FUNCION.has(code)) return true;
+  if (code.startsWith("PGRST")) return PGRST_ANTES.test(code);
+  return /^[0-9A-Z]{5}$/.test(code) && !SQLSTATE_SIN_CERTEZA.test(code);
+}
+
+/**
+ * ¿GoTrue contestó? auth-js arma `AuthRetryableFetchError` cuando el `fetch` se
+ * corta o la puerta contesta 502/503/504, y `AuthUnknownError` cuando el cuerpo
+ * no se lee (`lib/fetch.js`). En los dos el login pudo borrarse sin que la
+ * respuesta llegara. Un `AuthApiError` (p. ej. el 500 «Database error deleting
+ * user») es una respuesta: GoTrue deshizo su transacción.
+ */
+function goTrueContesto(e: { name?: unknown }): boolean {
+  return e.name !== "AuthRetryableFetchError" && e.name !== "AuthUnknownError";
 }
 
 /** Lo que devolvió la función, si tiene la forma que promete; si no, `null`. */
@@ -166,13 +206,17 @@ function fallo(motivo: MotivoDeBaja, paso: string, causa: unknown, ya: YaBorrado
  *      nombre). La identidad la valida GoTrue; la base confía en el id que
  *      recibe porque sólo `service_role` puede llamarla.
  *   1. `delete_account_organizations(user.id)`, una sola llamada:
- *        - contestó un error de la base → la transacción se deshizo: NO se
- *          borró nada, y el código dice por qué (`MOTIVO_DE_LA_BASE`);
- *        - no contestó, o contestó algo ilegible → NO SE SABE: pudo
- *          confirmarse. `yaBorrado` va en `null` y el login no se toca;
+ *        - contestó un error que DICE que la transacción se deshizo (los de la
+ *          función, un SQLSTATE que no sea de conexión ni de servidor caído, o
+ *          un PGRST de antes de la transacción: `laBaseContesto`) → NO se borró
+ *          nada, y el código dice por qué (`MOTIVO_DE_LA_BASE`);
+ *        - no contestó, contestó algo ilegible, o un error que no lo dice
+ *          (PGRST001, clase 08, 57P0x…) → NO SE SABE: pudo confirmarse.
+ *          `yaBorrado` va en `null` y el login no se toca;
  *        - contestó la forma prometida → lo que borró, contado.
- *   2. el acceso (`auth.admin.deleteUser`). Si falla, la frase dice lo que el
- *      paso 1 ya hizo y que queda el login.
+ *   2. el acceso (`auth.admin.deleteUser`). Si GoTrue contesta un error, la
+ *      frase dice lo que el paso 1 ya hizo y que queda el login; si no contesta
+ *      (`goTrueContesto`), dice que no se sabe si el login sigue.
  *
  * Reintentar retoma: la función sobre una persona sin membresías es un no-op y
  * devuelve todo vacío.
@@ -218,7 +262,10 @@ export async function deleteMyAccount(): Promise<BajaFallida> {
     // 2. El acceso.
     paso = "acceso";
     const { error: userErr } = await admin.auth.admin.deleteUser(user.id);
-    if (userErr) return fallo("no-se-pudo-borrar-el-acceso", paso, userErr, yaBorrado);
+    if (userErr) {
+      const motivo = goTrueContesto(userErr) ? "no-se-pudo-borrar-el-acceso" : "no-se-sabe-si-se-borro-el-acceso";
+      return fallo(motivo, paso, userErr, yaBorrado);
+    }
   } catch (lanzado) {
     return fallo(MOTIVO_SI_LANZA[paso], paso, lanzado, paso === "organizaciones" ? null : yaBorrado);
   }

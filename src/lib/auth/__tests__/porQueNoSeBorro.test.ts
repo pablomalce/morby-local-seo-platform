@@ -19,16 +19,18 @@ const MOTIVOS: MotivoDeBaja[] = [
   "no-se-pudo-verificar",
   "sello-en-otra-organizacion",
   "firma-en-otra-organizacion",
+  "sello-publicado-sin-quien-decida",
   "no-se-pudieron-borrar-las-organizaciones",
   "no-se-sabe-que-se-borro",
   "no-se-pudo-borrar-el-acceso",
+  "no-se-sabe-si-se-borro-el-acceso",
 ];
 
 describe("explicarBaja", () => {
   it.each(MOTIVOS)("«%s» tiene frase propia, con por qué y qué hacer", (motivo) => {
     const frase = explicarBaja(motivo, NADA_BORRADO);
     expect(frase).not.toMatch(/undefined/);
-    expect(frase).toMatch(/^Your account was not (fully )?deleted: /);
+    expect(frase).toMatch(/^Your account (was not|was not fully|may not be fully) deleted: /);
     // Ninguna frase es la de otro motivo: si dos coincidieran, la pantalla no
     // distinguiría casos que se arreglan en lugares distintos.
     const otras = MOTIVOS.filter((m) => m !== motivo).map((m) => explicarBaja(m, NADA_BORRADO));
@@ -38,6 +40,29 @@ describe("explicarBaja", () => {
   it("los rechazos que decide otra organización dicen que el paso siguiente es de ELLA, no reintentar ya", () => {
     expect(explicarBaja("firma-en-otra-organizacion", NADA_BORRADO)).toMatch(/That organization has to decide/);
     expect(explicarBaja("sello-en-otra-organizacion", NADA_BORRADO)).toMatch(/Ask that organization/);
+  });
+
+  it("el sello ya publicado donde nadie más aprueba manda a soporte: nadie de la organización puede soltarlo", () => {
+    const f = explicarBaja("sello-publicado-sin-quien-decida", NADA_BORRADO);
+    expect(f).toMatch(/publication record/);
+    expect(f).toMatch(/Contact support/);
+    expect(f).not.toMatch(/Ask that organization/);
+    expect(f).toMatch(/Nothing was deleted/);
+  });
+
+  it("GoTrue sin respuesta: no afirma que el login sigue, ni con algo hecho ni sin nada", () => {
+    const conAlgo = explicarBaja("no-se-sabe-si-se-borro-el-acceso", { ajenas: 1, propias: 1, sellos: 0 });
+    expect(conAlgo).toMatch(/could not confirm whether your login was deleted/);
+    expect(conAlgo).toMatch(/Already done: you were removed from 1 organization/);
+    expect(conAlgo).toMatch(/We cannot tell whether your login is still there\./);
+    expect(conAlgo).not.toMatch(/Your login is still there/);
+    const sinNada = explicarBaja("no-se-sabe-si-se-borro-el-acceso", NADA_BORRADO);
+    expect(sinNada).not.toMatch(/Nothing was deleted|Your login is still there/);
+    expect(sinNada).toMatch(/Nothing else had to be deleted\. We cannot tell whether your login is still there\./);
+    // Y el login que GoTrue SÍ dijo que no borró sigue diciéndose.
+    expect(explicarBaja("no-se-pudo-borrar-el-acceso", { ajenas: 1, propias: 0, sellos: 0 })).toMatch(
+      /Your login is still there/,
+    );
   });
 });
 
