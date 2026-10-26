@@ -100,7 +100,7 @@ let respuesta: Respuesta;
 let confirmo: boolean;
 let login: boolean;
 /** Lo que contesta auth-js: `AuthApiError` si GoTrue contestó, `AuthRetryableFetchError`/`AuthUnknownError` si no. */
-let falloDelLogin: { message: string; name?: string; status?: number } | null;
+let falloDelLogin: { message: string; name?: string; status?: number; code?: string } | null;
 /** Si GoTrue borró el login antes de que se perdiera la respuesta. */
 let borroYPerdio: boolean;
 let lanza: Record<string, Error>;
@@ -324,7 +324,8 @@ describe("deleteMyAccount — la base NO contestó: no se sabe, y no lo disfraza
 
 describe("deleteMyAccount — el login, después: lo que ya se hizo se dice", () => {
   it("no puede borrar el acceso: dice qué organizaciones se fueron, de cuáles salió, qué sellos soltó, y que queda el login", async () => {
-    falloDelLogin = { message: "Database error deleting user" };
+    // Un 4xx: GoTrue rechazó el pedido y no borró.
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
     const r = await deleteMyAccount();
     expect(r).toMatchObject({
       ok: false,
@@ -342,7 +343,7 @@ describe("deleteMyAccount — el login, después: lo que ya se hizo se dice", ()
   });
 
   it("después de un corte en el login, reintentar retoma: la función no tiene nada que hacer, y el login se borra", async () => {
-    falloDelLogin = { message: "Database error deleting user" };
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
     await deleteMyAccount();
     falloDelLogin = null;
     respuesta = { data: resultado([], [], []), error: null, status: 200 };
@@ -375,12 +376,39 @@ describe("deleteMyAccount — el login, después: lo que ya se hizo se dice", ()
     expect(redirect).not.toHaveBeenCalled();
   });
 
-  it("GoTrue CONTESTÓ un error (AuthApiError 500): ahí sí se sabe que el login sigue", async () => {
-    falloDelLogin = { name: "AuthApiError", status: 500, message: "Database error deleting user" };
+  it("GoTrue CONTESTÓ un 4xx (AuthApiError 403): ahí sí se sabe que el login sigue", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
     const r = await deleteMyAccount();
     expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso" });
     expect(r.message).toMatch(/Your login is still there/);
     expect(login).toBe(true);
+  });
+
+  it("GoTrue contestó un 5xx (unexpected_failure): no dice que el login sigue, porque su COMMIT pudo pasar", async () => {
+    // Es también lo que contesta GoTrue si pierde la conexión en su propio COMMIT
+    // (revisión del 2026-10-26): el análogo del PGRST001 de PostgREST.
+    borroYPerdio = true;
+    falloDelLogin = { name: "AuthApiError", status: 500, code: "unexpected_failure", message: "Database error deleting user" };
+    const r = await deleteMyAccount();
+    expect(login).toBe(false); // anti-vacuidad: el doble lo borró y contestó 500
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-sabe-si-se-borro-el-acceso" });
+    expect(r.message).not.toMatch(/Your login is still there/);
+  });
+
+  it("GoTrue dice que el login ya no existe (404 user_not_found, otra pestaña terminó): la baja terminó", async () => {
+    // Decir «no pudimos borrar tu login… sigue ahí» sobre un login que ya no
+    // existe sería falso (revisión del 2026-10-26).
+    login = false;
+    falloDelLogin = { name: "AuthApiError", status: 404, code: "user_not_found", message: "User not found" };
+    await terminada();
+    expect(pedidas).toEqual(SECUENCIA);
+  });
+
+  it("un 404 que NO es user_not_found no se lee como borrado", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 404, code: "not_found", message: "Not Found" };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso" });
+    expect(redirect).not.toHaveBeenCalled();
   });
 });
 

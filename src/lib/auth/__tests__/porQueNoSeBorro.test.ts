@@ -59,6 +59,9 @@ describe("explicarBaja", () => {
     const sinNada = explicarBaja("no-se-sabe-si-se-borro-el-acceso", NADA_BORRADO);
     expect(sinNada).not.toMatch(/Nothing was deleted|Your login is still there/);
     expect(sinNada).toMatch(/Nothing else had to be deleted\. We cannot tell whether your login is still there\./);
+    // No infiere nada de un login fallido: con GoTrue caído, entrar también falla.
+    expect(conAlgo).not.toMatch(/if you cannot|your account is gone/);
+    expect(conAlgo).toMatch(/contact support to confirm whether your login is gone/);
     // Y el login que GoTrue SÍ dijo que no borró sigue diciéndose.
     expect(explicarBaja("no-se-pudo-borrar-el-acceso", { ajenas: 1, propias: 0, sellos: 0 })).toMatch(
       /Your login is still there/,

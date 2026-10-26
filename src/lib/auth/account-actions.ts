@@ -134,14 +134,23 @@ function laBaseContesto(r: { status: number; error: { code?: unknown } }): boole
 }
 
 /**
- * ¿GoTrue contestó? auth-js arma `AuthRetryableFetchError` cuando el `fetch` se
- * corta o la puerta contesta 502/503/504, y `AuthUnknownError` cuando el cuerpo
- * no se lee (`lib/fetch.js`). En los dos el login pudo borrarse sin que la
- * respuesta llegara. Un `AuthApiError` (p. ej. el 500 «Database error deleting
- * user») es una respuesta: GoTrue deshizo su transacción.
+ * Qué dijo GoTrue del login, cuando `deleteUser` devuelve error.
+ *
+ *   * `no-se-sabe`: auth-js arma `AuthRetryableFetchError` cuando el `fetch` se
+ *     corta o la puerta contesta 502/503/504, y `AuthUnknownError` cuando el
+ *     cuerpo no se lee (`lib/fetch.js`): el login pudo borrarse sin que la
+ *     respuesta llegara. Y un `AuthApiError` 5xx tampoco lo dice: el genérico
+ *     `unexpected_failure` es también lo que contesta GoTrue si pierde la
+ *     conexión en su propio COMMIT (revisión del 2026-10-26);
+ *   * `borrado`: 404 `user_not_found`. Ya no está —otra pestaña terminó la
+ *     baja—, y decir «tu login sigue» sería falso;
+ *   * `sigue`: cualquier otro 4xx. GoTrue rechazó el pedido y no borró.
  */
-function goTrueContesto(e: { name?: unknown }): boolean {
-  return e.name !== "AuthRetryableFetchError" && e.name !== "AuthUnknownError";
+function queDijoGoTrue(e: { name?: unknown; status?: unknown; code?: unknown }): "sigue" | "borrado" | "no-se-sabe" {
+  if (e.name === "AuthRetryableFetchError" || e.name === "AuthUnknownError") return "no-se-sabe";
+  if (e.status === 404 && e.code === "user_not_found") return "borrado";
+  if (typeof e.status === "number" && e.status >= 400 && e.status < 500) return "sigue";
+  return "no-se-sabe";
 }
 
 /** Lo que devolvió la función, si tiene la forma que promete; si no, `null`. */
@@ -216,7 +225,8 @@ function fallo(motivo: MotivoDeBaja, paso: string, causa: unknown, ya: YaBorrado
  *        - contestó la forma prometida → lo que borró, contado.
  *   2. el acceso (`auth.admin.deleteUser`). Si GoTrue contesta un error, la
  *      frase dice lo que el paso 1 ya hizo y que queda el login; si no contesta
- *      (`goTrueContesto`), dice que no se sabe si el login sigue.
+ *      o contesta un 5xx, dice que no se sabe; si dice que el login ya no
+ *      existe, la baja terminó (`queDijoGoTrue`).
  *
  * Reintentar retoma: la función sobre una persona sin membresías es un no-op y
  * devuelve todo vacío.
@@ -263,8 +273,10 @@ export async function deleteMyAccount(): Promise<BajaFallida> {
     paso = "acceso";
     const { error: userErr } = await admin.auth.admin.deleteUser(user.id);
     if (userErr) {
-      const motivo = goTrueContesto(userErr) ? "no-se-pudo-borrar-el-acceso" : "no-se-sabe-si-se-borro-el-acceso";
-      return fallo(motivo, paso, userErr, yaBorrado);
+      const dijo = queDijoGoTrue(userErr);
+      if (dijo === "sigue") return fallo("no-se-pudo-borrar-el-acceso", paso, userErr, yaBorrado);
+      if (dijo === "no-se-sabe") return fallo("no-se-sabe-si-se-borro-el-acceso", paso, userErr, yaBorrado);
+      // `borrado`: el login ya no está, y la baja terminó.
     }
   } catch (lanzado) {
     return fallo(MOTIVO_SI_LANZA[paso], paso, lanzado, paso === "organizaciones" ? null : yaBorrado);

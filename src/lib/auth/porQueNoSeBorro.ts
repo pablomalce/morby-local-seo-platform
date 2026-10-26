@@ -80,7 +80,9 @@ export type MotivoDeBaja =
   | "no-se-pudo-borrar-el-acceso"
   /**
    * Sus organizaciones ya quedaron resueltas; GoTrue no contestó (fetch cortado,
-   * 502/503/504, cuerpo ilegible). El login pudo borrarse o no.
+   * 502/503/504, cuerpo ilegible) o contestó un 5xx. El login pudo borrarse o
+   * no. La frase no infiere nada de un login fallido: con GoTrue caído, entrar
+   * también falla.
    */
   | "no-se-sabe-si-se-borro-el-acceso";
 
@@ -140,7 +142,7 @@ const QUE_HACER: Record<MotivoDeBaja, string> = {
   "no-se-sabe-que-se-borro": "Try again: the deletion resumes where it stopped.",
   "no-se-pudo-borrar-el-acceso": "Try again: the deletion resumes where it stopped.",
   "no-se-sabe-si-se-borro-el-acceso":
-    "Try to sign in: if you can, retry the deletion and it resumes where it stopped; if you cannot, your account is gone.",
+    "Try again in a few minutes: the deletion resumes where it stopped. If it keeps failing, contact support to confirm whether your login is gone.",
 };
 
 function cuantas(n: number | null, una: string, varias: string): string {
