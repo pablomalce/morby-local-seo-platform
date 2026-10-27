@@ -56,24 +56,30 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * Las dos anteriores se cruzaron: la `0031` de H4.1 (PR #114), reservada
- * mientras la `0032_geo_grid` (H2-GO-3, `feat/la-grilla-mide-geografia`, PR
- * #115) se escribía con el número siguiente; y la `0032`, reservada por la rama
- * del sello (`fix/el-sello-lo-firma-quien-aprueba`, PR #116) mientras la
+ * Hoy no hay ninguna. La última fue la `0035_account_deletion_in_one_transaction`,
+ * de la baja de cuenta (`fix/la-baja-decide-y-borra-en-una-transaccion`, PR
+ * #120), reservada mientras la `0036_owner_grants_owner` (el rol de owner lo da
+ * un owner, `fix/solo-un-owner-da-o-quita-owner`, PR #128) se escribía con el
+ * número siguiente. Se borró el 2026-10-27, al integrar `main` en la rama del
+ * owner con la `0035` ya presente.
+ *
+ * Antes, la `0034_search_console_coverage`, de
+ * `fix/sin-token-propio-no-se-usa-el-de-la-agencia` (PR #118), reservada
+ * mientras la `0035` se escribía con el número siguiente. Se borró el
+ * 2026-10-23, al integrar `main` en la rama de la baja con la `0034` ya
+ * presente.
+ *
+ * Las dos de antes se cruzaron: la `0031` de H4.1 (PR
+ * #114), reservada mientras la `0032_geo_grid` (H2-GO-3,
+ * `feat/la-grilla-mide-geografia`, PR #115) se escribía con el número
+ * siguiente; y la `0032`, reservada por la rama del sello
+ * (`fix/el-sello-lo-firma-quien-aprueba`, PR #116) mientras la
  * `0033_seal_is_signed_by_sealer` se escribía con el número siguiente por
  * indicación de la sesión directora. Las dos se borraron el 2026-10-09: la
  * primera al integrar `main` en la rama de la grilla, la segunda al integrar
  * la rama de la grilla en la del sello, con los archivos ya presentes.
  */
-const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [
-  {
-    numero: 35,
-    porque:
-      "0035_account_deletion_in_one_transaction, de la baja de cuenta " +
-      "(fix/la-baja-decide-y-borra-en-una-transaccion, PR #120), abierto " +
-      "mientras la 0036_owner_grants_owner se escribía con el número siguiente",
-  },
-];
+const RESERVADOS: ReadonlyArray<{ numero: number; porque: string }> = [];
 
 describe("migration registry", () => {
   // Anti-vacuity. An empty or missing directory would make every assertion

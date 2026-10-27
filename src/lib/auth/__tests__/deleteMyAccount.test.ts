@@ -1,59 +1,64 @@
 /**
- * QUÉ IMPIDE ESTE ARCHIVO — EL BORRADO QUE DICE QUE BORRÓ, EL QUE BORRA A
- * MEDIAS, Y EL QUE BORRA LO QUE NO ERA SUYO
- *
- * Tres defectos de `deleteMyAccount`, el derecho al olvido.
+ * QUÉ IMPIDE ESTE ARCHIVO — EL BORRADO QUE DICE QUE BORRÓ, EL QUE DICE QUE NO
+ * BORRÓ SIN SABERLO, Y EL QUE CLASIFICA FUERA DE LA BASE
  *
  * 1. Tragarse el error. Hasta el 2026-10-01 ningún paso miraba su `error` y la
  *    función terminaba en `redirect("/")`, que en la pantalla se lee como
- *    éxito. Cualquier fallo de cualquier paso —la sesión incluida— tiene que
- *    volver como `ok: false` con un MOTIVO CON NOMBRE, sin redirigir, sin
- *    detalle de Postgres y diciendo lo que ya se borró.
+ *    éxito. Cualquier fallo —la sesión incluida— tiene que volver como
+ *    `ok: false` con un MOTIVO CON NOMBRE, sin redirigir y sin detalle de
+ *    Postgres.
  *
- * 2. Borrar a medias lo que se podía no borrar. Medido en la réplica el
- *    2026-10-11 con el orden anterior (propias → membresías → acceso): quien
- *    publicó una versión de la ficha o aprobó una tarjeta en una organización
- *    AJENA perdía primero sus organizaciones propias y después la base le
- *    rechazaba la salida de la ajena (23503); quien selló contenido en una ajena
- *    perdía organizaciones y membresías y la base le rechazaba el borrado de
- *    `auth.users` (23514, el SET NULL de `approved_by` contra el CHECK de la
- *    0015). Tres rechazos que nadie arregla reintentando, todos después del paso
- *    irreversible.
+ * 2. Clasificar con pedidos sueltos. Hasta #117 (`faade08`) la función leía
+ *    membresías y otros owners por PostgREST y borraba con otros pedidos: una
+ *    carrera entre co-owners dejaba una organización sin nadie, y una lectura
+ *    truncada por `max_rows` convertía una compartida en propia (bloques 402 y
+ *    403 de `supabase/qa/defects_test.sql`). Desde la 0035 eso lo hace
+ *    `delete_account_organizations` en una transacción, y este archivo exige
+ *    que la acción no vuelva a leer ni a borrar tablas por su cuenta: UNA
+ *    llamada a la base y después el login.
  *
- * 3. Llevarse una organización que no era sólo suya. «Propias» se leía como
- *    `role = owner`, y el esquema deja varios owners por organización y owners
- *    archivados. Medido en la réplica el 2026-10-11: la baja de un co-owner se
- *    llevaba la organización de la otra owner con sus negocios, y la de una
- *    owner archivada también.
+ * 3. Decir «no se borró nada» sin saberlo. Un error que CONTESTÓ la base (un
+ *    SQLSTATE o un PGRST con status HTTP) quiere decir que la transacción se
+ *    deshizo. Pero postgrest-js también devuelve `error` cuando el `fetch` se
+ *    corta (status 0, con el `code` del error de red, que puede tener forma de
+ *    SQLSTATE: `EPIPE`) o cuando un proxy contesta HTML: ahí la transacción
+ *    pudo confirmarse. Y una respuesta sin error pero sin la forma prometida
+ *    es una base que confirmó algo que no se puede contar. En los dos casos la
+ *    frase dice que no se sabe, `yaBorrado` va en `null` y el login NO se toca.
  *
- * EL DOBLE RECORRE LA SECUENCIA (R13). No es una lista de respuestas por
- * llamada: es una base chiquita —organizaciones, membresías con rol y estado,
- * sellos, firmas y logins— que aplica cada lectura y cada borrado con los
- * filtros que la función le pasa, hace las cascadas, y rechaza lo que la réplica
- * rechazó con el mismo código. Así los tests miran el ESTADO que queda después
- * de que la cadena se corta en cada paso, no sólo qué se llamó.
+ * EL DOBLE. La clasificación ya no vive acá, así que el doble no la imita: es
+ * la frontera tal como la ve la acción —una sesión, una llamada `rpc` con la
+ * forma exacta de respuesta de postgrest-js 1.17 (`{ data, error, status }`,
+ * ver `PostgrestBuilder.js`) y un `deleteUser`— más el estado que importa: si
+ * la base CONFIRMÓ la transacción y si el login sigue. Y `from()` lanza: una
+ * lectura o un borrado directo de tablas es la regresión que esto impide.
  *
- * Lo que el doble NO prueba: que la base real rechace eso. Eso lo miden los
- * bloques 119 y 132 (salir con una firma → 23503), 118 y 131 (la baja entera de
- * una organización pasa) y 400 y 401 (las FK hacia `auth.users` y el rechazo del
- * sello) de `supabase/qa/defects_test.sql`, contra la réplica.
+ * Lo que el doble NO prueba: que la función de la base clasifique bien, se
+ * niegue con esos códigos o aguante la carrera. Eso lo miden los bloques 402 a
+ * 408 de `defects_test.sql` y `supabase/qa/baja_concurrente.sh`, contra la
+ * réplica.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NADA_BORRADO, type YaBorrado } from "../porQueNoSeBorro";
+import { NADA_BORRADO } from "../porQueNoSeBorro";
 
 const redirect = vi.fn();
-vi.mock("next/navigation", () => ({ redirect: (url: string) => redirect(url) }));
+// Como el de Next: `redirect` LANZA (NEXT_REDIRECT). Con un mock que devuelve,
+// mover el `redirect` adentro del `try` pasaba todos los tests, y en producción
+// el `catch` se tragaba la baja ya terminada y contestaba «no se pudo borrar el
+// acceso» sobre una cuenta borrada (revisión del 2026-10-26).
+vi.mock("next/navigation", () => ({
+  redirect: (url: string) => {
+    redirect(url);
+    throw Object.assign(new Error("NEXT_REDIRECT"), { digest: `NEXT_REDIRECT;replace;${url};307;` });
+  },
+}));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
 const UMA = "11111111-1111-4111-8111-111111111111"; // la que se va
-const VERA = "22222222-2222-4222-8222-222222222222"; // dueña de la ajena
-const WALT = "33333333-3333-4333-8333-333333333333"; // editor en la propia de uma
 const PROPIA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const PROPIA_2 = "abababab-abab-4bab-8bab-abababababab";
 const AJENA = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const COMPARTIDA = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"; // uma y vera, las dos owners activas
-const ARCHIVADA = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"; // uma, owner archivada
-const TERCERA = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const COMPARTIDA = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const ASSET = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 let sesion: { user: { id: string } | null; error: unknown };
 vi.mock("@/lib/supabase/server", () => ({
@@ -70,167 +75,66 @@ vi.mock("@/lib/supabase/server", () => ({
   },
 }));
 
-// ── La base del doble ────────────────────────────────────────────────────────
-type Fila = Record<string, unknown>;
-type ErrorDeBase = { code?: string; message: string; details?: string };
-
-interface Base {
-  organizations: Fila[];
-  org_members: Fila[];
-  content_assets: Fila[];
-  /** Registros firmados por una persona en una organización: published_by, verified_by, approver. */
-  firmas: { organization_id: string; user_id: string; constraint: string }[];
-  logins: Set<string>;
-}
-
-let base: Base;
-/** Un paso que contesta error sin tocar nada (la sentencia se deshace entera). */
-let fallas: Record<string, ErrorDeBase>;
-/** Un paso que LANZA en vez de contestar. */
-let lanza: Record<string, Error>;
-/** Un paso que contesta sin error y con otra forma (data null, count null). */
-let deforme: Record<string, Partial<{ data: unknown; count: number | null }>>;
-let pedidas: string[];
+// ── La frontera ──────────────────────────────────────────────────────────────
 /**
- * Cuántas veces se pidió cada `tabla.op`. La segunda lectura de `org_members`
- * —los OTROS owners de las que es owner— se llama `org_members.select#2`, para
- * poder hacerla fallar sola.
+ * Lo que devuelve `rpc()`, más `confirmo`: si la base confirmó la transacción.
+ * Eso no viaja en la respuesta —es lo que la acción NO puede ver— y el doble lo
+ * usa para el estado.
  */
-let vistas: Record<string, number>;
+type Respuesta = { data: unknown; error: Record<string, unknown> | null; status: number; confirmo?: boolean };
 
-function miembro(organization_id: string, user_id: string, role: string, state = "active"): Fila {
-  return { organization_id, user_id, role, state };
+/** Lo que la función de la base devuelve cuando confirma. */
+function resultado(deleted: string[], left: string[], released: string[]) {
+  return { deleted_organizations: deleted, left_organizations: left, released_seals: released };
 }
 
-function sembrar(): Base {
-  return {
-    organizations: [{ id: PROPIA }, { id: AJENA }],
-    org_members: [
-      miembro(PROPIA, UMA, "owner"),
-      miembro(PROPIA, WALT, "editor"),
-      miembro(AJENA, VERA, "owner"),
-      miembro(AJENA, UMA, "manager"),
-    ],
-    content_assets: [
-      // Un sello de uma en SU organización: se va con la cascada, no traba nada.
-      { id: "c-propio", organization_id: PROPIA, approved_by: UMA },
-      // Un sello de vera en la ajena: no es de uma.
-      { id: "c-vera", organization_id: AJENA, approved_by: VERA },
-    ],
-    firmas: [],
-    logins: new Set([UMA, VERA, WALT]),
-  };
+const TODO_HECHO = resultado([PROPIA], [AJENA, COMPARTIDA], [ASSET]);
+
+/** Un error que contestó la base: PostgREST lo manda con status HTTP y código. */
+function contesto(code: string, status = 400, message = "algo", details = ""): Respuesta {
+  return { data: null, error: { code, message, details, hint: null }, status, confirmo: false };
 }
 
-/** Suma una organización con sus membresías y lo que tiene adentro. */
-function sumar(id: string, miembros: Fila[], contenido: Fila[] = []) {
-  base.organizations.push({ id });
-  base.org_members.push(...miembros);
-  base.content_assets.push(...contenido);
-}
-
-/** `(a,b,c)` → ["a","b","c"], como lo lee PostgREST en `not.in`. */
-function lista(v: unknown): string[] {
-  const t = String(v).trim();
-  if (!t.startsWith("(") || !t.endsWith(")")) throw new Error(`doble: lista mal formada: ${t}`);
-  return t.slice(1, -1).split(",").map((x) => x.trim()).filter(Boolean);
-}
-
-function borrarOrganizaciones(ids: string[]) {
-  // ON DELETE CASCADE desde organizations: membresías, contenido y lo firmado ahí.
-  base.organizations = base.organizations.filter((o) => !ids.includes(o.id as string));
-  base.org_members = base.org_members.filter((m) => !ids.includes(m.organization_id as string));
-  base.content_assets = base.content_assets.filter((c) => !ids.includes(c.organization_id as string));
-  base.firmas = base.firmas.filter((f) => !ids.includes(f.organization_id));
-}
-
-/** La membresía que una firma traba, si alguna de `filas` lo está. */
-function trabada(filas: Fila[]) {
-  return base.firmas.find((f) =>
-    filas.some((m) => m.organization_id === f.organization_id && m.user_id === f.user_id),
-  );
-}
-
-function rechazoDeFirma(f: { organization_id: string; user_id: string; constraint: string }): ErrorDeBase {
-  // Textual a lo medido en la réplica, DETAIL incluido: nombra la otra organización.
-  return {
-    code: "23503",
-    message: `update or delete on table "org_members" violates foreign key constraint "${f.constraint}" on table "company_profiles"`,
-    details: `Key (organization_id, user_id)=(${f.organization_id}, ${f.user_id}) is still referenced from table "company_profiles".`,
-  };
-}
-
-function consulta(tabla: keyof Base, op: "select" | "delete", conteo: boolean) {
-  const filtros: ((f: Fila) => boolean)[] = [];
-  let limite: number | undefined;
-
-  async function ejecutar() {
-    const raiz = `${tabla}.${op}`;
-    vistas[raiz] = (vistas[raiz] ?? 0) + 1;
-    const nombre = vistas[raiz] === 1 ? raiz : `${raiz}#${vistas[raiz]}`;
-    pedidas.push(nombre);
-    if (lanza[nombre]) throw lanza[nombre];
-    if (fallas[nombre]) return { data: null, error: fallas[nombre], count: null };
-    const filas = (base[tabla] as Fila[]).filter((f) => filtros.every((p) => p(f)));
-
-    let r: { data: unknown; error: ErrorDeBase | null; count: number | null };
-    if (op === "select") {
-      r = { data: filas.slice(0, limite ?? filas.length).map((f) => ({ ...f })), error: null, count: null };
-    } else if (tabla === "org_members") {
-      // UNA sentencia: si una fila está trabada por una firma, no se borra ninguna.
-      const firma = trabada(filas);
-      if (firma) return { data: null, error: rechazoDeFirma(firma), count: null };
-      base.org_members = base.org_members.filter((m) => !filas.includes(m));
-      r = { data: null, error: null, count: conteo ? filas.length : null };
-    } else if (tabla === "organizations") {
-      borrarOrganizaciones(filas.map((o) => o.id as string));
-      r = { data: null, error: null, count: conteo ? filas.length : null };
-    } else {
-      throw new Error(`doble: ${raiz} no está modelado`);
-    }
-    return { ...r, ...(deforme[nombre] ?? {}) };
-  }
-
-  const q = {
-    eq: (c: string, v: unknown) => (filtros.push((f) => f[c] === v), q),
-    neq: (c: string, v: unknown) => (filtros.push((f) => f[c] !== v), q),
-    in: (c: string, vs: unknown[]) => (filtros.push((f) => vs.includes(f[c])), q),
-    not: (c: string, operador: string, v: unknown) => {
-      if (operador !== "in") throw new Error(`doble: not.${operador} no está modelado`);
-      const vs = lista(v);
-      filtros.push((f) => !vs.includes(String(f[c])));
-      return q;
-    },
-    limit: (n: number) => ((limite = n), q),
-    then: (ok: (r: unknown) => unknown, mal?: (e: unknown) => unknown) => ejecutar().then(ok, mal),
-  };
-  return q;
-}
+let respuesta: Respuesta;
+/** Si la base confirmó la transacción. Con la respuesta perdida, puede ser `true` igual. */
+let confirmo: boolean;
+let login: boolean;
+/** Lo que contesta auth-js: `AuthApiError` si GoTrue contestó, `AuthRetryableFetchError`/`AuthUnknownError` si no. */
+let falloDelLogin: { message: string; name?: string; status?: number; code?: string } | null;
+/** Si GoTrue borró el login antes de que se perdiera la respuesta. */
+let borroYPerdio: boolean;
+let lanza: Record<string, Error>;
+let pedidas: string[];
+let argumentos: unknown[];
 
 vi.mock("@/lib/supabase/admin", () => ({
   createSupabaseAdminClient: () => {
     if (lanza["admin"]) throw lanza["admin"];
     return {
-      from: (tabla: keyof Base) => ({
-        select: () => consulta(tabla, "select", false),
-        delete: (o?: { count?: string }) => consulta(tabla, "delete", o?.count === "exact"),
-      }),
+      from: (tabla: string) => {
+        pedidas.push(`from:${tabla}`);
+        throw new Error(`doble: la acción no lee ni borra tablas (${tabla}); eso lo hace la 0035`);
+      },
+      rpc: async (fn: string, args: unknown) => {
+        pedidas.push(`rpc:${fn}`);
+        argumentos.push(args);
+        if (lanza["rpc"]) {
+          // La llamada salió: la base pudo confirmar antes de que se cortara.
+          confirmo = true;
+          throw lanza["rpc"];
+        }
+        const { confirmo: c, ...vista } = respuesta;
+        confirmo = c ?? respuesta.error === null;
+        return vista;
+      },
       auth: {
         admin: {
           deleteUser: async (id: string) => {
             pedidas.push("auth.deleteUser");
             if (lanza["auth.deleteUser"]) throw lanza["auth.deleteUser"];
-            if (fallas["auth.deleteUser"]) return { data: null, error: fallas["auth.deleteUser"] };
-            // Lo que la réplica rechaza al borrar de `auth.users`, y GoTrue
-            // devuelve como «Database error deleting user»:
-            //  * un sello firmado por la persona (SET NULL contra el CHECK: 23514);
-            //  * una membresía que cae por cascada y está trabada por una firma (23503).
-            const membresias = base.org_members.filter((m) => m.user_id === id);
-            if (base.content_assets.some((c) => c.approved_by === id) || trabada(membresias)) {
-              return { data: null, error: { status: 500, message: "Database error deleting user" } };
-            }
-            base.logins.delete(id);
-            base.org_members = base.org_members.filter((m) => m.user_id !== id);
+            if (borroYPerdio && id === UMA) login = false;
+            if (falloDelLogin) return { data: null, error: falloDelLogin };
+            if (id === UMA) login = false;
             return { data: {}, error: null };
           },
         },
@@ -241,108 +145,74 @@ vi.mock("@/lib/supabase/admin", () => ({
 
 const { deleteMyAccount } = await import("../account-actions");
 
-const NOMBRES: Record<string, string> = {
-  [PROPIA]: "propia",
-  [PROPIA_2]: "propia2",
-  [AJENA]: "ajena",
-  [COMPARTIDA]: "compartida",
-  [ARCHIVADA]: "archivada",
-  [TERCERA]: "tercera",
-};
-
-/** Lo que queda de uma en la base. */
-function deUma() {
-  return {
-    propia: base.organizations.some((o) => o.id === PROPIA),
-    membresias: base.org_members
-      .filter((m) => m.user_id === UMA)
-      .map((m) => `${NOMBRES[m.organization_id as string] ?? "otra"}:${m.role}${m.state === "active" ? "" : `:${m.state}`}`)
-      .sort(),
-    login: base.logins.has(UMA),
-  };
-}
-
-/** Lo que queda de una organización: si existe, quiénes la integran y qué contenido tiene. */
-function deLaOrganizacion(id: string) {
-  return {
-    existe: base.organizations.some((o) => o.id === id),
-    miembros: base.org_members
-      .filter((m) => m.organization_id === id)
-      .map((m) => `${m.user_id === UMA ? "uma" : m.user_id === VERA ? "vera" : "walt"}:${m.role}`)
-      .sort(),
-    contenido: base.content_assets.filter((c) => c.organization_id === id).map((c) => c.id),
-  };
-}
-
-const INTACTA = { propia: true, membresias: ["ajena:manager", "propia:owner"], login: true };
-const SECUENCIA = [
-  "org_members.select",
-  "org_members.select#2",
-  "content_assets.select",
-  "org_members.delete",
-  "organizations.delete",
-  "auth.deleteUser",
-];
+const SECUENCIA = ["rpc:delete_account_organizations", "auth.deleteUser"];
 
 let consola: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   sesion = { user: { id: UMA }, error: null };
-  base = sembrar();
-  fallas = {};
+  respuesta = { data: TODO_HECHO, error: null, status: 200 };
+  confirmo = false;
+  login = true;
+  falloDelLogin = null;
+  borroYPerdio = false;
   lanza = {};
-  deforme = {};
   pedidas = [];
-  vistas = {};
+  argumentos = [];
   redirect.mockClear();
   consola = vi.spyOn(console, "error").mockImplementation(() => {});
 });
 afterEach(() => consola.mockRestore());
 
+/** Una baja que TERMINÓ: no vuelve, lanza el NEXT_REDIRECT de `redirect("/")`. */
+async function terminada() {
+  const e = await deleteMyAccount().then(
+    (r) => ({ volvio: r }),
+    (e: unknown) => e,
+  );
+  expect(e).toMatchObject({ digest: expect.stringMatching(/^NEXT_REDIRECT;replace;\/;/) });
+  expect(redirect).toHaveBeenCalledWith("/");
+}
+
 /** Nada de la base en la frase que ve la persona. */
 function sinDetalleDeLaBase(mensaje: string) {
-  expect(mensaje).not.toMatch(/23503|23514|foreign key|constraint|org_members|company_profiles|Database error/i);
+  expect(mensaje).not.toMatch(/23503|45008|45009|40001|55P03|PGRST|EPIPE|foreign key|constraint|org_members|Database error/i);
   expect(mensaje).not.toContain(AJENA);
   expect(mensaje).not.toContain(UMA);
 }
 
-describe("deleteMyAccount — la secuencia entera", () => {
-  it("CONTROL: con todo en verde, recorre los seis pasos en orden, no deja nada de uma y recién ahí redirige", async () => {
-    // Sin este caso, una función que nunca borrara —o nunca redirigiera—
+describe("deleteMyAccount — una llamada a la base y después el login", () => {
+  it("CONTROL: con todo en verde, llama a la función con SU id, borra el login y recién ahí redirige", async () => {
+    // Sin este caso, una acción que nunca borrara —o nunca redirigiera—
     // pasaría todos los de abajo.
-    expect(deUma()).toEqual(INTACTA); // anti-vacuidad: la fixture tiene lo que dice
-    await deleteMyAccount();
+    expect(login).toBe(true); // anti-vacuidad
+    await terminada();
     expect(pedidas).toEqual(SECUENCIA);
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: false });
-    expect(redirect).toHaveBeenCalledWith("/");
-    // La ajena sigue: uma se fue de ella, no la borró.
-    expect(base.organizations.map((o) => o.id)).toEqual([AJENA]);
-    expect(base.org_members.filter((m) => m.organization_id === AJENA).map((m) => m.user_id)).toEqual([VERA]);
+    expect(argumentos).toEqual([{ p_user_id: UMA }]);
+    expect(login).toBe(false);
   });
 
-  it("un sello suyo en SU organización no traba nada: se va con la cascada", async () => {
-    expect(base.content_assets.some((c) => c.approved_by === UMA && c.organization_id === PROPIA)).toBe(true);
-    await deleteMyAccount();
-    expect(redirect).toHaveBeenCalledWith("/");
+  it("el redirect queda FUERA del try: la baja terminada no se convierte en un fallo con motivo", async () => {
+    // Si el catch atajara el NEXT_REDIRECT, la acción devolvería un BajaFallida
+    // (con el login ya borrado) en vez de lanzar, y la pantalla mostraría un
+    // error sobre una cuenta que ya no existe.
+    await terminada();
+    expect(consola).not.toHaveBeenCalled();
   });
 
-  it("sin organizaciones propias, sale de las ajenas y borra el acceso", async () => {
-    base.organizations = base.organizations.filter((o) => o.id !== PROPIA);
-    base.org_members = base.org_members.filter((m) => m.organization_id !== PROPIA);
-    base.content_assets = base.content_assets.filter((c) => c.organization_id !== PROPIA);
-    await deleteMyAccount();
-    expect(pedidas).toEqual(["org_members.select", "content_assets.select", "org_members.delete", "auth.deleteUser"]);
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: false });
-    expect(redirect).toHaveBeenCalledWith("/");
+  it("no lee ni borra ninguna tabla por su cuenta: la clasificación es de la base (bloques 402 y 403)", async () => {
+    await terminada();
+    expect(pedidas.filter((p) => p.startsWith("from:"))).toEqual([]);
+    expect(pedidas.filter((p) => p.startsWith("rpc:"))).toEqual(["rpc:delete_account_organizations"]);
   });
 
-  it("con DOS propias, borra las dos", async () => {
-    sumar(PROPIA_2, [miembro(PROPIA_2, UMA, "owner")]);
-    await deleteMyAccount();
-    expect(base.organizations.map((o) => o.id)).toEqual([AJENA]);
-    expect(redirect).toHaveBeenCalledWith("/");
+  it("sin organizaciones ni sellos (la función devuelve todo vacío) también borra el login: reintentar retoma", async () => {
+    respuesta = { data: resultado([], [], []), error: null, status: 200 };
+    await terminada();
+    expect(pedidas).toEqual(SECUENCIA);
+    expect(login).toBe(false);
   });
 
-  it("sin sesión no toca nada y lo dice con nombre", async () => {
+  it("sin sesión no llama a la base y lo dice con nombre", async () => {
     sesion = { user: null, error: null };
     const r = await deleteMyAccount();
     expect(r).toMatchObject({ ok: false, motivo: "sin-sesion", yaBorrado: NADA_BORRADO });
@@ -352,318 +222,218 @@ describe("deleteMyAccount — la secuencia entera", () => {
   });
 });
 
-describe("deleteMyAccount — sólo se borra la organización que es SÓLO suya", () => {
-  // El defecto medido en la réplica el 2026-10-11: «propias» era `role = owner`.
-  // Un owner suma un admin, el admin se sube a owner por la RLS, y la baja del
-  // segundo se llevaba la organización del primero con todo lo que tenía.
-
-  it("con OTRO owner activo, la organización es compartida: sale de ella y queda entera para la otra", async () => {
-    sumar(
-      COMPARTIDA,
-      [miembro(COMPARTIDA, VERA, "owner"), miembro(COMPARTIDA, UMA, "owner")],
-      [{ id: "c-vera-compartida", organization_id: COMPARTIDA, approved_by: VERA }],
-    );
-    await deleteMyAccount();
-    expect(redirect).toHaveBeenCalledWith("/");
-    expect(deLaOrganizacion(COMPARTIDA)).toEqual({
-      existe: true,
-      miembros: ["vera:owner"],
-      contenido: ["c-vera-compartida"],
-    });
-    // La que sí era sólo suya, se fue.
-    expect(deLaOrganizacion(PROPIA).existe).toBe(false);
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: false });
-  });
-
-  it("owner ARCHIVADA (ya la sacaron): no es suya, sale y la organización queda", async () => {
-    // Como en hosted el 2026-10-11: membresías owner archivadas en
-    // organizaciones sin otro miembro activo.
-    sumar(
-      ARCHIVADA,
-      [miembro(ARCHIVADA, UMA, "owner", "archived")],
-      [{ id: "c-archivada", organization_id: ARCHIVADA, approved_by: null }],
-    );
-    await deleteMyAccount();
-    expect(redirect).toHaveBeenCalledWith("/");
-    expect(deLaOrganizacion(ARCHIVADA)).toEqual({ existe: true, miembros: [], contenido: ["c-archivada"] });
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: false });
-  });
-
-  it("owner archivada donde otra es owner activa: tampoco la borra", async () => {
-    sumar(ARCHIVADA, [miembro(ARCHIVADA, VERA, "owner"), miembro(ARCHIVADA, UMA, "owner", "archived")]);
-    await deleteMyAccount();
-    expect(deLaOrganizacion(ARCHIVADA)).toMatchObject({ existe: true, miembros: ["vera:owner"] });
-  });
-
-  it("el OTRO owner archivado no la vuelve compartida: es sólo suya y se borra", async () => {
-    // Sin el filtro de estado en la lectura de los otros owners, la propia se
-    // leería compartida, uma saldría de ella y la organización quedaría sin
-    // ningún owner activo, con todo lo que tiene.
-    base.org_members = base.org_members.map((m) =>
-      m.organization_id === PROPIA && m.user_id === WALT ? { ...m, role: "owner", state: "archived" } : m,
-    );
-    await deleteMyAccount();
-    expect(redirect).toHaveBeenCalledWith("/");
-    expect(deLaOrganizacion(PROPIA).existe).toBe(false);
-  });
-
-  it("selló contenido en la COMPARTIDA: no se borra nada (esa organización no se va, y el sello traba el acceso)", async () => {
-    sumar(
-      COMPARTIDA,
-      [miembro(COMPARTIDA, VERA, "owner"), miembro(COMPARTIDA, UMA, "owner")],
-      [{ id: "c-uma-compartida", organization_id: COMPARTIDA, approved_by: UMA }],
-    );
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "sello-en-otra-organizacion", yaBorrado: NADA_BORRADO });
-    expect(deUma()).toEqual({ ...INTACTA, membresias: ["ajena:manager", "compartida:owner", "propia:owner"] });
-    expect(pedidas).not.toContain("org_members.delete");
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
+describe("deleteMyAccount — la base CONTESTÓ un error: se deshizo todo, y el código dice por qué", () => {
   it.each([
-    ["admin", "active"],
-    ["manager", "active"],
-    ["editor", "active"],
-    ["viewer", "active"],
-    ["client", "active"],
-    ["owner", "active"], // compartida: vera también es owner activa
-    ["owner", "archived"],
-    ["manager", "archived"],
-  ])(
-    "sale de una organización donde es %s (%s) ANTES de borrar la propia: una firma ahí no deja nada a medias",
-    async (role, state) => {
-      // Una membresía que el paso de salir NO quita la encuentra después la
-      // cascada de `auth.users`, con la propia ya borrada: queda sólo el login.
-      sumar(TERCERA, [miembro(TERCERA, VERA, "owner"), miembro(TERCERA, UMA, role, state)]);
-      base.firmas.push({ organization_id: TERCERA, user_id: UMA, constraint: "company_profiles_published_by_member_fkey" });
-      const r = await deleteMyAccount();
-      expect(r).toMatchObject({ ok: false, motivo: "firma-en-otra-organizacion", yaBorrado: NADA_BORRADO });
-      expect(deLaOrganizacion(PROPIA).existe).toBe(true);
-      expect(base.logins.has(UMA)).toBe(true);
-      expect(pedidas).not.toContain("organizations.delete");
-      expect(redirect).not.toHaveBeenCalled();
-    },
-  );
-});
-
-describe("deleteMyAccount — los rechazos que deciden otros, ANTES de borrar nada", () => {
-  it("publicó una versión de la ficha en la ajena: NO se borra nada, ni siquiera la propia", async () => {
-    // El defecto medido: con el orden viejo, la propia ya se había ido cuando
-    // la base rechazaba la salida de la ajena.
-    base.firmas.push({ organization_id: AJENA, user_id: UMA, constraint: "company_profiles_published_by_member_fkey" });
+    // [código, status con el que lo manda PostgREST, motivo, frase]
+    ["45008", 400, "sello-en-otra-organizacion", /Ask that organization/],
+    ["45010", 400, "sello-publicado-sin-quien-decida", /Contact support/],
+    ["23503", 409, "firma-en-otra-organizacion", /That organization has to decide/],
+    ["45009", 400, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["40001", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["40P01", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["55P03", 500, "no-se-pudo-verificar", /could not check what deleting it involves/],
+    ["22023", 400, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // Una sentencia cancelada por statement_timeout: se deshizo, aunque venga con 500.
+    ["57014", 500, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    ["42501", 403, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // La función no existe (la 0035 sin aplicar): PostgREST no abrió la transacción.
+    ["PGRST202", 404, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    // Sin conexión del pool, o sin conectar: tampoco.
+    ["PGRST003", 504, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+    ["PGRST000", 503, "no-se-pudieron-borrar-las-organizaciones", /could not delete the organizations that are only yours/],
+  ])("%s (%s) → «%s», «Nothing was deleted», y el login no se toca", async (code, status, motivo, frase) => {
+    respuesta = contesto(code, status, "texto de postgres",
+      `Key (organization_id, user_id)=(${AJENA}, ${UMA}) is still referenced`);
     const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "firma-en-otra-organizacion", yaBorrado: { ajenas: 0, propias: 0 } });
-    expect(deUma()).toEqual(INTACTA);
-    expect(pedidas).not.toContain("organizations.delete");
-    expect(pedidas).not.toContain("auth.deleteUser");
+    expect(confirmo).toBe(false); // anti-vacuidad: el doble deshizo
+    expect(r).toMatchObject({ ok: false, motivo, yaBorrado: NADA_BORRADO });
+    expect(r.message).toMatch(frase);
     expect(r.message).toMatch(/Nothing was deleted/);
-    sinDetalleDeLaBase(r.message);
+    expect(pedidas).toEqual(["rpc:delete_account_organizations"]);
+    expect(login).toBe(true);
     expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("aprobó una tarjeta en la ajena: lo mismo, con la FK del aprobador", async () => {
-    base.firmas.push({ organization_id: AJENA, user_id: UMA, constraint: "board_cards_approver_member_fkey" });
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "firma-en-otra-organizacion" });
-    expect(deUma()).toEqual(INTACTA);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("selló contenido en la ajena: lo ve ANTES de salir de nada, y no borra nada", async () => {
-    // El rechazo que la base da recién en `auth.users`. Sin la verificación,
-    // la cadena llegaba ahí con la propia y las membresías ya borradas.
-    base.content_assets.push({ id: "c-uma-en-ajena", organization_id: AJENA, approved_by: UMA });
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "sello-en-otra-organizacion", yaBorrado: { ajenas: 0, propias: 0 } });
-    expect(deUma()).toEqual(INTACTA);
-    expect(pedidas).toEqual(["org_members.select", "org_members.select#2", "content_assets.select"]);
-    expect(r.message).toMatch(/Nothing was deleted/);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-});
-
-describe("deleteMyAccount — un fallo en CADA paso vuelve con su motivo y dice qué quedó (R13)", () => {
-  it("paso 1, no puede leer sus membresías: no borra nada", async () => {
-    fallas["org_members.select"] = { message: "timeout" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar" });
-    expect(pedidas).toEqual(["org_members.select"]);
-    expect(deUma()).toEqual(INTACTA);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("paso 1, sin error y SIN FILAS (data null): no es cero, no sigue", async () => {
-    // Con `data ?? []` el paso de las propias se salteaba y el del acceso las
-    // dejaba sin dueño: la cascada de `auth.users` se lleva la membresía owner y
-    // la organización queda, inalcanzable.
-    deforme["org_members.select"] = { data: null };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar" });
-    expect(deUma()).toEqual(INTACTA);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("paso 2, no puede leer los OTROS owners: no borra nada (no sabe cuál es sólo suya)", async () => {
-    fallas["org_members.select#2"] = { message: "timeout" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar", yaBorrado: NADA_BORRADO });
-    expect(pedidas).toEqual(["org_members.select", "org_members.select#2"]);
-    expect(deUma()).toEqual(INTACTA);
-  });
-
-  it("paso 2, sin error y sin filas: tampoco sigue (ausencia de otros owners no es «ninguno»)", async () => {
-    // Leído como cero, una compartida se borraría como si fuera sólo suya.
-    sumar(COMPARTIDA, [miembro(COMPARTIDA, VERA, "owner"), miembro(COMPARTIDA, UMA, "owner")]);
-    deforme["org_members.select#2"] = { data: null };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar" });
-    expect(deLaOrganizacion(COMPARTIDA).existe).toBe(true);
-    expect(deLaOrganizacion(PROPIA).existe).toBe(true);
-  });
-
-  it("paso 3, no puede verificar los sellos: no borra nada", async () => {
-    fallas["content_assets.select"] = { message: "permission denied" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar" });
-    expect(pedidas).toEqual(["org_members.select", "org_members.select#2", "content_assets.select"]);
-    expect(deUma()).toEqual(INTACTA);
-  });
-
-  it("paso 3, sin error y sin filas: tampoco sigue", async () => {
-    deforme["content_assets.select"] = { data: null };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-verificar" });
-    expect(deUma()).toEqual(INTACTA);
-  });
-
-  it("paso 4, no puede salir de las demás por otro motivo: no borra nada y no lo llama firma", async () => {
-    fallas["org_members.delete"] = { code: "57014", message: "canceling statement due to statement timeout" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-salir" });
-    expect(deUma()).toEqual(INTACTA);
-    expect(pedidas).not.toContain("organizations.delete");
     sinDetalleDeLaBase(r.message);
   });
-
-  it("paso 5, no puede borrar las propias: ya salió de la ajena, y lo DICE", async () => {
-    fallas["organizations.delete"] = { message: "timeout" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({
-      ok: false,
-      motivo: "no-se-pudieron-borrar-las-propias",
-      yaBorrado: { ajenas: 1, propias: 0 },
-    });
-    expect(deUma()).toEqual({ propia: true, membresias: ["propia:owner"], login: true });
-    expect(pedidas).not.toContain("auth.deleteUser");
-    expect(r.message).toMatch(/removed from 1 organization that is not only yours/);
-    expect(r.message).not.toMatch(/Nothing was deleted/);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("paso 5, borra MENOS de las que leyó: no sigue al acceso (dejaría organizaciones sin dueño)", async () => {
-    deforme["organizations.delete"] = { count: 0 };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudieron-borrar-las-propias" });
-    expect(pedidas).not.toContain("auth.deleteUser");
-    expect(base.logins.has(UMA)).toBe(true);
-  });
-
-  it("paso 5, no dice CUÁNTAS borró (count null): tampoco sigue al acceso, y no inventa el número", async () => {
-    // Sin error no es «todas»: si no se sabe, el paso 6 podría dejar alguna
-    // propia sin dueño por la cascada de `auth.users`.
-    deforme["organizations.delete"] = { count: null };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({
-      ok: false,
-      motivo: "no-se-pudieron-borrar-las-propias",
-      yaBorrado: { ajenas: 1, propias: null },
-    });
-    expect(pedidas).not.toContain("auth.deleteUser");
-    expect(base.logins.has(UMA)).toBe(true);
-    expect(r.message).toMatch(/organizations that were only yours may have been deleted/);
-    expect(r.message).not.toMatch(/Nothing was deleted/);
-  });
-
-  it("paso 4 no dice cuántas quitó (count null) y después se corta: la frase dice que salió, sin número", async () => {
-    deforme["org_members.delete"] = { count: null };
-    fallas["auth.deleteUser"] = { message: "Database error deleting user" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso", yaBorrado: { ajenas: null, propias: 1 } });
-    expect(r.message).toMatch(/you were removed from organizations that are not only yours;/);
-  });
-
-  it("paso 4 no dice cuántas quitó y el 5 falla: NO dice «Nothing was deleted»", async () => {
-    deforme["org_members.delete"] = { count: null };
-    fallas["organizations.delete"] = { message: "timeout" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({ ok: false, yaBorrado: { ajenas: null, propias: 0 } });
-    expect(r.message).not.toMatch(/Nothing was deleted/);
-    expect(r.message).toMatch(/removed from organizations that are not only yours/);
-  });
-
-  it("paso 6, no puede borrar el acceso: dice que salió de la ajena, que la propia se borró, y que queda el login", async () => {
-    fallas["auth.deleteUser"] = { message: "Database error deleting user" };
-    const r = await deleteMyAccount();
-    expect(r).toMatchObject({
-      ok: false,
-      motivo: "no-se-pudo-borrar-el-acceso",
-      yaBorrado: { ajenas: 1, propias: 1 },
-    });
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: true });
-    expect(r.message).toMatch(/removed from 1 organization that is not only yours/);
-    expect(r.message).toMatch(/1 organization that was only yours was deleted/);
-    expect(r.message).toMatch(/login is still there/);
-    expect(r.message).not.toMatch(/Nothing was deleted/);
-    sinDetalleDeLaBase(r.message);
-    expect(redirect).not.toHaveBeenCalled();
-  });
-
-  it("después de un corte en el paso 6, reintentar retoma y termina", async () => {
-    fallas["auth.deleteUser"] = { message: "Database error deleting user" };
-    await deleteMyAccount();
-    delete fallas["auth.deleteUser"];
-    pedidas = [];
-    vistas = {};
-    await deleteMyAccount();
-    expect(pedidas).toEqual(["org_members.select", "content_assets.select", "org_members.delete", "auth.deleteUser"]);
-    expect(deUma()).toEqual({ propia: false, membresias: [], login: false });
-    expect(redirect).toHaveBeenCalledWith("/");
-  });
-
-  const SALIO: YaBorrado = { ajenas: 1, propias: 0 };
-  const SALIO_Y_BORRO: YaBorrado = { ajenas: 1, propias: 1 };
-  it.each([
-    ["server", "sin-sesion", NADA_BORRADO, INTACTA],
-    ["getUser", "sin-sesion", NADA_BORRADO, INTACTA],
-    ["admin", "no-se-pudo-verificar", NADA_BORRADO, INTACTA],
-    ["org_members.select", "no-se-pudo-verificar", NADA_BORRADO, INTACTA],
-    ["org_members.select#2", "no-se-pudo-verificar", NADA_BORRADO, INTACTA],
-    ["content_assets.select", "no-se-pudo-verificar", NADA_BORRADO, INTACTA],
-    ["org_members.delete", "no-se-pudo-salir", NADA_BORRADO, INTACTA],
-    ["organizations.delete", "no-se-pudieron-borrar-las-propias", SALIO, { propia: true, membresias: ["propia:owner"], login: true }],
-    ["auth.deleteUser", "no-se-pudo-borrar-el-acceso", SALIO_Y_BORRO, { propia: false, membresias: [], login: true }],
-  ])(
-    "un paso que LANZA (%s) vuelve con el motivo de ese paso y con lo que ya se borró, no como excepción",
-    async (paso, motivo, yaBorrado, queda) => {
-      lanza[paso] = new Error("fetch failed");
-      const r = await deleteMyAccount();
-      expect(r).toMatchObject({ ok: false, motivo });
-      // Lo que ya no está no se olvida porque el paso lanzó en vez de contestar.
-      expect(r.yaBorrado).toEqual(yaBorrado);
-      expect(deUma()).toEqual(queda);
-      if (yaBorrado.ajenas === 0 && yaBorrado.propias === 0) expect(r.message).toMatch(/Nothing was deleted/);
-      else expect(r.message).not.toMatch(/Nothing was deleted/);
-      expect(redirect).not.toHaveBeenCalled();
-      sinDetalleDeLaBase(r.message);
-      expect(r.message).not.toContain("fetch failed");
-    },
-  );
 
   it("el detalle de la base va al log, no a la pantalla", async () => {
-    base.firmas.push({ organization_id: AJENA, user_id: UMA, constraint: "company_profiles_published_by_member_fkey" });
+    respuesta = contesto("23503", 409, "update or delete on table \"org_members\" violates foreign key constraint");
     const r = await deleteMyAccount();
     sinDetalleDeLaBase(r.message);
     // Y SÍ llega al log: un motivo con nombre no puede costar el diagnóstico.
     expect(consola.mock.calls.flat().join(" ")).toMatch(/23503/);
+  });
+});
+
+describe("deleteMyAccount — la base NO contestó: no se sabe, y no lo disfraza de cero", () => {
+  it.each([
+    ["el fetch se cortó (status 0, sin código)",
+      { data: null, error: { message: "TypeError: fetch failed", code: "" }, status: 0, confirmo: true }],
+    // `EPIPE` tiene la forma de un SQLSTATE: cinco mayúsculas. El status 0 dice que no contestó nadie.
+    ["el socket se rompió (status 0, código EPIPE)",
+      { data: null, error: { message: "Error: write EPIPE", code: "EPIPE" }, status: 0, confirmo: true }],
+    ["un proxy contestó HTML (502, sin código)",
+      { data: null, error: { message: "<html>Bad Gateway</html>" }, status: 502, confirmo: true }],
+    ["un 504 de la puerta, con un código que no es de la base",
+      { data: null, error: { message: "timeout", code: "GATEWAY" }, status: 504, confirmo: true }],
+    // PostgREST perdió la conexión con Postgres mientras mandaba el COMMIT o leía
+    // su respuesta (revisión del 2026-10-26): pudo confirmarse.
+    ["PGRST001: PostgREST perdió la conexión con la base (503)",
+      { data: null, error: { message: "Database client error. Retrying the connection.", code: "PGRST001" }, status: 503, confirmo: true }],
+    ["08006: la conexión se cayó (503)",
+      { data: null, error: { message: "connection failure", code: "08006" }, status: 503, confirmo: true }],
+    // Con réplica sincrónica, el apagado llega con el COMMIT ya escrito.
+    ["57P01: el servidor se apagó (503)",
+      { data: null, error: { message: "terminating connection due to administrator command", code: "57P01" }, status: 503, confirmo: true }],
+    ["XX000: error interno (500)",
+      { data: null, error: { message: "internal error", code: "XX000" }, status: 500, confirmo: true }],
+    ["53100: sin disco (503)",
+      { data: null, error: { message: "could not extend file", code: "53100" }, status: 503, confirmo: true }],
+    ["un PGRST que no se conoce",
+      { data: null, error: { message: "algo nuevo", code: "PGRST999" }, status: 500, confirmo: true }],
+  ])("%s → «no-se-sabe-que-se-borro», yaBorrado null, y el login no se toca", async (_caso, r0) => {
+    respuesta = r0 as Respuesta;
+    const r = await deleteMyAccount();
+    expect(confirmo).toBe(true); // anti-vacuidad: el doble confirmó y perdió la respuesta
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-sabe-que-se-borro", yaBorrado: null });
+    expect(r.message).not.toMatch(/Nothing was deleted|Already done/);
+    expect(r.message).toMatch(/could not confirm whether your organizations were deleted/);
+    expect(r.message).toMatch(/login is still there/);
+    expect(pedidas).not.toContain("auth.deleteUser");
+    expect(login).toBe(true);
+    expect(redirect).not.toHaveBeenCalled();
+    sinDetalleDeLaBase(r.message);
+  });
+
+  it.each([
+    ["data null", null],
+    ["un objeto vacío", {}],
+    ["falta released_seals", { deleted_organizations: [], left_organizations: [] }],
+    ["un arreglo que no es de ids", { deleted_organizations: [1], left_organizations: [], released_seals: [] }],
+    ["un número en vez de un arreglo", { deleted_organizations: 1, left_organizations: [], released_seals: [] }],
+    ["un arreglo de filas (forma SETOF)", [TODO_HECHO]],
+  ])("sin error y sin la forma prometida (%s): no se sabe qué borró, y no borra el login", async (_caso, data) => {
+    // La base CONFIRMÓ algo. Contarlo como cero y seguir al login sería borrar
+    // el acceso sobre una suposición.
+    respuesta = { data, error: null, status: 200 };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-sabe-que-se-borro", yaBorrado: null });
+    expect(pedidas).toEqual(["rpc:delete_account_organizations"]);
+    expect(login).toBe(true);
+  });
+});
+
+describe("deleteMyAccount — el login, después: lo que ya se hizo se dice", () => {
+  it("no puede borrar el acceso: dice qué organizaciones se fueron, de cuáles salió, qué sellos soltó, y que queda el login", async () => {
+    // Un 4xx: GoTrue rechazó el pedido y no borró.
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({
+      ok: false,
+      motivo: "no-se-pudo-borrar-el-acceso",
+      yaBorrado: { ajenas: 2, propias: 1, sellos: 1 },
+    });
+    expect(r.message).toMatch(/removed from 2 organizations that are not only yours/);
+    expect(r.message).toMatch(/1 organization that was only yours was deleted/);
+    expect(r.message).toMatch(/1 approval of yours was withdrawn/);
+    expect(r.message).toMatch(/login is still there/);
+    expect(r.message).not.toMatch(/Nothing was deleted/);
+    expect(login).toBe(true);
+    sinDetalleDeLaBase(r.message);
+    expect(redirect).not.toHaveBeenCalled();
+  });
+
+  it("después de un corte en el login, reintentar retoma: la función no tiene nada que hacer, y el login se borra", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
+    await deleteMyAccount();
+    falloDelLogin = null;
+    respuesta = { data: resultado([], [], []), error: null, status: 200 };
+    pedidas = [];
+    await terminada();
+    expect(pedidas).toEqual(SECUENCIA);
+    expect(login).toBe(false);
+  });
+
+  it.each([
+    ["el fetch se cortó (status 0)", { name: "AuthRetryableFetchError", status: 0, message: "fetch failed" }],
+    ["la puerta contestó 504", { name: "AuthRetryableFetchError", status: 504, message: "Gateway Timeout" }],
+    ["el cuerpo no se pudo leer", { name: "AuthUnknownError", message: "Unexpected token <" }],
+  ])("GoTrue no contestó (%s): NO dice que el login sigue, dice que no se sabe", async (_caso, err) => {
+    // GoTrue pudo borrar `auth.users` y perder la respuesta (revisión del
+    // 2026-10-26). Decir «Your login is still there» sería afirmar lo que no se sabe.
+    borroYPerdio = true;
+    falloDelLogin = err;
+    const r = await deleteMyAccount();
+    expect(login).toBe(false); // anti-vacuidad: el doble lo borró y perdió la respuesta
+    expect(r).toMatchObject({
+      ok: false,
+      motivo: "no-se-sabe-si-se-borro-el-acceso",
+      yaBorrado: { ajenas: 2, propias: 1, sellos: 1 },
+    });
+    expect(r.message).toMatch(/could not confirm whether your login was deleted/);
+    expect(r.message).toMatch(/We cannot tell whether your login is still there/);
+    expect(r.message).not.toMatch(/Your login is still there/);
+    expect(r.message).toMatch(/Already done: you were removed from 2 organizations/);
+    expect(redirect).not.toHaveBeenCalled();
+  });
+
+  it("GoTrue CONTESTÓ un 4xx (AuthApiError 403): ahí sí se sabe que el login sigue", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 403, code: "not_admin", message: "User not allowed" };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso" });
+    expect(r.message).toMatch(/Your login is still there/);
+    expect(login).toBe(true);
+  });
+
+  it("GoTrue contestó un 5xx (unexpected_failure): no dice que el login sigue, porque su COMMIT pudo pasar", async () => {
+    // Es también lo que contesta GoTrue si pierde la conexión en su propio COMMIT
+    // (revisión del 2026-10-26): el análogo del PGRST001 de PostgREST.
+    borroYPerdio = true;
+    falloDelLogin = { name: "AuthApiError", status: 500, code: "unexpected_failure", message: "Database error deleting user" };
+    const r = await deleteMyAccount();
+    expect(login).toBe(false); // anti-vacuidad: el doble lo borró y contestó 500
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-sabe-si-se-borro-el-acceso" });
+    expect(r.message).not.toMatch(/Your login is still there/);
+  });
+
+  it("GoTrue dice que el login ya no existe (404 user_not_found, otra pestaña terminó): la baja terminó", async () => {
+    // Decir «no pudimos borrar tu login… sigue ahí» sobre un login que ya no
+    // existe sería falso (revisión del 2026-10-26).
+    login = false;
+    falloDelLogin = { name: "AuthApiError", status: 404, code: "user_not_found", message: "User not found" };
+    await terminada();
+    expect(pedidas).toEqual(SECUENCIA);
+  });
+
+  it("un 404 que NO es user_not_found no se lee como borrado", async () => {
+    falloDelLogin = { name: "AuthApiError", status: 404, code: "not_found", message: "Not Found" };
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo: "no-se-pudo-borrar-el-acceso" });
+    expect(redirect).not.toHaveBeenCalled();
+  });
+});
+
+describe("deleteMyAccount — un paso que LANZA vuelve con el motivo de ese paso, no como excepción", () => {
+  const HECHO = { ajenas: 2, propias: 1, sellos: 1 };
+  it.each([
+    ["server", "sin-sesion", NADA_BORRADO],
+    ["getUser", "sin-sesion", NADA_BORRADO],
+    ["admin", "no-se-pudo-verificar", NADA_BORRADO],
+    // La llamada salió y no volvió: pudo confirmarse.
+    ["rpc", "no-se-sabe-que-se-borro", null],
+    // Lanzó adentro de auth-js: no se sabe si GoTrue llegó a borrarlo.
+    ["auth.deleteUser", "no-se-sabe-si-se-borro-el-acceso", HECHO],
+  ])("%s → «%s», con lo que ya se sabe que se borró", async (paso, motivo, yaBorrado) => {
+    lanza[paso] = new Error("fetch failed");
+    const r = await deleteMyAccount();
+    expect(r).toMatchObject({ ok: false, motivo });
+    expect(r.yaBorrado).toEqual(yaBorrado);
+    if (yaBorrado === null) expect(r.message).not.toMatch(/Nothing was deleted|Already done/);
+    else if (yaBorrado === NADA_BORRADO) expect(r.message).toMatch(/Nothing was deleted/);
+    else expect(r.message).toMatch(/Already done/);
+    if (paso !== "auth.deleteUser") expect(pedidas).not.toContain("auth.deleteUser");
+    expect(login).toBe(true);
+    expect(redirect).not.toHaveBeenCalled();
+    sinDetalleDeLaBase(r.message);
+    expect(r.message).not.toContain("fetch failed");
   });
 });
