@@ -136,9 +136,9 @@
 --     llegan si la dueña de la función es un rol sin BYPASSRLS al que todo lo
 --     demás le está abierto (N3b, en la tabla de abajo): entonces 402, 403,
 --     404, 406 y 407 se ponen rojos con 40001, y sin la 0036 los cuatro
---     primeros dan verde. Corrida en cambio con la sesión de quien se va, la baja se rompe
---     igual SIN la 0036 —la frenan antes la permisiva de la 0013 y el eje de la
---     0031—, así que esa forma no mide nada de acá.
+--     primeros dan verde. Corrida en cambio con la sesión de quien se va, la
+--     baja se rompe igual SIN la 0036 —la frenan antes la permisiva de la 0013
+--     y el eje de la 0031—, así que esa forma no mide nada de acá.
 --   * `ingest_lead_won()` (0019) no escribe `org_members`: la organización que
 --     crea nace SIN miembros, y su primer owner lo pone el servidor. El bloque
 --     255 la ejecuta y lo mide, para que el día que empiece a dar owners —un
