@@ -86,8 +86,10 @@
 --   b. FOR UPDATE sobre TODAS las membresías de la persona y TODAS las de las
 --      candidatas, en orden de id, y en la MISMA sentencia se anotan los ids de
 --      las suyas. Un UPDATE de rol no toca la FK, así que (a) no lo frena: un
---      admin que se sube a owner (policy `members_owner_write`) a mitad de la
---      baja se encola acá, y la baja lee su rol nuevo.
+--      admin al que suben a owner a mitad de la baja se encola acá, y la baja
+--      lee su rol nuevo. (Hasta la 0036 el admin se subía solo, por la policy
+--      `members_owner_write`; desde la 0036 lo sube un owner activo o el
+--      servidor. El orden es el mismo.)
 --   c. La clasificación se hace DESPUÉS de los locks y sólo sobre las membresías
 --      anotadas en (b), que nadie más puede tocar hasta el COMMIT (y que el lock
 --      devuelve como quedaron: READ COMMITTED, por eso la función se niega a
@@ -178,9 +180,10 @@
 --     transacción, DESPUÉS de esta. Entre las dos, una membresía o un sello
 --     nuevos de la persona los encuentra la cascada de `auth.users` (o su
 --     CHECK). Es una ventana de un pedido HTTP, no de cuatro.
---   * Que un admin se pueda subir a owner (`members_owner_write`, FOR ALL para
---     owner y admin, 0013) sigue abierto: es otro frente. Esta función lo
---     ordena (b), no lo impide.
+--   * Que un admin se pudiera subir a owner (`members_owner_write`, FOR ALL
+--     para owner y admin, 0013) quedaba abierto acá: era otro frente, y lo
+--     cerró la 0036 (#128). Esta función lo ordena (b); impedirlo es de la
+--     0036.
 --   * Una FIRMA (no un sello) en una organización sin nadie que decida sigue
 --     trabando la baja sin salida: esas filas son registros firmados e
 --     inmutables (0026, 0027, 0029) y soltarlas no es un UPDATE. Decisión

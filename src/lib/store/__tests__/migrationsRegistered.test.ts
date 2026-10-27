@@ -56,10 +56,16 @@ const REGISTRY_MIGRATION = "0008_schema_migrations";
  * propósito, porque se vuelve vieja en el instante en que el dueño mergea, y
  * un rojo ahí lo pagaría `main`, no esta rama. Se borra al integrar.
  *
- * Hoy no hay ninguna. La última fue la `0034_search_console_coverage`, de
+ * Hoy no hay ninguna. La última fue la `0035_account_deletion_in_one_transaction`,
+ * de la baja de cuenta (`fix/la-baja-decide-y-borra-en-una-transaccion`, PR
+ * #120), reservada mientras la `0036_owner_grants_owner` (el rol de owner lo da
+ * un owner, `fix/solo-un-owner-da-o-quita-owner`, PR #128) se escribía con el
+ * número siguiente. Se borró el 2026-10-27, al integrar `main` en la rama del
+ * owner con la `0035` ya presente.
+ *
+ * Antes, la `0034_search_console_coverage`, de
  * `fix/sin-token-propio-no-se-usa-el-de-la-agencia` (PR #118), reservada
- * mientras la `0035_account_deletion_in_one_transaction` (la baja de cuenta en
- * una transacción, PR #120) se escribía con el número siguiente. Se borró el
+ * mientras la `0035` se escribía con el número siguiente. Se borró el
  * 2026-10-23, al integrar `main` en la rama de la baja con la `0034` ya
  * presente.
  *
