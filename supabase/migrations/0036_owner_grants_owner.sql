@@ -15,10 +15,12 @@
 -- y A quedó con tres owners activos, dos puestos por una admin. Por el mismo
 -- camino la admin degradaba o archivaba al owner que la había sumado.
 --
--- La mención medida está en el encabezado de `deleteMyAccount`
+-- La mención medida estaba en el encabezado de `deleteMyAccount`
 -- (`src/lib/auth/account-actions.ts`, #117): «un owner suma un admin y el admin
--- se sube a owner». La baja tiene que seguir sabiendo de co-owners —un owner
--- puede sumar otro owner—, pero ese camino, el del admin, deja de existir.
+-- se sube a owner». La 0035 (#120) se la llevó a su propio encabezado: su
+-- protocolo (b) ORDENA ese UPDATE contra la baja, y su LO QUE NO CIERRA lo deja
+-- para otro frente, que es éste. La baja tiene que seguir sabiendo de co-owners
+-- —un owner puede sumar otro owner—, pero el camino del admin deja de existir.
 --
 -- LA REGLA
 --
@@ -110,8 +112,13 @@
 --     creador corre como `postgres` y no evalúa ninguna policy. Ninguna de las
 --     dos cambia, y el bloque 255 las ejecuta: la segunda como `authenticated`,
 --     la primera con un uid ajeno puesto en la sesión.
---   * `service_role` escribe sin RLS. Lo único que escribe `org_members` en
---     `src/` hoy es el `.delete()` de la baja de cuenta, con `service_role`.
+--   * `service_role` escribe sin RLS. Lo único que escribe `org_members` desde
+--     `src/` hoy es la baja de cuenta: `deleteMyAccount` llama con
+--     `service_role` a `delete_account_organizations()` (0035), SECURITY
+--     DEFINER de `postgres`, que borra las membresías de quien se va como
+--     `postgres` y no evalúa ninguna policy, tampoco éstas. Los bloques 402 a
+--     408 corren con la 0036 puesta: si una restrictiva de acá le llegara a la
+--     baja, la salida de una organización con otro owner se pondría roja.
 --   * `ingest_lead_won()` (0019) no escribe `org_members`: la organización que
 --     crea nace SIN miembros, y su primer owner lo pone el servidor. El bloque
 --     255 la ejecuta y lo mide, para que el día que empiece a dar owners —un
@@ -121,10 +128,10 @@
 --
 -- Agrega una función y tres policies; no toca ni reemplaza ningún objeto que ya
 -- existe, y `members_owner_write` queda como la dejó la 0013. Nada en `src/`
--- escribe `org_members` con sesión (grep del 2026-10-23: lecturas en seis
--- archivos y el `.delete()` de `service_role` en `account-actions.ts`), así que
--- no hay código desplegado al que le cambie una respuesta. El .down saca las
--- cuatro piezas y vuelve exactamente a la 0013.
+-- escribe `org_members` con sesión (grep del 2026-10-27, con la 0035 en `main`:
+-- `.select()` en nueve archivos y ninguna escritura; la baja borra por la RPC
+-- de la 0035), así que no hay código desplegado al que le cambie una
+-- respuesta. El .down saca las cuatro piezas y vuelve exactamente a la 0013.
 --
 -- LO QUE NO CIERRA, Y QUEDA DICHO
 --
@@ -132,8 +139,12 @@
 --     owner— hasta dejar la organización sin ningún owner activo. Desde ahí
 --     nadie por sesión vuelve a dar owner: sólo el servidor. Cerrarlo pide una
 --     invariante de conjunto («queda al menos uno») con lock, porque dos owners
---     que se degradan a la vez se leen uno al otro; es su propio frente, y la
---     baja de cuenta (#120) tiene la misma carrera.
+--     que se degradan a la vez se leen uno al otro; es su propio frente. La
+--     baja de cuenta (0035) cerró la suya —dos co-owners que se van a la vez—
+--     bloqueando la organización (bloque 402 y escenario 1 de
+--     `baja_concurrente.sh`), pero un owner que se degrada mientras su
+--     co-owner se da de baja todavía puede dejarla sin owners: es esta misma
+--     invariante.
 --   * El owner da owner sin aceptación de quien lo recibe, como la 0031 ya dijo
 --     de cualquier rol.
 --   * Admin sobre admin sigue como estaba: un admin asciende a otro a admin, lo

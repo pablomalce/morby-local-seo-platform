@@ -20,8 +20,10 @@
 #      espera su COMMIT y lo ve; la organización queda con la nueva owner;
 #   3. la baja va primero: el INSERT de la owner nueva espera, y muere con 23503
 #      porque la organización ya no está. No queda una membresía colgada;
-#   4. un admin se sube a owner (la policy `members_owner_write` lo deja) a mitad
-#      de la baja: la baja espera el UPDATE y lo ve; la organización queda;
+#   4. a un admin lo suben a owner a mitad de la baja: la baja espera el UPDATE
+#      y lo ve; la organización queda. Desde la 0036 sólo lo sube un owner
+#      activo o el servidor (antes se subía solo, por `members_owner_write`);
+#      la sesión de acá escribe como `postgres`, que es el servidor;
 #   5. a la persona la suben a owner de una organización que no estaba entre las
 #      bloqueadas mientras esperaba: la baja se niega (40001) sin borrar nada;
 #   6. fuera de READ COMMITTED la baja se niega (45009): su clasificación
@@ -247,7 +249,7 @@ else
     rojo "3. la baja primero" "esperó: $espero" "estado: $ESTADO" "baja: $R1" "insert: $I2"
 fi
 
-# ── 4. Un admin se sube a owner a mitad de la baja ──────────────────────────
+# ── 4. A un admin lo suben a owner a mitad de la baja ───────────────────────
 personas 7 8
 E=$(u 7); F=$(u 8); Q=$(org_de "$E")
 consulta "INSERT INTO public.org_members (organization_id, user_id, role) VALUES ('$Q', '$F', 'admin');" >/dev/null
@@ -267,9 +269,9 @@ ESTADO=$(consulta "SELECT format('q_existe=%s owners=%s de_e=%s',
                      (SELECT count(*) FROM public.org_members WHERE user_id = '$E'))")
 if [ "$espero" = si ] && [ "$ESTADO" = "q_existe=t owners=f de_e=0" ] \
    && grep -q "\"left_organizations\": \[\"$Q\"\]" <<<"$R1"; then
-    verde "4. admin que se sube a owner a mitad: la baja esperó el UPDATE, lo vio, y Q quedó con él ($ESTADO)"
+    verde "4. admin al que suben a owner a mitad: la baja esperó el UPDATE, lo vio, y Q quedó con él ($ESTADO)"
 else
-    rojo "4. admin que se sube a owner a mitad" "esperó: $espero" "estado: $ESTADO" "baja: $R1"
+    rojo "4. admin al que suben a owner a mitad" "esperó: $espero" "estado: $ESTADO" "baja: $R1"
 fi
 
 # ── 5. La suben a owner de una organización no bloqueada mientras espera ────
