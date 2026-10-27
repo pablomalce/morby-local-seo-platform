@@ -10532,9 +10532,11 @@ SELECT x.caso, pg_temp.o36_n(x.dml) AS sentencia, x.prep
         'INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''owner'')',
         o.a, pg_temp.o36('nico')), NULL),
     -- Una fila owner ARCHIVADA también es una fila owner: la regla mira el rol,
-    -- no el estado. Sin estos tres casos, una 0036 que copiara el
-    -- `state = 'active'` de las funciones a las filas («sólo un owner activo
-    -- escribe owners ACTIVOS») daba los mismos verdes.
+    -- no el estado. Sin estos tres casos, copiar el `state = 'active'` de las
+    -- funciones al WITH CHECK de INSERT o de UPDATE, o al USING de DELETE
+    -- («sólo un owner activo escribe owners ACTIVOS»; mutaciones O20 a O22,
+    -- juntas o por separado), daba los mismos verdes. Copiado también al USING
+    -- de UPDATE (O23) ya lo cazaba el desarchivo de ofelia.
     ('alta de nico como owner archivada', format(
         'INSERT INTO public.org_members (organization_id, user_id, role, state) VALUES (%L, %L, ''owner'', ''archived'')',
         o.a, pg_temp.o36('nico')), NULL),
@@ -10697,9 +10699,9 @@ SELECT 252, 'an active owner cannot grant, move, demote, archive, unarchive or d
 -- ── 253 ──────────────────────────────────────────────────────────────────────
 -- LO QUE NO SE LE SACA AL ADMIN. ada suma a nico como editor, asciende a mara a
 -- admin, la degrada a editor, la archiva y la borra: una fila cada uno. Sin
--- este bloque, una regla
--- que pidiera ser owner para escribir CUALQUIER membresía pondría verdes el 250
--- y el 251 y dejaría a los admins sin poder administrar.
+-- este bloque, una regla que pidiera ser owner para escribir CUALQUIER
+-- membresía pondría verdes el 250 y el 251 y dejaría a los admins sin poder
+-- administrar.
 INSERT INTO defect_report
 SELECT 253, 'an active admin can no longer manage the memberships that are not owner',
        count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 5,
@@ -10736,7 +10738,8 @@ SELECT 254, 'current_user_owner_org_ids() answers for someone who is not an acti
 --      ser él. Acá inserta `authenticated` —tampoco tiene BYPASSRLS—, con el
 --      INSERT sobre `auth.users` devuelto adentro de la medición y el uid de lea
 --      puesto (así la lectura de después ve su membresía), para que ni «no hay
---      uid» ni el rol de quien inserta sean lo que la exime. Lo que la exime es que la función es SECURITY DEFINER de
+--      uid» ni el rol de quien inserta sean lo que la exime. Lo que la exime es
+--      que la función es SECURITY DEFINER de
 --      `postgres`, con BYPASSRLS: como INVOKER, la alta muere en la RLS de
 --      `organizations` antes de llegar a `org_members` (mutación O19). Insertar
 --      como `postgres`, como hacía este caso, daba verde también con INVOKER;

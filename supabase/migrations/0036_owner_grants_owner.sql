@@ -122,17 +122,23 @@
 --     no tiene BYPASSRLS: como INVOKER, cualquiera de las dos muere en la RLS
 --     de `organizations` antes de llegar acá (mutaciones O16 y O19).
 --   * `service_role` escribe sin RLS. Desde `src/`, `org_members` se escribe
---     sólo por dos RPC SECURITY DEFINER de `postgres`, que no evalúan ninguna
---     policy: `create_client_organization()` (`POST /api/organizations`, con
---     la sesión de quien crea; el punto de arriba) y la baja de cuenta, que
---     `deleteMyAccount` llama con `service_role`: `delete_account_organizations()`
---     (0035) borra las membresías de quien se va como `postgres`. Los bloques
---     402 a 408 corren con la 0036 puesta, pero solos no dicen que una
---     restrictiva de acá no le llegue a la baja: como INVOKER tampoco le
---     llegaría, porque `service_role` también tiene BYPASSRLS (mutación N3,
---     sólo el 405, por catálogo). Le llega si la baja la corre un rol sin
---     BYPASSRLS, y entonces 402, 403, 404, 406 y 407 se ponen rojos con 40001
---     (N3b).
+--     por tres caminos, y ninguno evalúa una policy: la alta de usuario (el
+--     magic link de `signInWithEmail` crea la cuenta si no existe; GoTrue
+--     inserta en `auth.users` y `handle_new_user()` da el owner), la alta de
+--     cliente (`POST /api/organizations` llama, con la sesión de quien crea, a
+--     `create_client_organization()`) —las dos del punto de arriba— y la baja
+--     de cuenta, que `deleteMyAccount` llama con `service_role`:
+--     `delete_account_organizations()` (0035) borra las membresías de quien se
+--     va como `postgres`. Lo que deja a la baja afuera de estas restrictivas es
+--     eso, que corre como `postgres`, y lo mira el 405 por catálogo. Los 402 a
+--     408 solos no lo dicen: como INVOKER tampoco le llegarían, porque
+--     `service_role` también tiene BYPASSRLS (mutación N3, sólo el 405). Les
+--     llegan si la dueña de la función es un rol sin BYPASSRLS al que todo lo
+--     demás le está abierto (N3b, en la tabla de abajo): entonces 402, 403,
+--     404, 406 y 407 se ponen rojos con 40001, y sin la 0036 los cuatro
+--     primeros dan verde. Corrida en cambio con la sesión de quien se va, la baja se rompe
+--     igual SIN la 0036 —la frenan antes la permisiva de la 0013 y el eje de la
+--     0031—, así que esa forma no mide nada de acá.
 --   * `ingest_lead_won()` (0019) no escribe `org_members`: la organización que
 --     crea nace SIN miembros, y su primer owner lo pone el servidor. El bloque
 --     255 la ejecuta y lo mide, para que el día que empiece a dar owners —un
@@ -143,9 +149,10 @@
 -- Agrega una función y tres policies; no toca ni reemplaza ningún objeto que ya
 -- existe, y `members_owner_write` queda como la dejó la 0013. Nada en `src/`
 -- escribe `org_members` directamente (grep del 2026-10-27, con la 0035 en
--- `main`: `.select()` en nueve archivos y ninguna escritura; las dos que hay
--- van por las RPC del punto de arriba, que no evalúan policies), así que no hay
--- código desplegado al que le cambie una respuesta. El .down saca las cuatro piezas y vuelve exactamente a la 0013.
+-- `main`: `.select()` en nueve archivos y ninguna escritura; las que hay van
+-- por los tres caminos del punto de arriba, que no evalúan policies), así que no
+-- hay código desplegado al que le cambie una respuesta. El .down saca las cuatro
+-- piezas y vuelve exactamente a la 0013.
 --
 -- LO QUE NO CIERRA, Y QUEDA DICHO
 --
@@ -158,12 +165,17 @@
 --     bloqueando la organización (bloque 402 y escenario 1 de
 --     `baja_concurrente.sh`), pero un owner que se degrada mientras su
 --     co-owner se da de baja todavía puede dejarla sin owners: es esta misma
---     invariante. Y tiene otra cara, medida el 2026-10-27 con dos sesiones: si
---     otto archiva a olga mientras una UPDATE de olga sobre su propia fila
---     espera ese lock, cuando otto confirma la de olga se aplica igual —en READ
---     COMMITTED la subconsulta de la policy lee la foto de la sentencia, donde
---     olga todavía es owner activa— y olga queda desarchivada; sin la carrera,
---     la misma UPDATE da 0 filas. Es la misma invariante con lock.
+--     invariante.
+--   * UNA REVOCACIÓN QUE SE PIERDE EN LA CARRERA. Medido el 2026-10-27 con dos
+--     sesiones: si otto archiva a olga mientras una UPDATE de olga sobre su
+--     propia fila espera ese lock, cuando otto confirma la de olga se aplica
+--     igual, con el permiso que ya no tiene —en READ COMMITTED la subconsulta
+--     de la policy lee la foto de la sentencia, donde olga todavía es owner
+--     activa—: si escribe `state`, olga queda desarchivada; si escribe otra
+--     columna, la cambia y sigue archivada. Sin la carrera, la misma UPDATE da
+--     0 filas. Pasa igual sin la 0036 (viene de la permisiva de la 0013), y
+--     no es la invariante de «queda al menos uno»: cerrarlo pide que la
+--     escritura vuelva a leer, con lock, si quien la hace sigue siendo owner.
 --   * El owner da owner sin aceptación de quien lo recibe, como la 0031 ya dijo
 --     de cualquier rol.
 --   * Admin sobre admin sigue como estaba: un admin asciende a otro a admin, lo
@@ -229,12 +241,15 @@
 -- RE-MEDIDO (2026-10-27, réplica `growthos-replica-o36`, sobre `main` 1d07da1
 -- —con la 0035— más esta rama). Verde: 208 de 208, y `rollback.sh` deja el
 -- esquema idéntico (1337 objetos). La revisión de #128 encontró dos huecos en
--- la suite y se taparon: ningún caso escribía una fila owner ARCHIVADA (casos
--- nuevos en 250, 251 y 252), y la alta de usuario del 255 insertaba como
+-- la suite y se taparon: ningún caso CREABA ni BORRABA una fila owner archivada
+-- —sólo se desarchivaba a ofelia— (casos nuevos en 250, 251 y 252), y la alta
+-- de usuario del 255 insertaba como
 -- `postgres`, con BYPASSRLS, así que daba verde también con
 -- `handle_new_user()` como INVOKER (ahora inserta `authenticated`). Con la
 -- suite así, O01 a O18 dan los mismos rojos de arriba —ninguno toca los 402 a
--- 408— y además:
+-- 408—, salvo que la O11 a veces suma el 205 y el 207: `h41_primera` elige la
+-- contraprueba con `ORDER BY id` sobre uuid al azar, y con la O11 a veces le
+-- toca otra persona. Además:
 --
 --   O19 `handle_new_user()` como INVOKER  . . . . . . . . . . . . . rojo 255
 --   O20 la de INSERT sólo frena filas owner ACTIVAS . . . . . . . . rojo 250
@@ -243,11 +258,18 @@
 --   O23 el USING de la de UPDATE, sólo owner ACTIVA . . . . . . . . rojo 251
 --   N1  la de DELETE sin la excepción del owner . . . . . . . . . . rojo 252
 --   N3  `delete_account_organizations()` (0035) como INVOKER  . . . rojo 405
---   N3b la baja corrida por un rol sin BYPASSRLS
+--   N3b la dueña de `delete_account_organizations()` es un rol sin BYPASSRLS
+--       con permisivas `USING (true)` para él en las tablas que toca y las
+--       restrictivas de la 0031 fuera de su alcance: sólo la 0036 lo frena
 --                                       rojo 402, 403, 404, 406, 407 (40001)
+--       y la misma armazón SIN la 0036 deja verdes el 402, el 403, el 404 y
+--       el 406 (el 405, el 208 y el 407 —éste con 45005, del trigger del
+--       sello de la 0033— los pone rojos la armazón, no la 0036).
 --
--- La O19 a la O22 sobrevivían a la suite de antes (la O20 a la O22 son la
--- 0036 que copia el `state = 'active'` de las funciones a las filas).
+-- La O19 a la O22 sobrevivían a la suite de antes: la O20 a la O22, juntas o
+-- por separado, son la 0036 que copia el `state = 'active'` de las funciones a
+-- las filas. Copiado también al USING de la de UPDATE (O23) ya lo cazaba el
+-- desarchivo de ofelia.
 
 \set ON_ERROR_STOP on
 
