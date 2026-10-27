@@ -10531,6 +10531,20 @@ SELECT x.caso, pg_temp.o36_n(x.dml) AS sentencia, x.prep
     ('alta de nico como owner', format(
         'INSERT INTO public.org_members (organization_id, user_id, role) VALUES (%L, %L, ''owner'')',
         o.a, pg_temp.o36('nico')), NULL),
+    -- Una fila owner ARCHIVADA también es una fila owner: la regla mira el rol,
+    -- no el estado. Sin estos tres casos, una 0036 que copiara el
+    -- `state = 'active'` de las funciones a las filas («sólo un owner activo
+    -- escribe owners ACTIVOS») daba los mismos verdes.
+    ('alta de nico como owner archivada', format(
+        'INSERT INTO public.org_members (organization_id, user_id, role, state) VALUES (%L, %L, ''owner'', ''archived'')',
+        o.a, pg_temp.o36('nico')), NULL),
+    ('mara a owner archivada', format(
+        'UPDATE public.org_members SET role = ''owner'', state = ''archived'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('mara')), NULL),
+    ('borrar a ofelia', format(
+        'DELETE FROM public.org_members WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('ofelia')),
+     'GRANT DELETE ON public.org_members TO authenticated'),
     -- Propone `admin` y el ON CONFLICT sube a owner: así llega al camino de
     -- UPDATE del upsert. Uno que propone owner directamente —lo que manda
     -- PostgREST con merge-duplicates— muere antes, en el WITH CHECK del INSERT
@@ -10572,6 +10586,9 @@ SELECT x.caso, pg_temp.o36_n(x.dml) AS sentencia, x.prep
     ('mara a admin', format(
         'UPDATE public.org_members SET role = ''admin'' WHERE organization_id = %L AND user_id = %L',
         o.a, pg_temp.o36('mara')), NULL),
+    ('degradar a mara', format(
+        'UPDATE public.org_members SET role = ''editor'' WHERE organization_id = %L AND user_id = %L',
+        o.a, pg_temp.o36('mara')), NULL),
     ('archivar a mara', format(
         'UPDATE public.org_members SET state = ''archived'' WHERE organization_id = %L AND user_id = %L',
         o.a, pg_temp.o36('mara')), NULL),
@@ -10590,10 +10607,13 @@ SELECT e.bloque, e.orden, e.caso, e.quien, e.esperado,
     (250, 2, 'alta de nico como owner',                'ada',  'ERR 42501 rls:org_members_owner_insert'),
     (250, 3, 'upsert de ada como owner',               'ada',  'ERR 42501 rls:org_members_owner_update'),
     (250, 4, 'mudar a A un owner de la propia (ada)',  'ada',  'ERR 42501 rls:org_members_owner_update'),
+    (250, 5, 'alta de nico como owner archivada',      'ada',  'ERR 42501 rls:org_members_owner_insert'),
+    (250, 6, 'mara a owner archivada',                 'ada',  'ERR 42501 rls:org_members_owner_update'),
     (251, 1, 'degradar a olga',                        'ada',  'n=0'),
     (251, 2, 'archivar a olga',                        'ada',  'n=0'),
     (251, 3, 'desarchivar a ofelia',                   'ada',  'n=0'),
     (251, 4, 'borrar a olga',                          'ada',  'n=0'),
+    (251, 5, 'borrar a ofelia',                        'ada',  'n=0'),
     (252, 1, 'a ada a owner',                          'olga', 'n=1'),
     (252, 2, 'alta de nico como owner',                'olga', 'n=1'),
     (252, 3, 'upsert de ada como owner',               'olga', 'n=1'),
@@ -10602,10 +10622,14 @@ SELECT e.bloque, e.orden, e.caso, e.quien, e.esperado,
     (252, 6, 'archivar a olga',                        'otto', 'n=1'),
     (252, 7, 'desarchivar a ofelia',                   'olga', 'n=1'),
     (252, 8, 'borrar a olga',                          'otto', 'n=1'),
+    (252, 9, 'alta de nico como owner archivada',      'olga', 'n=1'),
+    (252, 10, 'mara a owner archivada',                'olga', 'n=1'),
+    (252, 11, 'borrar a ofelia',                       'otto', 'n=1'),
     (253, 1, 'alta de nico como editor',               'ada',  'n=1'),
     (253, 2, 'mara a admin',                           'ada',  'n=1'),
-    (253, 3, 'archivar a mara',                        'ada',  'n=1'),
-    (253, 4, 'borrar a mara',                          'ada',  'n=1')
+    (253, 3, 'degradar a mara',                        'ada',  'n=1'),
+    (253, 4, 'archivar a mara',                        'ada',  'n=1'),
+    (253, 5, 'borrar a mara',                          'ada',  'n=1')
   ) e(bloque, orden, caso, quien, esperado)
   JOIN o36_sql s ON s.caso = e.caso;
 
@@ -10613,8 +10637,8 @@ SELECT e.bloque, e.orden, e.caso, e.quien, e.esperado,
 -- sentencia, el JOIN lo pierde, y el bloque pasaría sobre menos casos.
 DO $$
 BEGIN
-    IF (SELECT count(*) FROM o36_medido) <> 20 THEN
-        RAISE EXCEPTION 'Vacuous run: los bloques 250 a 253 midieron % de 20 casos.',
+    IF (SELECT count(*) FROM o36_medido) <> 27 THEN
+        RAISE EXCEPTION 'Vacuous run: los bloques 250 a 253 midieron % de 27 casos.',
             (SELECT count(*) FROM o36_medido);
     END IF;
 END
@@ -10634,24 +10658,27 @@ $$;
 -- ── 250 ──────────────────────────────────────────────────────────────────────
 -- EL ATAQUE MEDIDO. ada, admin activa de A, como PostgREST: subirse a owner,
 -- sumar a nico como owner, subirse por el ON CONFLICT de un upsert y mudar a A
--- una fila owner de SU organización —donde es owner y la puede escribir—. Cada uno muere con 42501
+-- una fila owner de SU organización —donde es owner y la puede escribir—. Y lo
+-- mismo con la fila nueva ARCHIVADA: sumar a nico como owner archivada y
+-- volver a mara owner archivada. Cada uno muere con 42501
 -- y el mensaje nombra la restrictiva de la 0036: la permisiva de la 0013 y el
 -- eje de la 0031 la dejan pasar, porque es admin y escribe.
 INSERT INTO defect_report
 SELECT 250, 'an active admin can make someone an owner of the organization, herself included',
-       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 6,
        pg_temp.o36_informe(250)
   FROM o36_medido WHERE bloque = 250;
 
 -- ── 251 ──────────────────────────────────────────────────────────────────────
 -- LA OTRA MITAD: quitar el rol. ada degrada a olga, la archiva, desarchiva a
--- ofelia y, con DELETE devuelto adentro de la medición, borra la fila de olga.
+-- ofelia y, con DELETE devuelto adentro de la medición, borra la fila de olga y
+-- la de ofelia (owner archivada).
 -- Cada uno, 0 filas: el USING de la restrictiva le esconde la fila owner al
 -- verbo. Que esas filas existen y se pueden escribir lo dice el 252, con las
 -- mismas sentencias.
 INSERT INTO defect_report
 SELECT 251, 'an active admin can demote, archive, unarchive or delete an owner',
-       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 5,
        pg_temp.o36_informe(251)
   FROM o36_medido WHERE bloque = 251;
 
@@ -10663,27 +10690,29 @@ SELECT 251, 'an active admin can demote, archive, unarchive or delete an owner',
 -- es owner de las dos organizaciones.
 INSERT INTO defect_report
 SELECT 252, 'an active owner cannot grant, move, demote, archive, unarchive or delete an owner',
-       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 8,
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 11,
        pg_temp.o36_informe(252)
   FROM o36_medido WHERE bloque = 252;
 
 -- ── 253 ──────────────────────────────────────────────────────────────────────
 -- LO QUE NO SE LE SACA AL ADMIN. ada suma a nico como editor, asciende a mara a
--- admin, la archiva y la borra: una fila cada uno. Sin este bloque, una regla
+-- admin, la degrada a editor, la archiva y la borra: una fila cada uno. Sin
+-- este bloque, una regla
 -- que pidiera ser owner para escribir CUALQUIER membresía pondría verdes el 250
 -- y el 251 y dejaría a los admins sin poder administrar.
 INSERT INTO defect_report
 SELECT 253, 'an active admin can no longer manage the memberships that are not owner',
-       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 4,
+       count(*) FILTER (WHERE medido IS DISTINCT FROM esperado) > 0 OR count(*) <> 5,
        pg_temp.o36_informe(253)
   FROM o36_medido WHERE bloque = 253;
 
 -- ── 254 ──────────────────────────────────────────────────────────────────────
 -- `current_user_owner_org_ids()`, persona por persona, sobre A. Es lo único que
 -- ve el `state = 'active'` de la función: ofelia, owner archivada, no llega a
--- la policy de la 0036 porque la permisiva de la 0013 ya la frena (bloque 16),
--- así que sacarle el estado a la función no cambia ninguna escritura de hoy.
--- Cambia la próxima permisiva que no lo mire.
+-- la policy de la 0036 porque antes la frenan la permisiva de la 0013 (bloque
+-- 16) y el eje de la 0031 (`current_user_writer_org_ids()` también pide
+-- `state = 'active'`), así que sacarle el estado a la función no cambia
+-- ninguna escritura de hoy. Cambia la próxima permisiva que no lo mire.
 CREATE TEMP TABLE o36_funcion AS
 SELECT string_agg(CASE pg_temp.o36_como(pg_temp.o36(q.quien), format(
                            'SELECT count(*)::text FROM public.current_user_owner_org_ids() f WHERE f = %L',
@@ -10702,10 +10731,15 @@ SELECT 254, 'current_user_owner_org_ids() answers for someone who is not an acti
 -- QUIEN DA OWNERS SIN SER OWNER DE ESA ORGANIZACIÓN, Y TIENE QUE PODER:
 --
 --   a. `handle_new_user()`: la alta de lea crea su organización y la hace owner.
---      GoTrue inserta como `supabase_auth_admin`, que el stub no tiene con
---      INSERT; acá inserta `postgres`, con el uid de ada puesto en la sesión
---      para que «no hay uid» no sea lo que la exime. Lo que la exime es que la
---      función es SECURITY DEFINER de `postgres`, con BYPASSRLS;
+--      GoTrue inserta como `supabase_auth_admin`, que en la imagen no tiene
+--      BYPASSRLS ni INSERT sobre el stub de `auth.users`, y `postgres` no puede
+--      ser él. Acá inserta `authenticated` —tampoco tiene BYPASSRLS—, con el
+--      INSERT sobre `auth.users` devuelto adentro de la medición y el uid de lea
+--      puesto (así la lectura de después ve su membresía), para que ni «no hay
+--      uid» ni el rol de quien inserta sean lo que la exime. Lo que la exime es que la función es SECURITY DEFINER de
+--      `postgres`, con BYPASSRLS: como INVOKER, la alta muere en la RLS de
+--      `organizations` antes de llegar a `org_members` (mutación O19). Insertar
+--      como `postgres`, como hacía este caso, daba verde también con INVOKER;
 --   b. `create_client_organization()`, como `authenticated` con el uid de ada:
 --      ada queda owner de la organización nueva, de la que antes no era nada;
 --   c. el servidor, `service_role` sin uid, da de alta a nico como owner de A;
@@ -10760,7 +10794,8 @@ CREATE TEMP TABLE o36_servidor AS
 SELECT x.orden, x.caso, x.esperado, x.medido
   FROM (VALUES
     (1, 'alta de usuario', 'owner/active',
-        pg_temp.o36_como(pg_temp.o36('ada'), 'SELECT pg_temp.o36_alta()', NULL, 'postgres')),
+        pg_temp.o36_como(pg_temp.o36('lea'), 'SELECT pg_temp.o36_alta()',
+                         'GRANT USAGE ON SCHEMA auth TO authenticated; GRANT INSERT ON auth.users TO authenticated')),
     (2, 'alta de cliente', 'owner/active',
         pg_temp.o36_como(pg_temp.o36('ada'), 'SELECT pg_temp.o36_cliente()')),
     (3, 'service_role', 'n=1',
